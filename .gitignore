@@ -1,0 +1,36 @@
+# Allow only Python source, the example environment file, this ignore file, and the README.
+*
+!*/
+!*.py
+!.env.example
+!.gitignore
+!README.md
+
+# Secrets, generated files, and local-only artifacts
+.env
+.DS_Store
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+.firecrawl/
+
+# Python packaging and tooling artifacts
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+.tox/
+.nox/
+.pytype/
+.dmypy.json
+dmypy.json
+pip-wheel-metadata/
