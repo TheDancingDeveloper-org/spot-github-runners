@@ -14,7 +14,11 @@ for the two ARM64 runners through the OrbStack socket.
 
 ```mermaid
 flowchart TD
-    A[Read online runners and busy jobs] --> B{Busy share above 50%?}
+    A[Read runners and current VM prices] --> P{Any VM over the price cap?}
+    P -- Yes --> R[Delete overpriced VMs and disks]
+    R --> S[Find and launch affordable replacements]
+    S --> A
+    P -- No --> B{Busy share above 50%?}
     B -- Yes and at most 25 workers --> C[Double Spot VM count]
     C --> D{More than 25 workers online?}
     D -- No --> C
@@ -43,6 +47,20 @@ runner and distinct-host floors. Deleting a VM also deletes its attached disks.
 Each added host contributes eight runner containers, including two Docker
 workers and six Spot workers. Spot VM prices cover compute only. Persistent
 disks and network use have separate charges.
+
+Every loop fetches current regional Spot prices and checks each running managed
+VM against `--max-daily-usd` (default: $5 per VM per day for compute).
+Prices are shared within one loop for VMs of the same family and region, then
+fetched again on the next loop. The launch price is not a price guarantee.
+
+If a VM's current compute price exceeds the cap, the autoscaler deletes that VM
+and its attached disks immediately, even if its runners have active jobs. Those
+jobs can fail and need to be rerun. It then searches for affordable replacements
+and uses the deployment manager to check their prices again before launch.
+Pending replacements survive process restarts and are retried when no eligible
+capacity is available. Utilization scaling waits during replacement work.
+If GCP cannot provide a valid price, the autoscaler logs the failed
+check, keeps that VM, and retries on the next loop.
 
 ## Storage layout
 

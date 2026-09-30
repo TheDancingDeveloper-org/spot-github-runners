@@ -17,6 +17,7 @@ from tempfile import NamedTemporaryFile
 from .autoscaling_policy import affordable_offers
 from .compute_api import get_auth
 from .environment import load_env
+from .price_guard import check_running_prices, delete_overpriced_vm
 from .runner_labels import counts_toward_capacity
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
@@ -34,7 +35,8 @@ def count_online_runners(org: str, label: str) -> int:
 
 def runner_is_managed(runner: GitHubRunner) -> bool:
     """Return whether a runner belongs to this GCP x64 fleet."""
-    current_shape = "n2-standard-32" in runner.labels
+    current_shape = bool({"n2-standard-32", "e2-standard-32", "c2d-standard-32"}
+                         .intersection(runner.labels))
     legacy_toronto = {
         "oxidex-spot-7x27", "northamerica-northeast2"
     }.issubset(runner.labels)
@@ -151,7 +153,8 @@ def read_scale_state(path: Path) -> dict:
         LOG.warning("Ignoring unreadable autoscaler state at %s: %s", path, exc)
         return {"idle_loops": 0, "scale_up_active": False}
     return {"idle_loops": int(state.get("idle_loops", 0)),
-            "scale_up_active": bool(state.get("scale_up_active", False))}
+            "scale_up_active": bool(state.get("scale_up_active", False)),
+            "price_replacement_target": int(state.get("price_replacement_target", 0))}
 
 
 def write_scale_state(path: Path, state: dict) -> None:
@@ -201,6 +204,48 @@ def scale_up(additional_hosts: int, offers, args: argparse.Namespace) -> int:
         else:
             break
     return launched
+
+
+def reconcile_prices(vms, runners, args, state, state_path) -> bool:
+    """Evict overpriced VMs and retry replacements across loop restarts."""
+    fleet = spot_instances(vms)
+    overpriced = check_running_prices(fleet, args.project, args.max_daily_usd)
+    if overpriced:
+        state["price_replacement_target"] = max(
+            state.get("price_replacement_target", 0), len(fleet))
+        state["idle_loops"] = 0
+        write_scale_state(state_path, state)
+    for vm in overpriced:
+        LOG.warning("Price exceeds cap: deleting %s with its disks, including any active jobs", vm.name)
+        try:
+            delete_overpriced_vm(vm, args.project)
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            LOG.error("Price eviction failed for %s; retrying next loop: %s", vm.name, exc)
+            continue
+        for runner in host_runners(vm, runners, fleet):
+            result = subprocess.run([
+                "gh", "api", "-X", "DELETE", f"orgs/{args.org}/actions/runners/{runner.runner_id}",
+            ], text=True, capture_output=True, timeout=60)
+            if result.returncode:
+                LOG.warning("Could not remove stale runner record %s", runner.name)
+    target = state.get("price_replacement_target", 0)
+    if not target:
+        return False
+    remaining = spot_instances(list_gcloud_vms(args.project, name_prefix="oxidex-runners-"))
+    if {vm.name for vm in remaining} & {vm.name for vm in overpriced}:
+        return True
+    missing = max(0, target - len(remaining))
+    if missing:
+        LOG.info("Finding affordable replacements for %d price evictions", missing)
+        offers = discover_offers(args.project, args.max_daily_usd)
+        launched = scale_up(missing, offers, args) if offers else 0
+        if launched < missing:
+            LOG.warning("Replacement capacity is pending; retrying next loop")
+            return True
+    state["price_replacement_target"] = 0
+    state["idle_loops"] = 0
+    write_scale_state(state_path, state)
+    return True
 
 
 def scaling_decision(online: int, busy: int, vm_count: int, idle_loops: int,
@@ -291,7 +336,15 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
     plist_path = launch_agents / "com.swacktools.spot-runner-autoscaler.plist"
     plist = {
         "Label": "com.swacktools.spot-runner-autoscaler",
-        "ProgramArguments": [sys.executable, str(ROOT / "src" / "spot_runner_autoscaler.py")],
+        "ProgramArguments": [sys.executable, str(ROOT / "src" / "spot_runner_autoscaler.py"),
+                             "--max-daily-usd", str(args.max_daily_usd),
+                             "--project", args.project, "--org", args.org,
+                             "--interval-seconds", str(args.interval_seconds),
+                             "--minimum-runners", str(args.minimum_runners),
+                             "--minimum-docker-runners", str(args.minimum_docker_runners),
+                             "--minimum-docker-hosts", str(args.minimum_docker_hosts),
+                             "--disk-size-gb", str(args.disk_size_gb),
+                             "--label", args.label, "--state-file", str(args.state_file.expanduser())],
         "WorkingDirectory": str(ROOT),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -344,6 +397,11 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         runners = list_github_runners(args.org)
         vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+        if reconcile_prices(vms, runners, args, state, state_path):
+            if args.once:
+                return 0
+            time.sleep(args.interval_seconds)
+            continue
         fleet_vms = spot_instances(vms)
         current, busy = utilization_counts(runners, args.label)
         docker_runners = [runner for runner in runners
