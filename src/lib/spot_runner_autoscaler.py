@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -11,12 +12,13 @@ import sys
 import time
 from decimal import Decimal
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-from .autoscaling_policy import affordable_offers, vm_count_for_floor
+from .autoscaling_policy import affordable_offers
 from .compute_api import get_auth
 from .environment import load_env
 from .runner_labels import counts_toward_capacity
-from .runner_fleet import GitHubRunner, list_github_runners
+from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,8 +45,7 @@ def docker_pool_hosts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...]) ->
     """Return host keys for online Docker runners without the Spot label."""
     hosts = set()
     for runner in runners:
-        if (not runner.online or not runner_is_managed(runner)
-                or DOCKER_LABEL not in runner.labels or "spot" in runner.labels):
+        if not runner.online or DOCKER_LABEL not in runner.labels or "spot" in runner.labels:
             continue
         # Runner names end in the per-host numeric slot, such as -1 or -2.
         host, separator, slot = runner.name.rpartition("-")
@@ -56,11 +57,10 @@ def docker_pool_hosts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...]) ->
 
 
 def docker_pool_state(org: str) -> tuple[int, int]:
-    """Return the online Docker runner count and distinct host count."""
+    """Return all online Docker runners and their distinct hosts."""
     runners = list_github_runners(org)
     docker_runners = [runner for runner in runners
-                      if runner.online and runner_is_managed(runner)
-                      and DOCKER_LABEL in runner.labels and "spot" not in runner.labels]
+                      if runner.online and DOCKER_LABEL in runner.labels and "spot" not in runner.labels]
     return len(docker_runners), len(docker_pool_hosts(docker_runners))
 
 
@@ -73,6 +73,151 @@ def docker_pool_satisfied(runner_count: int, host_count: int,
 def maximum_runner_name_length(prefix: str, instance_name: str, runner_count: int) -> int:
     """Estimate the longest runner name when GCE's hostname matches its VM name."""
     return max(len(f"{prefix}-{instance_name}-{index}") for index in range(1, runner_count + 1))
+
+
+def managed_online_runners(runners: list[GitHubRunner] | tuple[GitHubRunner, ...], label: str):
+    """Return online GCP fleet runners in either worker pool."""
+    return [runner for runner in runners if runner.online and runner_is_managed(runner)
+            and (counts_toward_capacity(runner.labels, label) or DOCKER_LABEL in runner.labels)]
+
+
+def spot_instances(vms: list[GceVm] | tuple[GceVm, ...]) -> list[GceVm]:
+    """Return running Spot VMs created for this runner fleet."""
+    return [vm for vm in vms if vm.running and vm.spot and vm.name.startswith("oxidex-runners-")]
+
+
+def utilization_counts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...], label: str) -> tuple[int, int]:
+    """Return online and busy runner counts for both GCP worker pools."""
+    online = managed_online_runners(runners, label)
+    return len(online), sum(runner.busy for runner in online)
+
+
+def host_runners(vm: GceVm, runners: list[GitHubRunner] | tuple[GitHubRunner, ...],
+                 vms: list[GceVm] | tuple[GceVm, ...]):
+    """Find runners assigned to the longest matching VM name."""
+    names = [candidate.name for candidate in vms]
+    assigned = []
+    for runner in runners:
+        matches = [name for name in names if name in runner.name]
+        if matches and max(matches, key=len) == vm.name:
+            assigned.append(runner)
+    return assigned
+
+
+def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner],
+                       docker_floor: int, docker_host_floor: int) -> list[GceVm]:
+    """Choose idle VMs without violating the Docker runner and host floors."""
+    candidates = []
+    fleet = spot_instances(vms)
+    for vm in fleet:
+        assigned = host_runners(vm, runners, fleet)
+        if not assigned or any(not runner.online or runner.busy for runner in assigned):
+            continue
+        remaining_docker = [runner for runner in runners
+                            if runner.online and DOCKER_LABEL in runner.labels
+                            and "spot" not in runner.labels
+                            and runner not in host_runners(vm, runners, fleet)]
+        if not docker_pool_satisfied(len(remaining_docker), len(docker_pool_hosts(remaining_docker)),
+                                     docker_floor, docker_host_floor):
+            continue
+        candidates.append(vm)
+    return sorted(candidates, key=lambda vm: any(
+        DOCKER_LABEL in runner.labels and "spot" not in runner.labels
+        for runner in host_runners(vm, runners, fleet)))
+
+
+def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRunner],
+                      vms: list[GceVm]) -> None:
+    """Delete an idle Spot VM and its attached disks, then remove stale runner records."""
+    assigned = host_runners(vm, runners, spot_instances(vms))
+    if not assigned or any(not runner.online or runner.busy for runner in assigned):
+        raise RuntimeError(f"Refusing to delete {vm.name}: runners are missing, offline, or busy")
+    subprocess.run(["gcloud", "compute", "instances", "delete", vm.name,
+                    f"--zone={vm.zone}", f"--project={project}", "--delete-disks=all", "--quiet"],
+                   check=True, text=True, capture_output=True)
+    for runner in assigned:
+        subprocess.run(["gh", "api", "-X", "DELETE",
+                        f"orgs/{org}/actions/runners/{runner.runner_id}"],
+                       check=True, text=True, capture_output=True)
+
+
+def read_scale_state(path: Path) -> dict:
+    """Read loop counters that must survive LaunchAgent restarts."""
+    try:
+        state = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"idle_loops": 0, "scale_up_active": False}
+    except (json.JSONDecodeError, OSError) as exc:
+        LOG.warning("Ignoring unreadable autoscaler state at %s: %s", path, exc)
+        return {"idle_loops": 0, "scale_up_active": False}
+    return {"idle_loops": int(state.get("idle_loops", 0)),
+            "scale_up_active": bool(state.get("scale_up_active", False))}
+
+
+def write_scale_state(path: Path, state: dict) -> None:
+    """Write autoscaler loop counters atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile("w", dir=path.parent, delete=False) as temp:
+        json.dump(state, temp)
+        temp.flush()
+        os.fsync(temp.fileno())
+        temporary_path = Path(temp.name)
+    temporary_path.replace(path)
+
+
+def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace) -> int:
+    """Halve the Spot VM fleet, deleting only idle hosts and their disks."""
+    fleet = spot_instances(vms)
+    target = max(1, len(fleet) // 2)
+    count = len(fleet) - target
+    candidates = removable_spot_vms(vms, runners, args.minimum_docker_runners,
+                                    args.minimum_docker_hosts)
+    if len(candidates) < count:
+        LOG.info("Scale-down waits: %d idle hosts are removable; %d are needed",
+                 len(candidates), count)
+    removed = 0
+    for vm in candidates[:count]:
+        LOG.info("Removing idle Spot VM %s and its attached disks", vm.name)
+        try:
+            terminate_spot_vm(vm, args.project, args.org, runners, vms)
+            removed += 1
+        except (OSError, subprocess.CalledProcessError) as exc:
+            LOG.error("Could not remove %s: %s", vm.name, exc)
+            break
+    return removed
+
+
+def scale_up(additional_hosts: int, offers, args: argparse.Namespace) -> int:
+    """Launch the requested host count, trying affordable offers in order."""
+    launched = 0
+    for _ in range(additional_hosts):
+        for offer in offers:
+            try:
+                launch_offer(offer, args)
+                launched += 1
+                break
+            except (RuntimeError, OSError) as exc:
+                LOG.warning("Could not deploy %s in %s: %s", offer.machine_type, offer.region, exc)
+        else:
+            break
+    return launched
+
+
+def scaling_decision(online: int, busy: int, vm_count: int, idle_loops: int,
+                     scale_up_active: bool, target_workers: int) -> tuple[str, int, int, bool]:
+    """Choose one scale action from utilization and the persisted loop state."""
+    if scale_up_active and online > target_workers:
+        return "hold", 0, 0, False
+    if scale_up_active or (online > 0 and online <= target_workers and busy * 2 > online):
+        target_vms = max(1, vm_count * 2)
+        return "up", max(0, target_vms - vm_count), 0, True
+    if vm_count > 1 and online > 0 and busy * 2 < online:
+        loops = idle_loops + 1
+        if loops >= 2:
+            target_vms = max(1, vm_count // 2)
+            return "down", vm_count - target_vms, 0, False
+        return "wait", 0, loops, False
+    return "wait", 0, 0, False
 
 
 def discover_offers(project: str, max_daily_usd: Decimal, top: int = 500):
@@ -172,6 +317,9 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("5"))
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--disk-size-gb", type=int, default=100)
+    parser.add_argument("--state-file", type=Path,
+                        default=Path.home() / "Library" / "Application Support"
+                        / "Spot Runner Autoscaler" / "state.json")
     parser.add_argument("--install-launch-agent", action="store_true")
     parser.add_argument("--once", action="store_true", help="Check and scale once, then exit")
     return parser
@@ -191,50 +339,55 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Installed LaunchAgent at {install_launch_agent(args)}")
         return 0
 
+    state_path = args.state_file.expanduser()
+    state = read_scale_state(state_path)
     while True:
-        current = count_online_runners(args.org, args.label)
-        LOG.info("Managed runners across Spot and Docker pools: %d online; target %d",
-                 current, args.minimum_runners)
-        docker_count, docker_hosts = docker_pool_state(args.org)
+        runners = list_github_runners(args.org)
+        vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+        fleet_vms = spot_instances(vms)
+        current, busy = utilization_counts(runners, args.label)
+        docker_runners = [runner for runner in runners
+                          if runner.online and DOCKER_LABEL in runner.labels
+                          and "spot" not in runner.labels]
+        docker_count = len(docker_runners)
+        docker_hosts = len(docker_pool_hosts(docker_runners))
+        LOG.info("Managed GCP runners: %d online, %d busy; %d Spot VMs",
+                 current, busy, len(fleet_vms))
         LOG.info("Online Docker runners: %d across %d hosts; targets %d runners across %d hosts",
                  docker_count, docker_hosts, args.minimum_docker_runners, args.minimum_docker_hosts)
-        if (current < args.minimum_runners or not docker_pool_satisfied(
-                docker_count, docker_hosts, args.minimum_docker_runners, args.minimum_docker_hosts)):
+        action, host_count, idle_loops, scale_up_active = scaling_decision(
+            current, busy, len(fleet_vms), state["idle_loops"],
+            state["scale_up_active"], args.minimum_runners)
+        if state["scale_up_active"] and not scale_up_active and action == "hold":
+            LOG.info("Scale-up complete: online capacity is above %d runners", args.minimum_runners)
+        state["scale_up_active"] = scale_up_active
+
+        docker_short = not docker_pool_satisfied(
+            docker_count, docker_hosts, args.minimum_docker_runners, args.minimum_docker_hosts)
+        if action == "up":
+            state["idle_loops"] = idle_loops
+            if host_count:
+                LOG.info("High usage started a doubling step: launching %d hosts", host_count)
+                offers = discover_offers(args.project, args.max_daily_usd)
+                launched = scale_up(host_count, offers, args) if offers else 0
+                if not launched:
+                    LOG.error("Could not launch Spot capacity below $%s/day", args.max_daily_usd)
+        elif docker_short:
+            state["idle_loops"] = 0
+            LOG.warning("Docker runner floor is short; launching one replacement host")
             offers = discover_offers(args.project, args.max_daily_usd)
-            if not offers:
-                LOG.error("No Spot VM offers are below $%s/day", args.max_daily_usd)
-            else:
-                for offer in offers:
-                    current = count_online_runners(args.org, args.label)
-                    docker_count, docker_hosts = docker_pool_state(args.org)
-                    spot_deficit = max(0, args.minimum_runners - current)
-                    docker_runner_deficit = max(0, args.minimum_docker_runners - docker_count)
-                    docker_host_deficit = max(0, args.minimum_docker_hosts - docker_hosts)
-                    if not (spot_deficit or not docker_pool_satisfied(
-                            docker_count, docker_hosts,
-                            args.minimum_docker_runners, args.minimum_docker_hosts)):
-                        break
-                    capacity = runner_capacity(offer.vcpu)
-                    if capacity < 1:
-                        continue
-                    spot_hosts = vm_count_for_floor(current, args.minimum_runners, capacity)
-                    docker_hosts_needed = max(
-                        1 if docker_host_deficit else 0,
-                        (docker_runner_deficit + 1) // 2,
-                    )
-                    needed = max(spot_hosts, docker_hosts_needed)
-                    for _ in range(needed):
-                        current = count_online_runners(args.org, args.label)
-                        docker_count, docker_hosts = docker_pool_state(args.org)
-                        if (current >= args.minimum_runners and docker_pool_satisfied(
-                                docker_count, docker_hosts,
-                                args.minimum_docker_runners, args.minimum_docker_hosts)):
-                            break
-                        try:
-                            launch_offer(offer, args)
-                        except (RuntimeError, OSError) as exc:
-                            LOG.warning("Could not deploy %s in %s: %s", offer.machine_type, offer.region, exc)
-                            break
+            if offers and not scale_up(1, offers, args):
+                LOG.error("Could not restore the Docker runner floor")
+        elif action == "down":
+            state["idle_loops"] = idle_loops
+            LOG.info("Low usage persisted for two checks; removing up to %d Spot hosts", host_count)
+            removed = scale_down(vms, runners, args)
+            LOG.info("Scale-down step removed %d hosts", removed)
+        else:
+            state["idle_loops"] = idle_loops
+            if action == "wait" and idle_loops:
+                LOG.info("Low usage observed in loop %d of 2", idle_loops)
+        write_scale_state(state_path, state)
         if args.once:
             return 0
         time.sleep(args.interval_seconds)

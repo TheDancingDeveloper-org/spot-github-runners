@@ -14,33 +14,35 @@ for the two ARM64 runners through the OrbStack socket.
 
 ```mermaid
 flowchart TD
-    A[Read online GitHub runners] --> B{At least 25 runners?}
-    B -- Yes --> C[Wait five minutes]
-    C --> A
-    B -- No --> D[Find Spot VM offers]
-    D --> E[Keep offers below 5 dollars per VM per day]
-    E --> F[Check price and quota]
-    F --> G[Create VM and attach 100 GB disk]
-    G --> H[Bootstrap Docker and containerd]
-    H --> I[Register persistent runner containers]
-    I --> J[Verify runner count, disk, and Docker socket]
-    J --> A
+    A[Read online runners and busy jobs] --> B{Busy share above 50%?}
+    B -- Yes and at most 25 workers --> C[Double Spot VM count]
+    C --> D{More than 25 workers online?}
+    D -- No --> C
+    D -- Yes --> A
+    B -- No --> E{Below 50% busy for two checks?}
+    E -- Yes --> F[Halve idle Spot VM count]
+    F --> G{One Spot VM remains?}
+    G -- No --> A
+    G -- Yes --> A
+    E -- No --> A
 ```
 
-The autoscaler maintains a combined floor across the `spot` and `docker` pools.
+The autoscaler scales the GCP Spot fleet with observed job usage.
 Docker builders use the separate `docker` label and never receive the `spot`
 label. GitHub
 adds the standard `self-hosted`, `Linux`, and `X64` labels to both pools. Spot
 runners also receive `spot` and optional machine and region labels. Docker
 runners receive `docker` and optional machine and region labels. The autoscaler
-launches a whole host at a time and verifies registrations before it reports a
-successful deployment. Every five-minute pass maintains at least 25 online
-runners across both pools and two Docker runners on distinct hosts.
-Docker runners must have the `docker` label and must not have `spot`; if their
-pool is short, the autoscaler uses the same exact-size, under-budget Spot offer
-flow to add capacity. Each added host contributes two Docker runners and six
-Spot runners. Spot VM prices cover compute only. Persistent disks and network
-use have separate charges.
+launches whole hosts and checks again every five minutes. When more than half
+of the online GCP runners are busy and 25 or fewer are online, it doubles the
+Spot VM count on each check until more than 25 workers are online. When fewer
+than half are busy for two consecutive checks, it halves the Spot VM count,
+repeating that reduction until one Spot VM remains. It removes only hosts
+whose registered runners are all online and idle, and it preserves the Docker
+runner and distinct-host floors. Deleting a VM also deletes its attached disks.
+Each added host contributes eight runner containers, including two Docker
+workers and six Spot workers. Spot VM prices cover compute only. Persistent
+disks and network use have separate charges.
 
 ## Storage layout
 
@@ -186,11 +188,10 @@ python3 src/spot_runner_autoscaler.py
 ```
 
 The autoscaler only considers Spot offers for exactly 32 vCPU and 128 GiB of
-RAM that cost less than the daily cap. It asks the deployment manager to create
-enough hosts to cover either pool's deficit. Each 32-vCPU host runs eight
-workers: two in the `docker` pool and six in the `spot` pool. New runner names use the short `gha` prefix and are checked against GitHub's 64-character
-name limit. The autoscaler logs errors and retries on the next interval. It
-does not delete VMs or interrupt busy runners.
+RAM that cost less than the daily cap. New runner names use the short `gha`
+prefix and are checked against GitHub's 64-character name limit. The autoscaler
+stores its idle-loop and scale-up state in
+`~/Library/Application Support/Spot Runner Autoscaler/state.json`.
 
 To install a per-user macOS LaunchAgent that starts at login and restarts the
 process if it exits, run:

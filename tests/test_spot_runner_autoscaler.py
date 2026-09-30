@@ -9,8 +9,10 @@ from lib.spot_runner_autoscaler import (
     docker_pool_hosts,
     docker_pool_satisfied,
     eligible_offers,
+    host_runners,
     maximum_runner_name_length,
     runner_capacity,
+    scaling_decision,
 )
 
 
@@ -69,7 +71,9 @@ class AutoscalerPolicyTests(unittest.TestCase):
             GitHubRunner(5, "gha-asia-d-321-1", "offline", False, ("docker", "n2-standard-32", "X64")),
             GitHubRunner(6, "oxidex-m4air-1", "online", False, ("docker", "ARM64")),
         )
-        self.assertEqual(docker_pool_hosts(runners), {"gha-asia-a-123", "gha-asia-b-456"})
+        self.assertEqual(docker_pool_hosts(runners), {
+            "gha-asia-a-123", "gha-asia-b-456", "oxidex-m4air"
+        })
 
     def test_total_floor_does_not_count_unmanaged_docker_or_arm_runners(self):
         from lib.spot_runner_autoscaler import count_online_runners
@@ -103,6 +107,36 @@ class AutoscalerPolicyTests(unittest.TestCase):
         self.assertFalse(docker_pool_satisfied(2, 1))
         self.assertFalse(docker_pool_satisfied(1, 2))
         self.assertTrue(docker_pool_satisfied(2, 2))
+
+    def test_low_usage_requires_two_loops_then_halves_vm_count(self):
+        self.assertEqual(scaling_decision(40, 10, 5, 0, False, 25),
+                         ("wait", 0, 1, False))
+        self.assertEqual(scaling_decision(40, 10, 5, 1, False, 25),
+                         ("down", 3, 0, False))
+        self.assertEqual(scaling_decision(16, 4, 2, 1, False, 25),
+                         ("down", 1, 0, False))
+        self.assertEqual(scaling_decision(8, 1, 1, 0, False, 25),
+                         ("wait", 0, 0, False))
+
+    def test_high_usage_doubles_hosts_until_worker_target_is_exceeded(self):
+        self.assertEqual(scaling_decision(8, 5, 1, 0, False, 25),
+                         ("up", 1, 0, True))
+        self.assertEqual(scaling_decision(16, 8, 2, 0, True, 25),
+                         ("up", 2, 0, True))
+        self.assertEqual(scaling_decision(32, 16, 4, 0, True, 25),
+                         ("hold", 0, 0, False))
+
+    def test_vm_runner_matching_prefers_the_longest_name(self):
+        from lib.runner_fleet import GceVm
+
+        short = GceVm("oxidex-runners-nane2", "zone-b", "RUNNING", "n2-standard-32", True)
+        long = GceVm("oxidex-runners-nane2-a", "zone-a", "RUNNING", "n2-standard-32", True)
+        runners = [
+            GitHubRunner(1, "oxidex-oxidex-runners-nane2-1", "online", False, ("spot",)),
+            GitHubRunner(2, "oxidex-oxidex-runners-nane2-a-1", "online", False, ("spot",)),
+        ]
+        self.assertEqual(host_runners(short, runners, [short, long]), [runners[0]])
+        self.assertEqual(host_runners(long, runners, [short, long]), [runners[1]])
 
 
 if __name__ == "__main__":
