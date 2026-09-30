@@ -114,7 +114,8 @@ class JobRecovery:
             if lost and key not in intentional and new_episode:
                 self.data['losses'][key] = {'vm': vm, 'lost_at': now,
                                            'last_seen_at': previous.get(key, {}).get('last_seen_at', now)}
-        self.state['intentional_deletions'] = [key for key in intentional if key not in current]
+        # The fleet observer consumes shared deletion markers after both observers
+        # see the disappearance. A present terminated host may be a delayed deletion.
         self.data['vms'] = {key: {**vm, 'last_seen_at': now} for key, vm in current.items()}
         self.save()
         posted_runs = set()

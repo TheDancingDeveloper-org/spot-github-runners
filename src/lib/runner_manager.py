@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import shlex
 import subprocess
 import tempfile
@@ -19,6 +20,9 @@ from decimal import Decimal
 from pathlib import Path
 
 from .environment import load_env
+from .fleet_logging import vm_details
+from .runner_fleet import GceVm, list_gcloud_vms
+from .log_format import configure_logging, error_detail, single_line
 from .runner_labels import DEFAULT_RUNNER_LABELS, custom_labels_for_runner
 from .runner_assets import RUNNER_DOCKERFILE, RUNNER_ENTRYPOINT, STARTUP_SCRIPT
 
@@ -26,15 +30,16 @@ ROOT = Path(__file__).resolve().parents[2]
 PROJECT = "homelab-424523"
 ORG = "swack-tools"
 RUNNER_VERSION = "2.337.0"
+LOG = logging.getLogger("spot_runner_autoscaler")
 
 
 def run(args: list[str], *, quiet: bool = False, input_data: str | None = None) -> str:
     result = subprocess.run(args, text=True, capture_output=True, input=input_data)
     if result.returncode:
-        raise RuntimeError(f"command failed ({result.returncode}): {shlex.join(args)}\n{(result.stderr or result.stdout).strip()}")
+        raise RuntimeError(f"command failed ({result.returncode}): {shlex.join(args)}; {error_detail(result.stderr or result.stdout)}")
     output = result.stdout.strip()
     if output and not quiet:
-        print(output)
+        LOG.info("Command output: %s", single_line(output))
     return output
 
 
@@ -80,6 +85,8 @@ def spot_rates(region: str, family: str) -> tuple[Decimal, Decimal]:
 
 def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", default=PROJECT)
+    parser.add_argument("--org", default=ORG)
     parser.add_argument("--max-cost", type=Decimal, required=True, help="Maximum compute USD/hour for this VM")
     parser.add_argument("--instance-type", default="n2-standard-32")
     parser.add_argument("--region", default="asia-south2")
@@ -133,8 +140,8 @@ def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:
         raise RuntimeError(f"GCE reports {cpu} vCPU/{ram} GiB; request was {args.cpu}/{args.ram}")
     core_rate, ram_rate = spot_rates(args.region, family)
     hourly = core_rate * cpu + ram_rate * ram
-    print(f"Live Spot {family.upper()} rates ({args.region}): ${core_rate}/vCPU-hour, ${ram_rate}/GiB-hour")
-    print(f"Compute estimate: ${hourly:.6f}/hour per VM. {args.disk_size_gb} GiB {args.disk_type} disk is billed separately.")
+    LOG.info(f"Live Spot {family.upper()} rates ({args.region}): ${core_rate}/vCPU-hour, ${ram_rate}/GiB-hour")
+    LOG.info(f"Compute estimate: ${hourly:.6f}/hour per VM. {args.disk_size_gb} GiB {args.disk_type} disk is billed separately.")
     if hourly >= args.max_cost:
         raise RuntimeError(f"Spot compute price ${hourly:.6f}/hour is not below ${args.max_cost}; no resources changed")
     if not args.existing_instance:
@@ -305,6 +312,11 @@ def online_runners(args: argparse.Namespace) -> list[str]:
         runners = [json.loads(row) for row in output.splitlines() if row.strip()]
         matches = [runner for runner in runners if runner.get("name") in expected_names]
         online = [runner["name"] for runner in matches if runner.get("status") == "online"]
+        if online and hasattr(args, "deployment_started_at") and not getattr(args, "registration_logged", False):
+            LOG.info("Instance first seen online in %s runners, registered to take jobs: %s; %.1f seconds "
+                     "from starting VM deployment; %d/%d runners online", ORG, deployment_details(args),
+                     time.monotonic() - args.deployment_started_at, len(online), args.runner_count)
+            args.registration_logged = True
         if len(online) == args.runner_count:
             return online
         time.sleep(10)
@@ -403,15 +415,37 @@ def remove_startup_metadata_if_vm_exists(args: argparse.Namespace, zone: str) ->
                 "--keys=startup-script", "--quiet"])
 
 
+
+def deployment_details(args: argparse.Namespace) -> str:
+    if hasattr(args, "deployment_vm"):
+        return vm_details(args.deployment_vm)
+    vm = GceVm(args.instance_name, args.zone or f"{args.region}-a", "PROVISIONING",
+               args.instance_type, True, vcpu=args.cpu, ram_gib=args.ram,
+               disks=({"boot": True, "diskSizeGb": 40, "diskType": "pd-balanced"},
+                      {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": args.disk_type}))
+    return "planned " + vm_details(vm)
+
+
+def observed_deployment_vm(args: argparse.Namespace, zone: str) -> GceVm:
+    for vm in list_gcloud_vms(PROJECT, name_prefix=args.instance_name):
+        if vm.name == args.instance_name and vm.zone == zone:
+            return vm
+    raise RuntimeError(f"Cannot observe deployed VM specifications: {deployment_details(args)}")
+
 def main() -> int:
+    global PROJECT, ORG
+    configure_logging()
     load_env(ROOT / ".env")
     args = args_parser().parse_args()
+    PROJECT, ORG = args.project, args.org
     zone = args.zone or f"{args.region}-a"
     select_sizing(args)
     hourly = verify_price_and_capacity(args, zone)
-    print(f"Plan: Spot {args.instance_type} in {zone}; {args.runner_count} runners, {args.runner_cpu} vCPU/{args.runner_memory_gb} GiB each; {args.disk_size_gb} GiB retained disk.")
+    if args.existing_instance:
+        args.deployment_vm = observed_deployment_vm(args, zone)
+    LOG.info(f"Plan: {deployment_details(args)}; {args.runner_count} runners, {args.runner_cpu} vCPU/{args.runner_memory_gb} GiB each; {args.disk_size_gb} GiB retained disk.")
     if not args.apply:
-        print("Preview only. Add --apply to provision through GCE startup metadata and register the runners.")
+        LOG.info("Preview only. Add --apply to provision through GCE startup metadata and register the runners.")
         return 0
 
     group = verify_runner_group(args)
@@ -425,7 +459,9 @@ def main() -> int:
     failure: BaseException | None = None
     online: list[str] = []
     try:
+        args.deployment_started_at = time.monotonic()
         apply_startup(args, zone, script)
+        args.deployment_vm = observed_deployment_vm(args, zone)
         wait_for_bootstrap(args, zone, deployment_id)
         online = online_runners(args)
         if len(online) != args.runner_count:
@@ -443,8 +479,8 @@ def main() -> int:
                 failure = RuntimeError(f"Could not remove one-use runner token from startup metadata: {exc}")
     if failure:
         raise failure
-    print(f"Org verification: {len(online)}/{args.runner_count} online: {', '.join(online) if online else '(none)'}")
+    LOG.info(f"Org verification: {deployment_details(args)}; {len(online)}/{args.runner_count} online: {', '.join(online) if online else '(none)'}")
     if len(online) != args.runner_count:
         raise RuntimeError("Some runners did not come online; the one-use token was removed. Rerun to bootstrap missing runners with a fresh token.")
-    print(f"Deployment complete. Compute ${hourly:.6f}/hour per VM, below ${args.max_cost}; disk cost is separate.")
+    LOG.info(f"Deployment complete: {deployment_details(args)}. Compute ${hourly:.6f}/hour per VM, below ${args.max_cost}; disk cost is separate.")
     return 0

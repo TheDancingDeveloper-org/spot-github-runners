@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass
 from urllib.parse import quote, urlencode
 
+from .log_format import error_detail
+
 API_HOST = "compute.googleapis.com"
 API_ROOT = "/compute/v1"
 CAPACITY_ROOT = "/compute/beta"
@@ -202,7 +204,8 @@ class AsyncGoogleApi:
                 if response_headers.get("content-encoding", "").lower() == "gzip":
                     response_body = gzip.decompress(response_body)
                 if status >= 400:
-                    raise RuntimeError(f"Google API HTTP {status}: {response_body[:1200].decode('utf-8', 'replace')}")
+                    detail = error_detail(f"Google API HTTP {status}: " + response_body.decode('utf-8', 'replace'))
+                    raise RuntimeError(detail)
                 return json.loads(response_body)
             except Exception:
                 writer.close()

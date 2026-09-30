@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from dataclasses import replace
 from decimal import Decimal
 
 from .runner_fleet import GceVm
+from .fleet_logging import vm_details
+from .log_format import error_detail
 from .runner_manager import spot_rates
 
 LOG = logging.getLogger("spot_runner_autoscaler")
@@ -49,12 +52,12 @@ def check_running_prices(vms: list[GceVm], project: str,
             if not daily.is_finite() or daily <= 0:
                 raise ValueError("The provider returned an invalid price")
             LOG.info("Live price: %s costs $%.6f/day compute; cap $%s/day",
-                     vm.name, daily, daily_cap)
+                     vm_details(replace(vm, vcpu=int(cpu), ram_gib=float(ram))), daily, daily_cap)
             if daily > daily_cap:
                 overpriced.append(vm)
         except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             LOG.error("Cannot verify price for %s; keeping VM and retrying next loop: %s",
-                      vm.name, exc)
+                      vm_details(vm), error_detail(exc))
     return overpriced
 
 

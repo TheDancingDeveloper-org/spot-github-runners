@@ -226,7 +226,13 @@ at `~/Library/Logs/spot-runner-autoscaler.log`.
 The controller appends timestamped events to `~/spot-ghrunner.log` on each run.
 It records startup, shutdown, live prices, scaling decisions, VM deletion attempts
 and completions, deployment attempts and completions, and changes in VM status.
-It saves the last VM inventory so it can detect missing VMs after a restart.
+Every event occupies one physical line, including errors and tracebacks.
+Google API errors show their HTTP code, message, and reason instead of an error
+JSON dump. VM events include the instance name, zone, machine type, vCPU, RAM,
+root and data disk sizes and types, storage interfaces such as NVMe, and GPUs
+when present. Specifications come from provider inventory; unavailable fields
+are marked unknown. The controller saves this inventory to keep specifications
+available when a VM disappears after a restart.
 A missing VM does not prove Spot preemption; check the earlier deletion events
 to identify controller actions. The log reports an unconfirmed cause for other
 disappearances or terminated VMs.
@@ -257,6 +263,26 @@ its log requests a manual GitHub check when the receipt remains uncertain. A
 confirmed HTTP rejection can be retried on the next loop. Unconfirmed crash
 investigations expire after one day; job records are retained for up to 30 days.
 
+When a managed VM terminates or disappears, the controller logs its replacement
+search and checks its saved disk attachments before launching replacement
+capacity. For a terminated host that still exists, it verifies the instance ID
+and current attachments, then deletes the host and its disks. For surviving
+persistent drives, it deletes only the recorded auto-delete disks in the same
+project whose IDs still match and which are ready and unattached. It verifies
+that all recorded drives are gone before launching a replacement. Attached,
+retained, or recreated drives, incomplete legacy inventories, and failed API
+calls leave recovery pending with a reason in the log. Cleanup and replacement
+work survive restarts. Intentional scale-down and price evictions have their own
+saved records, so they do not trigger an extra interruption replacement.
+
+Launch logs show candidate specifications and failure details for each zone.
+The manager logs the first observation of an online runner and elapsed seconds
+from starting VM deployment. This measures the first GitHub poll that observes
+registration; it does not claim the exact provider-side registration instant.
+The controller separately logs elapsed time through complete deployment,
+registration, label, and storage verification. Manager diagnostics are included
+as individual one-line events in the controller log.
+
 Use `--log-file PATH` to change the event log location. The LaunchAgent preserves
 this option. Existing log content is retained across restarts. To follow events:
 
@@ -266,7 +292,7 @@ tail -f ~/spot-ghrunner.log
 
 Graceful exits and `SIGTERM` or `SIGINT` signals write shutdown events. Power loss
 and `SIGKILL` cannot write a final event. The event log has no automatic rotation;
-service diagnostics and deployment subprocess output remain in the LaunchAgent log.
+service diagnostics also remain in the LaunchAgent log.
 
 ## Repository layout
 

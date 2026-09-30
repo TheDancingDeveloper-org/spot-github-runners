@@ -12,12 +12,17 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import logging
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Sequence
+
+from .log_format import error_detail
+
+LOG = logging.getLogger("spot_runner_autoscaler")
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,12 @@ class GceVm:
     status: str
     machine_type: str
     spot: bool
+    vcpu: int | None = None
+    ram_gib: float | None = None
+    disks: tuple[dict, ...] = ()
+    accelerators: tuple[dict, ...] = ()
+    instance_id: str = ""
+    specs_last_known: bool = False
 
     @property
     def running(self) -> bool:
@@ -88,7 +99,7 @@ def _command_json(args: Sequence[str]) -> object:
         raise RuntimeError(f"Required command not found: {args[0]}") from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout).strip()
-        raise RuntimeError(f"Command failed: {' '.join(args)}\n{detail}") from exc
+        raise RuntimeError(f"Command failed: {args[0]}: {error_detail(exc)}") from exc
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -157,11 +168,32 @@ def list_gcloud_vms(
     if not isinstance(rows, list):
         raise RuntimeError("gcloud returned an unexpected instance list")
 
+    try:
+        disk_rows = _command_json([gcloud_binary, "compute", "disks", "list", f"--project={project}", "--format=json(selfLink,id,type)"])
+        disk_inventory = {disk["selfLink"]: disk for disk in disk_rows}
+    except (RuntimeError, KeyError, TypeError) as exc:
+        disk_inventory = {}
+        LOG.warning("Disk type and identity inventory unavailable: %s", error_detail(exc))
     vms: list[GceVm] = []
+    shapes: dict[tuple[str, str], dict] = {}
     for item in rows:
         name = str(item.get("name", ""))
         if name_prefix and not name.startswith(name_prefix):
             continue
+        zone = str(item.get("zone", "")).rsplit("/", 1)[-1]
+        machine_type = str(item.get("machineType", "")).rsplit("/", 1)[-1]
+        key = (zone, machine_type)
+        if key not in shapes:
+            try:
+                shapes[key] = _command_json([
+                    gcloud_binary, "compute", "machine-types", "describe", machine_type,
+                    f"--zone={zone}", f"--project={project}", "--format=json(guestCpus,memoryMb)",
+                ])
+            except RuntimeError as exc:
+                shapes[key] = {}
+                LOG.warning("Machine specifications unavailable for %s in %s: %s",
+                            machine_type, zone, error_detail(exc))
+        shape = shapes[key]
         scheduling = item.get("scheduling", {})
         spot = (
             str(scheduling.get("provisioningModel", "")).upper() == "SPOT"
@@ -174,6 +206,15 @@ def list_gcloud_vms(
                 status=str(item.get("status", "UNKNOWN")),
                 machine_type=str(item.get("machineType", "")).rsplit("/", 1)[-1],
                 spot=spot,
+                vcpu=int(shape["guestCpus"]) if shape.get("guestCpus") is not None else None,
+                ram_gib=float(shape["memoryMb"]) / 1024 if shape.get("memoryMb") is not None else None,
+                disks=tuple({**disk,
+                             **({"diskId": disk_inventory[disk["source"]].get("id"),
+                                 "diskType": disk_inventory[disk["source"]].get("type", "").rsplit("/", 1)[-1]}
+                                if disk.get("source") in disk_inventory else {})}
+                            for disk in item.get("disks", [])),
+                accelerators=tuple(item.get("guestAccelerators", [])),
+                instance_id=str(item.get("id", "")),
             )
         )
     return tuple(vms)

@@ -26,6 +26,7 @@ from .compute_api import (
     record_quota,
     wait_for_quota_cooldown,
 )
+from .log_format import configure_logging, error_detail
 from .spot_pricing import load_catalog_rates, spot_price
 
 async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int,
@@ -249,9 +250,7 @@ def main() -> int:
                         help="Increase diagnostic detail; repeat (-v, -vv, -vvv)")
     args = parser.parse_args()
     LOG.verbosity = args.verbosity
-    logging.basicConfig(level=logging.DEBUG if args.verbosity >= 3 else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S",
-                        stream=sys.stderr)
+    configure_logging(logging.DEBUG if args.verbosity >= 3 else logging.INFO)
     if min(args.min_vcpu, args.min_ram, args.top, args.concurrency) <= 0 or (args.runners is not None and args.runners <= 0):
         parser.error("--min-vcpu, --min-ram, --top, --concurrency, and --runners must be positive")
     if args.list_price is not None and args.list_price <= 0:
@@ -267,7 +266,7 @@ def main() -> int:
                  args.list_price, catalog_key, args.runners))
         elapsed = time.perf_counter() - started
     except (OSError, RuntimeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {error_detail(exc)}", file=sys.stderr)
         return 1
 
     print(f"GCP Spot VM prices for project {auth.project}; {region_count} active regions, "
@@ -278,7 +277,7 @@ def main() -> int:
     if errors:
         print(f"Warning: {len(errors)} price request(s) failed; results may be incomplete.", file=sys.stderr)
         for error in errors[:5]:
-            print(f"  {error}", file=sys.stderr)
+            print(f"  {error_detail(error)}", file=sys.stderr)
     if not offers:
         print("No matching Spot price data found.", file=sys.stderr)
         return 2
