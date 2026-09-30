@@ -6,6 +6,10 @@ capacity after interruptions. The fleet belongs to the `swack-tools`
 organization and uses the repository-scoped `oxidex-m4air` runner group for
 `swack-tools/oxidex`.
 
+The runner image includes `zstd` for generated-table artifact compression.
+The separate [M4 Air configuration](m4air/README.md) provides Docker access
+for the two ARM64 runners through the OrbStack socket.
+
 ## How the fleet works
 
 ```mermaid

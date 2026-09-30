@@ -9,6 +9,7 @@
 !Dockerfile.*
 !.env.example
 !.gitignore
+!.dockerignore
 !README.md
 
 # Secrets, generated files, and local-only artifacts

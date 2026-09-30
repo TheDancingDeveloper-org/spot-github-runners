@@ -1,0 +1,44 @@
+name: oxidex-m4air
+
+services:
+  runner-1:
+    build:
+      context: .
+    image: oxidex-m4air-runner:ubuntu-24.04
+    container_name: oxidex-gha-runner-1
+    restart: unless-stopped
+    init: true
+    environment:
+      RUNNER_URL: https://github.com/swack-tools
+      RUNNER_NAME: oxidex-m4air-1
+      RUNNER_GROUP: oxidex-m4air
+      RUNNER_LABELS: oxidex-m4air,docker
+      RUNNER_WORKDIR: /runner-state/_work
+    volumes:
+      - runner-1-state:/runner-state
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-0}"
+
+  runner-2:
+    build:
+      context: .
+    image: oxidex-m4air-runner:ubuntu-24.04
+    container_name: oxidex-gha-runner-2
+    restart: unless-stopped
+    init: true
+    environment:
+      RUNNER_URL: https://github.com/swack-tools
+      RUNNER_NAME: oxidex-m4air-2
+      RUNNER_GROUP: oxidex-m4air
+      RUNNER_LABELS: oxidex-m4air,docker
+      RUNNER_WORKDIR: /runner-state/_work
+    volumes:
+      - runner-2-state:/runner-state
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-0}"
+
+volumes:
+  runner-1-state:
+  runner-2-state:
