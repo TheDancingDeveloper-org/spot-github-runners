@@ -1,7 +1,12 @@
-# Allow only Python source, the example environment file, this ignore file, and the README.
+# Allow project source, deployment assets, documentation, and the environment example.
 *
 !*/
 !*.py
+!*.sh
+!*.yaml
+!*.yml
+!Dockerfile
+!Dockerfile.*
 !.env.example
 !.gitignore
 !README.md

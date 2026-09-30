@@ -49,7 +49,7 @@ The bootstrap copies existing containerd data to the attached disk, configures
 containerd to use that path, restarts Docker, then removes the old default storage.
 Each runner's `/` filesystem should report about 98 GiB because its container
 overlay uses the attached disk. Only the two `docker` pool runners receive the
-host Docker socket; ordinary `spot` runners cannot access it. The manager checks
+host Docker socket; Docker runners do not receive the `spot` label. The manager checks
 the runner filesystem and socket separation before it reports success. The boot
 disk keeps the operating system and packages; increase the data disk only when
 its observed free space requires it.
@@ -129,11 +129,13 @@ uses a Spot VM with a 40-GiB boot disk and a 100-GiB `pd-balanced` data
 disk configured to delete with its VM. Stopping a VM preserves the data disk;
 deleting the VM removes its attached runner disk as well. Before deployment,
 the manager also removes unattached disks carrying its ownership label in the
-target zone, which cleans up disks left after failed VM creation. It never
-deletes attached disks or disks without its ownership label. GCE startup metadata installs Docker and Compose, configures Docker and
+target zone when they are at least six hours old. This avoids racing an active
+provisioning operation. It never deletes attached disks or disks without its
+ownership label. GCE startup metadata installs Docker and Compose, configures Docker and
 containerd storage, builds the runner image, and registers the persistent
 containers. The manager waits for a deployment-specific completion marker and
-checks disk and Docker access before returning success.
+checks that each runner root uses the data disk and has at least 20 GiB free,
+then verifies Docker access is limited to the Docker pool.
 
 Pass `--existing-instance` only when adopting a Spot VM with a supported machine
 type and disk configuration. The manager restarts the host to apply the current
@@ -172,8 +174,9 @@ five-minute interval, and a strict compute ceiling of $5 per VM per day:
 python3 src/spot_runner_autoscaler.py
 ```
 
-The autoscaler scans Spot offers, removes offers priced at the daily cap or higher, then asks the deployment manager to create enough hosts to cover
-the deficit. A 32-vCPU host reserves two runners for the `docker` pool, so it
+The autoscaler only considers Spot offers for exactly 32 vCPU and 128 GiB of
+RAM that cost less than the daily cap. It asks the deployment manager to create
+enough hosts to cover the deficit. A 32-vCPU host reserves two runners for the `docker` pool, so it
 adds six runners to the `spot` pool. It logs errors and retries on the next
 interval. It does not delete VMs or interrupt busy runners.
 
@@ -211,5 +214,7 @@ python3 -m py_compile src/*.py src/lib/*.py
 The runner group is limited to the OxiDex repository. Keep untrusted pull
 request code off persistent self-hosted runners. Route macOS signing and release
 jobs to macOS hosts; the Spot VMs in this fleet run Linux. Before changing CI to
-use `runs-on: spot`, keep at least 25 labeled runners online for 10 minutes and
-verify that the Docker client, host daemon, and runner filesystem checks pass.
+use `runs-on: [self-hosted, linux, x64, spot]`, keep at least 25 Spot-labeled
+runners online for 10 minutes, and verify that runner filesystem checks pass.
+Docker build jobs should use
+`runs-on: [self-hosted, linux, x64, docker]`.

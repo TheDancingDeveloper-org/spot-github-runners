@@ -1,0 +1,17 @@
+services:
+  runner:
+    image: ${RUNNER_IMAGE}
+    restart: unless-stopped
+    init: true
+    cpus: ${RUNNER_CPU:-7}
+    mem_limit: ${RUNNER_MEMORY_GB:-27}g
+    environment:
+      GITHUB_RUNNER_URL: https://github.com/swack-tools
+      RUNNER_GROUP_ID: ${RUNNER_GROUP_ID:-10}
+      RUNNER_LABELS: ${RUNNER_LABELS:-oxidex-spot-7x27,oxidex,spot}
+      RUNNER_NAME: ${RUNNER_NAME:-oxidex-runner}
+      RUNNER_STATE: /mnt/runner-state/${RUNNER_NAME}
+    volumes:
+      - /mnt/runner-data/instances:/mnt/runner-state
+      - /mnt/runner-data/work/${RUNNER_NAME}:/work
+    stop_grace_period: 2m
