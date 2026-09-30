@@ -117,6 +117,9 @@ def select_sizing(args: argparse.Namespace) -> None:
         raise RuntimeError("Docker runner count must be between zero and the total runner count")
     if args.runner_memory_gb * args.runner_count > args.ram - 8:
         raise RuntimeError("Runner RAM exceeds (host RAM - 8 GiB); lower runner count/memory")
+    longest_name = len(f"{args.runner_prefix}-{args.instance_name}-{args.runner_count}")
+    if longest_name > 64:
+        raise RuntimeError(f"Runner name would be {longest_name} characters; GitHub allows at most 64")
 
 
 def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:

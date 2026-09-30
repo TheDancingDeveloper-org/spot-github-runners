@@ -23,14 +23,20 @@ flowchart TD
     J --> A
 ```
 
-The autoscaler checks the `spot` label by default. Docker builders use the
-separate `docker` label and do not count toward the Spot runner floor. GitHub
+The autoscaler maintains a combined floor across the `spot` and `docker` pools.
+Docker builders use the separate `docker` label and never receive the `spot`
+label. GitHub
 adds the standard `self-hosted`, `Linux`, and `X64` labels to both pools. Spot
 runners also receive `spot` and optional machine and region labels. Docker
 runners receive `docker` and optional machine and region labels. The autoscaler
 launches a whole host at a time and verifies registrations before it reports a
-successful deployment. Spot VM prices cover compute only. Persistent disks and
-network use have separate charges.
+successful deployment. Every five-minute pass maintains at least 25 online
+runners across both pools and two Docker runners on distinct hosts.
+Docker runners must have the `docker` label and must not have `spot`; if their
+pool is short, the autoscaler uses the same exact-size, under-budget Spot offer
+flow to add capacity. Each added host contributes two Docker runners and six
+Spot runners. Spot VM prices cover compute only. Persistent disks and network
+use have separate charges.
 
 ## Storage layout
 
@@ -167,8 +173,9 @@ Run one check and scale pass:
 python3 src/spot_runner_autoscaler.py --once
 ```
 
-Run continuously with the default target of 25 online `spot` runners, a
-five-minute interval, and a strict compute ceiling of $5 per VM per day:
+Run continuously with a target of 25 online runners across the Spot and Docker
+pools, two Docker hosts, a five-minute interval, and a $5 per-VM daily compute
+cap:
 
 ```bash
 python3 src/spot_runner_autoscaler.py
@@ -176,9 +183,10 @@ python3 src/spot_runner_autoscaler.py
 
 The autoscaler only considers Spot offers for exactly 32 vCPU and 128 GiB of
 RAM that cost less than the daily cap. It asks the deployment manager to create
-enough hosts to cover the deficit. A 32-vCPU host reserves two runners for the `docker` pool, so it
-adds six runners to the `spot` pool. It logs errors and retries on the next
-interval. It does not delete VMs or interrupt busy runners.
+enough hosts to cover either pool's deficit. Each 32-vCPU host runs eight
+workers: two in the `docker` pool and six in the `spot` pool. New runner names use the short `gha` prefix and are checked against GitHub's 64-character
+name limit. The autoscaler logs errors and retries on the next interval. It
+does not delete VMs or interrupt busy runners.
 
 To install a per-user macOS LaunchAgent that starts at login and restarts the
 process if it exits, run:
@@ -213,8 +221,8 @@ python3 -m py_compile src/*.py src/lib/*.py
 
 The runner group is limited to the OxiDex repository. Keep untrusted pull
 request code off persistent self-hosted runners. Route macOS signing and release
-jobs to macOS hosts; the Spot VMs in this fleet run Linux. Before changing CI to
-use `runs-on: [self-hosted, linux, x64, spot]`, keep at least 25 Spot-labeled
-runners online for 10 minutes, and verify that runner filesystem checks pass.
+jobs to macOS hosts; the Spot VMs in this fleet run Linux. Before changing CI to use
+`runs-on: [self-hosted, linux, x64, spot]`, keep at least 25 online runners
+across both pools for 10 minutes, and verify that runner filesystem checks pass.
 Docker build jobs should use
 `runs-on: [self-hosted, linux, x64, docker]`.

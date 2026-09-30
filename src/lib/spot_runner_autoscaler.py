@@ -16,16 +16,59 @@ from .autoscaling_policy import affordable_offers, vm_count_for_floor
 from .compute_api import get_auth
 from .environment import load_env
 from .runner_labels import counts_toward_capacity
-from .runner_fleet import list_github_runners
+from .runner_fleet import GitHubRunner, list_github_runners
 from .spot_finder import find
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = logging.getLogger("spot_runner_autoscaler")
+DOCKER_LABEL = "docker"
 
 
 def count_online_runners(org: str, label: str) -> int:
-    return sum(runner.online and counts_toward_capacity(runner.labels, label)
+    return sum(runner.online and runner_is_managed(runner)
+               and counts_toward_capacity(runner.labels, label)
                for runner in list_github_runners(org))
+
+
+def runner_is_managed(runner: GitHubRunner) -> bool:
+    """Return whether a runner belongs to this GCP x64 fleet."""
+    return "n2-standard-32" in runner.labels and "X64" in runner.labels
+
+
+def docker_pool_hosts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...]) -> set[str]:
+    """Return host keys for online Docker runners without the Spot label."""
+    hosts = set()
+    for runner in runners:
+        if (not runner.online or not runner_is_managed(runner)
+                or DOCKER_LABEL not in runner.labels or "spot" in runner.labels):
+            continue
+        # Runner names end in the per-host numeric slot, such as -1 or -2.
+        host, separator, slot = runner.name.rpartition("-")
+        if separator and slot.isdecimal():
+            hosts.add(host)
+        else:
+            hosts.add(runner.name)
+    return hosts
+
+
+def docker_pool_state(org: str) -> tuple[int, int]:
+    """Return the online Docker runner count and distinct host count."""
+    runners = list_github_runners(org)
+    docker_runners = [runner for runner in runners
+                      if runner.online and runner_is_managed(runner)
+                      and DOCKER_LABEL in runner.labels and "spot" not in runner.labels]
+    return len(docker_runners), len(docker_pool_hosts(docker_runners))
+
+
+def docker_pool_satisfied(runner_count: int, host_count: int,
+                          minimum_runners: int = 2, minimum_hosts: int = 2) -> bool:
+    """Check the Docker runner count and host-diversity floors."""
+    return runner_count >= minimum_runners and host_count >= minimum_hosts
+
+
+def maximum_runner_name_length(prefix: str, instance_name: str, runner_count: int) -> int:
+    """Estimate the longest runner name when GCE's hostname matches its VM name."""
+    return max(len(f"{prefix}-{instance_name}-{index}") for index in range(1, runner_count + 1))
 
 
 def discover_offers(project: str, max_daily_usd: Decimal, top: int = 500):
@@ -48,7 +91,7 @@ def eligible_offers(offers, max_daily_usd: Decimal):
 def runner_capacity(vcpu: int) -> int:
     if vcpu < 4:
         return 0
-    return max(0, vcpu // 4 - 2)
+    return vcpu // 4
 
 
 def launch_offer(offer, args: argparse.Namespace) -> None:
@@ -65,15 +108,20 @@ def launch_offer(offer, args: argparse.Namespace) -> None:
     for zone in zones:
         letter = zone.rsplit("-", 1)[-1]
         suffix = f"{offer.region.replace('-', '')}-{letter}-{int(time.time())}"
+        instance_name = f"oxidex-runners-{suffix}"
+        runner_prefix = "gha"
+        longest_name = maximum_runner_name_length(runner_prefix, instance_name, 8)
+        if longest_name > 64:
+            raise RuntimeError(f"Generated GitHub runner name would be {longest_name} characters (maximum 64)")
         command = [
             sys.executable, str(ROOT / "src" / "spot_runner_manager.py"),
             "--max-cost", str(hourly_limit), "--instance-type", offer.machine_type,
             "--region", offer.region, "--zone", zone,
             "--cpu", str(offer.vcpu), "--ram", str(int(offer.ram_gib)),
-            "--instance-name", f"oxidex-runners-{suffix}",
+            "--instance-name", instance_name,
             "--disk-device-name", f"runner-data-{suffix}",
             "--disk-size-gb", str(args.disk_size_gb),
-            "--runner-prefix", f"oxidex-{suffix}",
+            "--runner-prefix", runner_prefix,
             "--runner-label", args.label, "--apply",
         ]
         LOG.info("Deploying %s in %s at $%.4f/day compute", offer.machine_type, zone, offer.hourly_usd * 24)
@@ -111,6 +159,8 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--org", default="swack-tools")
     parser.add_argument("--project", default="homelab-424523")
     parser.add_argument("--minimum-runners", type=int, default=25)
+    parser.add_argument("--minimum-docker-runners", type=int, default=2)
+    parser.add_argument("--minimum-docker-hosts", type=int, default=2)
     parser.add_argument("--label", default="spot")
     parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("5"))
     parser.add_argument("--interval-seconds", type=int, default=300)
@@ -123,8 +173,10 @@ def args_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = args_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if args.minimum_runners < 1 or args.interval_seconds < 1 or args.disk_size_gb < 1:
-        raise ValueError("runner floor, interval, and disk size must be positive")
+    if (args.minimum_runners < 1 or args.minimum_docker_runners < 1
+            or args.minimum_docker_hosts < 1 or args.interval_seconds < 1
+            or args.disk_size_gb < 1):
+        raise ValueError("runner floors, interval, and disk size must be positive")
     if args.max_daily_usd <= 0:
         raise ValueError("max daily VM cost must be positive")
     load_env(ROOT / ".env")
@@ -134,22 +186,42 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         current = count_online_runners(args.org, args.label)
-        LOG.info("GitHub runners with %r label: %d online; target %d", args.label, current, args.minimum_runners)
-        if current < args.minimum_runners:
+        LOG.info("Managed runners across Spot and Docker pools: %d online; target %d",
+                 current, args.minimum_runners)
+        docker_count, docker_hosts = docker_pool_state(args.org)
+        LOG.info("Online Docker runners: %d across %d hosts; targets %d runners across %d hosts",
+                 docker_count, docker_hosts, args.minimum_docker_runners, args.minimum_docker_hosts)
+        if (current < args.minimum_runners or not docker_pool_satisfied(
+                docker_count, docker_hosts, args.minimum_docker_runners, args.minimum_docker_hosts)):
             offers = discover_offers(args.project, args.max_daily_usd)
             if not offers:
                 LOG.error("No Spot VM offers are below $%s/day", args.max_daily_usd)
             else:
                 for offer in offers:
                     current = count_online_runners(args.org, args.label)
-                    if current >= args.minimum_runners:
+                    docker_count, docker_hosts = docker_pool_state(args.org)
+                    spot_deficit = max(0, args.minimum_runners - current)
+                    docker_runner_deficit = max(0, args.minimum_docker_runners - docker_count)
+                    docker_host_deficit = max(0, args.minimum_docker_hosts - docker_hosts)
+                    if not (spot_deficit or not docker_pool_satisfied(
+                            docker_count, docker_hosts,
+                            args.minimum_docker_runners, args.minimum_docker_hosts)):
                         break
                     capacity = runner_capacity(offer.vcpu)
                     if capacity < 1:
                         continue
-                    needed = vm_count_for_floor(current, args.minimum_runners, capacity)
+                    spot_hosts = vm_count_for_floor(current, args.minimum_runners, capacity)
+                    docker_hosts_needed = max(
+                        1 if docker_host_deficit else 0,
+                        (docker_runner_deficit + 1) // 2,
+                    )
+                    needed = max(spot_hosts, docker_hosts_needed)
                     for _ in range(needed):
-                        if count_online_runners(args.org, args.label) >= args.minimum_runners:
+                        current = count_online_runners(args.org, args.label)
+                        docker_count, docker_hosts = docker_pool_state(args.org)
+                        if (current >= args.minimum_runners and docker_pool_satisfied(
+                                docker_count, docker_hosts,
+                                args.minimum_docker_runners, args.minimum_docker_hosts)):
                             break
                         try:
                             launch_offer(offer, args)
