@@ -70,13 +70,25 @@ class PriceGuardTests(unittest.TestCase):
                 delete.assert_called_once_with(self.vm, "project")
             recovered = read_scale_state(path)
             self.assertEqual(recovered["price_replacement_target"], 1)
+            from lib.spot_runner_autoscaler import reconcile_host_operation
+            reconcile_host_operation([], [], self.args, recovered, path)
             with patch("lib.spot_runner_autoscaler.check_running_prices", return_value=[]), \
                     patch("lib.spot_runner_autoscaler.list_gcloud_vms", return_value=[]), \
                     patch("lib.spot_runner_autoscaler.discover_offers", return_value=["offer"]), \
                     patch("lib.spot_runner_autoscaler.scale_up", return_value=1) as launch:
                 self.assertTrue(reconcile_prices([], [], self.args, recovered, path))
-                launch.assert_called_once_with(1, ["offer"], self.args)
+                launch.assert_called_once_with(1, ["offer"], self.args, recovered, path)
+            self.assertEqual(read_scale_state(path)["price_replacement_target"], 1)
+            with patch("lib.spot_runner_autoscaler.check_running_prices", return_value=[]):
+                reconcile_prices([self.vm], [], self.args, recovered, path)
             self.assertEqual(read_scale_state(path)["price_replacement_target"], 0)
+
+    @patch("lib.price_guard.subprocess.run")
+    @patch("lib.price_guard.spot_rates", side_effect=RuntimeError("API unavailable"))
+    def test_strict_pending_eviction_price_check_exposes_lookup_failure(self, rates, command):
+        with self.assertRaisesRegex(RuntimeError, "API unavailable"):
+            check_running_prices([self.vm], "project", Decimal("5"), raise_on_error=True)
+        command.assert_not_called()
 
 
 if __name__ == "__main__":

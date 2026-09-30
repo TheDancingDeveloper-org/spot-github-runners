@@ -12,10 +12,12 @@ import subprocess
 import sys
 import time
 from decimal import Decimal
+from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .autoscaling_policy import affordable_offers
+from .machine_profiles import MINIMUM_RAM_GIB, machine_profile
 from .compute_api import get_auth
 from .environment import load_env
 from .job_recovery import JobRecovery
@@ -40,8 +42,7 @@ def count_online_runners(org: str, label: str) -> int:
 
 def runner_is_managed(runner: GitHubRunner) -> bool:
     """Return whether a runner belongs to this GCP x64 fleet."""
-    current_shape = bool({"n2-standard-32", "e2-standard-32", "c2d-standard-32"}
-                         .intersection(runner.labels))
+    current_shape = any('-' in label and machine_profile(label) is not None for label in runner.labels)
     legacy_toronto = {
         "oxidex-spot-7x27", "northamerica-northeast2"
     }.issubset(runner.labels)
@@ -161,7 +162,7 @@ def read_scale_state(path: Path) -> dict:
         LOG.warning("Ignoring unreadable autoscaler state at %s: %s", path, exc)
         return {"idle_loops": 0, "scale_up_active": False}
     return {**state, "idle_loops": int(state.get("idle_loops", 0)),
-            "scale_up_active": bool(state.get("scale_up_active", False)),
+            "scale_up_active": False,
             "price_replacement_target": int(state.get("price_replacement_target", 0)),
             "observed_vms": state.get("observed_vms", {}),
             "job_tracking": state.get("job_tracking", {}),
@@ -178,6 +179,129 @@ def write_scale_state(path: Path, state: dict) -> None:
         os.fsync(temp.fileno())
         temporary_path = Path(temp.name)
     temporary_path.replace(path)
+
+
+def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
+    """Persist the single host identity before making any cloud change."""
+    if state.get("host_operation"):
+        raise RuntimeError("A previous host operation is still pending")
+    state["host_operation"] = {"kind": kind, "vm": asdict(vm),
+                               "runner_ids": [runner.runner_id for runner in host_runners(vm, runners, vms)], **metadata}
+    if kind == "delete":
+        key = f"{vm.zone}/{vm.name}"
+        if key not in state.setdefault("intentional_deletions", []):
+            state["intentional_deletions"].append(key)
+        state.setdefault("intentional_deletion_ids", {})[key] = vm.instance_id
+    write_scale_state(state_path, state)
+
+
+def reconcile_host_operation(vms, runners, args, state, state_path):
+    """Hold all fleet changes until a fresh inventory confirms completion."""
+    operation = state.get("host_operation")
+    if not operation:
+        return False
+    from .fleet_logging import vm_from_record
+    vm = vm_from_record(operation["vm"])
+    current = next((item for item in vms if item.zone == vm.zone and item.name == vm.name), None)
+    if current and vm.instance_id and current.instance_id != vm.instance_id:
+        LOG.error("Host operation waits: instance identity changed for %s", vm_details(vm))
+        return True
+    if current and not vm.instance_id:
+        operation["vm"] = asdict(current)
+        vm = current
+        write_scale_state(state_path, state)
+    assigned = host_runners(vm, runners, [vm, *[item for item in vms if item.name != vm.name]])
+    if operation["kind"] == "delete" and current and current.status.upper() == "TERMINATED":
+        # A timed-out intentional delete can be followed by a stopped host.
+        # Finish only this identity's disk cleanup without creating a loss target.
+        # Keep the saved drive IDs as cleanup authorization. A partial current
+        # inventory must not discard IDs, or authorize newly attached drives.
+        vm = replace(vm, status=current.status)
+        operation.update(kind="delete_cleanup", vm=asdict(vm))
+        write_scale_state(state_path, state)
+    if operation["kind"] == "launch":
+        # A restart without a manager receipt cannot prove that an absent VM will
+        # not finish provisioning later. Retain intent until registration/loss is observed.
+        expected = {f"gha-{vm.name}-{slot}" for slot in range(1, 9)}
+        online_names = {runner.name for runner in assigned if runner.online}
+        if current and current.running and expected.issubset(online_names):
+            LOG.info("Host operation complete: all eight runners registered for %s", vm_details(current))
+            state.pop("host_operation")
+            write_scale_state(state_path, state)
+        else:
+            losses = state.setdefault("pending_vm_recovery", {})
+            if current is None and vm.instance_id:
+                # The manager observed a real host; its disappearance is a loss
+                # even when it happened before the controller's next full poll.
+                from .fleet_logging import recovery_key
+                key = recovery_key(f"{vm.zone}/{vm.name}", vm, losses)
+                if key not in losses:
+                    losses[key] = asdict(vm)
+                    LOG.warning("In-flight launch VM no longer present: %s; cause unconfirmed", vm_details(vm))
+            lost = next(((key, record) for key, record in losses.items()
+                         if record.get("name") == vm.name and record.get("zone") == vm.zone
+                         and (not vm.instance_id or record.get("instance_id") == vm.instance_id)), None)
+            if lost:
+                key, record = lost
+                from .vm_recovery import record_loss_restoration_target
+                record_loss_restoration_target(vms, state, state_path)
+                operation.update(kind="recovery", vm=record, recovery_key=key)
+                write_scale_state(state_path, state)
+            LOG.info("Fleet scaling waits for eight online runner slots on %s", vm_details(vm))
+        return True
+    if operation["kind"] in ("recovery", "delete_cleanup") and not operation.get("drives_deleted"):
+        from .vm_recovery import cleanup_lost_vm
+        try:
+            if cleanup_lost_vm(vm, args.project):
+                operation["drives_deleted"] = True
+                write_scale_state(state_path, state)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            LOG.warning("Recovery pending for %s: %s", vm_details(vm), error_detail(exc))
+        return True
+    if current and operation["kind"] in ("recovery", "delete_cleanup"):
+        LOG.info("Recovery waits for fresh VM absence confirmation: %s", vm_details(vm))
+        return True
+    if current:
+        LOG.info("Retrying deletion of the same pending host: %s", vm_details(vm))
+        try:
+            if operation.get("price_eviction"):
+                if not current.running:
+                    LOG.info("Price eviction waits for VM deletion confirmation: %s", vm_details(current))
+                    return True
+                overpriced = check_running_prices([current], args.project, args.max_daily_usd, raise_on_error=True)
+                if not overpriced:
+                    # The previous delete may still complete asynchronously.
+                    # Pause retries but retain its identity, intent and fleet barrier.
+                    LOG.info("Paused pending price eviction: fresh price is within cap; previous deletion outcome remains pending for %s",
+                             vm_details(current))
+                    return True
+                delete_overpriced_vm(current, args.project)
+            else:
+                terminate_spot_vm(current, args.project, args.org, runners, vms)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            clear_rejected_deletion(vm, exc, state, state_path)
+            LOG.warning("Deletion remains pending for %s: %s", vm_details(vm), error_detail(exc))
+        return True
+    recorded_ids = set(operation.get("runner_ids", []))
+    stale = [runner for runner in runners if runner.runner_id in recorded_ids or runner in assigned]
+    if any(runner.online or runner.busy for runner in stale):
+        LOG.info("Fleet scaling waits for deleted host runners to become offline and idle: %s", vm_details(vm))
+        return True
+    if stale:
+        for runner in stale:
+            try:
+                subprocess.run(["gh", "api", "-X", "DELETE", f"orgs/{args.org}/actions/runners/{runner.runner_id}"],
+                               check=True, text=True, capture_output=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as exc:
+                LOG.warning("Deregistration pending for %s: %s", runner.name, error_detail(exc))
+                break
+        return True  # Require another inventory proving the records are absent.
+    if operation["kind"] == "recovery":
+        state["pending_vm_recovery"][operation["recovery_key"]]["_cleanup_complete"] = True
+    state.pop("host_operation")
+    write_scale_state(state_path, state)
+    LOG.info("Host operation complete: VM and assigned runner records absent for %s", vm_details(vm))
+    return True
 
 
 def clear_rejected_deletion(vm: GceVm, exc: Exception, state: dict | None, state_path: Path) -> None:
@@ -197,103 +321,83 @@ def clear_rejected_deletion(vm: GceVm, exc: Exception, state: dict | None, state
     key = f'{vm.zone}/{vm.name}'
     state['intentional_deletions'] = [item for item in state.get('intentional_deletions', []) if item != key]
     state.get('intentional_deletion_ids', {}).pop(key, None)
+    state.pop('host_operation', None)
     write_scale_state(state_path, state)
     LOG.warning('Cleared deletion intent after provider rejection for %s: %s', vm_details(vm), error_detail(exc))
 
 
 def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace,
                state: dict | None = None, state_path: Path | None = None) -> int:
-    """Halve the Spot VM fleet, deleting only idle hosts and their disks."""
-    fleet = spot_instances(vms)
-    target = max(1, len(fleet) // 2)
-    count = len(fleet) - target
-    candidates = removable_spot_vms(vms, runners, args.minimum_docker_runners,
-                                    args.minimum_docker_hosts)
-    if len(candidates) < count:
-        LOG.info("Scale-down waits: %d idle hosts are removable; %d are needed",
-                 len(candidates), count)
-    removed = 0
-    for vm in candidates[:count]:
-        LOG.info("Removing idle Spot VM %s and its attached disks", vm_details(vm))
+    """Remove one idle host, then wait for confirmed VM and runner absence."""
+    state = state if state is not None else read_scale_state(args.state_file.expanduser())
+    state_path = state_path or args.state_file.expanduser()
+    if state.get("host_operation") or len(spot_instances(vms)) <= 1:
+        return 0
+    candidates = removable_spot_vms(vms, runners, args.minimum_docker_runners, args.minimum_docker_hosts)
+    if not candidates:
+        LOG.info("Scale-down waits: no idle host can be removed while preserving Docker floors")
+        return 0
+    vm = candidates[0]
+    try:
+        terminate_spot_vm(vm, args.project, args.org, runners, vms,
+                          on_deleted=lambda: begin_host_operation("delete", vm, runners, vms, state, state_path))
+        return 1
+    except (OSError, subprocess.SubprocessError) as exc:
+        clear_rejected_deletion(vm, exc, state, state_path)
+        LOG.error("Could not remove %s: %s", vm_details(vm), error_detail(exc))
+        return 0
+
+
+def scale_up(additional_hosts: int, offers, args: argparse.Namespace, state=None, state_path=None) -> int:
+    """Launch at most one host; fail over only after proving a failed host absent."""
+    state_path = state_path or args.state_file.expanduser()
+    state = state if state is not None else read_scale_state(state_path)
+    if additional_hosts <= 0 or state.get("host_operation"):
+        return 0
+    for offer in offers:
         try:
-            def record_deletion():
-                if state is not None:
-                    key = f"{vm.zone}/{vm.name}"
-                    state.setdefault("intentional_deletions", []).append(key)
-                    state.setdefault("intentional_deletion_ids", {})[key] = vm.instance_id
-                    write_scale_state(state_path or args.state_file.expanduser(), state)
-            terminate_spot_vm(vm, args.project, args.org, runners, vms, on_deleted=record_deletion)
-            removed += 1
-        except (OSError, subprocess.CalledProcessError) as exc:
-            clear_rejected_deletion(vm, exc, state, state_path or args.state_file.expanduser())
-            LOG.error("Could not remove %s: %s", vm_details(vm), error_detail(exc))
-            break
-    return removed
-
-
-def scale_up(additional_hosts: int, offers, args: argparse.Namespace) -> int:
-    """Launch the requested host count, trying affordable offers in order."""
-    launched = 0
-    for _ in range(additional_hosts):
-        for offer in offers:
-            try:
-                launch_offer(offer, args)
-                launched += 1
-                break
-            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-                LOG.warning("Could not deploy %s in %s: %s", offer.machine_type, offer.region, error_detail(exc))
-        else:
-            break
-    return launched
+            launch_offer(offer, args, state, state_path)
+            return 1
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            LOG.warning("Could not deploy %s in %s: %s", offer.machine_type, offer.region, error_detail(exc))
+            if state.get("host_operation"):
+                return 0
+    return 0
 
 
 def reconcile_prices(vms, runners, args, state, state_path) -> bool:
-    """Evict overpriced VMs and retry replacements across loop restarts."""
+    """Evict or restore one host, preserving the restoration target across polls."""
+    if state.get("host_operation"):
+        return True
     fleet = spot_instances(vms)
     overpriced = check_running_prices(fleet, args.project, args.max_daily_usd)
     if overpriced:
-        state["price_replacement_target"] = max(
-            state.get("price_replacement_target", 0), len(fleet))
+        state["price_replacement_target"] = max(state.get("price_replacement_target", 0), len(fleet))
         state["idle_loops"] = 0
-        write_scale_state(state_path, state)
-    for vm in overpriced:
+        vm = overpriced[0]
+        begin_host_operation("delete", vm, runners, vms, state, state_path, price_eviction=True)
         LOG.warning("Price exceeds cap: deleting %s with its disks, including any active jobs", vm_details(vm))
         try:
-            key = f"{vm.zone}/{vm.name}"
-            if key not in state.setdefault("intentional_deletions", []):
-                state["intentional_deletions"].append(key)
-            state.setdefault("intentional_deletion_ids", {})[key] = vm.instance_id
-            write_scale_state(state_path, state)
             delete_overpriced_vm(vm, args.project)
             LOG.info("Deleted overpriced Spot VM %s and its attached disks", vm_details(vm))
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             clear_rejected_deletion(vm, exc, state, state_path)
             LOG.error("Price eviction failed for %s; retrying next loop: %s", vm_details(vm), error_detail(exc))
-            continue
-        for runner in host_runners(vm, runners, fleet):
-            result = subprocess.run([
-                "gh", "api", "-X", "DELETE", f"orgs/{args.org}/actions/runners/{runner.runner_id}",
-            ], text=True, capture_output=True, timeout=60)
-            if result.returncode:
-                LOG.warning("Could not remove stale runner record %s on %s", runner.name, vm_details(vm))
+        return True
     target = state.get("price_replacement_target", 0)
     pending = state.get("pending_vm_recovery", {})
     if any(not record.get("_cleanup_complete") for record in pending.values()):
-        LOG.warning("Replacement waits until previous drives have been verified deleted")
+        LOG.warning("Replacement waits until previous drives and runner records have been verified deleted")
         return True
     if not target:
         return False
-    remaining = spot_instances(list_gcloud_vms(args.project, name_prefix="oxidex-runners-"))
-    if {vm.name for vm in remaining} & {vm.name for vm in overpriced}:
-        return True
-    missing = max(0, target - len(remaining))
+    missing = max(0, target - len(fleet))
     if missing:
-        LOG.info("Finding affordable replacements for %d missing managed hosts; restoration target %d", missing, target)
+        LOG.info("Finding one affordable replacement; %d missing hosts, restoration target %d", missing, target)
         offers = discover_offers(args.project, args.max_daily_usd)
-        launched = scale_up(missing, offers, args) if offers else 0
-        if launched < missing:
+        if not offers or not scale_up(1, offers, args, state, state_path):
             LOG.warning("Replacement capacity is pending; retrying next loop")
-            return True
+        return True  # Only fresh observations may clear the restoration target.
     for record in pending.values():
         state.get("observed_vms", {}).pop(f"{record['zone']}/{record['name']}", None)
     state["pending_vm_recovery"] = {}
@@ -305,17 +409,13 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
 
 def scaling_decision(online: int, busy: int, vm_count: int, idle_loops: int,
                      scale_up_active: bool, target_workers: int) -> tuple[str, int, int, bool]:
-    """Choose one scale action from utilization and the persisted loop state."""
-    if scale_up_active and online > target_workers:
-        return "hold", 0, 0, False
-    if scale_up_active or (online > 0 and online <= target_workers and busy * 2 > online):
-        target_vms = max(1, vm_count * 2)
-        return "up", max(0, target_vms - vm_count), 0, True
+    """Choose a single host change using only current utilization."""
+    if online > 0 and online <= target_workers and busy * 2 > online:
+        return "up", 1, 0, False
     if vm_count > 1 and online > 0 and busy * 2 < online:
         loops = idle_loops + 1
         if loops >= 2:
-            target_vms = max(1, vm_count // 2)
-            return "down", vm_count - target_vms, 0, False
+            return "down", 1, 0, False
         return "wait", 0, loops, False
     return "wait", 0, 0, False
 
@@ -323,7 +423,7 @@ def scaling_decision(online: int, busy: int, vm_count: int, idle_loops: int,
 def discover_offers(project: str, max_daily_usd: Decimal, top: int = 500):
     auth = get_auth(project)
     offers, _, _, errors = asyncio.run(
-        find(auth, min_vcpu=32, min_ram=128, top=top, concurrency=200,
+        find(auth, min_vcpu=32, min_ram=MINIMUM_RAM_GIB, top=top, concurrency=200,
              billing_api_key=os.environ.get("GOOGLE_CLOUD_API_KEY"))
     )
     for error in errors[:5]:
@@ -332,9 +432,11 @@ def discover_offers(project: str, max_daily_usd: Decimal, top: int = 500):
 
 
 def eligible_offers(offers, max_daily_usd: Decimal):
-    """Keep affordable offers with exactly 32 vCPU and 128 GiB of RAM."""
-    exact_shapes = [offer for offer in offers if offer.vcpu == 32 and offer.ram_gib == 128]
-    return affordable_offers(exact_shapes, max_daily_usd)
+    """Prefer newer supported CPUs within the compute cap and 110-GiB floor."""
+    shapes = [offer for offer in offers if offer.vcpu == 32 and offer.ram_gib >= MINIMUM_RAM_GIB
+              and machine_profile(offer.machine_type) is not None]
+    return sorted(affordable_offers(shapes, max_daily_usd),
+                  key=lambda offer: machine_profile(offer.machine_type).cpu_tier)
 
 
 def runner_capacity(vcpu: int) -> int:
@@ -343,8 +445,12 @@ def runner_capacity(vcpu: int) -> int:
     return vcpu // 4
 
 
-def launch_offer(offer, args: argparse.Namespace) -> None:
+def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -> None:
     """Try each zone until the manager confirms a complete runner deployment."""
+    state_path = state_path or args.state_file.expanduser()
+    state = state if state is not None else read_scale_state(state_path)
+    if state.get("host_operation"):
+        raise RuntimeError("A previous host operation is still pending")
     hourly_limit = args.max_daily_usd / Decimal(24)
     result = subprocess.run(
         ["gcloud", "compute", "zones", "list", f"--project={args.project}",
@@ -374,12 +480,18 @@ def launch_offer(offer, args: argparse.Namespace) -> None:
             "--runner-prefix", runner_prefix,
             "--runner-label", args.label, "--apply",
         ]
+        profile = machine_profile(offer.machine_type)
+        if profile is None:
+            raise RuntimeError(f'Unsupported runner machine type: {offer.machine_type}')
         vm = GceVm(instance_name, zone, "PROVISIONING", offer.machine_type, True,
                    vcpu=offer.vcpu, ram_gib=offer.ram_gib,
-                   disks=({"boot": True, "diskSizeGb": 40, "diskType": "pd-balanced"},
-                          {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": "pd-balanced"}))
+                   disks=({"boot": True, "diskSizeGb": 40, "diskType": profile.disk_type,
+                           "interface": profile.disk_interface},
+                          {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": profile.disk_type,
+                           "interface": profile.disk_interface}))
         LOG.info("Found instance in region %s: %s; $%.4f/day compute; attempting to launch it now",
                  offer.region, vm_details(vm), offer.hourly_usd * 24)
+        begin_host_operation("launch", vm, [], [], state, state_path)
         started = time.monotonic()
         result = subprocess.run(command, check=False, text=True, capture_output=True)
         for output in (result.stdout, result.stderr):
@@ -392,6 +504,33 @@ def launch_offer(offer, args: argparse.Namespace) -> None:
                      "deployment to manager confirmation of online runner registration and storage checks",
                      args.org, vm_details(vm), elapsed)
             return
+        inventory = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+        existing = next((item for item in inventory if item.zone == zone and item.name == instance_name), None)
+        if existing:
+            state["host_operation"]["vm"] = asdict(existing)
+            state.setdefault("observed_vms", {})[f"{existing.zone}/{existing.name}"] = asdict(existing)
+            write_scale_state(state_path, state)
+            raise RuntimeError(f"Deployment failed but {instance_name} still exists; waiting for this host")
+        failure = error_detail(result.stderr or result.stdout or "").lower()
+        uncertain = result.returncode < 0 or any(fragment in failure for fragment in
+                    ("timeout", "timed out", "deadline exceeded", "connection reset", "connection aborted"))
+        if uncertain:
+            raise RuntimeError(f"Deployment outcome for {instance_name} is uncertain; refusing failover")
+        disks = subprocess.run(["gcloud", "compute", "disks", "list", f"--project={args.project}",
+                                f"--zones={zone}", "--format=json"],
+                               check=True, text=True, capture_output=True, timeout=60)
+        disk_rows = json.loads(disks.stdout)
+        if not isinstance(disk_rows, list):
+            raise RuntimeError("Failed launch disk inventory is invalid; refusing failover")
+        if any(disk.get("name") in {instance_name, f"runner-data-{suffix}"} for disk in disk_rows):
+            raise RuntimeError(f"Failed launch {instance_name} has remaining disks; verify cleanup before failover")
+        stale = host_runners(vm, list_github_runners(args.org), [vm, *inventory])
+        if stale:
+            state["host_operation"].update(kind="delete", runner_ids=[runner.runner_id for runner in stale])
+            write_scale_state(state_path, state)
+            raise RuntimeError(f"Failed launch {instance_name} has runner records; waiting for deregistration")
+        state.pop("host_operation")
+        write_scale_state(state_path, state)
         LOG.warning("Deployment in %s failed; trying another zone. Tried to deploy %s; exit %d; %s",
                     zone, vm_details(vm), result.returncode,
                     error_detail(result.stderr or result.stdout or "no diagnostics"))
@@ -503,9 +642,10 @@ def _run_controller(args: argparse.Namespace) -> int:
         jobs.poll(vms)
         observe_vms(vms, state)
         write_scale_state(state_path, state)
-        recovery_work = reconcile_lost_vms(vms, runners, args, state, state_path)
-        price_work = False if recovery_work else reconcile_prices(vms, runners, args, state, state_path)
-        if price_work or recovery_work:
+        operation_work = reconcile_host_operation(vms, runners, args, state, state_path)
+        recovery_work = False if operation_work else reconcile_lost_vms(vms, runners, args, state, state_path)
+        price_work = False if recovery_work or operation_work else reconcile_prices(vms, runners, args, state, state_path)
+        if operation_work or price_work or recovery_work:
             if args.once:
                 return 0
             time.sleep(args.interval_seconds)
@@ -533,16 +673,16 @@ def _run_controller(args: argparse.Namespace) -> int:
         if action == "up":
             state["idle_loops"] = idle_loops
             if host_count:
-                LOG.info("High usage started a doubling step: launching %d hosts", host_count)
+                LOG.info("High usage: launching %d host, then checking fresh demand", host_count)
                 offers = discover_offers(args.project, args.max_daily_usd)
-                launched = scale_up(host_count, offers, args) if offers else 0
+                launched = scale_up(host_count, offers, args, state, state_path) if offers else 0
                 if not launched:
                     LOG.error("Could not launch Spot capacity below $%s/day", args.max_daily_usd)
         elif docker_short:
             state["idle_loops"] = 0
             LOG.warning("Docker runner floor is short; launching one replacement host")
             offers = discover_offers(args.project, args.max_daily_usd)
-            if offers and not scale_up(1, offers, args):
+            if offers and not scale_up(1, offers, args, state, state_path):
                 LOG.error("Could not restore the Docker runner floor")
         elif action == "down":
             state["idle_loops"] = idle_loops

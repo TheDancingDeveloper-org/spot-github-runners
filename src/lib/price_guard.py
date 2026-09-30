@@ -17,8 +17,8 @@ LOG = logging.getLogger("spot_runner_autoscaler")
 
 
 def check_running_prices(vms: list[GceVm], project: str,
-                         daily_cap: Decimal) -> list[GceVm]:
-    """Find VMs that exceed the daily compute cap using fresh regional prices."""
+                         daily_cap: Decimal, *, raise_on_error: bool = False) -> list[GceVm]:
+    """Find overpriced VMs; optionally expose unavailable prices to pending evictions."""
     rates = {}
     shapes = {}
     overpriced = []
@@ -58,6 +58,8 @@ def check_running_prices(vms: list[GceVm], project: str,
         except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             LOG.error("Cannot verify price for %s; keeping VM and retrying next loop: %s",
                       vm_details(vm), error_detail(exc))
+            if raise_on_error:
+                raise
     return overpriced
 
 

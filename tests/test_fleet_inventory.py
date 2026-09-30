@@ -48,7 +48,7 @@ class FleetInventoryTests(unittest.TestCase):
         self.assertIsNone(vms[0].vcpu)
         self.assertIsNone(vms[0].ram_gib)
 
-    def test_controller_replaces_missing_vm_and_does_not_skip_price_checks(self):
+    def test_controller_cleans_one_missing_vm_before_replacement(self):
         vm = GceVm('oxidex-runners-test', 'us-central1-a', 'RUNNING', 'n2-standard-32', True)
         state = {'observed_vms': {f'{vm.zone}/{vm.name}': asdict(vm)}}
         with tempfile.TemporaryDirectory() as directory:
@@ -63,9 +63,10 @@ class FleetInventoryTests(unittest.TestCase):
                     patch('lib.spot_runner_autoscaler.discover_offers', return_value=['offer']), \
                     patch('lib.spot_runner_autoscaler.scale_up', return_value=1) as launch:
                 self.assertEqual(run_controller(args), 0)
-            self.assertEqual(read_scale_state(path)['pending_vm_recovery'], {})
-            prices.assert_called_once()
-            launch.assert_called_once_with(1, ['offer'], args)
+            self.assertIn(f'{vm.zone}/{vm.name}', read_scale_state(path)['pending_vm_recovery'])
+            self.assertEqual(read_scale_state(path)['host_operation']['kind'], 'recovery')
+            prices.assert_not_called()
+            launch.assert_not_called()
 
     def test_job_and_fleet_observers_share_intent_until_disappearance(self):
         from lib.job_recovery import JobRecovery

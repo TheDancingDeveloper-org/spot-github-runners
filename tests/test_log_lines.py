@@ -190,10 +190,15 @@ class LogLineTests(unittest.TestCase):
         offer = Offer('us-west3', 'c2d-standard-32', 32, 128, 0.157184)
         results = [SimpleNamespace(returncode=0, stdout='us-west3-a\nus-west3-b\n'),
                    SimpleNamespace(returncode=2, stdout='', stderr='capacity unavailable\ntry later'),
+                   SimpleNamespace(returncode=0, stdout='[]', stderr=''),
                    SimpleNamespace(returncode=0, stdout='manager done\n', stderr='')]
-        with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=results), \
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
+                patch('lib.spot_runner_autoscaler.list_github_runners', return_value=[]), \
+                patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=results), \
                 patch('lib.spot_runner_autoscaler.time.monotonic', side_effect=[10, 20, 45]), \
                 self.assertLogs('spot_runner_autoscaler', 'INFO') as logs:
+            args.state_file = Path(directory) / "state.json"
             launch_offer(offer, args)
         failed = next(line for line in logs.output if 'failed; trying another zone' in line)
         for detail in ('c2d-standard-32', '32 vCPU', '128 GiB RAM', '40 GiB', '100 GiB', 'pd-balanced', 'capacity unavailable'):

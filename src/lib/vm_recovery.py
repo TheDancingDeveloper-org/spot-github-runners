@@ -96,36 +96,45 @@ def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
 
 
 
+def record_loss_restoration_target(vms, state, state_path):
+    """Record all new losses together so a launch transition cannot undercount."""
+    from .spot_runner_autoscaler import spot_instances, write_scale_state
+
+    pending = state.get('pending_vm_recovery', {})
+    new_losses = sum(not record.get('_target_recorded') for record in pending.values())
+    if not new_losses:
+        return
+    state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
+                                            len(spot_instances(vms)) + new_losses)
+    for record in pending.values():
+        record['_target_recorded'] = True
+    write_scale_state(state_path, state)
+
+
 def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
     """Share a persisted restoration target with price recovery; launch each deficit once."""
-    from .spot_runner_autoscaler import host_runners, reconcile_prices, spot_instances, write_scale_state
+    from .spot_runner_autoscaler import (begin_host_operation, reconcile_prices,
+                                        write_scale_state)
 
     pending = state.get('pending_vm_recovery', {})
     if not pending:
         return False
-    new_losses = sum(not record.get('_target_recorded') for record in pending.values())
-    if new_losses:
-        state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
-                                                len(spot_instances(vms)) + new_losses)
-        for record in pending.values():
-            record['_target_recorded'] = True
-        write_scale_state(state_path, state)
-    for key, record in list(pending.items()):
+    if state.get('host_operation'):
+        return True
+    record_loss_restoration_target(vms, state, state_path)
+    for key, record in pending.items():
         if record.get('_cleanup_complete'):
             continue
         vm = vm_from_record(record)
+        begin_host_operation('recovery', vm, runners,
+                             [vm, *[other for other in vms if other.name != vm.name]], state, state_path,
+                             recovery_key=key)
         try:
-            if not cleanup_lost_vm(vm, args.project):
-                continue
-            for runner in host_runners(vm, runners, [vm, *[other for other in vms if other.name != vm.name]]):
-                subprocess.run(['gh', 'api', '-X', 'DELETE',
-                                f'orgs/{args.org}/actions/runners/{runner.runner_id}'],
-                               check=True, text=True, capture_output=True, timeout=60)
-            record['_cleanup_complete'] = True
-            write_scale_state(state_path, state)
+            if cleanup_lost_vm(vm, args.project):
+                state['host_operation']['drives_deleted'] = True
+                write_scale_state(state_path, state)
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning('Recovery pending for %s; retrying next loop: %s', vm_details(vm), error_detail(exc))
-    # This still checks live prices when cleanup is blocked. The price reconciler
-    # holds new launches until all recorded drives are verified gone.
+        return True  # Finish this cleanup and deregistration before touching another host.
     reconcile_prices(vms, runners, args, state, state_path)
     return True

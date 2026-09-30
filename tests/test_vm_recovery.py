@@ -101,38 +101,42 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotIn('--zone=asia-south2-a', deletion)
 
     def test_existing_price_target_and_loss_share_one_capacity_deficit(self):
+        from lib.spot_runner_autoscaler import reconcile_host_operation
         vm = GceVm('oxidex-runners-live', self.vm.zone, 'RUNNING', self.vm.machine_type, True)
-        state = {'idle_loops': 0, 'scale_up_active': False, 'price_replacement_target': 3,
+        state = {'price_replacement_target': 3,
                  'pending_vm_recovery': {f'{self.vm.zone}/{self.vm.name}': asdict(self.vm)}}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.json'
             with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True), \
                     patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[vm]), \
                     patch('lib.spot_runner_autoscaler.discover_offers', return_value=['offer']), \
-                    patch('lib.spot_runner_autoscaler.scale_up', side_effect=lambda n, *args: n) as launch:
+                    patch('lib.spot_runner_autoscaler.scale_up', return_value=1) as launch:
                 vm_recovery.reconcile_lost_vms([vm], [], self.args, state, path)
-            self.assertEqual([call.args[0] for call in launch.call_args_list], [2])
-            self.assertEqual(read_scale_state(path)['pending_vm_recovery'], {})
+                launch.assert_not_called()
+                reconcile_host_operation([vm], [], self.args, state, path)
+                vm_recovery.reconcile_lost_vms([vm], [], self.args, state, path)
+                self.assertEqual([call.args[0] for call in launch.call_args_list], [1])
+                self.assertEqual(read_scale_state(path)['price_replacement_target'], 3)
+                self.assertTrue(state['pending_vm_recovery'][f'{self.vm.zone}/{self.vm.name}']['_cleanup_complete'])
 
     def test_new_loss_does_not_recount_loss_already_covered_by_live_replacement(self):
+        from lib.spot_runner_autoscaler import reconcile_host_operation
         old = {**asdict(self.vm), '_target_recorded': True, '_cleanup_complete': True}
         newly_lost = {**asdict(self.vm), 'name': 'oxidex-runners-second-loss'}
         live = [GceVm(name, self.vm.zone, 'RUNNING', self.vm.machine_type, True)
                 for name in ('oxidex-runners-live', 'oxidex-runners-replacement')]
-        state = {'idle_loops': 0, 'scale_up_active': False, 'price_replacement_target': 3,
-                 'pending_vm_recovery': {'old': old, 'new': newly_lost}}
+        state = {'price_replacement_target': 3, 'pending_vm_recovery': {'old': old, 'new': newly_lost}}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.json'
             with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True), \
                     patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=live), \
                     patch('lib.spot_runner_autoscaler.discover_offers', return_value=['offer']), \
-                    patch('lib.spot_runner_autoscaler.scale_up', side_effect=lambda n, *args: n) as launch:
+                    patch('lib.spot_runner_autoscaler.scale_up', return_value=1) as launch:
                 vm_recovery.reconcile_lost_vms(live, [], self.args, state, path)
-            self.assertEqual([call.args[0] for call in launch.call_args_list], [1])
+                reconcile_host_operation(live, [], self.args, state, path)
+                vm_recovery.reconcile_lost_vms(live, [], self.args, state, path)
+                self.assertEqual([call.args[0] for call in launch.call_args_list], [1])
+                self.assertEqual(state['price_replacement_target'], 3)
 
     def test_new_instance_identity_never_reuses_previous_cleanup_authorization(self):
         from dataclasses import replace
@@ -153,70 +157,64 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(cleanup.call_args.args[0].instance_id, '999')
             launch.assert_not_called()
 
-    def test_restart_after_successful_launch_observes_restored_target_without_relaunch(self):
+    def test_restart_with_partial_replacement_retains_barrier_and_restoration_target(self):
+        from lib.spot_runner_autoscaler import begin_host_operation, reconcile_host_operation
         key = f'{self.vm.zone}/{self.vm.name}'
-        state = {'idle_loops': 0, 'scale_up_active': False, 'pending_vm_recovery': {key: asdict(self.vm)}}
+        state = {'price_replacement_target': 1, 'pending_vm_recovery':
+                 {key: {**asdict(self.vm), '_target_recorded': True, '_cleanup_complete': True}}}
         replacement = GceVm('oxidex-runners-new', self.vm.zone, 'RUNNING', self.vm.machine_type, True)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.json'
-            write_scale_state(path, state)
-            real_write = write_scale_state
-            launched = False
-            def launch(n, *args):
-                nonlocal launched
-                launched = True
-                return n
-            def write(path, state):
-                if launched:
-                    raise OSError('simulated crash while persisting launch completion')
-                real_write(path, state)
-            with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True), \
-                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.discover_offers', return_value=['offer']), \
-                    patch('lib.spot_runner_autoscaler.scale_up', side_effect=launch), \
-                    patch('lib.spot_runner_autoscaler.write_scale_state', side_effect=write):
-                with self.assertRaises(OSError):
-                    vm_recovery.reconcile_lost_vms([], [], self.args, state, path)
+            begin_host_operation('launch', replacement, [], [], state, path)
             state = read_scale_state(path)
-            with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True), \
-                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[replacement]), \
-                    patch('lib.spot_runner_autoscaler.discover_offers', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.scale_up') as launch:
+            reconcile_host_operation([replacement], [], self.args, state, path)
+            with patch('lib.spot_runner_autoscaler.scale_up') as launch:
                 vm_recovery.reconcile_lost_vms([replacement], [], self.args, state, path)
                 launch.assert_not_called()
-            self.assertEqual(read_scale_state(path)['pending_vm_recovery'], {})
+            self.assertIn(key, state['pending_vm_recovery'])
+            self.assertEqual(state['price_replacement_target'], 1)
 
-    def test_pending_replacement_survives_restart_without_repeating_success(self):
+    def test_pending_replacement_survives_restart_until_fresh_capacity_restored(self):
+        from lib.spot_runner_autoscaler import reconcile_host_operation
         key = f'{self.vm.zone}/{self.vm.name}'
-        state = {'idle_loops': 0, 'scale_up_active': False, 'pending_vm_recovery': {key: asdict(self.vm)}}
+        state = {'pending_vm_recovery': {key: asdict(self.vm)}}
+        replacement = GceVm('oxidex-runners-new', self.vm.zone, 'RUNNING', self.vm.machine_type, True)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.json'
-            write_scale_state(path, state)
+            with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True):
+                vm_recovery.reconcile_lost_vms([], [], self.args, state, path)
             state = read_scale_state(path)
-            with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True), \
-                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
-                    patch('lib.vm_recovery.subprocess.run', return_value=SimpleNamespace(returncode=0)), \
+            reconcile_host_operation([], [], self.args, state, path)
+            with patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
                     patch('lib.spot_runner_autoscaler.discover_offers', return_value=['offer']), \
                     patch('lib.spot_runner_autoscaler.scale_up', return_value=0):
-                self.assertTrue(vm_recovery.reconcile_lost_vms([], [], self.args, state, path))
+                vm_recovery.reconcile_lost_vms([], [], self.args, state, path)
             state = read_scale_state(path)
             self.assertIn(key, state['pending_vm_recovery'])
-            with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True), \
-                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
-                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
-                    patch('lib.vm_recovery.subprocess.run', return_value=SimpleNamespace(returncode=0)), \
+            with patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
                     patch('lib.spot_runner_autoscaler.discover_offers', return_value=['offer']), \
-                    patch('lib.spot_runner_autoscaler.scale_up', return_value=1):
-                self.assertTrue(vm_recovery.reconcile_lost_vms([], [], self.args, state, path))
+                    patch('lib.spot_runner_autoscaler.scale_up', return_value=1) as launch:
+                vm_recovery.reconcile_lost_vms([], [], self.args, state, path)
+                self.assertEqual(launch.call_args.args[0], 1)
+                self.assertIn(key, state['pending_vm_recovery'])
+                vm_recovery.reconcile_lost_vms([replacement], [], self.args, state, path)
             self.assertEqual(read_scale_state(path)['pending_vm_recovery'], {})
-            self.assertFalse(vm_recovery.reconcile_lost_vms([], [], self.args, state, path))
+            self.assertFalse(vm_recovery.reconcile_lost_vms([replacement], [], self.args, state, path))
+
+    def test_two_lost_hosts_cleanup_only_one_and_block_second_until_deregistered(self):
+        from lib.spot_runner_autoscaler import reconcile_host_operation
+        second = {**asdict(self.vm), 'name': 'oxidex-runners-second', 'instance_id': '999'}
+        state = {'pending_vm_recovery': {'first': asdict(self.vm), 'second': second}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True) as cleanup:
+                vm_recovery.reconcile_lost_vms([], [], self.args, state, path)
+                vm_recovery.reconcile_lost_vms([], [], self.args, state, path)
+                cleanup.assert_called_once()
+                reconcile_host_operation([], [], self.args, state, path)
+                vm_recovery.reconcile_lost_vms([], [], self.args, state, path)
+                self.assertEqual(cleanup.call_count, 2)
+            self.assertEqual(state['price_replacement_target'], 2)
 
 
 if __name__ == '__main__':

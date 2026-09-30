@@ -14,20 +14,18 @@ for the two ARM64 runners through the OrbStack socket.
 
 ```mermaid
 flowchart TD
-    A[Read runners and current VM prices] --> P{Any VM over the price cap?}
-    P -- Yes --> R[Delete overpriced VMs and disks]
-    R --> S[Find and launch affordable replacements]
+    A[Read jobs, runners, VMs and prices] --> P{Host operation pending?}
+    P -- Yes --> W[Confirm eight runners online or VM and runners absent]
+    W --> A
+    P -- No --> R{Loss cleanup or price replacement pending?}
+    R -- Yes --> S[Clean, delete or launch one host]
     S --> A
-    P -- No --> B{Busy share above 50%?}
-    B -- Yes and at most 25 workers --> C[Double Spot VM count]
-    C --> D{More than 25 workers online?}
-    D -- No --> C
-    D -- Yes --> A
+    R -- No --> B{Busy share above 50% and at most 25 workers?}
+    B -- Yes --> C[Launch one host]
+    C --> A
     B -- No --> E{Below 50% busy for two checks?}
-    E -- Yes --> F[Halve idle Spot VM count]
-    F --> G{One Spot VM remains?}
-    G -- No --> A
-    G -- Yes --> A
+    E -- Yes --> F[Delete one idle host while preserving Docker floors]
+    F --> A
     E -- No --> A
 ```
 
@@ -37,13 +35,16 @@ label. GitHub
 adds the standard `self-hosted`, `Linux`, and `X64` labels to both pools. Spot
 runners also receive `spot` and optional machine and region labels. Docker
 runners receive `docker` and optional machine and region labels. The autoscaler
-launches whole hosts and checks again every five minutes. When more than half
-of the online GCP runners are busy and 25 or fewer are online, it doubles the
-Spot VM count on each check until more than 25 workers are online. When fewer
-than half are busy for two consecutive checks, it halves the Spot VM count,
-repeating that reduction until one Spot VM remains. It removes only hosts
-whose registered runners are all online and idle, and it preserves the Docker
-runner and distinct-host floors. Deleting a VM also deletes its attached disks.
+changes one host at a time and checks again every five minutes. When more than
+half of the online GCP runners are busy and 25 or fewer are online, it adds one
+Spot VM. It waits for that host's eight runner slots to be online, then checks
+fresh utilization before another change. Lower demand cancels further scale-up.
+When fewer than half are busy for two consecutive checks, it removes one host
+and waits for both the VM and its assigned GitHub runner records to be absent.
+It repeats the two-check debounce before another reduction, keeping at least
+one Spot VM. It removes only hosts whose registered runners are all online and
+idle, and preserves the Docker runner and distinct-host floors. Deleting a VM
+also deletes its attached disks.
 Each added host contributes eight runner containers, including two Docker
 workers and six Spot workers. Spot VM prices cover compute only. Persistent
 disks and network use have separate charges.
@@ -56,7 +57,7 @@ fetched again on the next loop. The launch price is not a price guarantee.
 If a VM's current compute price exceeds the cap, the autoscaler deletes that VM
 and its attached disks immediately, even if its runners have active jobs. Those
 jobs can fail and need to be rerun. It then searches for affordable replacements
-and uses the deployment manager to check their prices again before launch.
+one host at a time and uses the deployment manager to check prices again before launch.
 Pending replacements survive process restarts and are retried when no eligible
 capacity is available. Utilization scaling waits during replacement work.
 If GCP cannot provide a valid price, the autoscaler logs the failed
@@ -155,8 +156,12 @@ python3 src/spot_runner_manager.py \
 ```
 
 The manager verifies current Spot rates and quota before creating resources. It
-uses a Spot VM with a 40-GiB boot disk and a 100-GiB `pd-balanced` data
-disk configured to delete with its VM. Stopping a VM preserves the data disk;
+uses a Spot VM with a 40-GiB boot disk and a 100-GiB data disk configured to
+delete with its VM. C4, C4D, N4, and N4D use Hyperdisk Balanced boot and data
+disks with NVMe and gVNIC. Both disks explicitly provision the included
+3,000 IOPS and 140 MiB/s throughput baseline. N2, N2D, C2D, and E2 retain
+`pd-balanced` defaults. An incompatible existing data disk or explicit disk
+type is rejected before attachment. Stopping a VM preserves the data disk;
 deleting the VM removes its attached runner disk as well. Before deployment,
 the manager also removes unattached disks carrying its ownership label in the
 target zone when they are at least six hours old. This avoids racing an active
@@ -205,10 +210,17 @@ cap:
 python3 src/spot_runner_autoscaler.py
 ```
 
-The autoscaler only considers Spot offers for exactly 32 vCPU and 128 GiB of
-RAM that cost less than the daily cap. New runner names use the short `gha`
+The autoscaler considers supported x86 Spot offers with exactly 32 vCPU and
+at least 110 GiB of RAM that cost less than the daily compute cap. It prefers
+C4D/N4D (Turin), then C4/N4 (Emerald Rapids at 32 vCPU), older N2/N2D/C2D,
+and finally E2, choosing the cheapest
+offer within each tier. These are CPU-generation preferences, not measured
+Rust build rankings. C4's 120 GiB and C4D's 124 GiB qualify; ARM, Local SSD,
+and bare-metal variants are excluded. Data and boot disk charges are separate
+from the compute cap. Every deployment verifies fresh regional prices using
+the selected host's actual CPU and RAM counts. New runner names use the short `gha`
 prefix and are checked against GitHub's 64-character name limit. The autoscaler
-stores its idle-loop and scale-up state in
+stores its idle-loop counters, restoration targets, and pending host operation in
 `~/Library/Application Support/Spot Runner Autoscaler/state.json`.
 
 To install a per-user macOS LaunchAgent that starts at login and restarts the
@@ -274,6 +286,15 @@ retained, or recreated drives, incomplete legacy inventories, and failed API
 calls leave recovery pending with a reason in the log. Cleanup and replacement
 work survive restarts. Intentional scale-down and price evictions have their own
 saved records, so they do not trigger an extra interruption replacement.
+
+The controller saves each host operation's name, zone, and observed instance ID
+before cloud actions. Pending registration or deregistration blocks all other
+host changes, including price eviction and interruption replacement, across
+restarts. Deletion retries target the same host; stale runner removal requires
+fresh VM absence and offline, idle runner records. An uncertain launch with no
+VM receipt, a surviving failed deployment, or leftover deployment disks keeps
+scaling paused for verification. Failed launches can try another zone only
+after VM, disk, and runner inventories confirm that no resources remain.
 
 Launch logs show candidate specifications and failure details for each zone.
 The manager logs the first observation of an online runner and elapsed seconds

@@ -20,6 +20,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .environment import load_env
+from .machine_profiles import configure_storage
 from .fleet_logging import vm_details
 from .runner_fleet import GceVm, list_gcloud_vms
 from .log_format import configure_logging, error_detail, single_line
@@ -95,7 +96,8 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu", type=int, default=32, help="Expected VM vCPU")
     parser.add_argument("--instance-name", default="oxidex-spot-runners-asia")
     parser.add_argument("--disk-size-gb", type=int, default=100)
-    parser.add_argument("--disk-type", default="pd-balanced")
+    parser.add_argument("--disk-type", default=None,
+                        help="Data disk type; defaults to the machine family's compatible storage")
     parser.add_argument("--disk-device-name", default="runner-data")
     parser.add_argument("--runner-count", type=int, default=4)
     parser.add_argument("--runner-cpu", type=int, default=4)
@@ -112,6 +114,7 @@ def args_parser() -> argparse.ArgumentParser:
 
 
 def select_sizing(args: argparse.Namespace) -> None:
+    configure_storage(args)
     if not args.fixed_runner_sizing:
         if args.cpu < 4:
             raise RuntimeError("At least 4 host vCPUs are required for one runner")
@@ -131,22 +134,21 @@ def select_sizing(args: argparse.Namespace) -> None:
 
 def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:
     family = args.instance_type.split("-", 1)[0]
-    quota_metric_by_family = {"n2": "N2_CPUS", "c2d": "C2D_CPUS", "e2": "E2_CPUS"}
-    if family not in quota_metric_by_family:
-        raise RuntimeError("Live Spot pricing currently supports N2, C2D, and E2 machine types")
+    profile = configure_storage(args)
     machine = json.loads(gcloud(["compute", "machine-types", "describe", args.instance_type, "--zone", zone, "--format=json"], quiet=True))
     cpu, ram = int(machine["guestCpus"]), int(machine["memoryMb"]) // 1024
+    priced_ram = Decimal(str(machine["memoryMb"])) / 1024
     if (cpu, ram) != (args.cpu, args.ram):
         raise RuntimeError(f"GCE reports {cpu} vCPU/{ram} GiB; request was {args.cpu}/{args.ram}")
     core_rate, ram_rate = spot_rates(args.region, family)
-    hourly = core_rate * cpu + ram_rate * ram
+    hourly = core_rate * cpu + ram_rate * priced_ram
     LOG.info(f"Live Spot {family.upper()} rates ({args.region}): ${core_rate}/vCPU-hour, ${ram_rate}/GiB-hour")
     LOG.info(f"Compute estimate: ${hourly:.6f}/hour per VM. {args.disk_size_gb} GiB {args.disk_type} disk is billed separately.")
     if hourly >= args.max_cost:
         raise RuntimeError(f"Spot compute price ${hourly:.6f}/hour is not below ${args.max_cost}; no resources changed")
     if not args.existing_instance:
         regional = json.loads(gcloud(["compute", "regions", "describe", args.region, "--format=json"], quiet=True)).get("quotas", [])
-        regional_family = next((q for q in regional if q.get("metric") == quota_metric_by_family[family]), None)
+        regional_family = next((q for q in regional if q.get("metric") == profile.quota_metric), None)
         if regional_family and float(regional_family["limit"]) - float(regional_family["usage"]) < cpu:
             raise RuntimeError(f"Regional {family.upper()} CPU quota is insufficient: {regional_family}")
         global_quotas = json.loads(gcloud(["compute", "project-info", "describe", "--format=json"], quiet=True)).get("quotas", [])
@@ -220,6 +222,7 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
 
 
 def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
+    configure_storage(args)
     cleanup_orphan_runner_disks(zone)
     describe = subprocess.run(["gcloud", "compute", "instances", "describe", args.instance_name,
                                "--zone", zone, "--project", PROJECT, "--format=json"], text=True, capture_output=True)
@@ -239,12 +242,17 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                            "--zone", zone, "--project", PROJECT, "--format=json"], text=True, capture_output=True)
     created_disk = False
     if not disk.stdout:
+        performance = (["--provisioned-iops=3000", "--provisioned-throughput=140"]
+                       if args.disk_type == 'hyperdisk-balanced' else [])
         gcloud(["compute", "disks", "create", args.disk_device_name, f"--zone={zone}",
                 f"--size={args.disk_size_gb}GB", f"--type={args.disk_type}",
-                "--labels=managed-by=spot-runner-manager", "--quiet"])
+                "--labels=managed-by=spot-runner-manager", *performance, "--quiet"])
         created_disk = True
     else:
         disk_info = json.loads(disk.stdout)
+        actual_disk_type = disk_info.get('type', '').rsplit('/', 1)[-1]
+        if actual_disk_type != args.disk_type:
+            raise RuntimeError(f'Existing disk type {actual_disk_type or "unknown"} differs from {args.disk_type}')
         if disk_info.get("users") and not vm:
             raise RuntimeError(f"Disk {args.disk_device_name} is already attached; refusing to create another VM")
 
@@ -257,7 +265,7 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
             if args.disk_device_name not in attached:
                 gcloud(["compute", "instances", "attach-disk", args.instance_name, f"--zone={zone}",
                         f"--disk={args.disk_device_name}", f"--device-name={args.disk_device_name}", "--mode=rw",
-                        "--auto-delete", "--quiet"])
+                        f"--interface={args.disk_interface}", "--auto-delete", "--quiet"])
             else:
                 gcloud(["compute", "instances", "set-disk-auto-delete", args.instance_name,
                         f"--zone={zone}", f"--disk={args.disk_device_name}", "--auto-delete", "--quiet"])
@@ -271,13 +279,19 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                 raise RuntimeError(f"Cannot run startup bootstrap for VM status {vm.get('status')}")
         else:
             try:
+                boot_performance = (["--boot-disk-provisioned-iops=3000",
+                                     "--boot-disk-provisioned-throughput=140"]
+                                    if args.boot_disk_type == 'hyperdisk-balanced' else [])
+                network = ("--network-interface=network=default,nic-type=GVNIC"
+                           if args.boot_disk_type == 'hyperdisk-balanced' else "--network=default")
                 gcloud(["compute", "instances", "create", args.instance_name, f"--zone={zone}",
                         f"--machine-type={args.instance_type}", "--provisioning-model=SPOT",
                         "--instance-termination-action=STOP", "--maintenance-policy=TERMINATE",
-                        "--boot-disk-type=pd-balanced", "--boot-disk-size=40GB",
+                        f"--boot-disk-type={args.boot_disk_type}", "--boot-disk-size=40GB",
+                        f"--boot-disk-interface={args.disk_interface}", *boot_performance,
                         "--image-family=debian-13", "--image-project=debian-cloud",
-                        f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes",
-                        "--network=default", f"--metadata-from-file=startup-script={script_path}", "--quiet"])
+                        f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
+                        network, f"--metadata-from-file=startup-script={script_path}", "--quiet"])
             except RuntimeError:
                 if created_disk:
                     vm_check = subprocess.run(
@@ -419,10 +433,13 @@ def remove_startup_metadata_if_vm_exists(args: argparse.Namespace, zone: str) ->
 def deployment_details(args: argparse.Namespace) -> str:
     if hasattr(args, "deployment_vm"):
         return vm_details(args.deployment_vm)
+    configure_storage(args)
     vm = GceVm(args.instance_name, args.zone or f"{args.region}-a", "PROVISIONING",
                args.instance_type, True, vcpu=args.cpu, ram_gib=args.ram,
-               disks=({"boot": True, "diskSizeGb": 40, "diskType": "pd-balanced"},
-                      {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": args.disk_type}))
+               disks=({"boot": True, "diskSizeGb": 40, "diskType": args.boot_disk_type,
+                       "interface": args.disk_interface},
+                      {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": args.disk_type,
+                       "interface": args.disk_interface}))
     return "planned " + vm_details(vm)
 
 

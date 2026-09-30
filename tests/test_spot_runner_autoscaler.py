@@ -108,23 +108,23 @@ class AutoscalerPolicyTests(unittest.TestCase):
         self.assertFalse(docker_pool_satisfied(1, 2))
         self.assertTrue(docker_pool_satisfied(2, 2))
 
-    def test_low_usage_requires_two_loops_then_halves_vm_count(self):
+    def test_low_usage_requires_two_loops_then_removes_one_vm(self):
         self.assertEqual(scaling_decision(40, 10, 5, 0, False, 25),
                          ("wait", 0, 1, False))
         self.assertEqual(scaling_decision(40, 10, 5, 1, False, 25),
-                         ("down", 3, 0, False))
+                         ("down", 1, 0, False))
         self.assertEqual(scaling_decision(16, 4, 2, 1, False, 25),
                          ("down", 1, 0, False))
         self.assertEqual(scaling_decision(8, 1, 1, 0, False, 25),
                          ("wait", 0, 0, False))
 
-    def test_high_usage_doubles_hosts_until_worker_target_is_exceeded(self):
+    def test_high_usage_adds_one_host_and_rechecks_utilization(self):
         self.assertEqual(scaling_decision(8, 5, 1, 0, False, 25),
-                         ("up", 1, 0, True))
+                         ("up", 1, 0, False))
         self.assertEqual(scaling_decision(16, 8, 2, 0, True, 25),
-                         ("up", 2, 0, True))
+                         ("wait", 0, 0, False))
         self.assertEqual(scaling_decision(32, 16, 4, 0, True, 25),
-                         ("hold", 0, 0, False))
+                         ("wait", 0, 0, False))
 
     def test_vm_runner_matching_prefers_the_longest_name(self):
         from lib.runner_fleet import GceVm
