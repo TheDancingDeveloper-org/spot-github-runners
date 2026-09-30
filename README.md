@@ -231,6 +231,32 @@ A missing VM does not prove Spot preemption; check the earlier deletion events
 to identify controller actions. The log reports an unconfirmed cause for other
 disappearances or terminated VMs.
 
+The controller also tracks CI jobs assigned to managed Spot VMs. It saves job IDs,
+runner names, attempts, and job links in the same state file before a VM disappears.
+The default repository is `swack-tools/oxidex`; use `--job-repository OWNER/REPO`
+(repeat the flag for multiple repositories) to change the tracked set. These
+repositories require Actions read/write and Checks read permissions through `gh`.
+
+When a VM disappears or reaches `TERMINATED`, the controller logs the jobs that
+were running on it. It waits for GitHub to report a failed job with a runner-loss
+error before logging that the VM loss caused a CI crash. Successful jobs, user
+cancellations, ordinary code failures, and controller-initiated deletions do not
+trigger automatic crash retries. Job failures completed before the last observed
+VM presence are also excluded. A one-hour startup discovery window and retained
+in-progress run IDs (including workflows with queued jobs) cover jobs that finish
+between controller polls. Each repository retains its own discovery watermark.
+
+After the workflow run completes, it requests an individual crashed-job rerun.
+GitHub may also rerun jobs that depend on it. Multiple crashed jobs from the same
+run are submitted one at a time. The controller recognizes newer job attempts
+submitted manually, logs accepted requests and eventual results, and saves its
+request intent before calling GitHub. A shared state-file lock prevents concurrent
+controllers from submitting the same requests. If a request loses its response,
+the controller checks for a newer job attempt and holds automatic resubmission;
+its log requests a manual GitHub check when the receipt remains uncertain. A
+confirmed HTTP rejection can be retried on the next loop. Unconfirmed crash
+investigations expire after one day; job records are retained for up to 30 days.
+
 Use `--log-file PATH` to change the event log location. The LaunchAgent preserves
 this option. Existing log content is retained across restarts. To follow events:
 

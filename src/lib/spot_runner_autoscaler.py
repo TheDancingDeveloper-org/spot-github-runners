@@ -17,6 +17,7 @@ from tempfile import NamedTemporaryFile
 from .autoscaling_policy import affordable_offers
 from .compute_api import get_auth
 from .environment import load_env
+from .job_recovery import JobRecovery
 from .fleet_logging import lifecycle_log, observe_vms
 from .price_guard import check_running_prices, delete_overpriced_vm
 from .runner_labels import counts_toward_capacity
@@ -157,7 +158,9 @@ def read_scale_state(path: Path) -> dict:
     return {"idle_loops": int(state.get("idle_loops", 0)),
             "scale_up_active": bool(state.get("scale_up_active", False)),
             "price_replacement_target": int(state.get("price_replacement_target", 0)),
-            "observed_vms": state.get("observed_vms", {})}
+            "observed_vms": state.get("observed_vms", {}),
+            "job_tracking": state.get("job_tracking", {}),
+            "intentional_deletions": state.get("intentional_deletions", [])}
 
 
 def write_scale_state(path: Path, state: dict) -> None:
@@ -171,7 +174,8 @@ def write_scale_state(path: Path, state: dict) -> None:
     temporary_path.replace(path)
 
 
-def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace) -> int:
+def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace,
+               *, state: dict | None = None, state_path: Path | None = None) -> int:
     """Halve the Spot VM fleet, deleting only idle hosts and their disks."""
     fleet = spot_instances(vms)
     target = max(1, len(fleet) // 2)
@@ -185,6 +189,9 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     for vm in candidates[:count]:
         LOG.info("Removing idle Spot VM %s and its attached disks", vm.name)
         try:
+            if state is not None and state_path is not None:
+                state.setdefault("intentional_deletions", []).append(f"{vm.zone}/{vm.name}")
+                write_scale_state(state_path, state)
             terminate_spot_vm(vm, args.project, args.org, runners, vms)
             removed += 1
         except (OSError, subprocess.CalledProcessError) as exc:
@@ -221,6 +228,8 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
     for vm in overpriced:
         LOG.warning("Price exceeds cap: deleting %s with its disks, including any active jobs", vm.name)
         try:
+            state.setdefault("intentional_deletions", []).append(f"{vm.zone}/{vm.name}")
+            write_scale_state(state_path, state)
             delete_overpriced_vm(vm, args.project)
             LOG.info("Deleted overpriced Spot VM %s in %s and its attached disks", vm.name, vm.zone)
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -362,6 +371,8 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
         "StandardOutPath": str(home / "Library" / "Logs" / "spot-runner-autoscaler.log"),
         "StandardErrorPath": str(home / "Library" / "Logs" / "spot-runner-autoscaler.log"),
     }
+    for repo in args.job_repository or []:
+        plist["ProgramArguments"].extend(["--job-repository", repo])
     plist_path.write_bytes(plistlib.dumps(plist))
     subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], check=False)
     return plist_path
@@ -383,6 +394,8 @@ def args_parser() -> argparse.ArgumentParser:
                         default=Path.home() / "Library" / "Application Support"
                         / "Spot Runner Autoscaler" / "state.json")
     parser.add_argument("--install-launch-agent", action="store_true")
+    parser.add_argument("--job-repository", action="append", default=None,
+                        help="Repository whose crash jobs are tracked/rerun; repeat for multiple repos (default: ORG/oxidex)")
     parser.add_argument("--once", action="store_true", help="Check and scale once, then exit")
     return parser
 
@@ -408,12 +421,29 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run_controller(args: argparse.Namespace) -> int:
+    """Hold one controller lock so concurrent checks cannot duplicate reruns."""
+    import fcntl
+
+    state_path = args.state_file.expanduser()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with state_path.with_suffix(state_path.suffix + ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"Another controller owns state {state_path}") from exc
+        return _run_controller(args)
+
+
+def _run_controller(args: argparse.Namespace) -> int:
     """Run fleet checks until interrupted or a single check completes."""
     state_path = args.state_file.expanduser()
     state = read_scale_state(state_path)
+    jobs = JobRecovery(state, lambda: write_scale_state(state_path, state),
+                       args.job_repository or [f"{args.org}/oxidex"])
     while True:
         runners = list_github_runners(args.org)
         vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+        jobs.poll(vms)
         observe_vms(vms, state)
         write_scale_state(state_path, state)
         if reconcile_prices(vms, runners, args, state, state_path):
@@ -458,7 +488,7 @@ def run_controller(args: argparse.Namespace) -> int:
         elif action == "down":
             state["idle_loops"] = idle_loops
             LOG.info("Low usage persisted for two checks; removing up to %d Spot hosts", host_count)
-            removed = scale_down(vms, runners, args)
+            removed = scale_down(vms, runners, args, state=state, state_path=state_path)
             LOG.info("Scale-down step removed %d hosts", removed)
         else:
             state["idle_loops"] = idle_loops

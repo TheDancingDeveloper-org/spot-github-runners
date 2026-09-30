@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 import unittest
 from unittest.mock import patch
 
@@ -6,8 +7,11 @@ from lib.runner_manager import cleanup_orphan_runner_disks
 
 
 class RunnerDiskLifecycleTests(unittest.TestCase):
+    @patch("lib.runner_manager.datetime")
     @patch("lib.runner_manager.gcloud")
-    def test_orphan_cleanup_deletes_only_unattached_owned_disks(self, gcloud):
+    def test_orphan_cleanup_deletes_only_unattached_owned_disks(self, gcloud, clock):
+        clock.now.return_value = datetime(2026, 9, 30, 8, tzinfo=timezone.utc)
+        clock.fromisoformat.side_effect = datetime.fromisoformat
         gcloud.return_value = json.dumps([
             {"name": "runner-data-old", "status": "READY", "users": [],
              "labels": {"managed-by": "spot-runner-manager"},
