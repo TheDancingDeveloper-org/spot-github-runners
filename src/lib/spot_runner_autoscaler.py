@@ -32,7 +32,11 @@ def count_online_runners(org: str, label: str) -> int:
 
 def runner_is_managed(runner: GitHubRunner) -> bool:
     """Return whether a runner belongs to this GCP x64 fleet."""
-    return "n2-standard-32" in runner.labels and "X64" in runner.labels
+    current_shape = "n2-standard-32" in runner.labels
+    legacy_toronto = {
+        "oxidex-spot-7x27", "northamerica-northeast2"
+    }.issubset(runner.labels)
+    return (current_shape or legacy_toronto) and "X64" in runner.labels
 
 
 def docker_pool_hosts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...]) -> set[str]:
@@ -146,6 +150,9 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
         "WorkingDirectory": str(ROOT),
         "RunAtLoad": True,
         "KeepAlive": True,
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
         "StandardOutPath": str(home / "Library" / "Logs" / "spot-runner-autoscaler.log"),
         "StandardErrorPath": str(home / "Library" / "Logs" / "spot-runner-autoscaler.log"),
     }

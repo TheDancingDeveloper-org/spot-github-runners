@@ -83,6 +83,17 @@ class AutoscalerPolicyTests(unittest.TestCase):
         with patch("lib.spot_runner_autoscaler.list_github_runners", return_value=runners):
             self.assertEqual(count_online_runners("swack-tools", "spot"), 1)
 
+    def test_total_floor_counts_legacy_toronto_spot_labels(self):
+        from lib.spot_runner_autoscaler import count_online_runners
+        from unittest.mock import patch
+
+        runners = [
+            GitHubRunner(1, "oxidex-nane2-1", "online", False,
+                         ("spot", "oxidex-spot-7x27", "northamerica-northeast2", "X64")),
+        ]
+        with patch("lib.spot_runner_autoscaler.list_github_runners", return_value=runners):
+            self.assertEqual(count_online_runners("swack-tools", "spot"), 1)
+
     def test_autoscaler_runner_names_fit_github_limit_with_short_prefix(self):
         instance = "oxidex-runners-northamericanortheast2-a-2147483647"
         self.assertLessEqual(maximum_runner_name_length("gha", instance, 8), 64)
