@@ -17,6 +17,7 @@ from tempfile import NamedTemporaryFile
 from .autoscaling_policy import affordable_offers
 from .compute_api import get_auth
 from .environment import load_env
+from .fleet_logging import lifecycle_log, observe_vms
 from .price_guard import check_running_prices, delete_overpriced_vm
 from .runner_labels import counts_toward_capacity
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
@@ -137,6 +138,7 @@ def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRun
     subprocess.run(["gcloud", "compute", "instances", "delete", vm.name,
                     f"--zone={vm.zone}", f"--project={project}", "--delete-disks=all", "--quiet"],
                    check=True, text=True, capture_output=True)
+    LOG.info("Deleted idle Spot VM %s in %s and its attached disks", vm.name, vm.zone)
     for runner in assigned:
         subprocess.run(["gh", "api", "-X", "DELETE",
                         f"orgs/{org}/actions/runners/{runner.runner_id}"],
@@ -154,7 +156,8 @@ def read_scale_state(path: Path) -> dict:
         return {"idle_loops": 0, "scale_up_active": False}
     return {"idle_loops": int(state.get("idle_loops", 0)),
             "scale_up_active": bool(state.get("scale_up_active", False)),
-            "price_replacement_target": int(state.get("price_replacement_target", 0))}
+            "price_replacement_target": int(state.get("price_replacement_target", 0)),
+            "observed_vms": state.get("observed_vms", {})}
 
 
 def write_scale_state(path: Path, state: dict) -> None:
@@ -219,6 +222,7 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
         LOG.warning("Price exceeds cap: deleting %s with its disks, including any active jobs", vm.name)
         try:
             delete_overpriced_vm(vm, args.project)
+            LOG.info("Deleted overpriced Spot VM %s in %s and its attached disks", vm.name, vm.zone)
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.error("Price eviction failed for %s; retrying next loop: %s", vm.name, exc)
             continue
@@ -318,9 +322,12 @@ def launch_offer(offer, args: argparse.Namespace) -> None:
             "--runner-prefix", runner_prefix,
             "--runner-label", args.label, "--apply",
         ]
-        LOG.info("Deploying %s in %s at $%.4f/day compute", offer.machine_type, zone, offer.hourly_usd * 24)
+        LOG.info("Launching Spot VM %s: %s in %s at $%.4f/day compute",
+                 instance_name, offer.machine_type, zone, offer.hourly_usd * 24)
         result = subprocess.run(command, check=False)
         if result.returncode == 0:
+            LOG.info("Spot VM deployment completed: %s in %s; manager confirmed runner registration",
+                     instance_name, zone)
             return
         LOG.warning("Deployment in %s failed; trying another zone", zone)
     raise RuntimeError(f"No zone accepted {offer.machine_type} in {offer.region}")
@@ -344,7 +351,8 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
                              "--minimum-docker-runners", str(args.minimum_docker_runners),
                              "--minimum-docker-hosts", str(args.minimum_docker_hosts),
                              "--disk-size-gb", str(args.disk_size_gb),
-                             "--label", args.label, "--state-file", str(args.state_file.expanduser())],
+                             "--label", args.label, "--state-file", str(args.state_file.expanduser()),
+                             "--log-file", str(args.log_file.expanduser())],
         "WorkingDirectory": str(ROOT),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -370,6 +378,7 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("5"))
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--disk-size-gb", type=int, default=100)
+    parser.add_argument("--log-file", type=Path, default=Path.home() / "spot-ghrunner.log")
     parser.add_argument("--state-file", type=Path,
                         default=Path.home() / "Library" / "Application Support"
                         / "Spot Runner Autoscaler" / "state.json")
@@ -392,11 +401,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Installed LaunchAgent at {install_launch_agent(args)}")
         return 0
 
+    with lifecycle_log(args.log_file):
+        LOG.info("Checking fleet every %d seconds; compute cap $%s/day per VM",
+                 args.interval_seconds, args.max_daily_usd)
+        return run_controller(args)
+
+
+def run_controller(args: argparse.Namespace) -> int:
+    """Run fleet checks until interrupted or a single check completes."""
     state_path = args.state_file.expanduser()
     state = read_scale_state(state_path)
     while True:
         runners = list_github_runners(args.org)
         vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+        observe_vms(vms, state)
+        write_scale_state(state_path, state)
         if reconcile_prices(vms, runners, args, state, state_path):
             if args.once:
                 return 0

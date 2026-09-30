@@ -223,6 +223,25 @@ the current user's `gcloud` and `gh` credentials. Review its status with
 `launchctl print gui/$(id -u)/com.swacktools.spot-runner-autoscaler` and its log
 at `~/Library/Logs/spot-runner-autoscaler.log`.
 
+The controller appends timestamped events to `~/spot-ghrunner.log` on each run.
+It records startup, shutdown, live prices, scaling decisions, VM deletion attempts
+and completions, deployment attempts and completions, and changes in VM status.
+It saves the last VM inventory so it can detect missing VMs after a restart.
+A missing VM does not prove Spot preemption; check the earlier deletion events
+to identify controller actions. The log reports an unconfirmed cause for other
+disappearances or terminated VMs.
+
+Use `--log-file PATH` to change the event log location. The LaunchAgent preserves
+this option. Existing log content is retained across restarts. To follow events:
+
+```bash
+tail -f ~/spot-ghrunner.log
+```
+
+Graceful exits and `SIGTERM` or `SIGINT` signals write shutdown events. Power loss
+and `SIGKILL` cannot write a final event. The event log has no automatic rotation;
+service diagnostics and deployment subprocess output remain in the LaunchAgent log.
+
 ## Repository layout
 
 - `src/spot_runner_manager.py` is the provisioning command-line entry point.
