@@ -330,11 +330,12 @@ investigations expire after one day; job records are retained for up to 30 days.
 When a managed VM terminates or disappears, the controller logs its replacement
 search and checks its saved disk attachments before launching replacement
 capacity. For a terminated host that still exists, it verifies the instance ID
-and current attachments, then deletes the host and its disks. For surviving
-persistent drives, it deletes only the recorded auto-delete disks in the same
-project whose IDs still match and which are ready and unattached. It verifies
-that all recorded drives are gone before launching a replacement. Attached,
-retained, or recreated drives, incomplete legacy inventories, and failed API
+and current attachments before deleting the host with its configured disk
+auto-delete behavior. It then deletes any surviving recorded persistent drive
+in the same project only when its ID still matches and it is ready and
+unattached, regardless of its prior auto-delete setting. It verifies that all
+recorded drives are gone before launching a replacement. Attached, recreated,
+foreign, or unverifiable drives, incomplete legacy inventories, and failed API
 calls leave recovery pending with a reason in the log. Cleanup and replacement
 work survive restarts. Intentional scale-down and price evictions have their own
 saved records, so they do not trigger an extra interruption replacement.

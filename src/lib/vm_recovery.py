@@ -24,7 +24,7 @@ def _list(args: list[str]) -> list[dict]:
 
 
 def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
-    """Delete only the same stopped host and its recorded auto-delete disks."""
+    """Delete the same stopped host and verify every recorded persistent disk is gone."""
     if not vm.spot or not vm.name.startswith('oxidex-runners-'):
         raise ValueError('Recovery requires a managed Spot VM')
     sources = []
@@ -33,8 +33,8 @@ def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
             continue  # Local SSDs disappear with the host; no persistent disk remains.
         source = disk.get('source', '')
         match = DISK_SOURCE.fullmatch(source)
-        if not match or match[1] != project or not disk.get('autoDelete'):
-            LOG.warning('Disk cleanup cannot authorize retained or foreign drive %s for %s; retrying next loop',
+        if not match or match[1] != project:
+            LOG.warning('Disk cleanup cannot authorize foreign or unknown drive %s for %s; retrying next loop',
                         source or 'unknown', vm_details(vm))
             return False
         sources.append((disk, match[2], match[3], match[4]))
@@ -51,10 +51,9 @@ def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
             return False
         recorded = {disk['source'] for disk, *_ in sources}
         attachments = existing.get('disks', [])
-        if any(disk.get('type') != 'SCRATCH' and
-               (disk.get('source') not in recorded or not disk.get('autoDelete'))
+        if any(disk.get('type') != 'SCRATCH' and disk.get('source') not in recorded
                for disk in attachments):
-            LOG.warning('Disk cleanup waits for %s: current attachments differ from recorded auto-delete drives',
+            LOG.warning('Disk cleanup waits for %s: current attachments differ from recorded drives',
                         vm_details(vm))
             return False
         disk_inventory = {item.get('selfLink'): item for item in _list(['disks', 'list', f'--project={project}'])}
@@ -65,9 +64,9 @@ def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
                 LOG.warning('Disk cleanup waits for %s: attached drive identity is unknown or changed', vm_details(vm))
                 return False
         subprocess.run(['gcloud', 'compute', 'instances', 'delete', vm.name,
-                        f'--zone={vm.zone}', f'--project={project}', '--delete-disks=all', '--quiet'],
+                        f'--zone={vm.zone}', f'--project={project}', '--quiet'],
                        check=True, text=True, capture_output=True, timeout=180)
-        LOG.info('Deleted terminated Spot VM and its attached disks: %s', vm_details(vm))
+        LOG.info('Deleted terminated Spot VM; checking recorded drive cleanup: %s', vm_details(vm))
         if any(item.get('name') == vm.name for item in _list(
                 ['instances', 'list', f'--project={project}', f'--zones={vm.zone}'])):
             return False
