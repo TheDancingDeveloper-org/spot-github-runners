@@ -8,8 +8,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && rm -rf /var/lib/apt/lists/* \
     && install -d -o runner -g runner /runner-state /work
 COPY entrypoint.sh /usr/local/bin/gha-runner-entrypoint
-RUN chmod 0755 /usr/local/bin/gha-runner-entrypoint
+COPY job-completed.sh /usr/local/bin/gha-runner-job-completed.sh
+COPY clean_target.py /usr/local/bin/gha-runner-clean-target.py
+RUN chmod 0755 /usr/local/bin/gha-runner-entrypoint /usr/local/bin/gha-runner-job-completed.sh
 USER runner
 WORKDIR /work
 ENV RUNNER_STATE=/runner-state
+ENV OXIDEX_CLEAN_TARGET=1
+ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh
 ENTRYPOINT ["/usr/local/bin/gha-runner-entrypoint"]

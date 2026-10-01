@@ -378,7 +378,13 @@ service diagnostics also remain in the LaunchAgent log.
 - `src/runner_fleet.py` is the fleet status command-line entry point.
 - `src/spot_finder.py` is the Spot offer search command-line entry point.
 - `src/lib/` contains reusable fleet, pricing, provisioning, and autoscaling methods.
-- `src/lib/runner_assets.py` embeds the startup script, image definition, and entrypoint.
+- `src/lib/runner_assets.py` embeds the startup script and runner image files.
+- The runner image enables a completed-job hook that removes only
+  `/work/oxidex/oxidex/target` after OxiDex jobs. It checks the repository,
+  workspace, and symlinks before removal, and logs free disk bytes before and
+  after. Set `OXIDEX_CLEAN_TARGET=0` in the runner container to disable it.
+  Custom `CARGO_TARGET_DIR` paths and old outputs outside this directory are
+  outside this cleanup boundary.
 - `tests/` contains unit tests for pricing and capacity rules.
 
 Run the Python checks from the repository root:

@@ -75,6 +75,8 @@ apt-get clean
 install -d -m 0755 /opt/gha-runners/build
 printf '%s' '{{DOCKERFILE_B64}}' | base64 -d >/opt/gha-runners/build/Dockerfile
 printf '%s' '{{ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/build/entrypoint.sh
+printf '%s' '{{JOB_COMPLETED_B64}}' | base64 -d >/opt/gha-runners/build/job-completed.sh
+printf '%s' '{{CLEAN_TARGET_B64}}' | base64 -d >/opt/gha-runners/build/clean_target.py
 chmod 0755 /opt/gha-runners/build/entrypoint.sh
 docker build --pull -t oxidex-self-hosted-runner:{{RUNNER_VERSION}} /opt/gha-runners/build
 
