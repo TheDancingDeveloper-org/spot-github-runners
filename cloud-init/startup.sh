@@ -45,7 +45,7 @@ cat >/etc/docker/daemon.json <<EOF
 EOF
 # Docker's data-root alone does not move containerd snapshots. Copy its current
 # content once, then point containerd at the persistent data disk before Docker
-# starts. This puts image overlays (what `df /` inside a job sees) on the 100GB
+# starts. This puts image overlays (what `df /` inside a job sees) on the 100 GB
 # disk too, rather than filling the VM's small boot disk.
 systemctl stop docker || true
 systemctl stop containerd || true
@@ -89,7 +89,7 @@ RUNNER_CPU={{RUNNER_CPU}}
 RUNNER_MEMORY_GB={{RUNNER_MEMORY_GB}}
 DOCKER_RUNNER_COUNT={{DOCKER_RUNNER_COUNT}}
 # Docker Engine storage (images, layers, build cache and containers) must stay
-# on the mounted persistent data disk. Abort if it did not mount as expected.
+# on the mounted persistent data disk. Stop if it did not mount as expected.
 docker_root=$(docker info --format=json | jq -r .DockerRootDir)
 [[ "$docker_root" == "$MOUNT_POINT/docker" ]] || { echo "Docker root is $docker_root, expected $MOUNT_POINT/docker" >&2; exit 1; }
 socket_gid=$(stat -c '%g' /var/run/docker.sock)
