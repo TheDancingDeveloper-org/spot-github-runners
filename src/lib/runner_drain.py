@@ -65,8 +65,9 @@ def jobs_finished(vm, state, org):
 
 
 def drain_runners(operation, vm, args, state, save, assigned):
-    """Return true only after fresh observations prove all quarantined runners absent."""
-    path = isolated_group(operation, args.org, save)
+    """Return true only after fresh observations prove all draining runners absent."""
+    legacy_group = operation.get('drain_mode') != 'label_only'
+    path = isolated_group(operation, args.org, save) if legacy_group else None
     recorded = operation.setdefault('runner_names', {})
     done = set(operation.get('deregistered_runner_ids', []))
     changed = not operation.get('runners_isolated')
@@ -81,16 +82,17 @@ def drain_runners(operation, vm, args, state, save, assigned):
             save()
         if runner.runner_id in done:
             raise RuntimeError('A deregistered runner appeared again during drain')
-    members = {row['id'] for row in pages(api(args.org, 'GET', path + '/runners', paginate=True), 'runners')}
-    if members - set(operation['runner_ids']):
-        raise RuntimeError('Drain group contains unrelated runners')
+    if legacy_group:
+        members = {row['id'] for row in pages(api(args.org, 'GET', path + '/runners', paginate=True), 'runners')}
+        if members - set(operation['runner_ids']):
+            raise RuntimeError('Drain group contains unrelated runners')
     for runner in assigned:
         if set(runner.labels) - DEFAULT_RUNNER_LABELS:
             result = api(args.org, 'DELETE', f'orgs/{args.org}/actions/runners/{runner.runner_id}/labels')
             if any(label.get('type') != 'read-only' for label in result['labels']):
                 raise RuntimeError('Custom scheduling labels remain after removal')
             changed = True
-        if runner.runner_id not in members:
+        if legacy_group and runner.runner_id not in members:
             api(args.org, 'PUT', path + f'/runners/{runner.runner_id}')
             changed = True
     if changed:

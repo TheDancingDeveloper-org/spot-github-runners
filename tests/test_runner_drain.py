@@ -105,9 +105,15 @@ class RunnerDrainTests(unittest.TestCase):
         else:self.fail('Unexpected API: '+path)
         return SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr='')
 
-    def begin(self):
+    def begin(self, legacy=False):
         with patch('lib.spot_runner_autoscaler.removable_spot_vms',return_value=[self.vm]):
             controller.scale_down([self.vm,self.other],self.runners,self.args,self.state,self.path)
+        if legacy:
+            self.state['host_operation'].pop('drain_mode',None)
+            self.state['host_operation']['drain_group_name']='spot-drain-legacy'
+            self.state['host_operation']['runners_isolated']=False
+            controller.write_scale_state(self.path,self.state)
+            self.reconcile()
 
     def reconcile(self, vms=None):
         controller.reconcile_host_operation(vms if vms is not None else [self.vm,self.other],
@@ -117,9 +123,11 @@ class RunnerDrainTests(unittest.TestCase):
         self.begin()
         self.assertIn('host_operation',self.state)
         self.assertEqual(self.state['host_operation']['kind'],'drain')
+        self.assertEqual(self.state['host_operation']['drain_mode'],'label_only')
         self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
         self.assertTrue(all(r.labels==('self-hosted','Linux','X64') for r in self.live))
-        self.assertEqual(self.members,set(range(1,9)))
+        self.assertEqual(self.members,set())
+        self.assertFalse(any('runner-groups' in str(c) for c in self.commands))
         self.reconcile()
         self.assertEqual(self.live,[])
         self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
@@ -129,6 +137,23 @@ class RunnerDrainTests(unittest.TestCase):
         self.reconcile([self.other])
         self.assertNotIn('host_operation',self.state)
         self.assertIsNone(self.group)
+
+    def test_label_only_drain_keeps_runner_group_and_waits_for_active_jobs(self):
+        self.live[0]=replace(self.live[0],busy=True)
+        self.begin()
+        self.assertEqual(len(self.live),8)
+        self.assertFalse(any('runner-groups' in str(c) for c in self.commands))
+        self.live[0]=replace(self.live[0],busy=False)
+        self.reconcile();self.reconcile()
+        self.assertTrue(any(c[:4]==['gcloud','compute','instances','delete'] for c in self.commands))
+
+    def test_legacy_group_drain_remains_supported(self):
+        self.state['host_operation']={'kind':'drain','vm':controller.asdict(self.vm),
+            'runner_ids':[r.runner_id for r in self.runners],
+            'runner_names':{str(r.runner_id):r.name for r in self.runners},
+            'drain_group_name':'spot-drain-legacy'}
+        self.reconcile()
+        self.assertEqual(self.members,set(range(1,9)))
 
     def test_job_assigned_after_selection_finishes_before_any_deregistration(self):
         self.live[0]=replace(self.live[0],busy=True)
@@ -151,7 +176,7 @@ class RunnerDrainTests(unittest.TestCase):
         self.assertTrue(any(c[0]=='gcloud' for c in self.commands))
 
     def test_failed_label_removal_preserves_drain_across_restart(self):
-        self.fail_label=True;self.begin()
+        self.fail_label=True;self.begin(legacy=True)
         self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
         self.state=controller.read_scale_state(self.path)
         self.fail_label=False;self.reconcile()
@@ -159,19 +184,19 @@ class RunnerDrainTests(unittest.TestCase):
         self.assertTrue(all('spot' not in r.labels for r in self.live))
 
     def test_group_with_repository_access_blocks_deregistration(self):
-        self.begin();self.repo_access=[{'id':999}]
+        self.begin(legacy=True);self.repo_access=[{'id':999}]
         self.reconcile()
         self.assertEqual(len(self.live),8)
         self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
 
     def test_group_with_public_repository_access_blocks_deregistration(self):
-        self.begin();self.group['allows_public_repositories']=True
+        self.begin(legacy=True);self.group['allows_public_repositories']=True
         self.reconcile()
         self.assertEqual(len(self.live),8)
         self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
 
     def test_group_with_unknown_public_repository_access_blocks_deregistration(self):
-        self.begin();self.group.pop('allows_public_repositories')
+        self.begin(legacy=True);self.group.pop('allows_public_repositories')
         self.reconcile()
         self.assertEqual(len(self.live),8)
         self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
@@ -202,7 +227,7 @@ class RunnerDrainTests(unittest.TestCase):
         self.assertFalse(self.state.get('intentional_deletions'))
 
     def test_provider_read_rejection_preserves_drain_and_group_identity(self):
-        self.begin();self.reconcile();self.fail_describe=True;self.reconcile()
+        self.begin(legacy=True);self.reconcile();self.fail_describe=True;self.reconcile()
         self.state=controller.read_scale_state(self.path)
         self.assertEqual(self.state['host_operation']['kind'],'drain')
         self.assertEqual(self.state['host_operation']['drain_group_id'],99)
@@ -212,7 +237,7 @@ class RunnerDrainTests(unittest.TestCase):
         self.assertEqual(self.state['host_operation']['kind'],'delete')
 
     def test_rejected_delete_keeps_drain_state_and_can_retry(self):
-        self.begin();self.reconcile();self.fail_delete=True;self.reconcile()
+        self.begin(legacy=True);self.reconcile();self.fail_delete=True;self.reconcile()
         self.assertEqual(self.state['host_operation']['kind'],'drain')
         self.assertFalse(self.state['intentional_deletions'])
         self.fail_delete=False;self.reconcile()

@@ -245,7 +245,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
     if (operation["kind"] == "delete" and current and current.running
             and not operation.get("price_eviction") and not operation.get("drained")):
         operation.update(kind="drain", runner_names={str(r.runner_id): r.name for r in assigned},
-                         drain_group_name=f"spot-drain-{uuid.uuid4().hex}")
+                         drain_mode="label_only")
         write_scale_state(state_path, state)
     if operation["kind"] == "drain":
         if current and current.running:
@@ -449,7 +449,7 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     assigned = host_runners(vm, runners, vms)
     begin_host_operation("drain", vm, runners, vms, state, state_path,
                          runner_names={str(runner.runner_id): runner.name for runner in assigned},
-                         drain_group_name=f"spot-drain-{uuid.uuid4().hex}")
+                         drain_mode="label_only")
     reconcile_host_operation(vms, runners, args, state, state_path)
     return 0  # Host removal is counted only after the drain completes.
 
