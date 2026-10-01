@@ -1,5 +1,7 @@
 """Offline proofs of the persisted, one-host fleet operation barrier."""
 import subprocess
+import json
+from dataclasses import asdict
 import tempfile
 import unittest
 from dataclasses import replace
@@ -23,6 +25,50 @@ class SequentialScalingTests(unittest.TestCase):
         self.vm = GceVm('oxidex-runners-test', 'asia-south2-a', 'RUNNING', 'n2-standard-32', True, instance_id='123')
         self.other = replace(self.vm, name='oxidex-runners-other', instance_id='456')
         self.runners = [GitHubRunner(i, f'gha-{self.vm.name}-{i}', 'online', False, ('spot', 'X64', 'n2-standard-32')) for i in range(1, 9)]
+
+    def test_manager_receipt_preserves_success_and_failure_launch_identity(self):
+        offer = SimpleNamespace(region='asia-south2', machine_type='n2-standard-32', vcpu=32, ram_gib=128, hourly_usd=.1)
+        for exit_code in (0, 1):
+            with self.subTest(exit_code=exit_code):
+                state = {}
+                def command(args, **kwargs):
+                    if args[:3] == ['gcloud', 'compute', 'zones']:
+                        return SimpleNamespace(returncode=0, stdout='asia-south2-a\n')
+                    path = Path(args[args.index('--deployment-receipt') + 1])
+                    actual = replace(self.vm, name=state['host_operation']['vm']['name'],
+                                     disks=({'source': 'disks/root', 'autoDelete': True},))
+                    path.write_text(json.dumps(asdict(actual)))
+                    return SimpleNamespace(returncode=exit_code, stdout='', stderr='')
+                with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=command), \
+                     patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]):
+                    controller.scale_up(1, [offer], self.args, state, self.path)
+                restarted = controller.read_scale_state(self.path)
+                controller.reconcile_host_operation([], [], self.args, restarted, self.path)
+                self.assertEqual(restarted['host_operation']['kind'], 'recovery')
+                self.assertEqual(restarted['host_operation']['vm']['instance_id'], '123')
+
+    def test_restart_loads_receipt_before_absent_launch_reconciliation(self):
+        state = {}
+        receipt = self.path.parent / 'receipt.json'
+        controller.begin_host_operation('launch', replace(self.vm, instance_id=''), [], [], state, self.path,
+                                        deployment_receipt=str(receipt))
+        receipt.write_text(json.dumps(asdict(self.vm)))
+        restarted = controller.read_scale_state(self.path)
+        controller.reconcile_host_operation([], [], self.args, restarted, self.path)
+        self.assertEqual(restarted['host_operation']['kind'], 'recovery')
+        self.assertEqual(restarted['host_operation']['vm']['instance_id'], '123')
+
+    def test_receipt_for_another_host_never_authorizes_recovery(self):
+        state = {}
+        receipt = self.path.parent / 'wrong-receipt.json'
+        controller.begin_host_operation('launch', replace(self.vm, instance_id=''), [], [], state, self.path,
+                                        deployment_receipt=str(receipt))
+        receipt.write_text(json.dumps(asdict(self.other)))
+        with self.assertRaisesRegex(RuntimeError, 'does not match'):
+            controller.reconcile_host_operation([], [], self.args, state, self.path)
+        self.assertEqual(state['host_operation']['kind'], 'launch')
+        self.assertEqual(state['host_operation']['vm']['instance_id'], '')
+        self.assertFalse(state.get('pending_vm_recovery'))
 
     def test_high_demand_adds_one_and_sticky_old_state_does_not_override_idle_load(self):
         self.assertEqual(controller.scaling_decision(24, 14, 3, 0, False, 25), ('up', 1, 0, False))

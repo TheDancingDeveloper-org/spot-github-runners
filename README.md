@@ -161,8 +161,12 @@ delete with its VM. C4, C4D, N4, and N4D use Hyperdisk Balanced boot and data
 disks with NVMe and gVNIC. Both disks explicitly provision the included
 3,000 IOPS and 140 MiB/s throughput baseline. N2, N2D, C2D, and E2 retain
 `pd-balanced` defaults. An incompatible existing data disk or explicit disk
-type is rejected before attachment. Stopping a VM preserves the data disk;
-deleting the VM removes its attached runner disk as well. Before deployment,
+type is rejected before attachment. New Spot VMs use the `DELETE` preemption
+action, with automatic deletion explicitly enabled for both boot and data
+disks. Adopting a VM also enables automatic deletion on its boot and runner
+data disks. An ordinary stop preserves disks; existing VMs that use the
+`STOP` preemption action retain the controller's loss cleanup behavior.
+Deleting a VM removes its boot and runner data disks. Before deployment,
 the manager also removes unattached disks carrying its ownership label in the
 target zone when they are at least six hours old. This avoids racing an active
 provisioning operation. It never deletes attached disks or disks without its

@@ -7,6 +7,7 @@ import argparse
 import base64
 import json
 import logging
+import os
 import shlex
 import subprocess
 import tempfile
@@ -16,6 +17,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 
@@ -109,6 +111,8 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runner-group-id", type=int, default=10)
     parser.add_argument("--runner-prefix", default="oxidex-asia")
     parser.add_argument("--existing-instance", action="store_true", help="Attach/bootstrap an existing Spot VM")
+    parser.add_argument("--deployment-receipt", type=Path,
+                        help="Persist the created VM identity before waiting for runner registration")
     parser.add_argument("--apply", action="store_true", help="Run provisioning and startup-script deployment")
     return parser
 
@@ -221,6 +225,22 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
     return source
 
 
+def write_deployment_receipt(args: argparse.Namespace, vm: GceVm) -> None:
+    """Save safe provider identity independently of controller and registration lifetimes."""
+    if not getattr(args, "deployment_receipt", None):
+        return
+    if not vm.instance_id or vm.name != args.instance_name:
+        raise RuntimeError("Cannot persist an unidentified deployment")
+    path = args.deployment_receipt
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as temp:
+        json.dump(asdict(vm), temp)
+        temp.flush()
+        os.fsync(temp.fileno())
+        temporary = Path(temp.name)
+    temporary.replace(path)
+
+
 def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     configure_storage(args)
     cleanup_orphan_runner_disks(zone)
@@ -261,6 +281,11 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
         script_path = temp.name
     try:
         if vm:
+            for boot_disk in vm.get("disks", []):
+                if boot_disk.get("boot"):
+                    gcloud(["compute", "instances", "set-disk-auto-delete", args.instance_name,
+                            f"--zone={zone}", f"--device-name={boot_disk['deviceName']}",
+                            "--auto-delete", "--quiet"])
             attached = {disk.get("deviceName") for disk in vm.get("disks", [])}
             if args.disk_device_name not in attached:
                 gcloud(["compute", "instances", "attach-disk", args.instance_name, f"--zone={zone}",
@@ -284,14 +309,30 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                                     if args.boot_disk_type == 'hyperdisk-balanced' else [])
                 network = ("--network-interface=network=default,nic-type=GVNIC"
                            if args.boot_disk_type == 'hyperdisk-balanced' else "--network=default")
-                gcloud(["compute", "instances", "create", args.instance_name, f"--zone={zone}",
+                created = gcloud(["compute", "instances", "create", args.instance_name, f"--zone={zone}",
                         f"--machine-type={args.instance_type}", "--provisioning-model=SPOT",
-                        "--instance-termination-action=STOP", "--maintenance-policy=TERMINATE",
+                        "--instance-termination-action=DELETE", "--maintenance-policy=TERMINATE",
                         f"--boot-disk-type={args.boot_disk_type}", "--boot-disk-size=40GB",
+                        "--boot-disk-auto-delete",
                         f"--boot-disk-interface={args.disk_interface}", *boot_performance,
                         "--image-family=debian-13", "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
-                        network, f"--metadata-from-file=startup-script={script_path}", "--quiet"])
+                        network, f"--metadata-from-file=startup-script={script_path}",
+                        "--format=json(id,name,zone,status,disks)",
+                        "--quiet"], quiet=True)
+                if getattr(args, "deployment_receipt", None):
+                    rows = json.loads(created)
+                    row = rows[0] if isinstance(rows, list) and len(rows) == 1 else rows
+                    if (not isinstance(row, dict) or row.get("name") != args.instance_name
+                            or row.get("zone", "").rsplit("/", 1)[-1] != zone):
+                        raise RuntimeError("Create response does not identify the requested VM")
+                    write_deployment_receipt(args, GceVm(
+                        row["name"], zone, row.get("status", "PROVISIONING"), args.instance_type, True,
+                        disks=tuple({key: disk[key] for key in
+                                     ("boot", "source", "autoDelete", "deviceName", "interface", "diskSizeGb")
+                                     if key in disk} for disk in row.get("disks", [])),
+                        instance_id=str(row.get("id") or ""),
+                        vcpu=args.cpu, ram_gib=args.ram))
             except RuntimeError:
                 if created_disk:
                     vm_check = subprocess.run(
@@ -460,7 +501,7 @@ def main() -> int:
     hourly = verify_price_and_capacity(args, zone)
     if args.existing_instance:
         args.deployment_vm = observed_deployment_vm(args, zone)
-    LOG.info(f"Plan: {deployment_details(args)}; {args.runner_count} runners, {args.runner_cpu} vCPU/{args.runner_memory_gb} GiB each; {args.disk_size_gb} GiB retained disk.")
+    LOG.info(f"Plan: {deployment_details(args)}; {args.runner_count} runners, {args.runner_cpu} vCPU/{args.runner_memory_gb} GiB each; {args.disk_size_gb} GiB auto-delete data disk.")
     if not args.apply:
         LOG.info("Preview only. Add --apply to provision through GCE startup metadata and register the runners.")
         return 0
@@ -479,6 +520,7 @@ def main() -> int:
         args.deployment_started_at = time.monotonic()
         apply_startup(args, zone, script)
         args.deployment_vm = observed_deployment_vm(args, zone)
+        write_deployment_receipt(args, args.deployment_vm)
         wait_for_bootstrap(args, zone, deployment_id)
         online = online_runners(args)
         if len(online) != args.runner_count:

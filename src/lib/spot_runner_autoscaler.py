@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from decimal import Decimal
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -195,11 +196,33 @@ def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
     write_scale_state(state_path, state)
 
 
+def import_deployment_receipt(state, state_path):
+    """Recover the provider identity even when a launch vanishes before inventory."""
+    operation = state.get("host_operation", {})
+    receipt = operation.get("deployment_receipt")
+    if (operation.get("kind") != "launch" or operation.get("receipt_imported")
+            or not receipt or not Path(receipt).exists()):
+        return False
+    from .fleet_logging import vm_from_record
+    actual = vm_from_record(json.loads(Path(receipt).read_text()))
+    planned = vm_from_record(operation["vm"])
+    if (not actual.instance_id or not actual.spot or actual.name != planned.name
+            or actual.zone != planned.zone or actual.machine_type != planned.machine_type
+            or (planned.instance_id and actual.instance_id != planned.instance_id)):
+        raise RuntimeError("Deployment receipt does not match the pending host identity")
+    operation["vm"] = asdict(actual)
+    operation["receipt_imported"] = True
+    state.setdefault("observed_vms", {})[f"{actual.zone}/{actual.name}"] = asdict(actual)
+    write_scale_state(state_path, state)
+    return True
+
+
 def reconcile_host_operation(vms, runners, args, state, state_path):
     """Hold all fleet changes until a fresh inventory confirms completion."""
     operation = state.get("host_operation")
     if not operation:
         return False
+    import_deployment_receipt(state, state_path)
     from .fleet_logging import vm_from_record
     vm = vm_from_record(operation["vm"])
     current = next((item for item in vms if item.zone == vm.zone and item.name == vm.name), None)
@@ -491,9 +514,12 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
                            "interface": profile.disk_interface}))
         LOG.info("Found instance in region %s: %s; $%.4f/day compute; attempting to launch it now",
                  offer.region, vm_details(vm), offer.hourly_usd * 24)
-        begin_host_operation("launch", vm, [], [], state, state_path)
+        receipt = state_path.parent / f"{instance_name}-{uuid.uuid4().hex}-deployment.json"
+        command.extend(["--deployment-receipt", str(receipt)])
+        begin_host_operation("launch", vm, [], [], state, state_path, deployment_receipt=str(receipt))
         started = time.monotonic()
         result = subprocess.run(command, check=False, text=True, capture_output=True)
+        identity_observed = import_deployment_receipt(state, state_path)
         for output in (result.stdout, result.stderr):
             for line in (output or "").splitlines():
                 if line.strip():
@@ -511,6 +537,8 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             state.setdefault("observed_vms", {})[f"{existing.zone}/{existing.name}"] = asdict(existing)
             write_scale_state(state_path, state)
             raise RuntimeError(f"Deployment failed but {instance_name} still exists; waiting for this host")
+        if identity_observed:
+            raise RuntimeError(f"Deployment VM {instance_name} disappeared; waiting for loss recovery")
         failure = error_detail(result.stderr or result.stdout or "").lower()
         uncertain = result.returncode < 0 or any(fragment in failure for fragment in
                     ("timeout", "timed out", "deadline exceeded", "connection reset", "connection aborted"))
