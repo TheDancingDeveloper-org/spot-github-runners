@@ -120,7 +120,13 @@ def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner],
     fleet = spot_instances(vms)
     for vm in fleet:
         assigned = host_runners(vm, runners, fleet)
-        if not assigned or any(not runner.online or runner.busy for runner in assigned):
+        names = {runner.name for runner in assigned}
+        marker = f"-{vm.name}-"
+        prefixes = {name.rsplit(marker, 1)[0] for name in names if marker in name}
+        complete = any(prefix and {f"{prefix}-{vm.name}-{slot}" for slot in range(1, 9)}.issubset(names)
+                       for prefix in prefixes)
+        if (not vm.instance_id or not complete
+                or any(not runner.online or runner.busy for runner in assigned)):
             continue
         remaining_docker = [runner for runner in runners
                             if runner.online and DOCKER_LABEL in runner.labels
@@ -234,6 +240,45 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         vm = current
         write_scale_state(state_path, state)
     assigned = host_runners(vm, runners, [vm, *[item for item in vms if item.name != vm.name]])
+    if (operation["kind"] == "delete" and current and current.running
+            and not operation.get("price_eviction") and not operation.get("drained")):
+        operation.update(kind="drain", runner_names={str(r.runner_id): r.name for r in assigned},
+                         drain_group_name=f"spot-drain-{uuid.uuid4().hex}")
+        write_scale_state(state_path, state)
+    if operation["kind"] == "drain":
+        if current and current.running:
+            try:
+                from .runner_drain import drain_runners
+                fresh = list_github_runners(args.org)
+                assigned = host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]])
+                if drain_runners(operation, vm, args, state,
+                                 lambda: write_scale_state(state_path, state), assigned):
+                    def before_delete():
+                        operation.update(kind="delete", drained=True)
+                        key = f"{vm.zone}/{vm.name}"
+                        if key not in state.setdefault("intentional_deletions", []):
+                            state["intentional_deletions"].append(key)
+                        state.setdefault("intentional_deletion_ids", {})[key] = vm.instance_id
+                        write_scale_state(state_path, state)
+                    delete_drained_vm(vm, args, before_delete)
+            except (RuntimeError, ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+                clear_rejected_deletion(vm, exc, state, state_path)
+                LOG.warning("Drain remains pending for %s: %s", vm_details(vm), error_detail(exc))
+            return True
+        if f"{vm.zone}/{vm.name}" in state.get("intentional_deletions", []):
+            # An older controller may already have submitted an asynchronous delete.
+            operation.update(kind="delete_cleanup")
+            write_scale_state(state_path, state)
+            return True
+        # A real preemption during drain remains unexpected until a provider delete is requested.
+        from .fleet_logging import recovery_key
+        from .vm_recovery import record_loss_restoration_target
+        losses = state.setdefault("pending_vm_recovery", {})
+        key = recovery_key(f"{vm.zone}/{vm.name}", vm, losses)
+        losses.setdefault(key, asdict(vm))
+        record_loss_restoration_target(vms, state, state_path)
+        operation.update(kind="recovery", recovery_key=key)
+        write_scale_state(state_path, state)
     if operation["kind"] == "delete" and current and current.status.upper() == "TERMINATED":
         # A timed-out intentional delete can be followed by a stopped host.
         # Finish only this identity's disk cleanup without creating a loss target.
@@ -300,7 +345,14 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                     return True
                 delete_overpriced_vm(current, args.project)
             else:
-                terminate_spot_vm(current, args.project, args.org, runners, vms)
+                if operation.get("drained"):
+                    fresh = list_github_runners(args.org)
+                    if host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]]):
+                        LOG.warning("Deletion waits: runner records reappeared for %s", vm_details(vm))
+                        return True
+                    delete_drained_vm(current, args)
+                else:
+                    terminate_spot_vm(current, args.project, args.org, runners, vms)
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             clear_rejected_deletion(vm, exc, state, state_path)
             LOG.warning("Deletion remains pending for %s: %s", vm_details(vm), error_detail(exc))
@@ -321,6 +373,13 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         return True  # Require another inventory proving the records are absent.
     if operation["kind"] == "recovery":
         state["pending_vm_recovery"][operation["recovery_key"]]["_cleanup_complete"] = True
+    if operation.get("drain_group_id"):
+        from .runner_drain import cleanup_group
+        try:
+            cleanup_group(operation, args.org)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            LOG.warning("Drain group cleanup remains pending: %s", error_detail(exc))
+            return True
     state.pop("host_operation")
     write_scale_state(state_path, state)
     LOG.info("Host operation complete: VM and assigned runner records absent for %s", vm_details(vm))
@@ -332,7 +391,8 @@ def clear_rejected_deletion(vm: GceVm, exc: Exception, state: dict | None, state
     if state is None or not isinstance(exc, subprocess.CalledProcessError):
         return
     command = exc.cmd if isinstance(exc.cmd, (list, tuple)) else []
-    if not command or Path(str(command[0])).name != 'gcloud':
+    if (not command or Path(str(command[0])).name != 'gcloud'
+            or list(command[1:4]) != ['compute', 'instances', 'delete']):
         return  # A subsequent runner deregistration failure does not undo VM deletion.
     detail = error_detail(exc).lower()
     rejected = (re.search(r'http (400|401|403)\b', detail)
@@ -344,14 +404,32 @@ def clear_rejected_deletion(vm: GceVm, exc: Exception, state: dict | None, state
     key = f'{vm.zone}/{vm.name}'
     state['intentional_deletions'] = [item for item in state.get('intentional_deletions', []) if item != key]
     state.get('intentional_deletion_ids', {}).pop(key, None)
-    state.pop('host_operation', None)
+    operation = state.get('host_operation', {})
+    if operation.get('drained'):
+        operation['kind'] = 'drain'
+    else:
+        state.pop('host_operation', None)
     write_scale_state(state_path, state)
     LOG.warning('Cleared deletion intent after provider rejection for %s: %s', vm_details(vm), error_detail(exc))
 
 
+def delete_drained_vm(vm, args, before_delete=None):
+    observed = subprocess.run(["gcloud", "compute", "instances", "describe", vm.name,
+                               f"--zone={vm.zone}", f"--project={args.project}", "--format=value(id)"],
+                              check=True, text=True, capture_output=True, timeout=60)
+    if not vm.instance_id or observed.stdout.strip() != vm.instance_id:
+        raise RuntimeError("Refusing drained deletion: provider instance identity changed")
+    if before_delete is not None:
+        before_delete()
+    subprocess.run(["gcloud", "compute", "instances", "delete", vm.name,
+                    f"--zone={vm.zone}", f"--project={args.project}", "--delete-disks=all", "--quiet"],
+                   check=True, text=True, capture_output=True, timeout=180)
+    LOG.info("Deleted drained Spot VM %s and its attached disks", vm_details(vm))
+
+
 def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace,
                state: dict | None = None, state_path: Path | None = None) -> int:
-    """Remove one idle host, then wait for confirmed VM and runner absence."""
+    """Drain one idle host, then wait for CI completion and deregistration before deletion."""
     state = state if state is not None else read_scale_state(args.state_file.expanduser())
     state_path = state_path or args.state_file.expanduser()
     if state.get("host_operation") or len(spot_instances(vms)) <= 1:
@@ -361,14 +439,12 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
         LOG.info("Scale-down waits: no idle host can be removed while preserving Docker floors")
         return 0
     vm = candidates[0]
-    try:
-        terminate_spot_vm(vm, args.project, args.org, runners, vms,
-                          on_deleted=lambda: begin_host_operation("delete", vm, runners, vms, state, state_path))
-        return 1
-    except (OSError, subprocess.SubprocessError) as exc:
-        clear_rejected_deletion(vm, exc, state, state_path)
-        LOG.error("Could not remove %s: %s", vm_details(vm), error_detail(exc))
-        return 0
+    assigned = host_runners(vm, runners, vms)
+    begin_host_operation("drain", vm, runners, vms, state, state_path,
+                         runner_names={str(runner.runner_id): runner.name for runner in assigned},
+                         drain_group_name=f"spot-drain-{uuid.uuid4().hex}")
+    reconcile_host_operation(vms, runners, args, state, state_path)
+    return 0  # Host removal is counted only after the drain completes.
 
 
 def scale_up(additional_hosts: int, offers, args: argparse.Namespace, state=None, state_path=None) -> int:

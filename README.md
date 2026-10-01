@@ -15,7 +15,7 @@ for the two ARM64 runners through the OrbStack socket.
 ```mermaid
 flowchart TD
     A[Read jobs, runners, VMs and prices] --> P{Host operation pending?}
-    P -- Yes --> W[Confirm eight runners online or VM and runners absent]
+    P -- Yes --> W[Continue launch, drain or deletion confirmation]
     W --> A
     P -- No --> R{Loss cleanup or price replacement pending?}
     R -- Yes --> S[Clean, delete or launch one host]
@@ -24,7 +24,7 @@ flowchart TD
     B -- Yes --> C[Launch one host]
     C --> A
     B -- No --> E{Below 50% busy for two checks?}
-    E -- Yes --> F[Delete one idle host while preserving Docker floors]
+    E -- Yes --> F[Drain one idle host while preserving Docker floors]
     F --> A
     E -- No --> A
 ```
@@ -39,12 +39,20 @@ changes one host at a time and checks again every five minutes. When more than
 half of the online GCP runners are busy and 25 or fewer are online, it adds one
 Spot VM. It waits for that host's eight runner slots to be online, then checks
 fresh utilization before another change. Lower demand cancels further scale-up.
-When fewer than half are busy for two consecutive checks, it removes one host
+When fewer than half are busy for two consecutive checks, it drains one host
 and waits for both the VM and its assigned GitHub runner records to be absent.
 It repeats the two-check debounce before another reduction, keeping at least
-one Spot VM. It removes only hosts whose registered runners are all online and
-idle, and preserves the Docker runner and distinct-host floors. Deleting a VM
-also deletes its attached disks.
+one Spot VM. It selects a host only after observing all eight runner slots online
+and idle, and preserves the Docker runner and distinct-host floors. It removes
+all custom scheduling labels and moves the host's runners into a temporary
+group with no repository access. This also blocks assignments using GitHub's
+built-in labels. Existing jobs can finish while the host remains running.
+Fresh observations must show every runner idle and every tracked CI job
+completed before deregistration. The controller then requires a fresh inventory
+with all assigned runner records absent and verifies the VM identity before
+deleting it and its attached disks. It removes the empty temporary group after
+confirming VM absence. GitHub group and label management require organization
+self-hosted runner write permissions through `gh`.
 Each added host contributes eight runner containers, including two Docker
 workers and six Spot workers. Spot VM prices cover compute only. Persistent
 disks and network use have separate charges.
@@ -292,9 +300,12 @@ work survive restarts. Intentional scale-down and price evictions have their own
 saved records, so they do not trigger an extra interruption replacement.
 
 The controller saves each host operation's name, zone, and observed instance ID
-before cloud actions. Pending registration or deregistration blocks all other
+before cloud actions. Pending registration, draining, or deregistration blocks all other
 host changes, including price eviction and interruption replacement, across
-restarts. Deletion retries target the same host; stale runner removal requires
+restarts. Drain progress, group identity, and individual deregistration requests
+survive restarts and uncertain API responses. A preemption before the controller
+requests deletion remains eligible for interruption recovery. Deletion retries
+target the same host; stale runner removal after loss requires
 fresh VM absence and offline, idle runner records. An uncertain launch with no
 VM receipt, a surviving failed deployment, or leftover deployment disks keeps
 scaling paused for verification. Failed launches can try another zone only

@@ -140,7 +140,7 @@ class FleetInventoryTests(unittest.TestCase):
                 self.assertIn(key, state['job_tracking']['losses'])
                 self.assertIn(key, state['pending_vm_recovery'])
 
-    def test_scale_down_records_deletion_even_if_runner_deregistration_fails(self):
+    def test_scale_down_persists_drain_without_deletion_intent_if_inventory_fails(self):
         vm = GceVm('oxidex-runners-test', 'us-central1-a', 'RUNNING', 'n2-standard-32', True)
         other = GceVm('oxidex-runners-other', vm.zone, 'RUNNING', vm.machine_type, True)
         runner = GitHubRunner(1, f'gha-{vm.name}-1', 'online', False, ('spot',))
@@ -148,9 +148,12 @@ class FleetInventoryTests(unittest.TestCase):
             args = args_parser().parse_args(['--state-file', str(Path(directory) / 'state.json')])
             state = {'idle_loops': 0, 'scale_up_active': False}
             with patch('lib.spot_runner_autoscaler.removable_spot_vms', return_value=[vm]), \
-                    patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=[SimpleNamespace(returncode=0), subprocess.CalledProcessError(1, ['gh'])]):
+                    patch('lib.spot_runner_autoscaler.list_github_runners', side_effect=RuntimeError('GitHub unavailable')):
                 scale_down([vm, other], [runner], args, state)
-            self.assertEqual(read_scale_state(args.state_file)['intentional_deletions'], [f'{vm.zone}/{vm.name}'])
+            persisted = read_scale_state(args.state_file)
+            self.assertEqual(persisted['host_operation']['kind'], 'drain')
+            self.assertEqual(persisted['host_operation']['runner_ids'], [1])
+            self.assertFalse(persisted['intentional_deletions'])
 
 
 if __name__ == '__main__':
