@@ -24,27 +24,25 @@ flowchart TD
     B -- Yes --> C[Launch one host]
     C --> A
     B -- No --> E{Below 50% busy for two checks?}
-    E -- Yes --> F[Drain one idle host while preserving Docker floors]
+    E -- Yes --> F[Drain one idle host]
     F --> A
     E -- No --> A
 ```
 
-The autoscaler scales the GCP Spot fleet with observed job usage.
-Docker builders use the separate `docker` label and never receive the `spot`
-label. GitHub
-adds the standard `self-hosted`, `Linux`, and `X64` labels to both pools. Spot
-runners also receive `spot` and optional machine and region labels. Docker
-runners receive `docker` and optional machine and region labels. The autoscaler
-changes one host at a time and checks again every five minutes. When more than
-half of the online GCP runners are busy and 25 or fewer are online, it adds one
+The autoscaler scales the GCP Spot fleet with observed job usage. Docker builds
+run on GitHub-hosted workers, so Spot runners no longer receive the `docker`
+label or host Docker socket. GitHub adds the standard `self-hosted`, `Linux`,
+and `X64` labels to Spot runners, which also receive `spot` and optional machine
+and region labels. Separate `oxidex-m4air` runners remain managed by their own
+configuration. The autoscaler changes one host at a time and checks again
+every five minutes. When more than half of the online GCP runners are busy and 25 or fewer are online, it adds one
 Spot VM. It waits for that host's eight runner slots to be online, then checks
 fresh utilization before another change. Lower demand cancels further scale-up.
 When fewer than half are busy for two consecutive checks, it drains one host
 and waits for both the VM and its assigned GitHub runner records to be absent.
 It repeats the two-check debounce before another reduction, keeping at least
 one Spot VM. It selects a host only after observing all eight runner slots online
-and idle, and preserves the Docker runner and distinct-host floors. It removes
-all custom scheduling labels and moves the host's runners into a temporary
+and idle. It removes all custom scheduling labels and moves the host's runners into a temporary
 group with no repository access. This also blocks assignments using GitHub's
 built-in labels. Existing jobs can finish while the host remains running.
 Fresh observations must show every runner idle and every tracked CI job
@@ -53,9 +51,9 @@ with all assigned runner records absent and verifies the VM identity before
 deleting it and its attached disks. It removes the empty temporary group after
 confirming VM absence. GitHub group and label management require organization
 self-hosted runner write permissions through `gh`.
-Each added host contributes eight runner containers, including two Docker
-workers and six Spot workers. The VM budget includes compute and boot/data disk
-capacity and provisioned performance charges. Network use is billed separately.
+Each added host contributes eight Spot runner containers. The VM budget includes
+compute and boot/data disk capacity and provisioned performance charges. Network
+use is billed separately.
 
 Every loop fetches current regional Spot prices and checks each running managed
 VM against `--max-daily-usd` (default: $10 per VM per day for compute and attached storage).
@@ -87,8 +85,8 @@ Moving only Docker's `data-root` leaves containerd snapshots on the boot disk.
 The bootstrap copies existing containerd data to the attached disk, configures
 containerd to use that path, restarts Docker, then removes the old default storage.
 Each runner's `/` filesystem should report about 98 GiB because its container
-overlay uses the attached disk. Only the two `docker` pool runners receive the
-host Docker socket; Docker runners do not receive the `spot` label. The manager checks
+overlay uses the attached disk. The host Docker engine runs isolated runner
+containers, but its socket is never mounted into a runner. The manager checks
 the runner filesystem and socket separation before it reports success. The boot
 disk keeps the operating system and packages; increase the data disk only when
 its observed free space requires it.

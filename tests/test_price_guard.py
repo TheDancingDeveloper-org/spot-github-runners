@@ -53,7 +53,7 @@ class PriceGuardTests(unittest.TestCase):
         runners = [GitHubRunner(index, f"gha-replacement-{index}", "online", False,
                                ("spot", "X64", shape))
                    for index, shape in enumerate(("e2-standard-32", "c2d-standard-32"))]
-        self.assertEqual(utilization_counts(runners, "spot"), (2, 0))
+        self.assertEqual(utilization_counts(runners), (2, 0))
 
     def test_busy_price_eviction_saves_replacement_before_deleting(self):
         runner = GitHubRunner(1, "gha-oxidex-runners-test-1", "online", True, ("spot",))

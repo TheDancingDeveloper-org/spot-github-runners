@@ -26,7 +26,7 @@ from .project_costs import log_project_costs
 from .fleet_logging import vm_details
 from .runner_fleet import GceVm, list_gcloud_vms
 from .log_format import configure_logging, error_detail, single_line
-from .runner_labels import DEFAULT_RUNNER_LABELS, custom_labels_for_runner
+from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, JOB_COMPLETED, RUNNER_DOCKERFILE,
                             RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
 
@@ -90,8 +90,6 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runner-count", type=int, default=4)
     parser.add_argument("--runner-cpu", type=int, default=4)
     parser.add_argument("--runner-memory-gb", type=int, default=15)
-    parser.add_argument("--docker-runner-count", type=int, default=2,
-                        help="Number of runners that receive only the docker label and host socket")
     parser.add_argument("--fixed-runner-sizing", action="store_true", help="Use the explicit runner sizing values")
     parser.add_argument("--runner-label", default="oxidex-spot-7x27")
     parser.add_argument("--runner-group-id", type=int, default=10)
@@ -114,8 +112,6 @@ def select_sizing(args: argparse.Namespace) -> None:
         args.runner_memory_gb = (args.ram - 8) // args.runner_count
     if args.runner_count < 1 or args.runner_cpu * args.runner_count > args.cpu:
         raise RuntimeError("Runner count or CPU limits exceed the requested host capacity")
-    if args.docker_runner_count < 0 or args.docker_runner_count > args.runner_count:
-        raise RuntimeError("Docker runner count must be between zero and the total runner count")
     if args.runner_memory_gb * args.runner_count > args.ram - 8:
         raise RuntimeError("Runner RAM exceeds (host RAM - 8 GiB); lower runner count/memory")
     longest_name = len(f"{args.runner_prefix}-{args.instance_name}-{args.runner_count}")
@@ -225,14 +221,12 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "RUNNER_VERSION": "2.337.0",
         "ORG": ORG,
         "RUNNER_LABELS": f"{args.runner_label},{args.instance_type},{args.region}",
-        "DOCKER_RUNNER_LABELS": f"docker,{args.instance_type},{args.region}",
         "RUNNER_GROUP": group_name,
         "RUNNER_PREFIX": args.runner_prefix,
         "REGISTRATION_TOKEN": shlex.quote(token),
         "RUNNER_COUNT": str(args.runner_count),
         "RUNNER_CPU": str(args.runner_cpu),
         "RUNNER_MEMORY_GB": str(args.runner_memory_gb),
-        "DOCKER_RUNNER_COUNT": str(args.docker_runner_count),
         "INSTANCE_NAME": args.instance_name,
         "DEPLOYMENT_ID": deployment_id,
     }
@@ -417,7 +411,7 @@ def online_runners(args: argparse.Namespace) -> list[str]:
 
 
 def sync_runner_labels(args: argparse.Namespace) -> None:
-    """Give builder runners only the docker custom label; keep the standard pool separate."""
+    """Ensure every Spot VM runner has the common scheduling labels."""
     expected_names = {f"{args.runner_prefix}-{args.instance_name}-{n}": n
                       for n in range(1, args.runner_count + 1)}
     output = run(["gh", "api", "--paginate", f"orgs/{ORG}/actions/runners",
@@ -431,9 +425,7 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
         if name not in expected_names:
             continue
         seen.add(name)
-        index = expected_names[name]
-        desired = custom_labels_for_runner(index, args.docker_runner_count,
-                                           [args.runner_label, args.instance_type, args.region])
+        desired = list(dict.fromkeys([args.runner_label, args.instance_type, args.region]))
         current = {label.get("name") for label in runner.get("labels", [])} - DEFAULT_RUNNER_LABELS
         if current != set(desired):
             response = run(["gh", "api", "--method", "PUT",
@@ -463,15 +455,14 @@ def wait_for_bootstrap(args: argparse.Namespace, zone: str, deployment_id: str) 
     raise TimeoutError(f"Startup script did not complete deployment {deployment_id}; startup metadata retained for diagnosis")
 
 
-def verify_runner_storage_and_socket(args: argparse.Namespace, zone: str) -> None:
-    """Require the data disk to back Docker, containerd overlays, and runner Docker access."""
+def verify_runner_storage(args: argparse.Namespace, zone: str) -> None:
+    """Require the data disk to back Docker and containerd without exposing its socket."""
     prefix = f"{args.runner_prefix}-{args.instance_name}-"
     command = """set -euo pipefail
 mountpoint -q /mnt/runner-data
 test "$(docker info --format=json | jq -r .DockerRootDir)" = /mnt/runner-data/docker
 systemctl show -p ExecStart --value containerd | grep -F -- '--root /mnt/runner-data/containerd' >/dev/null
 sudo test -d /mnt/runner-data/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots
-docker_count=0
 runner_count=0
 for n in $(docker ps --format '{{.Names}}' | grep -F -- "$RUNNER_PREFIX" || true); do
   runner_count=$((runner_count + 1))
@@ -480,22 +471,14 @@ for n in $(docker ps --format '{{.Names}}' | grep -F -- "$RUNNER_PREFIX" || true
   available=$(docker exec "$n" df -B1 / | awk 'NR == 2 {print $4}')
   test "$total" -ge 70000000000
   test "$available" -ge 20000000000
-  index=${n##*-}
-  if (( index <= $DOCKER_RUNNER_COUNT )); then
-    docker_count=$((docker_count + 1))
-    printf '%s' "$binds" | grep -F '/var/run/docker.sock:/var/run/docker.sock' >/dev/null
-    docker exec "$n" docker version --format '{{.Server.Version}}' >/dev/null
-    docker exec "$n" test -w /var/run/docker.sock
-  elif printf '%s' "$binds" | grep -F '/var/run/docker.sock:/var/run/docker.sock' >/dev/null; then
-    echo "Non-builder runner has host Docker socket: $n" >&2
+  if printf '%s' "$binds" | grep -F '/var/run/docker.sock:/var/run/docker.sock' >/dev/null; then
+    echo "Runner has host Docker socket mounted: $n" >&2
     exit 1
   fi
 done
-test "$docker_count" -eq $DOCKER_RUNNER_COUNT
 test "$runner_count" -eq $EXPECTED_RUNNER_COUNT
         """.replace("$RUNNER_PREFIX", shlex.quote(prefix)).replace(
-            "$DOCKER_RUNNER_COUNT", str(args.docker_runner_count)
-        ).replace("$EXPECTED_RUNNER_COUNT", str(args.runner_count))
+            "$EXPECTED_RUNNER_COUNT", str(args.runner_count))
     gcloud(["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={command}"], quiet=True)
 
 
@@ -572,7 +555,7 @@ def main() -> int:
         if len(online) != args.runner_count:
             raise RuntimeError(f"Only {len(online)}/{args.runner_count} expected runners are online")
         sync_runner_labels(args)
-        verify_runner_storage_and_socket(args, zone)
+        verify_runner_storage(args, zone)
         online = online_runners(args)
     except BaseException as exc:
         failure = exc

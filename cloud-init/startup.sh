@@ -82,23 +82,16 @@ docker build --pull -t oxidex-self-hosted-runner:{{RUNNER_VERSION}} /opt/gha-run
 
 ORG_URL=https://github.com/{{ORG}}
 RUNNER_LABELS='{{RUNNER_LABELS}}'
-DOCKER_RUNNER_LABELS='{{DOCKER_RUNNER_LABELS}}'
 RUNNER_GROUP='{{RUNNER_GROUP}}'
 RUNNER_PREFIX='{{RUNNER_PREFIX}}'
 REGISTRATION_TOKEN={{REGISTRATION_TOKEN}}
 RUNNER_COUNT={{RUNNER_COUNT}}
 RUNNER_CPU={{RUNNER_CPU}}
 RUNNER_MEMORY_GB={{RUNNER_MEMORY_GB}}
-DOCKER_RUNNER_COUNT={{DOCKER_RUNNER_COUNT}}
 # Docker Engine storage (images, layers, build cache and containers) must stay
 # on the mounted persistent data disk. Stop if it did not mount as expected.
 docker_root=$(docker info --format=json | jq -r .DockerRootDir)
 [[ "$docker_root" == "$MOUNT_POINT/docker" ]] || { echo "Docker root is $docker_root, expected $MOUNT_POINT/docker" >&2; exit 1; }
-socket_gid=$(stat -c '%g' /var/run/docker.sock)
-if (( DOCKER_RUNNER_COUNT < 0 || DOCKER_RUNNER_COUNT > RUNNER_COUNT )); then
-  echo "Docker runner count must be between zero and RUNNER_COUNT" >&2
-  exit 1
-fi
 for i in $(seq 1 "$RUNNER_COUNT"); do
   name="${RUNNER_PREFIX}-$(hostname -s)-${i}"
   state="$MOUNT_POINT/instances/$name"
@@ -106,7 +99,6 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
   mkdir -p "$state" "$work"
   chown -R 1001:1001 "$state" "$work"
   runner_labels="$RUNNER_LABELS"
-  if (( i <= DOCKER_RUNNER_COUNT )); then runner_labels="$DOCKER_RUNNER_LABELS"; fi
   env_file="/run/${name}.env"
   umask 077
   printf 'GITHUB_RUNNER_TOKEN=%s\n' "$REGISTRATION_TOKEN" >"$env_file"
@@ -121,9 +113,6 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     --name "$name" -e RUNNER_NAME="$name" -e RUNNER_LABELS="$runner_labels" \
     -e RUNNER_GROUP_NAME="$RUNNER_GROUP" -e GITHUB_RUNNER_URL="$ORG_URL" \
     -e RUNNER_STATE=/runner-state -v "$state:/runner-state" -v "$work:/work")
-  if (( i <= DOCKER_RUNNER_COUNT )); then
-    docker_args+=(--group-add "$socket_gid" -v /var/run/docker.sock:/var/run/docker.sock)
-  fi
   docker_args+=(oxidex-self-hosted-runner:{{RUNNER_VERSION}})
   docker run "${docker_args[@]}"
 done

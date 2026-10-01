@@ -211,15 +211,20 @@ class RunnerDrainTests(unittest.TestCase):
 
     def test_missing_runner_slot_never_selects_a_host_for_deletion(self):
         docker=GitHubRunner(88,'unrelated-docker-1','online',False,('docker',))
-        self.assertEqual(controller.removable_spot_vms([self.vm,self.other], self.runners[:7]+[docker],0,0),[])
+        self.assertEqual(controller.removable_spot_vms([self.vm,self.other], self.runners[:7]+[docker]),[])
+
+    def test_old_docker_labeled_slots_do_not_block_draining_the_spot_vm(self):
+        legacy = [replace(r, labels=('docker', 'n2-standard-32', 'X64')) if r.runner_id <= 2 else r
+                  for r in self.runners]
+        self.assertEqual(controller.removable_spot_vms([self.vm, self.other], legacy), [self.vm])
 
     def test_custom_runner_prefix_with_all_eight_slots_can_be_drained(self):
         assigned=[replace(r,name=r.name.replace('gha-','oxidex-example-',1)) for r in self.runners]
-        self.assertEqual(controller.removable_spot_vms([self.vm,self.other],assigned,0,0),[self.vm])
+        self.assertEqual(controller.removable_spot_vms([self.vm,self.other],assigned),[self.vm])
 
     def test_two_incomplete_prefixes_do_not_prove_all_slots_registered(self):
         assigned=[replace(r,name=r.name.replace('gha-','first-' if r.runner_id<=4 else 'second-',1)) for r in self.runners]
-        self.assertEqual(controller.removable_spot_vms([self.vm,self.other],assigned,0,0),[])
+        self.assertEqual(controller.removable_spot_vms([self.vm,self.other],assigned),[])
 
     def test_changed_provider_identity_blocks_deletion_without_intent(self):
         self.begin();self.reconcile();self.provider_id='999';self.reconcile()

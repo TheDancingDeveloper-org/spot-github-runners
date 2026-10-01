@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from lib.runner_manager import apply_startup, args_parser, cleanup_orphan_runner_disks, select_sizing
+from lib.runner_manager import apply_startup, args_parser, cleanup_orphan_runner_disks, render_startup, select_sizing
 
 
 class RunnerDiskLifecycleTests(unittest.TestCase):
@@ -44,6 +44,18 @@ class RunnerDiskLifecycleTests(unittest.TestCase):
                 self.assertIn('--boot-disk-auto-delete', create)
                 self.assertIn('--instance-termination-action=DELETE', create)
                 self.assertTrue(any('auto-delete=yes' in flag for flag in create if flag.startswith('--disk=')))
+
+    def test_spot_startup_uses_one_label_set_and_never_mounts_host_docker_socket(self):
+        args = SimpleNamespace(disk_device_name='runner-data', instance_type='n2-standard-32',
+                               region='asia-south2', runner_label='spot', runner_prefix='gha',
+                               runner_count=8, runner_cpu=4, runner_memory_gb=15,
+                               instance_name='oxidex-runners-test')
+        startup = render_startup(args, 'registration-token', 'oxidex-m4air', 'deployment-id')
+        self.assertIn("RUNNER_LABELS='spot,n2-standard-32,asia-south2'", startup)
+        self.assertNotIn('DOCKER_RUNNER_LABELS', startup)
+        self.assertNotIn('DOCKER_RUNNER_COUNT', startup)
+        self.assertNotIn('/var/run/docker.sock', startup)
+        self.assertNotIn('--group-add', startup)
 
     def test_adoption_enforces_boot_and_data_deletion_without_touching_extra_disk(self):
         vm = {'machineType': 'types/n2-standard-32', 'status': 'TERMINATED',

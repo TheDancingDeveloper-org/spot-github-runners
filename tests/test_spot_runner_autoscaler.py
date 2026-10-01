@@ -4,11 +4,8 @@ import unittest
 from pricing_fixtures import storage_prices_for
 from lib.compute_api import Offer
 from lib.autoscaling_policy import affordable_offers, vm_count_for_floor
-from lib.runner_labels import counts_toward_capacity, custom_labels_for_runner
 from lib.runner_fleet import GitHubRunner
 from lib.spot_runner_autoscaler import (
-    docker_pool_hosts,
-    docker_pool_satisfied,
     eligible_offers,
     host_runners,
     maximum_runner_name_length,
@@ -52,29 +49,12 @@ class AutoscalerPolicyTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 vm_count_for_floor(*values)
 
-    def test_docker_runners_use_a_separate_pool_without_spot(self):
-        self.assertEqual(custom_labels_for_runner(1, 2, ["spot", "n2-standard-32", "asia-south2"]),
-                         ["docker", "n2-standard-32", "asia-south2"])
-        self.assertEqual(custom_labels_for_runner(3, 2, ["spot", "n2-standard-32", "asia-south2"]),
-                         ["spot", "n2-standard-32", "asia-south2"])
+    def test_existing_docker_labeled_spot_runners_count_as_managed_capacity(self):
+        from lib.spot_runner_autoscaler import utilization_counts
 
-    def test_docker_runners_do_not_count_toward_the_spot_fleet_floor(self):
-        self.assertFalse(counts_toward_capacity(["docker"], "spot"))
-        self.assertTrue(counts_toward_capacity(["spot"], "spot"))
-        self.assertFalse(counts_toward_capacity(["other"], "spot"))
-
-    def test_docker_pool_requires_online_non_spot_runners_on_distinct_hosts(self):
-        runners = (
-            GitHubRunner(1, "gha-asia-a-123-1", "online", False, ("docker", "n2-standard-32", "X64")),
-            GitHubRunner(2, "gha-asia-a-123-2", "online", False, ("docker", "n2-standard-32", "X64")),
-            GitHubRunner(3, "gha-asia-b-456-1", "online", False, ("docker", "n2-standard-32", "X64")),
-            GitHubRunner(4, "gha-asia-c-789-1", "online", False, ("docker", "spot", "n2-standard-32", "X64")),
-            GitHubRunner(5, "gha-asia-d-321-1", "offline", False, ("docker", "n2-standard-32", "X64")),
-            GitHubRunner(6, "oxidex-m4air-1", "online", False, ("docker", "ARM64")),
-        )
-        self.assertEqual(docker_pool_hosts(runners), {
-            "gha-asia-a-123", "gha-asia-b-456", "oxidex-m4air"
-        })
+        runners = [GitHubRunner(1, "spot-1", "online", False, ("docker", "n2-standard-32", "X64")),
+                   GitHubRunner(2, "spot-2", "online", True, ("spot", "n2-standard-32", "X64"))]
+        self.assertEqual(utilization_counts(runners), (2, 1))
 
     def test_total_floor_does_not_count_unmanaged_docker_or_arm_runners(self):
         from lib.spot_runner_autoscaler import count_online_runners
@@ -102,12 +82,6 @@ class AutoscalerPolicyTests(unittest.TestCase):
     def test_autoscaler_runner_names_fit_github_limit_with_short_prefix(self):
         instance = "oxidex-runners-northamericanortheast2-a-2147483647"
         self.assertLessEqual(maximum_runner_name_length("gha", instance, 8), 64)
-
-    def test_docker_pool_floor_requires_two_runners_on_two_hosts(self):
-        self.assertFalse(docker_pool_satisfied(1, 1))
-        self.assertFalse(docker_pool_satisfied(2, 1))
-        self.assertFalse(docker_pool_satisfied(1, 2))
-        self.assertTrue(docker_pool_satisfied(2, 2))
 
     def test_low_usage_requires_two_loops_then_removes_one_vm(self):
         self.assertEqual(scaling_decision(40, 10, 5, 0, False, 25),

@@ -26,7 +26,6 @@ from .fleet_logging import lifecycle_log, observe_vms, reconcile_deletion_identi
 from .log_format import configure_logging, error_detail
 from .vm_recovery import reconcile_lost_vms
 from .price_guard import check_running_prices, delete_overpriced_vm
-from .runner_labels import counts_toward_capacity
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
 from .storage_selection import storage_rates, cheapest_storage
@@ -34,12 +33,11 @@ from .billing_catalog import clear_catalog_cache, monthly_to_daily
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = logging.getLogger("spot_runner_autoscaler")
-DOCKER_LABEL = "docker"
 
 
 def count_online_runners(org: str, label: str) -> int:
     return sum(runner.online and runner_is_managed(runner)
-               and counts_toward_capacity(runner.labels, label)
+               and label in runner.labels
                for runner in list_github_runners(org))
 
 
@@ -52,44 +50,14 @@ def runner_is_managed(runner: GitHubRunner) -> bool:
     return (current_shape or legacy_toronto) and "X64" in runner.labels
 
 
-def docker_pool_hosts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...]) -> set[str]:
-    """Return host keys for online Docker runners without the Spot label."""
-    hosts = set()
-    for runner in runners:
-        if not runner.online or DOCKER_LABEL not in runner.labels or "spot" in runner.labels:
-            continue
-        # Runner names end in the per-host numeric slot, such as -1 or -2.
-        host, separator, slot = runner.name.rpartition("-")
-        if separator and slot.isdecimal():
-            hosts.add(host)
-        else:
-            hosts.add(runner.name)
-    return hosts
-
-
-def docker_pool_state(org: str) -> tuple[int, int]:
-    """Return all online Docker runners and their distinct hosts."""
-    runners = list_github_runners(org)
-    docker_runners = [runner for runner in runners
-                      if runner.online and DOCKER_LABEL in runner.labels and "spot" not in runner.labels]
-    return len(docker_runners), len(docker_pool_hosts(docker_runners))
-
-
-def docker_pool_satisfied(runner_count: int, host_count: int,
-                          minimum_runners: int = 2, minimum_hosts: int = 2) -> bool:
-    """Check the Docker runner count and host-diversity floors."""
-    return runner_count >= minimum_runners and host_count >= minimum_hosts
-
-
 def maximum_runner_name_length(prefix: str, instance_name: str, runner_count: int) -> int:
     """Estimate the longest runner name when GCE's hostname matches its VM name."""
     return max(len(f"{prefix}-{instance_name}-{index}") for index in range(1, runner_count + 1))
 
 
-def managed_online_runners(runners: list[GitHubRunner] | tuple[GitHubRunner, ...], label: str):
-    """Return online GCP fleet runners in either worker pool."""
-    return [runner for runner in runners if runner.online and runner_is_managed(runner)
-            and (counts_toward_capacity(runner.labels, label) or DOCKER_LABEL in runner.labels)]
+def managed_online_runners(runners: list[GitHubRunner] | tuple[GitHubRunner, ...]):
+    """Return all online runners on managed GCP x64 machine types."""
+    return [runner for runner in runners if runner.online and runner_is_managed(runner)]
 
 
 def spot_instances(vms: list[GceVm] | tuple[GceVm, ...]) -> list[GceVm]:
@@ -97,9 +65,9 @@ def spot_instances(vms: list[GceVm] | tuple[GceVm, ...]) -> list[GceVm]:
     return [vm for vm in vms if vm.running and vm.spot and vm.name.startswith("oxidex-runners-")]
 
 
-def utilization_counts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...], label: str) -> tuple[int, int]:
-    """Return online and busy runner counts for both GCP worker pools."""
-    online = managed_online_runners(runners, label)
+def utilization_counts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...]) -> tuple[int, int]:
+    """Return online and busy runner counts for the managed GCP fleet."""
+    online = managed_online_runners(runners)
     return len(online), sum(runner.busy for runner in online)
 
 
@@ -115,9 +83,8 @@ def host_runners(vm: GceVm, runners: list[GitHubRunner] | tuple[GitHubRunner, ..
     return assigned
 
 
-def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner],
-                       docker_floor: int, docker_host_floor: int) -> list[GceVm]:
-    """Choose idle VMs without violating the Docker runner and host floors."""
+def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner]) -> list[GceVm]:
+    """Choose complete, idle Spot VMs for scale-down."""
     candidates = []
     fleet = spot_instances(vms)
     for vm in fleet:
@@ -130,17 +97,8 @@ def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner],
         if (not vm.instance_id or not complete
                 or any(not runner.online or runner.busy for runner in assigned)):
             continue
-        remaining_docker = [runner for runner in runners
-                            if runner.online and DOCKER_LABEL in runner.labels
-                            and "spot" not in runner.labels
-                            and runner not in host_runners(vm, runners, fleet)]
-        if not docker_pool_satisfied(len(remaining_docker), len(docker_pool_hosts(remaining_docker)),
-                                     docker_floor, docker_host_floor):
-            continue
         candidates.append(vm)
-    return sorted(candidates, key=lambda vm: any(
-        DOCKER_LABEL in runner.labels and "spot" not in runner.labels
-        for runner in host_runners(vm, runners, fleet)))
+    return candidates
 
 
 def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRunner],
@@ -441,9 +399,9 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     state_path = state_path or args.state_file.expanduser()
     if state.get("host_operation") or len(spot_instances(vms)) <= 1:
         return 0
-    candidates = removable_spot_vms(vms, runners, args.minimum_docker_runners, args.minimum_docker_hosts)
+    candidates = removable_spot_vms(vms, runners)
     if not candidates:
-        LOG.info("Scale-down waits: no idle host can be removed while preserving Docker floors")
+        LOG.info("Scale-down waits: no complete idle host is available")
         return 0
     vm = candidates[0]
     assigned = host_runners(vm, runners, vms)
@@ -730,8 +688,6 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
                              "--project", args.project, "--org", args.org,
                              "--interval-seconds", str(args.interval_seconds),
                              "--minimum-runners", str(args.minimum_runners),
-                             "--minimum-docker-runners", str(args.minimum_docker_runners),
-                             "--minimum-docker-hosts", str(args.minimum_docker_hosts),
                              "--disk-size-gb", str(args.disk_size_gb),
                              "--label", args.label, "--state-file", str(args.state_file.expanduser()),
                              "--log-file", str(args.log_file.expanduser())],
@@ -758,8 +714,6 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--org", default="swack-tools")
     parser.add_argument("--project", default="homelab-424523")
     parser.add_argument("--minimum-runners", type=int, default=25)
-    parser.add_argument("--minimum-docker-runners", type=int, default=2)
-    parser.add_argument("--minimum-docker-hosts", type=int, default=2)
     parser.add_argument("--label", default="spot")
     parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("10"),
                         help='Maximum daily compute plus boot/data storage cost per VM')
@@ -780,9 +734,7 @@ def args_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = args_parser().parse_args(argv)
     configure_logging()
-    if (args.minimum_runners < 1 or args.minimum_docker_runners < 1
-            or args.minimum_docker_hosts < 1 or args.interval_seconds < 1
-            or args.disk_size_gb < 1):
+    if args.minimum_runners < 1 or args.interval_seconds < 1 or args.disk_size_gb < 1:
         raise ValueError("runner floors, interval, and disk size must be positive")
     if args.max_daily_usd <= 0:
         raise ValueError("max daily VM cost must be positive")
@@ -846,16 +798,9 @@ def _run_controller(args: argparse.Namespace) -> int:
             time.sleep(args.interval_seconds)
             continue
         fleet_vms = spot_instances(vms)
-        current, busy = utilization_counts(runners, args.label)
-        docker_runners = [runner for runner in runners
-                          if runner.online and DOCKER_LABEL in runner.labels
-                          and "spot" not in runner.labels]
-        docker_count = len(docker_runners)
-        docker_hosts = len(docker_pool_hosts(docker_runners))
+        current, busy = utilization_counts(runners)
         LOG.info("Managed GCP runners: %d online, %d busy; %d Spot VMs",
                  current, busy, len(fleet_vms))
-        LOG.info("Online Docker runners: %d across %d hosts; targets %d runners across %d hosts",
-                 docker_count, docker_hosts, args.minimum_docker_runners, args.minimum_docker_hosts)
         action, host_count, idle_loops, scale_up_active = scaling_decision(
             current, busy, len(fleet_vms), state["idle_loops"],
             state["scale_up_active"], args.minimum_runners)
@@ -863,8 +808,6 @@ def _run_controller(args: argparse.Namespace) -> int:
             LOG.info("Scale-up complete: online capacity is above %d runners", args.minimum_runners)
         state["scale_up_active"] = scale_up_active
 
-        docker_short = not docker_pool_satisfied(
-            docker_count, docker_hosts, args.minimum_docker_runners, args.minimum_docker_hosts)
         if action == "up":
             state["idle_loops"] = idle_loops
             if host_count:
@@ -873,12 +816,6 @@ def _run_controller(args: argparse.Namespace) -> int:
                 launched = scale_up(host_count, offers, args, state, state_path) if offers else 0
                 if not launched:
                     LOG.error("Could not launch Spot capacity below $%s/day", args.max_daily_usd)
-        elif docker_short:
-            state["idle_loops"] = 0
-            LOG.warning("Docker runner floor is short; launching one replacement host")
-            offers = discover_offers(args.project, args.max_daily_usd, disk_size_gb=args.disk_size_gb)
-            if offers and not scale_up(1, offers, args, state, state_path):
-                LOG.error("Could not restore the Docker runner floor")
         elif action == "down":
             state["idle_loops"] = idle_loops
             LOG.info("Low usage persisted for two checks; removing up to %d Spot hosts", host_count)
