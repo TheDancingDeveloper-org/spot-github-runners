@@ -17,6 +17,9 @@ class FleetInventoryTests(unittest.TestCase):
         external = patch('subprocess.run', side_effect=AssertionError('Unexpected external command in offline test'))
         external.start()
         self.addCleanup(external.stop)
+        platform_map = patch('lib.spot_runner_autoscaler.load_cpu_platform_map', return_value={'us-central1-a': ['Intel Ice Lake']})
+        platform_map.start()
+        self.addCleanup(platform_map.stop)
 
     def test_inventory_retains_actual_shapes_disk_types_ids_and_gpu(self):
         source = 'https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/disks/root'

@@ -15,8 +15,12 @@ from lib.spot_runner_autoscaler import read_scale_state, reconcile_prices, utili
 
 class PriceGuardTests(unittest.TestCase):
     def setUp(self):
-        self.vm = GceVm("oxidex-runners-test", "asia-south2-a", "RUNNING", "n2-standard-32", True)
-        self.args = SimpleNamespace(project="project", org="org", max_daily_usd=Decimal("5"))
+        self.vm = GceVm("oxidex-runners-test", "asia-south2-a", "RUNNING", "n2-standard-32", True,
+                       disks=({'diskType': 'pd-standard', 'diskSizeGb': 140},))
+        self.args = SimpleNamespace(project="project", org="org", max_daily_usd=Decimal("5"), disk_size_gb=100)
+        disk_rates = patch('lib.price_guard.storage_rates', return_value={'pd-standard:capacity': Decimal('.04')})
+        disk_rates.start()
+        self.addCleanup(disk_rates.stop)
         self.shape = SimpleNamespace(stdout=json.dumps({"guestCpus": 32, "memoryMb": 131072}))
 
     @patch("lib.price_guard.subprocess.run")
@@ -25,7 +29,7 @@ class PriceGuardTests(unittest.TestCase):
         command.return_value = self.shape
         rates.side_effect = [(Decimal("0.005"), Decimal(0)),
                              (Decimal("0.01"), Decimal(0))]
-        self.assertEqual(check_running_prices([self.vm], "project", Decimal("3.84")), [])
+        self.assertEqual(check_running_prices([self.vm], "project", Decimal("3.84") + Decimal('5.6') * 24 / 730), [self.vm])
         self.assertEqual(check_running_prices([self.vm], "project", Decimal("5")), [self.vm])
         self.assertEqual(rates.call_count, 2)
 

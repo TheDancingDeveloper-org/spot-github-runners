@@ -18,7 +18,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .autoscaling_policy import affordable_offers
-from .machine_profiles import MINIMUM_RAM_GIB, machine_profile
+from .machine_profiles import MINIMUM_RAM_GIB, machine_profile, CpuOffer, platform_preferences, cpu_platform_satisfies
 from .compute_api import get_auth
 from .environment import load_env
 from .job_recovery import JobRecovery
@@ -29,6 +29,8 @@ from .price_guard import check_running_prices, delete_overpriced_vm
 from .runner_labels import counts_toward_capacity
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
+from .storage_selection import storage_rates, cheapest_storage
+from .billing_catalog import clear_catalog_cache, monthly_to_daily
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = logging.getLogger("spot_runner_autoscaler")
@@ -292,6 +294,11 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         # not finish provisioning later. Retain intent until registration/loss is observed.
         expected = {f"gha-{vm.name}-{slot}" for slot in range(1, 9)}
         online_names = {runner.name for runner in assigned if runner.online}
+        requested = operation.get('requested_cpu_platform')
+        if current and current.running and requested and not cpu_platform_satisfies(current.machine_type, current.cpu_platform, requested):
+            LOG.error('Host operation waits: observed CPU platform %s does not satisfy requested minimum %s for %s',
+                      current.cpu_platform or 'unknown', requested, vm_details(current))
+            return True
         if current and current.running and expected.issubset(online_names):
             LOG.info("Host operation complete: all eight runners registered for %s", vm_details(current))
             state.pop("host_operation")
@@ -453,14 +460,19 @@ def scale_up(additional_hosts: int, offers, args: argparse.Namespace, state=None
     state = state if state is not None else read_scale_state(state_path)
     if additional_hosts <= 0 or state.get("host_operation"):
         return 0
+    if hasattr(args, 'cpu_platforms_by_zone') and args.cpu_platforms_by_zone is None:
+        LOG.warning('Capacity launch waits for a current CPU platform zone map')
+        return 0
     for offer in offers:
         try:
             launch_offer(offer, args, state, state_path)
             return 1
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            LOG.warning("Could not deploy %s in %s: %s", offer.machine_type, offer.region, error_detail(exc))
+            LOG.warning("Could not deploy %s requesting CPU platform %s in %s: %s", offer.machine_type,
+                        getattr(offer, 'cpu_platform', 'preferred family platform'), offer.region, error_detail(exc))
             if state.get("host_operation"):
                 return 0
+            LOG.info('No deployment remains pending; trying the next ranked platform offer')
     return 0
 
 
@@ -493,7 +505,7 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
     missing = max(0, target - len(fleet))
     if missing:
         LOG.info("Finding one affordable replacement; %d missing hosts, restoration target %d", missing, target)
-        offers = discover_offers(args.project, args.max_daily_usd)
+        offers = discover_offers(args.project, args.max_daily_usd, disk_size_gb=args.disk_size_gb)
         if not offers or not scale_up(1, offers, args, state, state_path):
             LOG.warning("Replacement capacity is pending; retrying next loop")
         return True  # Only fresh observations may clear the restoration target.
@@ -519,23 +531,59 @@ def scaling_decision(online: int, busy: int, vm_count: int, idle_loops: int,
     return "wait", 0, 0, False
 
 
-def discover_offers(project: str, max_daily_usd: Decimal, top: int = 500):
+def discover_offers(project: str, max_daily_usd: Decimal, disk_size_gb: int = 100):
     auth = get_auth(project)
     offers, _, _, errors = asyncio.run(
-        find(auth, min_vcpu=32, min_ram=MINIMUM_RAM_GIB, top=top, concurrency=200,
+        find(auth, min_vcpu=32, min_ram=MINIMUM_RAM_GIB, top=None, concurrency=200,
              billing_api_key=os.environ.get("GOOGLE_CLOUD_API_KEY"))
     )
     for error in errors[:5]:
         LOG.warning("Spot scan warning: %s", error_detail(error))
-    return eligible_offers(offers, max_daily_usd)
+    prices = {region: storage_rates(region) for region in {offer.region for offer in offers}}
+    return eligible_offers(offers, max_daily_usd, storage_rates=prices, disk_size_gb=disk_size_gb)
 
 
-def eligible_offers(offers, max_daily_usd: Decimal):
-    """Prefer newer supported CPUs within the compute cap and 110-GiB floor."""
+def eligible_offers(offers, max_daily_usd: Decimal, *, storage_rates=None, disk_size_gb: int = 100):
+    """Rank explicitly requested platforms, then regional compute price."""
     shapes = [offer for offer in offers if offer.vcpu == 32 and offer.ram_gib >= MINIMUM_RAM_GIB
               and machine_profile(offer.machine_type) is not None]
-    return sorted(affordable_offers(shapes, max_daily_usd),
-                  key=lambda offer: machine_profile(offer.machine_type).cpu_tier)
+    if storage_rates is None:
+        raise RuntimeError('Regional storage prices are required to rank total VM cost')
+    candidates = []
+    for offer in affordable_offers(shapes, max_daily_usd):
+        try:
+            boot, data, monthly = cheapest_storage(offer.machine_type, disk_size_gb,
+                                                   storage_rates.get(offer.region, {}))
+        except RuntimeError as exc:
+            LOG.warning('Skipping %s in %s: %s', offer.machine_type, offer.region, error_detail(exc))
+            continue
+        for rank, platform in platform_preferences(offer.machine_type):
+            candidate = CpuOffer(offer.region, offer.machine_type, offer.vcpu, offer.ram_gib,
+                                 offer.hourly_usd, platform, rank, boot, data, monthly)
+            if candidate.total_daily_usd < max_daily_usd:
+                candidates.append(candidate)
+    return sorted(candidates, key=lambda offer: (offer.cpu_rank, offer.total_daily_usd,
+                                                offer.region, offer.machine_type))
+
+
+def load_cpu_platform_map(project: str) -> dict[str, list[str]]:
+    result = subprocess.run(['gcloud', 'compute', 'zones', 'list', f'--project={project}',
+                             '--format=json(name,status,availableCpuPlatforms)'],
+                            check=True, text=True, capture_output=True, timeout=60)
+    rows = json.loads(result.stdout)
+    if not isinstance(rows, list):
+        raise RuntimeError('CPU platform zone inventory is invalid')
+    platforms = {}
+    for row in rows:
+        if row.get('status') != 'UP':
+            continue
+        advertised = row.get('availableCpuPlatforms')
+        if not row.get('name') or not isinstance(advertised, list) or not advertised or not all(isinstance(p, str) for p in advertised):
+            raise RuntimeError('CPU platform zone inventory is incomplete')
+        platforms[row['name']] = advertised
+    if not platforms:
+        raise RuntimeError('CPU platform zone inventory is empty')
+    return platforms
 
 
 def runner_capacity(vcpu: int) -> int:
@@ -550,6 +598,13 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
     state = state if state is not None else read_scale_state(state_path)
     if state.get("host_operation"):
         raise RuntimeError("A previous host operation is still pending")
+    preferences = platform_preferences(offer.machine_type)
+    if not preferences:
+        raise RuntimeError(f'{offer.machine_type} cannot request a CPU platform; refusing automatic launch')
+    cpu_platform = getattr(offer, 'cpu_platform', preferences[0][1])
+    cpu_rank = next((rank for rank, platform in preferences if platform == cpu_platform), None)
+    if cpu_rank is None:
+        raise RuntimeError(f'Unsupported CPU platform {cpu_platform} for {offer.machine_type}')
     hourly_limit = args.max_daily_usd / Decimal(24)
     result = subprocess.run(
         ["gcloud", "compute", "zones", "list", f"--project={args.project}",
@@ -560,6 +615,15 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
     if not zones:
         raise RuntimeError(f"No active Compute Engine zones found in {offer.region}")
     for zone in zones:
+        platform_map = getattr(args, 'cpu_platforms_by_zone', None)
+        if platform_map is not None and cpu_platform not in platform_map.get(zone, []):
+            LOG.info('Skipping %s in %s: requested platform %s is not advertised by the startup CPU map',
+                     offer.machine_type, zone, cpu_platform)
+            continue
+        if cpu_platform not in {platform for _, platform in platform_preferences(offer.machine_type, zone)}:
+            LOG.info('Skipping %s in %s: requested CPU platform %s is unsupported for this shape/zone',
+                     offer.machine_type, zone, cpu_platform)
+            continue
         letter = zone.rsplit("-", 1)[-1]
         suffix = f"{offer.region.replace('-', '')}-{letter}-{int(time.time())}"
         instance_name = f"oxidex-runners-{suffix}"
@@ -571,6 +635,8 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             sys.executable, str(ROOT / "src" / "spot_runner_manager.py"),
             "--project", args.project, "--org", args.org,
             "--max-cost", str(hourly_limit), "--instance-type", offer.machine_type,
+            '--max-total-daily-usd', str(args.max_daily_usd), '--cheapest-storage',
+            "--min-cpu-platform", cpu_platform,
             "--region", offer.region, "--zone", zone,
             "--cpu", str(offer.vcpu), "--ram", str(int(offer.ram_gib)),
             "--instance-name", instance_name,
@@ -579,20 +645,28 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             "--runner-prefix", runner_prefix,
             "--runner-label", args.label, "--apply",
         ]
+        if getattr(args, 'billing_export_table', None):
+            command.extend(['--billing-export-table', args.billing_export_table])
         profile = machine_profile(offer.machine_type)
         if profile is None:
             raise RuntimeError(f'Unsupported runner machine type: {offer.machine_type}')
         vm = GceVm(instance_name, zone, "PROVISIONING", offer.machine_type, True,
-                   vcpu=offer.vcpu, ram_gib=offer.ram_gib,
-                   disks=({"boot": True, "diskSizeGb": 40, "diskType": profile.disk_type,
-                           "interface": profile.disk_interface},
-                          {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": profile.disk_type,
-                           "interface": profile.disk_interface}))
-        LOG.info("Found instance in region %s: %s; $%.4f/day compute; attempting to launch it now",
-                 offer.region, vm_details(vm), offer.hourly_usd * 24)
+                   vcpu=offer.vcpu, ram_gib=offer.ram_gib, requested_cpu_platform=cpu_platform,
+                   disks=({"boot": True, "diskSizeGb": 40,
+                           "diskType": getattr(offer, 'boot_disk_type', '') or profile.disk_type,
+                           "interface": 'NVME' if (getattr(offer, 'boot_disk_type', '') or profile.disk_type).startswith('hyperdisk-') else 'SCSI'},
+                          {"boot": False, "diskSizeGb": args.disk_size_gb,
+                           "diskType": getattr(offer, 'data_disk_type', '') or profile.disk_type,
+                           "interface": 'NVME' if (getattr(offer, 'data_disk_type', '') or profile.disk_type).startswith('hyperdisk-') else 'SCSI'}))
+        storage_daily = monthly_to_daily(getattr(offer, 'storage_monthly_usd', Decimal(0)))
+        LOG.info("Found instance in region %s: %s; CPU preference rank %d (hardware estimate, "
+                 "Rust performance unmeasured); $%.6f/day compute + $%.6f/day storage = $%.6f/day total; attempting to launch it now",
+                 offer.region, vm_details(vm), cpu_rank + 1, offer.hourly_usd * 24,
+                 storage_daily, Decimal(str(offer.hourly_usd)) * 24 + storage_daily)
         receipt = state_path.parent / f"{instance_name}-{uuid.uuid4().hex}-deployment.json"
         command.extend(["--deployment-receipt", str(receipt)])
-        begin_host_operation("launch", vm, [], [], state, state_path, deployment_receipt=str(receipt))
+        begin_host_operation("launch", vm, [], [], state, state_path,
+                             requested_cpu_platform=cpu_platform, deployment_receipt=str(receipt))
         started = time.monotonic()
         result = subprocess.run(command, check=False, text=True, capture_output=True)
         identity_observed = import_deployment_receipt(state, state_path)
@@ -672,6 +746,8 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
     }
     for repo in args.job_repository or []:
         plist["ProgramArguments"].extend(["--job-repository", repo])
+    if getattr(args, 'billing_export_table', None):
+        plist['ProgramArguments'].extend(['--billing-export-table', args.billing_export_table])
     plist_path.write_bytes(plistlib.dumps(plist))
     subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], check=False)
     return plist_path
@@ -685,9 +761,11 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-docker-runners", type=int, default=2)
     parser.add_argument("--minimum-docker-hosts", type=int, default=2)
     parser.add_argument("--label", default="spot")
-    parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("5"))
+    parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("10"),
+                        help='Maximum daily compute plus boot/data storage cost per VM')
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--disk-size-gb", type=int, default=100)
+    parser.add_argument('--billing-export-table', help='Billing export project.dataset.table for launch cost logs (or GCP_BILLING_EXPORT_TABLE)')
     parser.add_argument("--log-file", type=Path, default=Path.home() / "spot-ghrunner.log")
     parser.add_argument("--state-file", type=Path,
                         default=Path.home() / "Library" / "Application Support"
@@ -709,12 +787,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_daily_usd <= 0:
         raise ValueError("max daily VM cost must be positive")
     load_env(ROOT / ".env")
+    args.billing_export_table = args.billing_export_table or os.environ.get('GCP_BILLING_EXPORT_TABLE')
     if args.install_launch_agent:
         print(f"Installed LaunchAgent at {install_launch_agent(args)}")
         return 0
 
     with lifecycle_log(args.log_file):
-        LOG.info("Checking fleet every %d seconds; compute cap $%s/day per VM",
+        LOG.info("Checking fleet every %d seconds; total compute/storage cap $%s/day per VM",
                  args.interval_seconds, args.max_daily_usd)
         return run_controller(args)
 
@@ -739,7 +818,19 @@ def _run_controller(args: argparse.Namespace) -> int:
     state = read_scale_state(state_path)
     jobs = JobRecovery(state, lambda: write_scale_state(state_path, state),
                        args.job_repository or [f"{args.org}/oxidex"])
+    args.cpu_platforms_by_zone = None
     while True:
+        clear_catalog_cache()
+        if args.cpu_platforms_by_zone is None:
+            try:
+                args.cpu_platforms_by_zone = load_cpu_platform_map(args.project)
+                state['cpu_platforms_by_zone'] = args.cpu_platforms_by_zone
+                state['cpu_platform_map_updated_at'] = time.time()
+                write_scale_state(state_path, state)
+                LOG.info('Loaded current CPU platform map for %d zones from GCP; refresh on controller restart',
+                         len(args.cpu_platforms_by_zone))
+            except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                LOG.error('CPU platform map unavailable; capacity launches paused until fresh inventory succeeds: %s', error_detail(exc))
         runners = list_github_runners(args.org)
         vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
         reconcile_deletion_identities(vms, state)
@@ -778,14 +869,14 @@ def _run_controller(args: argparse.Namespace) -> int:
             state["idle_loops"] = idle_loops
             if host_count:
                 LOG.info("High usage: launching %d host, then checking fresh demand", host_count)
-                offers = discover_offers(args.project, args.max_daily_usd)
+                offers = discover_offers(args.project, args.max_daily_usd, disk_size_gb=args.disk_size_gb)
                 launched = scale_up(host_count, offers, args, state, state_path) if offers else 0
                 if not launched:
                     LOG.error("Could not launch Spot capacity below $%s/day", args.max_daily_usd)
         elif docker_short:
             state["idle_loops"] = 0
             LOG.warning("Docker runner floor is short; launching one replacement host")
-            offers = discover_offers(args.project, args.max_daily_usd)
+            offers = discover_offers(args.project, args.max_daily_usd, disk_size_gb=args.disk_size_gb)
             if offers and not scale_up(1, offers, args, state, state_path):
                 LOG.error("Could not restore the Docker runner floor")
         elif action == "down":

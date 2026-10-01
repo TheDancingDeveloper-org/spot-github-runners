@@ -29,7 +29,7 @@ from .compute_api import (
 from .log_format import configure_logging, error_detail
 from .spot_pricing import load_catalog_rates, spot_price
 
-async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int,
+async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
                concurrency: int, list_price_baseline: float | None = None
                , billing_api_key: str | None = None
                , runners: int | None = None

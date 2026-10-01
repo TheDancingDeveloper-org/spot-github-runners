@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from pricing_fixtures import storage_prices_for
 from lib.compute_api import Offer
 from lib.runner_fleet import GitHubRunner
 from lib.spot_runner_autoscaler import eligible_offers, runner_is_managed
@@ -28,23 +29,24 @@ class CpuPriorityTests(unittest.TestCase):
                   Offer('other', 'c4a-standard-32', 32, 128, .08),
                   Offer('lssd', 'c4-standard-32-lssd', 32, 120, .15),
                   Offer('expensive', 'c4d-standard-32', 32, 124, .22)]
-        self.assertEqual([o.machine_type for o in eligible_offers(offers, Decimal('5'))],
-                         ['c4d-standard-32', 'c4-standard-32', 'n2-standard-32', 'e2-standard-32'])
+        self.assertEqual([o.machine_type for o in eligible_offers(offers, Decimal('5'), storage_rates=storage_prices_for(offers))],
+                         ['c4d-standard-32', 'c4-standard-32', 'c4-standard-32',
+                          'n2-standard-32', 'n2-standard-32'])
 
     def test_ram_floor_accepts_110_and_keeps_exact_cpu_count(self):
         offers = [Offer('a', 'n2-custom-32-112640', 32, 110, .15),
                   Offer('a', 'n2-custom-32-111616', 32, 109, .14),
                   Offer('a', 'n2-standard-64', 64, 256, .15)]
-        self.assertEqual([o.ram_gib for o in eligible_offers(offers, Decimal('5'))], [110])
+        self.assertEqual([o.ram_gib for o in eligible_offers(offers, Decimal('5'), storage_rates=storage_prices_for(offers))], [110, 110])
 
-    def test_exact_32_cpu_generation_tiers_use_cheapest_peer(self):
+    def test_exact_32_cpu_family_platform_preferences_precede_price(self):
         offers = [Offer('a', 'c4-standard-32', 32, 120, .19),
                   Offer('b', 'n4-standard-32', 32, 128, .17),
                   Offer('c', 'c4d-standard-32', 32, 124, .18),
                   Offer('d', 'n4d-standard-32', 32, 128, .16)]
-        self.assertEqual([o.machine_type for o in eligible_offers(offers, Decimal('5'))],
-                         ['n4d-standard-32', 'c4d-standard-32',
-                          'n4-standard-32', 'c4-standard-32'])
+        self.assertEqual([o.machine_type for o in eligible_offers(offers, Decimal('5'), storage_rates=storage_prices_for(offers))],
+                         ['c4d-standard-32', 'n4d-standard-32',
+                          'c4-standard-32', 'c4-standard-32', 'n4-standard-32'])
 
     def test_new_families_are_counted_as_managed_x64_runners(self):
         for family in ('c4', 'c4d', 'n4', 'n4d', 'n2d'):
@@ -78,7 +80,7 @@ class CpuPriorityTests(unittest.TestCase):
     def test_legacy_hosts_keep_pd_balanced_disks(self):
         args = args_parser().parse_args(['--max-cost', '.2'])
         select_sizing(args)
-        self.assertEqual(args.disk_type, 'pd-balanced')
+        self.assertEqual(args.disk_type, 'pd-standard')
 
     def test_hyperdisk_family_rejects_incompatible_explicit_disk_type(self):
         args = args_parser().parse_args(['--max-cost', '.2', '--instance-type', 'c4d-standard-32',

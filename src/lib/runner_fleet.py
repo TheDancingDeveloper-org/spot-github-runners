@@ -51,6 +51,8 @@ class GceVm:
     accelerators: tuple[dict, ...] = ()
     instance_id: str = ""
     specs_last_known: bool = False
+    cpu_platform: str = ""
+    requested_cpu_platform: str = ""
 
     @property
     def running(self) -> bool:
@@ -169,7 +171,7 @@ def list_gcloud_vms(
         raise RuntimeError("gcloud returned an unexpected instance list")
 
     try:
-        disk_rows = _command_json([gcloud_binary, "compute", "disks", "list", f"--project={project}", "--format=json(selfLink,id,type)"])
+        disk_rows = _command_json([gcloud_binary, "compute", "disks", "list", f"--project={project}", "--format=json(selfLink,id,type,sizeGb,provisionedIops,provisionedThroughput)"])
         disk_inventory = {disk["selfLink"]: disk for disk in disk_rows}
     except (RuntimeError, KeyError, TypeError) as exc:
         disk_inventory = {}
@@ -210,11 +212,15 @@ def list_gcloud_vms(
                 ram_gib=float(shape["memoryMb"]) / 1024 if shape.get("memoryMb") is not None else None,
                 disks=tuple({**disk,
                              **({"diskId": disk_inventory[disk["source"]].get("id"),
-                                 "diskType": disk_inventory[disk["source"]].get("type", "").rsplit("/", 1)[-1]}
+                                 "diskType": disk_inventory[disk["source"]].get("type", "").rsplit("/", 1)[-1],
+                                 **({'diskSizeGb': disk_inventory[disk['source']]['sizeGb']} if 'sizeGb' in disk_inventory[disk['source']] else {}),
+                                 **{key: disk_inventory[disk['source']][key] for key in ('provisionedIops', 'provisionedThroughput') if key in disk_inventory[disk['source']]}}
                                 if disk.get("source") in disk_inventory else {})}
                             for disk in item.get("disks", [])),
                 accelerators=tuple(item.get("guestAccelerators", [])),
                 instance_id=str(item.get("id", "")),
+                cpu_platform=str(item.get("cpuPlatform", "")),
+                requested_cpu_platform=str(item.get("minCpuPlatform", "")),
             )
         )
     return tuple(vms)

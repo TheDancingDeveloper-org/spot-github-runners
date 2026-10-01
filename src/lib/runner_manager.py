@@ -12,9 +12,6 @@ import shlex
 import subprocess
 import tempfile
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 from datetime import datetime, timezone
 from dataclasses import asdict
@@ -22,7 +19,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from .environment import load_env
-from .machine_profiles import configure_storage
+from .machine_profiles import configure_storage, configure_cpu_platform, cpu_platform_satisfies
+from .billing_catalog import catalog_skus, unit_price, monthly_to_daily
+from .storage_selection import storage_rates, cheapest_storage, throughput_floor, observed_storage_monthly, disk_monthly_cost
+from .project_costs import log_project_costs
 from .fleet_logging import vm_details
 from .runner_fleet import GceVm, list_gcloud_vms
 from .log_format import configure_logging, error_detail, single_line
@@ -52,35 +52,15 @@ def gcloud(args: list[str], *, quiet: bool = False) -> str:
 
 def spot_rates(region: str, family: str) -> tuple[Decimal, Decimal]:
     """Read the exact regional Spot Preemptible core and RAM SKU prices."""
-    token = run(["gcloud", "auth", "print-access-token"], quiet=True)
-    endpoint = "https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus"
-    query = urllib.parse.urlencode({"currencyCode": "USD", "pageSize": 5000})
-    page: str | None = None
     rates: dict[str, Decimal] = {}
-    while True:
-        url = endpoint + "?" + query + ("&pageToken=" + urllib.parse.quote(page) if page else "")
-        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                result = json.load(response)
-        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
-            raise RuntimeError(f"Unable to verify live GCP Spot prices: {exc}") from exc
-        for sku in result.get("skus", []):
-            desc = sku.get("description", "")
-            if region not in sku.get("serviceRegions", []) or not desc.lower().startswith(f"spot preemptible {family.lower()} "):
-                continue
-            key = "cpu" if "Instance Core running" in desc else "ram" if "Instance Ram running" in desc else None
-            if not key:
-                continue
-            tiers = sku.get("pricingInfo", [{}])[0].get("pricingExpression", {}).get("tieredRates", [])
-            if tiers:
-                price = tiers[0].get("unitPrice", {})
-                amount = Decimal(price.get("units", "0")) + Decimal(price.get("nanos", 0)) / Decimal(1_000_000_000)
-                if amount > 0:
-                    rates[key] = amount
-        page = result.get("nextPageToken")
-        if not page:
-            break
+    for sku in catalog_skus():
+        desc = sku.get('description', '')
+        if region not in sku.get('serviceRegions', []) or not desc.lower().startswith(f'spot preemptible {family.lower()} '):
+            continue
+        key = 'cpu' if 'Instance Core running' in desc else 'ram' if 'Instance Ram running' in desc else None
+        amount = unit_price(sku, 'h')
+        if key and amount is not None and amount > 0:
+            rates[key] = amount
     if set(rates) != {"cpu", "ram"}:
         raise RuntimeError(f"Exact Spot {family.upper()} core/RAM SKUs not found for {region}; refusing deployment")
     return rates["cpu"], rates["ram"]
@@ -91,7 +71,12 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", default=PROJECT)
     parser.add_argument("--org", default=ORG)
     parser.add_argument("--max-cost", type=Decimal, required=True, help="Maximum compute USD/hour for this VM")
+    parser.add_argument('--max-total-daily-usd', type=Decimal, help='Maximum compute plus boot/data storage USD/day')
+    parser.add_argument('--cheapest-storage', action='store_true', help='Choose compatible storage using current regional prices')
+    parser.add_argument('--billing-export-table', default=os.environ.get('GCP_BILLING_EXPORT_TABLE'),
+                        help='Billing export project.dataset.table for project-wide cost logs')
     parser.add_argument("--instance-type", default="n2-standard-32")
+    parser.add_argument("--min-cpu-platform", help="Explicit CPU platform; defaults to the preferred platform for this family")
     parser.add_argument("--region", default="asia-south2")
     parser.add_argument("--zone", default="")
     parser.add_argument("--ram", type=int, default=128, help="Expected VM RAM GiB")
@@ -119,6 +104,7 @@ def args_parser() -> argparse.ArgumentParser:
 
 def select_sizing(args: argparse.Namespace) -> None:
     configure_storage(args)
+    configure_cpu_platform(args)
     if not args.fixed_runner_sizing:
         if args.cpu < 4:
             raise RuntimeError("At least 4 host vCPUs are required for one runner")
@@ -146,6 +132,35 @@ def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:
         raise RuntimeError(f"GCE reports {cpu} vCPU/{ram} GiB; request was {args.cpu}/{args.ram}")
     core_rate, ram_rate = spot_rates(args.region, family)
     hourly = core_rate * cpu + ram_rate * priced_ram
+    if args.cheapest_storage or args.max_total_daily_usd is not None:
+        rates = storage_rates(args.region)
+        boot, data = args.boot_disk_type, args.disk_type
+        if args.cheapest_storage:
+            boot, data, monthly = cheapest_storage(args.instance_type, args.disk_size_gb, rates)
+        else:
+            monthly = disk_monthly_cost(boot, 40, rates) + disk_monthly_cost(data, args.disk_size_gb, rates,
+                throughput=throughput_floor(args.disk_size_gb) if data == 'hyperdisk-throughput' else 140)
+        if args.existing_instance:
+            vm = args.deployment_vm
+            boots = [disk for disk in vm.disks if disk.get('boot')]
+            if len(boots) != 1:
+                raise RuntimeError('Existing boot disk specifications are unavailable')
+            boot = boots[0].get('diskType', '')
+            retained_data = next((disk for disk in vm.disks if disk.get('deviceName') == args.disk_device_name), None)
+            monthly = observed_storage_monthly(vm.disks, rates)
+            if retained_data:
+                data = retained_data.get('diskType', '')
+            else:
+                monthly += disk_monthly_cost(data, args.disk_size_gb, rates,
+                    throughput=throughput_floor(args.disk_size_gb) if data == 'hyperdisk-throughput' else 140)
+        args.selected_boot_disk_type, args.disk_type = boot, data
+        configure_storage(args)
+        args.storage_monthly_usd = monthly
+        total_daily = hourly * 24 + monthly_to_daily(monthly)
+        LOG.info('Live total estimate: %s; $%.6f/day compute + $%.6f/day storage = $%.6f/day total',
+                 deployment_details(args), hourly * 24, monthly_to_daily(monthly), total_daily)
+        if args.max_total_daily_usd is not None and total_daily >= args.max_total_daily_usd:
+            raise RuntimeError(f'Total compute/storage price ${total_daily:.6f}/day is not below ${args.max_total_daily_usd}; no resources changed')
     LOG.info(f"Live Spot {family.upper()} rates ({args.region}): ${core_rate}/vCPU-hour, ${ram_rate}/GiB-hour")
     LOG.info(f"Compute estimate: ${hourly:.6f}/hour per VM. {args.disk_size_gb} GiB {args.disk_type} disk is billed separately.")
     if hourly >= args.max_cost:
@@ -243,6 +258,7 @@ def write_deployment_receipt(args: argparse.Namespace, vm: GceVm) -> None:
 
 def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     configure_storage(args)
+    configure_cpu_platform(args)
     cleanup_orphan_runner_disks(zone)
     describe = subprocess.run(["gcloud", "compute", "instances", "describe", args.instance_name,
                                "--zone", zone, "--project", PROJECT, "--format=json"], text=True, capture_output=True)
@@ -257,6 +273,11 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
         actual_type = vm.get("machineType", "").rsplit("/", 1)[-1]
         if actual_type != args.instance_type:
             raise RuntimeError(f"Existing VM type {actual_type} does not match {args.instance_type}")
+        if vm.get('status') == 'RUNNING' and args.min_cpu_platform and not cpu_platform_satisfies(args.instance_type, vm.get('cpuPlatform', ''), args.min_cpu_platform):
+            raise RuntimeError(f"Existing CPU platform {vm.get('cpuPlatform', 'unknown')} does not match requested {args.min_cpu_platform}")
+        if args.min_cpu_platform and vm.get('status') in {'STOPPED', 'TERMINATED'}:
+            gcloud(['compute', 'instances', 'update', args.instance_name,
+                    f'--zone={zone}', f'--min-cpu-platform={args.min_cpu_platform}', '--quiet'])
 
     disk = subprocess.run(["gcloud", "compute", "disks", "describe", args.disk_device_name,
                            "--zone", zone, "--project", PROJECT, "--format=json"], text=True, capture_output=True)
@@ -264,6 +285,8 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     if not disk.stdout:
         performance = (["--provisioned-iops=3000", "--provisioned-throughput=140"]
                        if args.disk_type == 'hyperdisk-balanced' else [])
+        if args.disk_type == 'hyperdisk-throughput':
+            performance = [f'--provisioned-throughput={throughput_floor(args.disk_size_gb)}']
         gcloud(["compute", "disks", "create", args.disk_device_name, f"--zone={zone}",
                 f"--size={args.disk_size_gb}GB", f"--type={args.disk_type}",
                 "--labels=managed-by=spot-runner-manager", *performance, "--quiet"])
@@ -273,6 +296,15 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
         actual_disk_type = disk_info.get('type', '').rsplit('/', 1)[-1]
         if actual_disk_type != args.disk_type:
             raise RuntimeError(f'Existing disk type {actual_disk_type or "unknown"} differs from {args.disk_type}')
+        attached_to_vm = vm and any(disk.get('deviceName') == args.disk_device_name for disk in vm.get('disks', []))
+        if not attached_to_vm:
+            if int(disk_info.get('sizeGb', 0)) != args.disk_size_gb:
+                raise RuntimeError('Existing unattached disk size differs from the priced deployment request')
+            if args.disk_type == 'hyperdisk-balanced' and (int(disk_info.get('provisionedIops', 0)) != 3000
+                    or int(disk_info.get('provisionedThroughput', 0)) != 140):
+                raise RuntimeError('Existing unattached disk performance differs from the priced baseline')
+            if args.disk_type == 'hyperdisk-throughput' and int(disk_info.get('provisionedThroughput', 0)) != throughput_floor(args.disk_size_gb):
+                raise RuntimeError('Existing unattached disk performance differs from the priced baseline')
         if disk_info.get("users") and not vm:
             raise RuntimeError(f"Disk {args.disk_device_name} is already attached; refusing to create another VM")
 
@@ -311,14 +343,15 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                            if args.boot_disk_type == 'hyperdisk-balanced' else "--network=default")
                 created = gcloud(["compute", "instances", "create", args.instance_name, f"--zone={zone}",
                         f"--machine-type={args.instance_type}", "--provisioning-model=SPOT",
+                        *([f'--min-cpu-platform={args.min_cpu_platform}'] if args.min_cpu_platform else []),
                         "--instance-termination-action=DELETE", "--maintenance-policy=TERMINATE",
                         f"--boot-disk-type={args.boot_disk_type}", "--boot-disk-size=40GB",
                         "--boot-disk-auto-delete",
-                        f"--boot-disk-interface={args.disk_interface}", *boot_performance,
+                        f"--boot-disk-interface={args.boot_disk_interface}", *boot_performance,
                         "--image-family=debian-13", "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
                         network, f"--metadata-from-file=startup-script={script_path}",
-                        "--format=json(id,name,zone,status,disks)",
+                        "--format=json(id,name,zone,status,disks,cpuPlatform,minCpuPlatform)",
                         "--quiet"], quiet=True)
                 if getattr(args, "deployment_receipt", None):
                     rows = json.loads(created)
@@ -332,7 +365,9 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                                      ("boot", "source", "autoDelete", "deviceName", "interface", "diskSizeGb")
                                      if key in disk} for disk in row.get("disks", [])),
                         instance_id=str(row.get("id") or ""),
-                        vcpu=args.cpu, ram_gib=args.ram))
+                        vcpu=args.cpu, ram_gib=args.ram,
+                        cpu_platform=row.get('cpuPlatform', ''),
+                        requested_cpu_platform=args.min_cpu_platform or ''))
             except RuntimeError:
                 if created_disk:
                     vm_check = subprocess.run(
@@ -477,8 +512,9 @@ def deployment_details(args: argparse.Namespace) -> str:
     configure_storage(args)
     vm = GceVm(args.instance_name, args.zone or f"{args.region}-a", "PROVISIONING",
                args.instance_type, True, vcpu=args.cpu, ram_gib=args.ram,
+               requested_cpu_platform=getattr(args, 'min_cpu_platform', '') or '',
                disks=({"boot": True, "diskSizeGb": 40, "diskType": args.boot_disk_type,
-                       "interface": args.disk_interface},
+                       "interface": args.boot_disk_interface},
                       {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": args.disk_type,
                        "interface": args.disk_interface}))
     return "planned " + vm_details(vm)
@@ -487,6 +523,9 @@ def deployment_details(args: argparse.Namespace) -> str:
 def observed_deployment_vm(args: argparse.Namespace, zone: str) -> GceVm:
     for vm in list_gcloud_vms(PROJECT, name_prefix=args.instance_name):
         if vm.name == args.instance_name and vm.zone == zone:
+            requested = getattr(args, 'min_cpu_platform', None)
+            if requested and vm.running and not cpu_platform_satisfies(args.instance_type, vm.cpu_platform, requested):
+                raise RuntimeError(f'Observed CPU platform {vm.cpu_platform or "unknown"} does not match requested {requested}: {vm_details(vm)}')
             return vm
     raise RuntimeError(f"Cannot observe deployed VM specifications: {deployment_details(args)}")
 
@@ -498,9 +537,9 @@ def main() -> int:
     PROJECT, ORG = args.project, args.org
     zone = args.zone or f"{args.region}-a"
     select_sizing(args)
-    hourly = verify_price_and_capacity(args, zone)
     if args.existing_instance:
         args.deployment_vm = observed_deployment_vm(args, zone)
+    hourly = verify_price_and_capacity(args, zone)
     LOG.info(f"Plan: {deployment_details(args)}; {args.runner_count} runners, {args.runner_cpu} vCPU/{args.runner_memory_gb} GiB each; {args.disk_size_gb} GiB auto-delete data disk.")
     if not args.apply:
         LOG.info("Preview only. Add --apply to provision through GCE startup metadata and register the runners.")
@@ -518,10 +557,14 @@ def main() -> int:
     online: list[str] = []
     try:
         args.deployment_started_at = time.monotonic()
+        log_project_costs(args.project, args.billing_export_table)
         apply_startup(args, zone, script)
         args.deployment_vm = observed_deployment_vm(args, zone)
         write_deployment_receipt(args, args.deployment_vm)
         wait_for_bootstrap(args, zone, deployment_id)
+        args.deployment_vm = observed_deployment_vm(args, zone)
+        if not args.deployment_vm.running:
+            raise RuntimeError(f'Deployed VM is not running: {deployment_details(args)}')
         online = online_runners(args)
         if len(online) != args.runner_count:
             raise RuntimeError(f"Only {len(online)}/{args.runner_count} expected runners are online")

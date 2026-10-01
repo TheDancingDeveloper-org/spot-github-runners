@@ -54,6 +54,9 @@ def vm_details(vm: GceVm) -> str:
     cpu = f"{vm.vcpu:g} vCPU" if vm.vcpu is not None else "vCPU unknown"
     ram = f"{vm.ram_gib:g} GiB RAM" if vm.ram_gib is not None else "RAM unknown"
     specs = [vm.machine_type or "machine type unknown", cpu, ram]
+    specs.append(f"CPU platform: {vm.cpu_platform or 'unknown'}")
+    if vm.requested_cpu_platform:
+        specs.append(f"requested CPU platform: {vm.requested_cpu_platform}")
     for disk in vm.disks:
         size = disk.get("diskSizeGb", "unknown")
         kind = disk.get("diskType") or disk.get("type", "storage type unknown")
@@ -120,8 +123,11 @@ def observe_vms(vms, state: dict) -> None:
             same_shape = old.get('machine_type') == vm.machine_type
             cpu = old.get('vcpu') if same_shape and vm.vcpu is None else vm.vcpu
             ram = old.get('ram_gib') if same_shape and vm.ram_gib is None else vm.ram_gib
-            last_known |= cpu != vm.vcpu or ram != vm.ram_gib
-            vm = replace(vm, vcpu=cpu, ram_gib=ram, disks=tuple(disks), specs_last_known=last_known)
+            platform = vm.cpu_platform or (old.get('cpu_platform', '') if same_shape else '')
+            requested = vm.requested_cpu_platform or (old.get('requested_cpu_platform', '') if same_shape else '')
+            last_known |= cpu != vm.vcpu or ram != vm.ram_gib or platform != vm.cpu_platform
+            vm = replace(vm, vcpu=cpu, ram_gib=ram, disks=tuple(disks), specs_last_known=last_known,
+                         cpu_platform=platform, requested_cpu_platform=requested)
         current[key] = asdict(vm)
         old_status = old.get("status") if isinstance(old, dict) else old
         if key not in previous:

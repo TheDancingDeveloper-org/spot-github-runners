@@ -1,6 +1,7 @@
 from decimal import Decimal
 import unittest
 
+from pricing_fixtures import storage_prices_for
 from lib.compute_api import Offer
 from lib.autoscaling_policy import affordable_offers, vm_count_for_floor
 from lib.runner_labels import counts_toward_capacity, custom_labels_for_runner
@@ -34,8 +35,8 @@ class AutoscalerPolicyTests(unittest.TestCase):
             Offer("us-east1", "n2-standard-32", 32, 256.0, 0.21),
             Offer("us-east2", "n2-standard-32", 32, 128.0, 5.0 / 24.0),
         ]
-        selected = eligible_offers(offers, Decimal("5"))
-        self.assertEqual([offer.region for offer in selected], ["us-west3", "us-west4"])
+        selected = eligible_offers(offers, Decimal("5"), storage_rates=storage_prices_for(offers))
+        self.assertEqual([offer.region for offer in selected], ["us-west3"])
 
     def test_host_capacity_counts_all_runners_on_the_machine(self):
         self.assertEqual(runner_capacity(32), 8)
