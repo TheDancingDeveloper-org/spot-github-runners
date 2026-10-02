@@ -281,6 +281,7 @@ class JobRecoveryTests(unittest.TestCase):
                 patch('lib.spot_runner_autoscaler.list_github_runners', return_value=[]), \
                 patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[VM]), \
                 patch('lib.spot_runner_autoscaler.reconcile_prices', return_value=True), \
+                patch('lib.spot_runner_autoscaler.log_hourly_spend'), \
                 patch('lib.job_recovery.utc_now', return_value='2026-09-30T20:01:00Z'):
             self.assertEqual(run_controller(args), 0)
         self.assertIn('swack-tools/oxidex/11', read_scale_state(self.path)['job_tracking']['jobs'])
@@ -289,6 +290,7 @@ class JobRecoveryTests(unittest.TestCase):
                 patch('lib.spot_runner_autoscaler.list_github_runners', return_value=[]), \
                 patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
                 patch('lib.spot_runner_autoscaler.reconcile_prices', return_value=True), \
+                patch('lib.spot_runner_autoscaler.log_hourly_spend'), \
                 patch('lib.job_recovery.utc_now', return_value='2026-09-30T20:06:00Z'):
             self.assertEqual(run_controller(args), 0)
         self.assertEqual(self.api.posts, ['repos/swack-tools/oxidex/actions/jobs/11/rerun'])

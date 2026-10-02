@@ -19,8 +19,12 @@ LOG = logging.getLogger("spot_runner_autoscaler")
 
 
 def check_running_prices(vms: list[GceVm], project: str,
-                         daily_cap: Decimal, *, raise_on_error: bool = False) -> list[GceVm]:
-    """Find overpriced VMs; optionally expose unavailable prices to pending evictions."""
+                         daily_cap: Decimal, *, raise_on_error: bool = False,
+                         totals: dict[str, Decimal] | None = None) -> list[GceVm]:
+    """Find overpriced VMs; optionally expose unavailable prices to pending evictions.
+
+    When ``totals`` is given, it receives each priced VM's daily compute plus storage cost by name.
+    """
     rates = {}
     disk_rates = {}
     clear_catalog_cache()
@@ -61,6 +65,8 @@ def check_running_prices(vms: list[GceVm], project: str,
                 raise ValueError("The provider returned an invalid price")
             LOG.info("Live price: %s costs $%.6f/day compute + $%.6f/day storage = $%.6f/day total; cap $%s/day total",
                      vm_details(replace(vm, vcpu=int(cpu), ram_gib=float(ram))), compute_daily, storage_daily, daily, daily_cap)
+            if totals is not None:
+                totals[vm.name] = daily
             if daily >= daily_cap:
                 overpriced.append(vm)
         except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:

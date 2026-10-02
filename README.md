@@ -384,6 +384,11 @@ Every check logs a one-line fleet summary. It lists online, busy, and offline
 GitHub runners, Spot VMs grouped by status, machine type, CPU platform, and zone,
 and any pending host operation with its elapsed time.
 
+Once an hour the controller logs the fleet's spend rate from live compute and
+storage prices, for example `Spend rate: 2 Spot VMs = $10.31/day ($0.43/hour)`.
+It then logs reported project spend for the last 24 hours, 7 days, and 30 days
+from the billing export configured by `GCP_BILLING_EXPORT_TABLE`.
+
 Launch logs show candidate specifications and failure details for each zone.
 The manager logs the first observation of an online runner and elapsed seconds
 from starting VM deployment. This measures the first GitHub poll that observes

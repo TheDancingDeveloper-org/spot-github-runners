@@ -27,6 +27,7 @@ from .fleet_logging import lifecycle_log, observe_vms, reconcile_deletion_identi
 from .log_format import configure_logging, error_detail
 from .vm_recovery import reconcile_lost_vms
 from .price_guard import check_running_prices, delete_overpriced_vm
+from .project_costs import log_project_costs
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
 from .storage_selection import storage_rates, cheapest_storage
@@ -40,6 +41,7 @@ LOG = logging.getLogger("spot_runner_autoscaler")
 LAUNCH_DEADLINE_SECONDS = 600
 # One check stops starting new launch attempts after this long so other fleet work still runs.
 LAUNCH_SEARCH_BUDGET_SECONDS = 600
+SPEND_LOG_INTERVAL_SECONDS = 3600
 
 
 def now() -> float:
@@ -115,6 +117,24 @@ def fleet_summary(vms, runners, state: dict) -> str:
     return (f"Fleet: GitHub runners {len(online)} online ({sum(runner.busy for runner in online)} busy), "
             f"{len(managed_online_runners(runners))} on Spot VMs, {len(runners) - len(online)} offline; "
             f"Spot VMs {len(fleet)}{': ' + hosts if hosts else ''}; {pending}")
+
+
+def log_hourly_spend(vms, args: argparse.Namespace, state: dict, state_path: Path) -> None:
+    """Log the fleet's current spend rate and reported project spend at most once an hour."""
+    if now() - state.get("spend_logged_at", 0) < SPEND_LOG_INTERVAL_SECONDS:
+        return
+    fleet = spot_instances(vms)
+    totals: dict[str, Decimal] = {}
+    if fleet:
+        check_running_prices(fleet, args.project, args.max_daily_usd, totals=totals)
+    daily = sum(totals.values(), Decimal(0))
+    unpriced = len(fleet) - len(totals)
+    LOG.info("Spend rate: %d Spot VMs = $%.2f/day ($%.2f/hour) for compute and storage at current prices%s",
+             len(fleet), daily, daily / 24,
+             f"; {unpriced} VM price{'s' if unpriced != 1 else ''} unavailable" if unpriced else "")
+    log_project_costs(args.project, getattr(args, "billing_export_table", None))
+    state["spend_logged_at"] = now()
+    write_scale_state(state_path, state)
 
 
 def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner]) -> list[GceVm]:
@@ -991,6 +1011,7 @@ def _run_controller(args: argparse.Namespace) -> int:
         observe_vms(vms, state)
         write_scale_state(state_path, state)
         LOG.info(fleet_summary(vms, runners, state))
+        log_hourly_spend(vms, args, state, state_path)
         operation_work = reconcile_host_operation(vms, runners, args, state, state_path)
         recovery_work = False if operation_work else reconcile_lost_vms(vms, runners, args, state, state_path)
         price_work = False if recovery_work or operation_work else reconcile_prices(vms, runners, args, state, state_path)
