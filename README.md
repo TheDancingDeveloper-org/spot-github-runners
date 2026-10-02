@@ -228,13 +228,15 @@ C4D (AMD Turin), N4D (AMD Turin), C4 (Intel Granite Rapids),
 C4 (Intel Emerald Rapids), N4 (Intel Emerald Rapids), C2D (AMD Milan),
 N2D (AMD Milan), N2 (Intel Ice Lake), then N2 (Intel Cascade Lake).
 Within each family/platform preference it chooses the cheapest regional offer,
-including 40 GiB of boot storage and the configured data disk size.
+including 40 GiB of boot storage and the configured data disk size. The cap
+applies to that total: a $9/day VM with $1.50/day of storage does not qualify
+under a $10/day cap.
 These are provisional hardware estimates; Rust build performance is unmeasured.
 E2 hosts remain recognized, but automatic launches exclude E2 because GCP does
 not allow requesting a CPU platform for that family. C4's 120 GiB and C4D's 124 GiB qualify; ARM, Local SSD,
 and bare-metal variants are excluded. Boot and data disks use the cheapest
-supported baseline storage: Standard/Balanced/SSD Persistent Disk for older
-families and Hyperdisk Balanced for C4/C4D/N4/N4D. Data disks of at least 2 TiB
+supported baseline storage. Older families use Standard, Balanced, or SSD
+Persistent Disk, and C4/C4D/N4/N4D use Hyperdisk Balanced. Data disks of at least 2 TiB
 also compare Hyperdisk Throughput where supported, including its minimum
 provisioned throughput charge. Hyperdisk Balanced uses its included 3,000 IOPS
 and 140 MiB/s throughput. Monthly SKU storage prices use Google's 730-hour month for the
@@ -246,28 +248,46 @@ prefix and are checked against GitHub's 64-character name limit. The autoscaler
 stores its idle-loop counters, restoration targets, and pending host operation in
 `~/Library/Application Support/Spot Runner Autoscaler/state.json`.
 
+Each scan prices every qualifying shape from one authenticated Billing Catalog
+snapshot. The manager and price guard use the same source. Shapes without a
+catalog Spot price are excluded because the manager cannot deploy them. The scan
+then expands each offer into one candidate per zone and keeps only zones that
+pass a launch preflight:
+
+- The zone is `UP` and advertises the requested CPU platform. Small C4 Granite
+  Rapids launches are also limited to Google's documented minimum-platform zones.
+- The zone offers the machine type and the selected boot and data disk types.
+- Regional CPU, family CPU, instance, and disk quotas, and the global CPU quota,
+  have room for one more host. Spot VMs use preemptible CPU quota when the
+  project has any.
+
+The controller logs the scan totals, the top 10 ranked candidates, and why each
+offer without a launchable zone was skipped.
+
 Each launch passes an explicit `--min-cpu-platform` request to GCP. The manager
-checks that the observed platform meets the requested minimum before confirming a running host, and the controller
-preserves that request across restarts. Failed launches fall back through zones,
-regions, and platform preferences only after confirming that no VM, disks, or
-runner records remain. Uncertain results pause fallback. Logs include the
-requested platform, observed platform, preference rank, and compute/storage prices.
-At startup the controller reads each zone's available CPU platforms from GCP
-and saves the map in state. A restart refreshes it. This zone inventory does not
-prove platform support for a particular shape: small C4 Granite Rapids launches
-are additionally limited to Google's documented minimum-platform zones.
+checks that the observed platform meets the requested minimum before confirming
+a running host, and the controller preserves that request across restarts. The
+controller tries each candidate once per search. After every failed launch, it
+removes that launch's VM, disks, and runner records, rescans prices and
+preflight, then tries the next untried candidate. When every candidate has
+failed, it logs that the list is exhausted and starts a new search on the next
+check. A successful launch also resets the search, so the next host starts from
+the top of the list. One check stops starting new attempts after 10 minutes so
+price checks and recovery keep running; the next check continues with the next
+untried candidate. Logs include the requested platform, observed platform,
+preference rank, and compute/storage prices.
 For manual provisioning, `--min-cpu-platform` can select a compatible platform;
 omitting it defaults to the family's first preference.
 
-Before provisioning, the manager logs project-wide costs for the rolling last
-24 hours, 7 days, and 30 days, both before credits and after credits. This requires
-a standard or detailed [Cloud Billing usage export to BigQuery](https://docs.cloud.google.com/billing/docs/how-to/export-data-bigquery-setup).
+Before provisioning, the manager logs project-wide costs before and after
+credits for the rolling last 24 hours, 7 days, and 30 days. This requires
+a standard or detailed [GCP Billing usage export to BigQuery](https://docs.cloud.google.com/billing/docs/how-to/export-data-bigquery-setup).
 Set `GCP_BILLING_EXPORT_TABLE=project.dataset.table` in `.env`, or pass
 `--billing-export-table project.dataset.table` to the controller or manager.
 The current `gcloud` identity needs BigQuery table read access and permission to
 run query jobs in the managed project. Queries use the table's location and a
 1 GiB billed-bytes limit. The lookup uses the BigQuery REST API without requiring
-the `bq` CLI. Missing configuration, empty history, or failed lookups produce an
+the `bq` command-line tool. Missing configuration, empty history, or failed lookups produce an
 unavailable warning and do not prevent provisioning. Export timestamps and
 partial-history warnings accompany totals because reporting can lag and a new
 export may not contain the complete 30-day window. SKU rates cannot substitute
@@ -288,7 +308,7 @@ at `~/Library/Logs/spot-runner-autoscaler.log`.
 The controller appends timestamped events to `~/spot-ghrunner.log` on each run.
 It records startup, shutdown, live prices, scaling decisions, VM deletion attempts
 and completions, deployment attempts and completions, and changes in VM status.
-Every event occupies one physical line, including errors and tracebacks.
+Every event, including errors and tracebacks, occupies one physical line.
 Google API errors show their HTTP code, message, and reason instead of an error
 JSON dump. VM events include the instance name, zone, machine type, vCPU, RAM,
 root and data disk sizes and types, storage interfaces such as NVMe, and GPUs
@@ -345,10 +365,24 @@ restarts. Drain progress, group identity, and individual deregistration requests
 survive restarts and uncertain API responses. A preemption before the controller
 requests deletion remains eligible for interruption recovery. Deletion retries
 target the same host; stale runner removal after loss requires
-fresh VM absence and offline, idle runner records. An uncertain launch with no
-VM receipt, a surviving failed deployment, or leftover deployment disks keeps
-scaling paused for verification. Failed launches can try another zone only
-after VM, disk, and runner inventories confirm that no resources remain.
+fresh VM absence and offline, idle runner records.
+
+A launch must register all eight runners within 10 minutes of starting.
+Healthy hosts take 5 to 8 minutes. The manager stops waiting for bootstrap at
+that deadline. If the controller still sees fewer than eight online runners, or
+observes a CPU platform below the requested minimum, it deletes the VM with its
+disks and deregisters its runner records. It then records the candidate as failed
+and moves on. A host whose manager already confirmed eight online runners is
+exempt, so a runner restart later cannot delete a busy host. If the manager hangs
+past the deadline, the controller keeps the host when GitHub shows all eight
+runners online. When a launch request times out and no VM exists, the controller
+waits until the deadline before trusting that absence. Launches saved before
+this deadline existed expire 10 minutes after the controller restarts. A leftover
+disk that is still attached keeps cleanup pending.
+
+Every check logs a one-line fleet summary. It lists online, busy, and offline
+GitHub runners, Spot VMs grouped by status, machine type, CPU platform, and zone,
+and any pending host operation with its elapsed time.
 
 Launch logs show candidate specifications and failure details for each zone.
 The manager logs the first observation of an online runner and elapsed seconds
@@ -380,7 +414,7 @@ service diagnostics also remain in the LaunchAgent log.
 - The runner image enables a completed-job hook that removes only
   `/work/oxidex/oxidex/target` after OxiDex jobs. It checks the repository,
   workspace, and symlinks before removal, and logs free disk bytes before and
-  after. Set `OXIDEX_CLEAN_TARGET=0` in the runner container to disable it.
+  after. Set `OXIDEX_CLEAN_TARGET=0` in the runner container to turn it off.
   Custom `CARGO_TARGET_DIR` paths and old outputs outside this directory are
   outside this cleanup boundary.
 - `tests/` contains unit tests for pricing and capacity rules.

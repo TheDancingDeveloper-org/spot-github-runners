@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
 from .log_format import error_detail
@@ -33,6 +33,7 @@ class Offer:
     vcpu: int
     ram_gib: float
     hourly_usd: float
+    zones: tuple[str, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)

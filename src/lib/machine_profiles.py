@@ -63,6 +63,7 @@ class CpuOffer(Offer):
     boot_disk_type: str = ''
     data_disk_type: str = ''
     storage_monthly_usd: Decimal = Decimal(0)
+    zone: str = ''
 
     @property
     def total_daily_usd(self) -> Decimal:

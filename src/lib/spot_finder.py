@@ -14,6 +14,7 @@ from .compute_api import (
     DEFAULT_CONCURRENCY,
     LOG,
     QUOTA_COOLDOWN,
+    QUOTA_RETRY_DELAY,
     Auth,
     AsyncGoogleApi,
     Offer,
@@ -33,12 +34,16 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
                concurrency: int, list_price_baseline: float | None = None
                , billing_api_key: str | None = None
                , runners: int | None = None
+               , catalog_rates: dict | None = None
                ) -> tuple[list[Offer], int, int, list[str]]:
     await wait_for_quota_cooldown(auth.project)
     api = AsyncGoogleApi(auth.token, concurrency)
     inventory_started = time.perf_counter()
     regions = await list_regions(api, auth.project)
-    if billing_api_key and list_price_baseline is None:
+    if catalog_rates is not None:
+        machine_types, unreachable_zones = await list_machines(
+            api, auth.project, min_vcpu, int(min_ram * 1024))
+    elif billing_api_key and list_price_baseline is None:
         (machine_types, unreachable_zones), catalog_rates = await asyncio.gather(
             list_machines(api, auth.project, min_vcpu, int(min_ram * 1024)),
             load_catalog_rates(billing_api_key))
@@ -51,6 +56,7 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
                     len(unreachable_zones), ", ".join(unreachable_zones[:10]))
     region_names = {item["name"] for item in regions}
     shapes: dict[tuple[str, str], tuple[int, float]] = {}
+    shape_zones: dict[tuple[str, str], set[str]] = {}
     for item in machine_types:
         name = item.get("name", "")
         zone = item.get("zone", "").rsplit("/", 1)[-1]
@@ -64,6 +70,7 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
         supported = not unsupported_series and not lower_name.endswith("-metal")
         if region in region_names and name and supported and vcpu >= min_vcpu and ram >= min_ram:
             shapes[(region, name)] = (vcpu, ram)
+            shape_zones.setdefault((region, name), set()).add(zone)
     log(1, "GCP inventory: %d active regions; %d shapes qualify (%.2fs)",
         len(region_names), len(shapes), time.perf_counter() - inventory_started)
     log(2, "aggregated machine inventory contains %d rows", len(machine_types))
@@ -95,7 +102,7 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
             missing_spot_prices.append((region, machine))
             continue
         hourly = cpu_spot * vcpu + ram_spot * ram
-        offer = Offer(region, machine, vcpu, ram, hourly)
+        offer = Offer(region, machine, vcpu, ram, hourly, zones=tuple(sorted(shape_zones[(region, machine)])))
         offers.append(offer)
         cpu_regular = catalog_rates.get(("ondemand", region, series, "CPU"))
         ram_regular = catalog_rates.get(("ondemand", region, series, "RAM"))
@@ -128,6 +135,10 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
                     return region, machine, None, None, True
                 return region, machine, None, str(exc), False
 
+    if catalog_rates is not None:
+        # Callers that supply catalog rates deploy only catalog-priced shapes.
+        log(1, "%d shapes have no catalog Spot price and are excluded", len(missing_spot_prices))
+        missing_spot_prices = []
     pending = missing_spot_prices
     for sweep in range(2):
         deferred: list[tuple[str, str]] = []
@@ -147,7 +158,7 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
             if hourly is None:
                 log(2, "no Spot price: %s/%s", region, machine)
                 continue
-            offer = Offer(region, machine, vcpu, ram, hourly)
+            offer = Offer(region, machine, vcpu, ram, hourly, zones=tuple(sorted(shape_zones[(region, machine)])))
             offers.append(offer)
             if list_price_baseline and list_price_baseline > 0:
                 baseline = list_price_baseline

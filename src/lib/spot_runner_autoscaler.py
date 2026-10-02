@@ -16,6 +16,7 @@ from decimal import Decimal
 from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from types import SimpleNamespace
 
 from .autoscaling_policy import affordable_offers
 from .machine_profiles import MINIMUM_RAM_GIB, machine_profile, CpuOffer, platform_preferences, cpu_platform_satisfies
@@ -29,10 +30,20 @@ from .price_guard import check_running_prices, delete_overpriced_vm
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
 from .storage_selection import storage_rates, cheapest_storage
-from .billing_catalog import clear_catalog_cache, monthly_to_daily
+from .billing_catalog import catalog_skus, clear_catalog_cache, monthly_to_daily
+from .launch_candidates import LaunchInventory, candidate_key, launchable_candidates
+from .spot_pricing import parse_component_rates
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = logging.getLogger("spot_runner_autoscaler")
+# Healthy hosts register all runners in 5-8 minutes; slower launches are treated as broken.
+LAUNCH_DEADLINE_SECONDS = 600
+# One check stops starting new launch attempts after this long so other fleet work still runs.
+LAUNCH_SEARCH_BUDGET_SECONDS = 600
+
+
+def now() -> float:
+    return time.time()
 
 
 def count_online_runners(org: str, label: str) -> int:
@@ -81,6 +92,29 @@ def host_runners(vm: GceVm, runners: list[GitHubRunner] | tuple[GitHubRunner, ..
         if matches and max(matches, key=len) == vm.name:
             assigned.append(runner)
     return assigned
+
+
+def fleet_summary(vms, runners, state: dict) -> str:
+    """Describe runner capacity, Spot hosts, and any pending host operation in one line."""
+    online = [runner for runner in runners if runner.online]
+    groups: dict[tuple[str, str, str, str], int] = {}
+    fleet = [vm for vm in vms if vm.spot and vm.name.startswith("oxidex-runners-")]
+    for vm in fleet:
+        group = (vm.status, vm.machine_type, vm.cpu_platform or "CPU platform unknown", vm.zone)
+        groups[group] = groups.get(group, 0) + 1
+    hosts = ", ".join(f"{count} {status} {machine} {platform} in {zone}"
+                      for (status, machine, platform, zone), count in groups.items())
+    operation = state.get("host_operation")
+    if not operation:
+        pending = "no pending host operation"
+    else:
+        pending = f"pending {operation['kind']} of {operation['vm']['name']}"
+        if operation["kind"] == "launch" and "started_at" in operation:
+            minutes, seconds = divmod(int(now() - operation["started_at"]), 60)
+            pending += f" for {minutes}m {seconds}s of the {LAUNCH_DEADLINE_SECONDS // 60}m limit"
+    return (f"Fleet: GitHub runners {len(online)} online ({sum(runner.busy for runner in online)} busy), "
+            f"{len(managed_online_runners(runners))} on Spot VMs, {len(runners) - len(online)} offline; "
+            f"Spot VMs {len(fleet)}{': ' + hosts if hosts else ''}; {pending}")
 
 
 def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner]) -> list[GceVm]:
@@ -248,19 +282,32 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         operation.update(kind="delete_cleanup", vm=asdict(vm))
         write_scale_state(state_path, state)
     if operation["kind"] == "launch":
-        # A restart without a manager receipt cannot prove that an absent VM will
-        # not finish provisioning later. Retain intent until registration/loss is observed.
+        if "started_at" not in operation:
+            # Launches recorded before deadlines existed expire relative to this restart.
+            operation["started_at"] = now()
+            write_scale_state(state_path, state)
         expected = {f"gha-{vm.name}-{slot}" for slot in range(1, 9)}
         online_names = {runner.name for runner in assigned if runner.online}
         requested = operation.get('requested_cpu_platform')
-        if current and current.running and requested and not cpu_platform_satisfies(current.machine_type, current.cpu_platform, requested):
-            LOG.error('Host operation waits: observed CPU platform %s does not satisfy requested minimum %s for %s',
-                      current.cpu_platform or 'unknown', requested, vm_details(current))
-            return True
-        if current and current.running and expected.issubset(online_names):
+        platform_ok = not requested or (current is not None and cpu_platform_satisfies(
+            current.machine_type, current.cpu_platform, requested))
+        if current and current.running and current.cpu_platform and not platform_ok:
+            operation.setdefault("abandon", f"observed CPU platform {current.cpu_platform} "
+                                            f"does not satisfy requested minimum {requested}")
+        elif current and current.running and platform_ok and expected.issubset(online_names):
             LOG.info("Host operation complete: all eight runners registered for %s", vm_details(current))
             state.pop("host_operation")
             write_scale_state(state_path, state)
+            return True
+        # A manager-confirmed host keeps its jobs even if one runner briefly restarts later.
+        if not operation.get("registered") and now() - operation["started_at"] >= LAUNCH_DEADLINE_SECONDS:
+            operation.setdefault("abandon", f"all eight runners did not register within "
+                                            f"{LAUNCH_DEADLINE_SECONDS // 60} minutes")
+        if operation.get("abandon"):
+            try:
+                abandon_launch(args, state, state_path)
+            except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+                LOG.warning("Launch cleanup pending for %s: %s", vm_details(vm), error_detail(exc))
         else:
             losses = state.setdefault("pending_vm_recovery", {})
             if current is None and vm.instance_id:
@@ -412,8 +459,13 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     return 0  # Host removal is counted only after the drain completes.
 
 
-def scale_up(additional_hosts: int, offers, args: argparse.Namespace, state=None, state_path=None) -> int:
-    """Launch at most one host; fail over only after proving a failed host absent."""
+def scale_up(additional_hosts: int, offers, args: argparse.Namespace, state=None, state_path=None,
+             refresh=None) -> int:
+    """Launch at most one host, trying each ranked candidate once per search.
+
+    A failed candidate is skipped until the list is exhausted or a launch succeeds.
+    After each failure, ``refresh`` supplies a fresh price scan when provided.
+    """
     state_path = state_path or args.state_file.expanduser()
     state = state if state is not None else read_scale_state(state_path)
     if additional_hosts <= 0 or state.get("host_operation"):
@@ -421,17 +473,38 @@ def scale_up(additional_hosts: int, offers, args: argparse.Namespace, state=None
     if hasattr(args, 'cpu_platforms_by_zone') and args.cpu_platforms_by_zone is None:
         LOG.warning('Capacity launch waits for a current CPU platform zone map')
         return 0
-    for offer in offers:
+    failed = state.setdefault("failed_launch_candidates", {})
+    search_started = now()
+    while True:
+        untried = [offer for offer in offers if candidate_key(offer) not in failed]
+        if not untried:
+            if offers:
+                LOG.warning("Launch candidates exhausted: all %d failed in this search; "
+                            "retrying the full list on the next check", len(failed))
+                failed.clear()
+                write_scale_state(state_path, state)
+            return 0
+        offer = untried[0]
         try:
             launch_offer(offer, args, state, state_path)
+            failed.clear()
+            write_scale_state(state_path, state)
             return 1
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            failed[candidate_key(offer)] = now()
+            write_scale_state(state_path, state)
             LOG.warning("Could not deploy %s requesting CPU platform %s in %s: %s", offer.machine_type,
-                        getattr(offer, 'cpu_platform', 'preferred family platform'), offer.region, error_detail(exc))
+                        getattr(offer, 'cpu_platform', 'preferred family platform'),
+                        getattr(offer, 'zone', '') or offer.region, error_detail(exc))
             if state.get("host_operation"):
                 return 0
-            LOG.info('No deployment remains pending; trying the next ranked platform offer')
-    return 0
+            if now() - search_started >= LAUNCH_SEARCH_BUDGET_SECONDS:
+                LOG.info("Launch search paused after %d minutes; the next check continues with "
+                         "the next untried candidate", LAUNCH_SEARCH_BUDGET_SECONDS // 60)
+                return 0
+            if refresh is not None:
+                LOG.info("Refreshing Spot prices and launch preflight before the next candidate")
+                offers = refresh()
 
 
 def reconcile_prices(vms, runners, args, state, state_path) -> bool:
@@ -463,8 +536,9 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
     missing = max(0, target - len(fleet))
     if missing:
         LOG.info("Finding one affordable replacement; %d missing hosts, restoration target %d", missing, target)
-        offers = discover_offers(args.project, args.max_daily_usd, disk_size_gb=args.disk_size_gb)
-        if not offers or not scale_up(1, offers, args, state, state_path):
+        refresh = offer_refresher(args)
+        offers = refresh()
+        if not offers or not scale_up(1, offers, args, state, state_path, refresh=refresh):
             LOG.warning("Replacement capacity is pending; retrying next loop")
         return True  # Only fresh observations may clear the restoration target.
     for record in pending.values():
@@ -489,16 +563,67 @@ def scaling_decision(online: int, busy: int, vm_count: int, idle_loops: int,
     return "wait", 0, 0, False
 
 
+CANDIDATE_LOG_LIMIT = 10
+
+
+def offer_refresher(args: argparse.Namespace):
+    """Return a scan function that logs provider failures instead of stopping the controller."""
+    def refresh():
+        try:
+            return discover_offers(args.project, args.max_daily_usd, disk_size_gb=args.disk_size_gb)
+        except (RuntimeError, ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+            LOG.error("Spot scan failed; launches wait for the next check: %s", error_detail(exc))
+            return []
+    return refresh
+
+
 def discover_offers(project: str, max_daily_usd: Decimal, disk_size_gb: int = 100):
+    """Return fresh zone candidates under the total cap that pass launch preflight, best first."""
+    clear_catalog_cache()
     auth = get_auth(project)
+    # The authenticated catalog is the same price source the manager and price guard use.
     offers, _, _, errors = asyncio.run(
         find(auth, min_vcpu=32, min_ram=MINIMUM_RAM_GIB, top=None, concurrency=200,
-             billing_api_key=os.environ.get("GOOGLE_CLOUD_API_KEY"))
+             catalog_rates=parse_component_rates(catalog_skus()))
     )
-    for error in errors[:5]:
-        LOG.warning("Spot scan warning: %s", error_detail(error))
+    if errors:
+        LOG.warning("Spot scan is incomplete: %d Spot price lookup(s) failed; first: %s",
+                    len(errors), error_detail(errors[0]))
     prices = {region: storage_rates(region) for region in {offer.region for offer in offers}}
-    return eligible_offers(offers, max_daily_usd, storage_rates=prices, disk_size_gb=disk_size_gb)
+    ranked = eligible_offers(offers, max_daily_usd, storage_rates=prices, disk_size_gb=disk_size_gb)
+    candidates, skipped = launchable_candidates(ranked, load_launch_inventory(project), disk_size_gb)
+    LOG.info("Spot scan: %d priced shapes; %d platform offers under $%s/day total; "
+             "%d launchable zone candidates; %d offers have no launchable zone",
+             len(offers), len(ranked), max_daily_usd, len(candidates), len(skipped))
+    for index, candidate in enumerate(candidates[:CANDIDATE_LOG_LIMIT], start=1):
+        LOG.info("Candidate #%d %s %s %s: CPU preference rank %d; $%.2f/day total",
+                 index, candidate.zone, candidate.machine_type, candidate.cpu_platform,
+                 candidate.cpu_rank + 1, candidate.total_daily_usd)
+    for reason in skipped:
+        LOG.info("Not launchable: %s", reason)
+    return candidates
+
+
+def load_launch_inventory(project: str) -> LaunchInventory:
+    """Read zone, disk-type, and quota facts that decide whether a launch can succeed."""
+    def gcloud_json(*command):
+        result = subprocess.run(['gcloud', 'compute', *command, f'--project={project}'],
+                                check=True, text=True, capture_output=True, timeout=60)
+        return json.loads(result.stdout)
+
+    def quotas(rows):
+        return {row['metric']: (float(row['limit']), float(row['usage'])) for row in rows or []}
+
+    disk_types: dict[str, set[str]] = {}
+    for row in gcloud_json('disk-types', 'list', '--format=json(name,zone)'):
+        if row.get('zone'):  # Regional disk types cannot back a zonal runner VM.
+            disk_types.setdefault(row['zone'].rsplit('/', 1)[-1], set()).add(row['name'])
+    return LaunchInventory(
+        platforms_by_zone=load_cpu_platform_map(project),
+        disk_types_by_zone=disk_types,
+        region_quotas={row['name']: quotas(row.get('quotas'))
+                       for row in gcloud_json('regions', 'list', '--format=json(name,quotas)')},
+        global_quotas=quotas(gcloud_json('project-info', 'describe', '--format=json(quotas)').get('quotas')))
 
 
 def eligible_offers(offers, max_daily_usd: Decimal, *, storage_rates=None, disk_size_gb: int = 100):
@@ -517,7 +642,7 @@ def eligible_offers(offers, max_daily_usd: Decimal, *, storage_rates=None, disk_
             continue
         for rank, platform in platform_preferences(offer.machine_type):
             candidate = CpuOffer(offer.region, offer.machine_type, offer.vcpu, offer.ram_gib,
-                                 offer.hourly_usd, platform, rank, boot, data, monthly)
+                                 offer.hourly_usd, platform, rank, boot, data, monthly, zones=offer.zones)
             if candidate.total_daily_usd < max_daily_usd:
                 candidates.append(candidate)
     return sorted(candidates, key=lambda offer: (offer.cpu_rank, offer.total_daily_usd,
@@ -564,17 +689,23 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
     if cpu_rank is None:
         raise RuntimeError(f'Unsupported CPU platform {cpu_platform} for {offer.machine_type}')
     hourly_limit = args.max_daily_usd / Decimal(24)
-    result = subprocess.run(
-        ["gcloud", "compute", "zones", "list", f"--project={args.project}",
-         f"--filter=name~'^{offer.region}-' AND status=UP", "--format=value(name)"],
-        check=True, text=True, capture_output=True,
-    )
-    zones = result.stdout.split()
+    preflighted_zone = getattr(offer, 'zone', '')
+    if preflighted_zone:
+        zones = [preflighted_zone]
+    else:
+        result = subprocess.run(
+            ["gcloud", "compute", "zones", "list", f"--project={args.project}",
+             f"--filter=name~'^{offer.region}-' AND status=UP", "--format=value(name)"],
+            check=True, text=True, capture_output=True,
+        )
+        zones = result.stdout.split()
     if not zones:
         raise RuntimeError(f"No active Compute Engine zones found in {offer.region}")
     for zone in zones:
         platform_map = getattr(args, 'cpu_platforms_by_zone', None)
-        if platform_map is not None and cpu_platform not in platform_map.get(zone, []):
+        if preflighted_zone:
+            pass  # Discovery checked a fresh zone inventory moments ago.
+        elif platform_map is not None and cpu_platform not in platform_map.get(zone, []):
             LOG.info('Skipping %s in %s: requested platform %s is not advertised by the startup CPU map',
                      offer.machine_type, zone, cpu_platform)
             continue
@@ -622,55 +753,125 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
                  offer.region, vm_details(vm), cpu_rank + 1, offer.hourly_usd * 24,
                  storage_daily, Decimal(str(offer.hourly_usd)) * 24 + storage_daily)
         receipt = state_path.parent / f"{instance_name}-{uuid.uuid4().hex}-deployment.json"
-        command.extend(["--deployment-receipt", str(receipt)])
+        command.extend(["--deployment-receipt", str(receipt),
+                        "--registration-timeout-seconds", str(LAUNCH_DEADLINE_SECONDS)])
         begin_host_operation("launch", vm, [], [], state, state_path,
-                             requested_cpu_platform=cpu_platform, deployment_receipt=str(receipt))
+                             requested_cpu_platform=cpu_platform, deployment_receipt=str(receipt),
+                             candidate_key=f"{zone}/{offer.machine_type}/{cpu_platform}",
+                             data_disk_name=f"runner-data-{suffix}", started_at=now())
         started = time.monotonic()
-        result = subprocess.run(command, check=False, text=True, capture_output=True)
+        manager_hung = False
+        try:
+            # The manager enforces the registration deadline; this backstop covers a hung manager.
+            result = subprocess.run(command, check=False, text=True, capture_output=True,
+                                    timeout=LAUNCH_DEADLINE_SECONDS + 120)
+        except subprocess.TimeoutExpired:
+            manager_hung = True
+            result = SimpleNamespace(returncode=-9, stdout="",
+                                     stderr="Deployment manager timed out before reporting an outcome")
         identity_observed = import_deployment_receipt(state, state_path)
         for output in (result.stdout, result.stderr):
             for line in (output or "").splitlines():
                 if line.strip():
                     LOG.info("Deployment diagnostics: %s; %s", vm_details(vm), error_detail(line))
+        if manager_hung and registered_host(vm, args):
+            LOG.warning("Deployment manager hung after all eight runners registered; keeping %s", vm_details(vm))
+            result = SimpleNamespace(returncode=0, stdout="", stderr="")
         if result.returncode == 0:
+            state["host_operation"]["registered"] = True
+            write_scale_state(state_path, state)
             elapsed = time.monotonic() - started
             LOG.info("Instance registered to take jobs in %s runners: %s; %.1f seconds from starting "
                      "deployment to manager confirmation of online runner registration and storage checks",
                      args.org, vm_details(vm), elapsed)
             return
-        inventory = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
-        existing = next((item for item in inventory if item.zone == zone and item.name == instance_name), None)
-        if existing:
-            state["host_operation"]["vm"] = asdict(existing)
-            state.setdefault("observed_vms", {})[f"{existing.zone}/{existing.name}"] = asdict(existing)
-            write_scale_state(state_path, state)
-            raise RuntimeError(f"Deployment failed but {instance_name} still exists; waiting for this host")
-        if identity_observed:
+        diagnostics = error_detail(result.stderr or result.stdout or "no diagnostics")
+        if identity_observed and not any(item.zone == zone and item.name == instance_name
+                                         for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")):
             raise RuntimeError(f"Deployment VM {instance_name} disappeared; waiting for loss recovery")
-        failure = error_detail(result.stderr or result.stdout or "").lower()
+        failure = diagnostics.lower()
         uncertain = result.returncode < 0 or any(fragment in failure for fragment in
                     ("timeout", "timed out", "deadline exceeded", "connection reset", "connection aborted"))
-        if uncertain:
-            raise RuntimeError(f"Deployment outcome for {instance_name} is uncertain; refusing failover")
-        disks = subprocess.run(["gcloud", "compute", "disks", "list", f"--project={args.project}",
-                                f"--zones={zone}", "--format=json"],
-                               check=True, text=True, capture_output=True, timeout=60)
-        disk_rows = json.loads(disks.stdout)
-        if not isinstance(disk_rows, list):
-            raise RuntimeError("Failed launch disk inventory is invalid; refusing failover")
-        if any(disk.get("name") in {instance_name, f"runner-data-{suffix}"} for disk in disk_rows):
-            raise RuntimeError(f"Failed launch {instance_name} has remaining disks; verify cleanup before failover")
-        stale = host_runners(vm, list_github_runners(args.org), [vm, *inventory])
-        if stale:
-            state["host_operation"].update(kind="delete", runner_ids=[runner.runner_id for runner in stale])
-            write_scale_state(state_path, state)
-            raise RuntimeError(f"Failed launch {instance_name} has runner records; waiting for deregistration")
-        state.pop("host_operation")
+        state["host_operation"]["abandon"] = f"deployment failed (exit {result.returncode}): {diagnostics}"
+        # An unconfirmed create may still be in flight; absence is trusted only after the deadline.
+        state["host_operation"]["outcome_uncertain"] = uncertain
         write_scale_state(state_path, state)
-        LOG.warning("Deployment in %s failed; trying another zone. Tried to deploy %s; exit %d; %s",
-                    zone, vm_details(vm), result.returncode,
-                    error_detail(result.stderr or result.stdout or "no diagnostics"))
+        if not abandon_launch(args, state, state_path):
+            raise RuntimeError(f"Deployment of {instance_name} failed; cleanup is pending before the next candidate")
+        LOG.warning("Deployment in %s failed; resources removed before the next candidate. Tried to deploy %s; exit %d; %s",
+                    zone, vm_details(vm), result.returncode, diagnostics)
     raise RuntimeError(f"No zone accepted {offer.machine_type} in {offer.region}")
+
+
+def registered_host(vm: GceVm, args: argparse.Namespace) -> bool:
+    """Return whether the launched VM is running with all eight runners online."""
+    current = next((item for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+                    if item.zone == vm.zone and item.name == vm.name), None)
+    if not current or not current.running:
+        return False
+    online = {runner.name for runner in host_runners(vm, list_github_runners(args.org), [vm]) if runner.online}
+    return {f"gha-{vm.name}-{slot}" for slot in range(1, 9)}.issubset(online)
+
+
+def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> bool:
+    """Delete a failed or stalled launch's VM, disks, and runner records.
+
+    Returns True once fresh inventories confirm all three are absent and the
+    host operation is cleared; otherwise cleanup continues on the next check.
+    """
+    operation = state["host_operation"]
+    from .fleet_logging import vm_from_record
+    vm = vm_from_record(operation["vm"])
+    reason = operation["abandon"]
+    if operation.get("candidate_key"):
+        state.setdefault("failed_launch_candidates", {})[operation["candidate_key"]] = now()
+    key = f"{vm.zone}/{vm.name}"
+    current = next((item for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+                    if item.zone == vm.zone and item.name == vm.name), None)
+    if current:
+        if key not in state.setdefault("intentional_deletions", []):
+            state["intentional_deletions"].append(key)
+        if current.instance_id:
+            state.setdefault("intentional_deletion_ids", {})[key] = current.instance_id
+        write_scale_state(state_path, state)
+        LOG.warning("Deleting launch %s with its disks: %s", vm_details(current), reason)
+        subprocess.run(["gcloud", "compute", "instances", "delete", vm.name, f"--zone={vm.zone}",
+                        f"--project={args.project}", "--delete-disks=all", "--quiet"],
+                       check=True, text=True, capture_output=True, timeout=300)
+        if any(item.zone == vm.zone and item.name == vm.name
+               for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")):
+            return False
+    elif (operation.get("outcome_uncertain")
+          and now() - operation.get("started_at", now()) < LAUNCH_DEADLINE_SECONDS):
+        LOG.info("Launch cleanup waits until the deadline confirms %s was never created: %s",
+                 vm.name, reason)
+        write_scale_state(state_path, state)
+        return False
+    names = {vm.name, operation.get("data_disk_name") or vm.name.replace("oxidex-runners-", "runner-data-", 1)}
+    disks = subprocess.run(["gcloud", "compute", "disks", "list", f"--project={args.project}",
+                            f"--zones={vm.zone}", "--format=json(name,users)"],
+                           check=True, text=True, capture_output=True, timeout=60)
+    leftovers = [disk for disk in json.loads(disks.stdout) if disk.get("name") in names]
+    if any(disk.get("users") for disk in leftovers):
+        LOG.warning("Launch cleanup waits: a disk of %s is still attached", vm.name)
+        write_scale_state(state_path, state)
+        return False
+    for disk in leftovers:
+        subprocess.run(["gcloud", "compute", "disks", "delete", disk["name"], f"--zone={vm.zone}",
+                        f"--project={args.project}", "--quiet"],
+                       check=True, text=True, capture_output=True, timeout=120)
+        LOG.info("Deleted disk %s left by launch %s", disk["name"], vm.name)
+    for runner in host_runners(vm, list_github_runners(args.org), [vm]):
+        subprocess.run(["gh", "api", "-X", "DELETE", f"orgs/{args.org}/actions/runners/{runner.runner_id}"],
+                       check=True, text=True, capture_output=True, timeout=60)
+    if host_runners(vm, list_github_runners(args.org), [vm]):
+        write_scale_state(state_path, state)
+        return False
+    state.pop("host_operation")
+    write_scale_state(state_path, state)
+    LOG.warning("Abandoned launch %s; its VM, disks, and runner records are absent: %s",
+                vm_details(vm), reason)
+    return True
 
 
 def install_launch_agent(args: argparse.Namespace) -> Path:
@@ -789,6 +990,7 @@ def _run_controller(args: argparse.Namespace) -> int:
         jobs.poll(vms)
         observe_vms(vms, state)
         write_scale_state(state_path, state)
+        LOG.info(fleet_summary(vms, runners, state))
         operation_work = reconcile_host_operation(vms, runners, args, state, state_path)
         recovery_work = False if operation_work else reconcile_lost_vms(vms, runners, args, state, state_path)
         price_work = False if recovery_work or operation_work else reconcile_prices(vms, runners, args, state, state_path)
@@ -812,8 +1014,9 @@ def _run_controller(args: argparse.Namespace) -> int:
             state["idle_loops"] = idle_loops
             if host_count:
                 LOG.info("High usage: launching %d host, then checking fresh demand", host_count)
-                offers = discover_offers(args.project, args.max_daily_usd, disk_size_gb=args.disk_size_gb)
-                launched = scale_up(host_count, offers, args, state, state_path) if offers else 0
+                refresh = offer_refresher(args)
+                offers = refresh()
+                launched = scale_up(host_count, offers, args, state, state_path, refresh=refresh) if offers else 0
                 if not launched:
                     LOG.error("Could not launch Spot capacity below $%s/day", args.max_daily_usd)
         elif action == "down":

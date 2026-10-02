@@ -97,6 +97,8 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--existing-instance", action="store_true", help="Attach/bootstrap an existing Spot VM")
     parser.add_argument("--deployment-receipt", type=Path,
                         help="Persist the created VM identity before waiting for runner registration")
+    parser.add_argument("--registration-timeout-seconds", type=int, default=1200,
+                        help="Fail when bootstrap has not finished this long after deployment starts")
     parser.add_argument("--apply", action="store_true", help="Run provisioning and startup-script deployment")
     return parser
 
@@ -441,14 +443,18 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
 
 def wait_for_bootstrap(args: argparse.Namespace, zone: str, deployment_id: str) -> None:
     """Wait for this exact startup-script execution before removing its metadata."""
-    deadline = time.monotonic() + 1200
+    started = getattr(args, "deployment_started_at", None) or time.monotonic()
+    deadline = started + args.registration_timeout_seconds
     marker = "sudo cat /var/lib/gha-runner-bootstrap.complete 2>/dev/null || true"
     while time.monotonic() < deadline:
-        result = subprocess.run(
-            ["gcloud", "compute", "ssh", args.instance_name, f"--zone={zone}",
-             f"--project={PROJECT}", "--quiet", f"--command={marker}"],
-            text=True, capture_output=True,
-        )
+        try:
+            result = subprocess.run(
+                ["gcloud", "compute", "ssh", args.instance_name, f"--zone={zone}",
+                 f"--project={PROJECT}", "--quiet", f"--command={marker}"],
+                text=True, capture_output=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if result.returncode == 0 and result.stdout.strip() == deployment_id:
             return
         time.sleep(10)

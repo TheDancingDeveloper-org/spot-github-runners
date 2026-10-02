@@ -108,23 +108,29 @@ class SequentialScalingTests(unittest.TestCase):
         controller.reconcile_host_operation([self.other], [], self.args, restarted, self.path)
         self.assertNotIn('host_operation', restarted)
 
-    def test_failed_launch_with_surviving_vm_never_tries_another_zone(self):
+    def test_failed_launch_with_surviving_vm_is_deleted_before_another_zone(self):
         offer = SimpleNamespace(region='asia-south2', machine_type='n2-standard-32', vcpu=32, ram_gib=128, hourly_usd=.1)
         state = {}
+        commands = []
         def command(args, **kwargs):
+            commands.append(args[:4])
             if args[:3] == ['gcloud', 'compute', 'zones']:
                 return SimpleNamespace(returncode=0, stdout='asia-south2-a\nasia-south2-b\n')
+            if args[:4] == ['gcloud', 'compute', 'instances', 'delete']:
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
             persisted = controller.read_scale_state(self.path)
             self.assertEqual(persisted['host_operation']['kind'], 'launch')
             return SimpleNamespace(returncode=1, stdout='', stderr='runner registration failed')
         def inventory(*args, **kwargs):
             operation = state['host_operation']
-            return [replace(self.vm, name=operation['vm']['name'])]
-        with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=command) as external, \
+            return [replace(self.vm, name=operation['vm']['name'])]  # Deletion is not yet confirmed.
+        with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=command), \
                 patch('lib.spot_runner_autoscaler.list_gcloud_vms', side_effect=inventory):
             self.assertEqual(controller.scale_up(3, [offer, offer], self.args, state, self.path), 0)
-            self.assertEqual(external.call_count, 2)
-            self.assertIn('host_operation', state)
+        self.assertEqual(commands[-1], ['gcloud', 'compute', 'instances', 'delete'])
+        self.assertEqual(len(commands), 3)  # Zones, one manager run, then deletion; no second zone yet.
+        self.assertIn('host_operation', state)
+        self.assertIn(f"asia-south2-a/{state['host_operation']['vm']['name']}", state['intentional_deletions'])
 
     def test_price_replacement_deficit_restores_only_one_and_keeps_target(self):
         state = {'price_replacement_target': 3}
@@ -163,7 +169,7 @@ class SequentialScalingTests(unittest.TestCase):
             self.assertEqual(controller.scale_up(1, ['offer'], self.args, restarted, self.path), 0)
             launch.assert_not_called()
 
-    def test_failed_launch_with_orphan_disk_blocks_zone_and_offer_failover(self):
+    def test_failed_launch_with_attached_leftover_disk_blocks_failover(self):
         offer = SimpleNamespace(region='asia-south2', machine_type='n2-standard-32', vcpu=32, ram_gib=128, hourly_usd=.1)
         state = {}
         def command(args, **kwargs):
@@ -172,7 +178,7 @@ class SequentialScalingTests(unittest.TestCase):
             if args[:3] == ['gcloud', 'compute', 'disks']:
                 import json
                 name = state['host_operation']['vm']['name'].removeprefix('oxidex-runners-')
-                return SimpleNamespace(returncode=0, stdout=json.dumps([{'name': f'runner-data-{name}'}]))
+                return SimpleNamespace(returncode=0, stdout=json.dumps([{'name': f'runner-data-{name}', 'users': ['vm']}]))
             return SimpleNamespace(returncode=1, stdout='', stderr='capacity unavailable')
         with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=command) as external, \
                 patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]):
@@ -249,30 +255,36 @@ class SequentialScalingTests(unittest.TestCase):
         self.assertEqual(state['price_replacement_target'], 4)
         self.assertEqual(controller.read_scale_state(self.path)['price_replacement_target'], 4)
 
-    def test_failed_launch_known_vm_disappearing_before_next_poll_enters_recovery(self):
+    def test_failed_launch_vm_deleted_by_cleanup_is_not_a_spot_loss(self):
         from lib.fleet_logging import observe_vms
         offer = SimpleNamespace(region='asia-south2', machine_type='n2-standard-32', vcpu=32, ram_gib=128, hourly_usd=.1)
         state = {}
-        actual = None
+        present = []
         def command(args, **kwargs):
             if args[:3] == ['gcloud', 'compute', 'zones']:
                 return SimpleNamespace(returncode=0, stdout='asia-south2-a\n')
+            if args[:4] == ['gcloud', 'compute', 'instances', 'delete']:
+                return SimpleNamespace(returncode=0, stdout='', stderr='')  # Confirmed only by a later inventory.
+            if args[:4] == ['gcloud', 'compute', 'disks', 'list']:
+                return SimpleNamespace(returncode=0, stdout='[]', stderr='')
             return SimpleNamespace(returncode=1, stdout='', stderr='registration failed')
         def inventory(*args, **kwargs):
-            nonlocal actual
-            name = state['host_operation']['vm']['name']
-            actual = replace(self.vm, name=name, disks=({'source': 'recorded-source', 'diskId': 'disk-123', 'autoDelete': True},))
-            return [actual]
+            if not present:
+                present.append(replace(self.vm, name=state['host_operation']['vm']['name']))
+            return list(present)
         with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=command), \
                 patch('lib.spot_runner_autoscaler.list_gcloud_vms', side_effect=inventory):
             controller.scale_up(1, [offer], self.args, state, self.path)
         restarted = controller.read_scale_state(self.path)
-        observe_vms([], restarted)
-        controller.reconcile_host_operation([], [], self.args, restarted, self.path)
-        self.assertEqual(restarted['host_operation']['kind'], 'recovery')
-        self.assertEqual(restarted['host_operation']['vm']['instance_id'], '123')
-        self.assertEqual(restarted['host_operation']['vm']['disks'][0]['diskId'], 'disk-123')
-        self.assertEqual(restarted['price_replacement_target'], 1)
+        observe_vms([present[0]], restarted)
+        observe_vms([], restarted)  # Cleanup deleted the VM.
+        with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=command), \
+                patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
+                patch('lib.spot_runner_autoscaler.list_github_runners', return_value=[]):
+            controller.reconcile_host_operation([], [], self.args, restarted, self.path)
+        self.assertNotIn('host_operation', restarted)
+        self.assertEqual(restarted['pending_vm_recovery'], {})
+        self.assertEqual(restarted.get('price_replacement_target', 0), 0)
 
     def test_known_launch_identity_without_old_observation_still_detects_loss(self):
         from lib.fleet_logging import observe_vms

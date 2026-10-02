@@ -22,7 +22,8 @@ def storage_rates(region: str) -> dict[str, Decimal]:
             continue
         description = sku.get('description', '')
         for prefix, (key, usage_unit) in PREFIXES.items():
-            if description.startswith(prefix):
+            # Some multi-region SKUs omit the trailing location, such as `Storage PD Capacity`.
+            if description.startswith(prefix) or description == prefix.removesuffix(' in '):
                 price = unit_price(sku, usage_unit)
                 if price is None and key.endswith(':throughput'):
                     price = unit_price(sku, 'MiBy/s.mo')
@@ -67,9 +68,9 @@ def cheapest_storage(machine_type: str, size_gib: int, rates: dict) -> tuple[str
     def choose(kinds, size):
         choices = []
         for kind in kinds:
-            if kind == 'hyperdisk-throughput' and not {
-                    kind + ':capacity', kind + ':throughput'}.issubset(rates):
-                continue  # This optional alternative cannot be quoted in the region.
+            if kind + ':capacity' not in rates or (kind == 'hyperdisk-throughput'
+                                                   and kind + ':throughput' not in rates):
+                continue  # A type without a regional quote cannot be selected.
             cost = disk_monthly_cost(kind, size, rates,
                                      throughput=throughput_floor(size) if kind == 'hyperdisk-throughput' else 140)
             choices.append((cost, kind))

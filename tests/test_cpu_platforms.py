@@ -124,17 +124,41 @@ class CpuPlatformTests(unittest.TestCase):
         observe_vms([replace(vm, instance_id='456', cpu_platform='')], state)
         self.assertEqual(state['observed_vms']['region-a/oxidex-runners-test']['cpu_platform'], '')
 
-    def test_restart_cannot_complete_launch_on_wrong_platform(self):
+    def test_launch_on_wrong_platform_is_deleted_instead_of_completed(self):
         from lib.runner_fleet import GitHubRunner
         vm = GceVm('oxidex-runners-test', 'region-a', 'RUNNING', 'n2-standard-32', True,
                    instance_id='123', cpu_platform='Intel Cascade Lake')
         runners = [GitHubRunner(i, f'gha-{vm.name}-{i}', 'online', False, ('spot',)) for i in range(1, 9)]
+        inventory = [vm]
+        commands = []
+        def external(command, **kwargs):
+            commands.append(command[:4])
+            if command[:4] == ['gcloud', 'compute', 'instances', 'delete']:
+                inventory.clear()
+            return SimpleNamespace(returncode=0, stdout='[]', stderr='')
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.json'
             args = controller.args_parser().parse_args(['--state-file', str(path)])
             state = {}
             controller.begin_host_operation('launch', vm, [], [], state, path,
                                             requested_cpu_platform='Intel Ice Lake')
+            with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=external), \
+                 patch('lib.spot_runner_autoscaler.list_gcloud_vms', side_effect=lambda *a, **k: list(inventory)), \
+                 patch('lib.spot_runner_autoscaler.list_github_runners', return_value=[]):
+                controller.reconcile_host_operation([vm], runners, args, state, path)
+            self.assertIn(['gcloud', 'compute', 'instances', 'delete'], commands)
+            self.assertNotIn('host_operation', state)
+
+    def test_launch_with_unreported_platform_waits_instead_of_completing(self):
+        from lib.runner_fleet import GitHubRunner
+        vm = GceVm('oxidex-runners-test', 'region-a', 'RUNNING', 'n2-standard-32', True, instance_id='123')
+        runners = [GitHubRunner(i, f'gha-{vm.name}-{i}', 'online', False, ('spot',)) for i in range(1, 9)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            args = controller.args_parser().parse_args(['--state-file', str(path)])
+            state = {}
+            controller.begin_host_operation('launch', vm, [], [], state, path,
+                                            requested_cpu_platform='Intel Ice Lake', started_at=controller.now())
             controller.reconcile_host_operation([vm], runners, args, state, path)
             self.assertIn('host_operation', state)
             controller.reconcile_host_operation([replace(vm, cpu_platform='Intel Ice Lake')],
@@ -153,9 +177,11 @@ class CpuPlatformTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             args = controller.args_parser().parse_args(['--state-file', str(Path(directory) / 'state.json')])
             state = {}
-            with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=external):
+            with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=external), \
+                 patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]):
                 self.assertEqual(controller.scale_up(1, offers, args, state), 0)
             self.assertEqual(requested, ['Intel Ice Lake'])
+            self.assertTrue(state['host_operation']['outcome_uncertain'])
             self.assertIn('host_operation', state)
 
     def test_price_breaks_ties_only_for_identical_family_and_platform(self):

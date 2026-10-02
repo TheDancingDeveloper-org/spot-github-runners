@@ -200,7 +200,7 @@ class LogLineTests(unittest.TestCase):
                 self.assertLogs('spot_runner_autoscaler', 'INFO') as logs:
             args.state_file = Path(directory) / "state.json"
             launch_offer(offer, args)
-        failed = next(line for line in logs.output if 'failed; trying another zone' in line)
+        failed = next(line for line in logs.output if 'failed; resources removed' in line)
         for detail in ('c2d-standard-32', '32 vCPU', '128 GiB RAM', '40 GiB', '100 GiB', 'pd-standard', 'capacity unavailable'):
             self.assertIn(detail, failed)
         registered = next(line for line in logs.output if 'registered' in line)

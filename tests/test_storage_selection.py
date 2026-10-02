@@ -26,12 +26,32 @@ class StorageSelectionTests(unittest.TestCase):
         rates['hyperdisk-throughput:throughput'] = Decimal('20')
         self.assertEqual(cheapest_storage('n4-standard-32', 2048, rates)[1], 'hyperdisk-balanced')
 
-    def test_cheapest_selection_fails_when_compatible_price_is_missing(self):
+    def test_cheapest_selection_fails_when_no_compatible_price_exists(self):
         from lib.storage_selection import cheapest_storage
         with self.assertRaisesRegex(RuntimeError, 'price'):
             cheapest_storage('n4-standard-32', 100, {'pd-standard:capacity': Decimal('.04')})
         with self.assertRaisesRegex(RuntimeError, 'price'):
-            cheapest_storage('n2-standard-32', 100, {'pd-ssd:capacity': Decimal('.17')})
+            cheapest_storage('n2-standard-32', 100, {'hyperdisk-balanced:capacity': Decimal('.08')})
+
+    def test_multi_region_pd_skus_without_a_location_suffix_are_priced(self):
+        from lib import storage_selection
+        def sku(description, regions, dollars):
+            return {'description': description, 'serviceRegions': regions, 'pricingInfo': [{'pricingExpression': {
+                'usageUnit': 'GiBy.mo', 'tieredRates': [{'unitPrice': {'currencyCode': 'USD', 'units': '0',
+                                                                       'nanos': int(dollars * 1e9)}}]}}]}
+        skus = (sku('Storage PD Capacity', ['us-central1', 'europe-west1'], .04),
+                sku('Balanced PD Capacity', ['europe-west1'], .1),
+                sku('Regional Storage PD Capacity', ['europe-west1'], .08),
+                sku('Storage PD Capacity in Belgium', ['europe-west2'], .05))
+        with patch.object(storage_selection, 'catalog_skus', return_value=skus):
+            rates = storage_selection.storage_rates('europe-west1')
+        self.assertEqual(rates, {'pd-standard:capacity': Decimal('0.04'), 'pd-balanced:capacity': Decimal('0.1')})
+
+    def test_missing_disk_price_skips_only_that_disk_type(self):
+        from lib.storage_selection import cheapest_storage
+        rates = {'pd-balanced:capacity': Decimal('.10'), 'pd-ssd:capacity': Decimal('.17')}
+        boot, data, monthly = cheapest_storage('n2-standard-32', 100, rates)
+        self.assertEqual((boot, data, monthly), ('pd-balanced', 'pd-balanced', Decimal('14.00')))
 
     def test_missing_optional_throughput_sku_keeps_priced_baseline_choice(self):
         from lib.storage_selection import cheapest_storage

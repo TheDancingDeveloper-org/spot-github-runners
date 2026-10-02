@@ -6,7 +6,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from lib.price_guard import check_running_prices, delete_overpriced_vm
 from lib.runner_fleet import GceVm, GitHubRunner
@@ -81,7 +81,7 @@ class PriceGuardTests(unittest.TestCase):
                     patch("lib.spot_runner_autoscaler.discover_offers", return_value=["offer"]), \
                     patch("lib.spot_runner_autoscaler.scale_up", return_value=1) as launch:
                 self.assertTrue(reconcile_prices([], [], self.args, recovered, path))
-                launch.assert_called_once_with(1, ["offer"], self.args, recovered, path)
+                launch.assert_called_once_with(1, ["offer"], self.args, recovered, path, refresh=ANY)
             self.assertEqual(read_scale_state(path)["price_replacement_target"], 1)
             with patch("lib.spot_runner_autoscaler.check_running_prices", return_value=[]):
                 reconcile_prices([self.vm], [], self.args, recovered, path)
