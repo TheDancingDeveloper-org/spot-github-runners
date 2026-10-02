@@ -87,6 +87,8 @@ RUNNER_PREFIX='{{RUNNER_PREFIX}}'
 REGISTRATION_TOKEN={{REGISTRATION_TOKEN}}
 RUNNER_COUNT={{RUNNER_COUNT}}
 RUNNER_MEMORY_GB={{RUNNER_MEMORY_GB}}
+# Empty unless fixed sizing requested an explicit per-runner vCPU cap.
+RUNNER_CPU_LIMIT='{{RUNNER_CPU_LIMIT}}'
 # Docker Engine storage (images, layers, build cache and containers) must stay
 # on the mounted persistent data disk. Stop if it did not mount as expected.
 docker_root=$(docker info --format=json | jq -r .DockerRootDir)
@@ -114,6 +116,7 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     --name "$name" -e RUNNER_NAME="$name" -e RUNNER_LABELS="$runner_labels" \
     -e RUNNER_GROUP_NAME="$RUNNER_GROUP" -e GITHUB_RUNNER_URL="$ORG_URL" \
     -e RUNNER_STATE=/runner-state -v "$state:/runner-state" -v "$work:/work")
+  [[ -z "$RUNNER_CPU_LIMIT" ]] || docker_args+=(--cpus="$RUNNER_CPU_LIMIT")
   docker_args+=(oxidex-self-hosted-runner:{{RUNNER_VERSION}})
   docker run "${docker_args[@]}"
 done

@@ -105,11 +105,12 @@ For a 32-vCPU, 128-GiB VM, the calculation is `(128 - 8) / 8 = 15 GiB` per
 runner. A 32-vCPU, 256-GiB VM gives 31 GiB per runner. `--fixed-runner-sizing`
 uses the explicit values for runner count, vCPU, and RAM.
 
-Each runner's memory is capped, but its CPU is not. Every runner container
+Each runner's memory is capped. With automatic sizing, its CPU is not. Every runner container
 gets an equal CPU weight, so busy runners split the cores evenly, and a job can
 use every idle vCPU on the host. Measured over a day, whole-host CPU never
 passed 49%, while heavy jobs spent about a quarter of their CPU time throttled
-by the former 4-vCPU cap.
+by the former 4-vCPU cap. `--fixed-runner-sizing` keeps `--runner-cpu` as a
+hard per-runner vCPU cap.
 
 ## Requirements and credentials
 
