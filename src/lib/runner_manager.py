@@ -227,7 +227,6 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "RUNNER_PREFIX": args.runner_prefix,
         "REGISTRATION_TOKEN": shlex.quote(token),
         "RUNNER_COUNT": str(args.runner_count),
-        "RUNNER_CPU": str(args.runner_cpu),
         "RUNNER_MEMORY_GB": str(args.runner_memory_gb),
         "INSTANCE_NAME": args.instance_name,
         "DEPLOYMENT_ID": deployment_id,
@@ -532,7 +531,7 @@ def main() -> int:
     if args.existing_instance:
         args.deployment_vm = observed_deployment_vm(args, zone)
     hourly = verify_price_and_capacity(args, zone)
-    LOG.info(f"Plan: {deployment_details(args)}; {args.runner_count} runners, {args.runner_cpu} vCPU/{args.runner_memory_gb} GiB each; {args.disk_size_gb} GiB auto-delete data disk.")
+    LOG.info(f"Plan: {deployment_details(args)}; {args.runner_count} runners, equal CPU shares (sized at {args.runner_cpu} vCPU each), {args.runner_memory_gb} GiB memory cap each; {args.disk_size_gb} GiB auto-delete data disk.")
     if not args.apply:
         LOG.info("Preview only. Add --apply to provision through GCE startup metadata and register the runners.")
         return 0

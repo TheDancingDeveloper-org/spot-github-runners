@@ -86,7 +86,6 @@ RUNNER_GROUP='{{RUNNER_GROUP}}'
 RUNNER_PREFIX='{{RUNNER_PREFIX}}'
 REGISTRATION_TOKEN={{REGISTRATION_TOKEN}}
 RUNNER_COUNT={{RUNNER_COUNT}}
-RUNNER_CPU={{RUNNER_CPU}}
 RUNNER_MEMORY_GB={{RUNNER_MEMORY_GB}}
 # Docker Engine storage (images, layers, build cache and containers) must stay
 # on the mounted persistent data disk. Stop if it did not mount as expected.
@@ -109,7 +108,9 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     -v "$state:/runner-state" -v "$work:/work" oxidex-self-hosted-runner:{{RUNNER_VERSION}}
   rm -f "$env_file"
   docker rm -f "$name" >/dev/null 2>&1 || true
-  docker_args=(-d --restart unless-stopped --cpus="$RUNNER_CPU" --memory="${RUNNER_MEMORY_GB}g" \
+  # Equal CPU weights split cores only under contention; an idle host lets one
+  # job use every vCPU. Memory stays capped so one job cannot starve the others.
+  docker_args=(-d --restart unless-stopped --cpu-shares=1024 --memory="${RUNNER_MEMORY_GB}g" \
     --name "$name" -e RUNNER_NAME="$name" -e RUNNER_LABELS="$runner_labels" \
     -e RUNNER_GROUP_NAME="$RUNNER_GROUP" -e GITHUB_RUNNER_URL="$ORG_URL" \
     -e RUNNER_STATE=/runner-state -v "$state:/runner-state" -v "$work:/work")

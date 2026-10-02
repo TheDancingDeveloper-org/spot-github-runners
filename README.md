@@ -93,7 +93,7 @@ its observed free space requires it.
 
 ## Runner sizing
 
-Runner count depends on vCPU capacity. Each runner receives four vCPU. Reserve
+Runner count depends on vCPU capacity: one runner per four vCPU. Reserve
 8 GiB of host RAM, then divide the remaining memory evenly:
 
 ```text
@@ -104,6 +104,12 @@ runner_RAM_GiB = (host_RAM_GiB - 8) // runner_count
 For a 32-vCPU, 128-GiB VM, the calculation is `(128 - 8) / 8 = 15 GiB` per
 runner. A 32-vCPU, 256-GiB VM gives 31 GiB per runner. `--fixed-runner-sizing`
 uses the explicit values for runner count, vCPU, and RAM.
+
+Each runner's memory is capped, but its CPU is not. Every runner container
+gets an equal CPU weight, so busy runners split the cores evenly, and a job can
+use every idle vCPU on the host. Measured over a day, whole-host CPU never
+passed 49%, while heavy jobs spent about a quarter of their CPU time throttled
+by the former 4-vCPU cap.
 
 ## Requirements and credentials
 

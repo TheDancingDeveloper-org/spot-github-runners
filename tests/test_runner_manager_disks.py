@@ -57,6 +57,17 @@ class RunnerDiskLifecycleTests(unittest.TestCase):
         self.assertNotIn('/var/run/docker.sock', startup)
         self.assertNotIn('--group-add', startup)
 
+    def test_runners_share_idle_cpu_instead_of_a_hard_four_vcpu_cap(self):
+        args = SimpleNamespace(disk_device_name='runner-data', instance_type='n4-standard-32',
+                               region='asia-east2', runner_label='spot', runner_prefix='gha',
+                               runner_count=8, runner_cpu=4, runner_memory_gb=15,
+                               instance_name='oxidex-runners-test')
+        startup = render_startup(args, 'registration-token', 'group', 'deployment-id')
+        self.assertNotIn('--cpus', startup)
+        self.assertIn('--cpu-shares=1024', startup)  # Equal weights split CPU only under contention.
+        self.assertIn('--memory="${RUNNER_MEMORY_GB}g"', startup)
+        self.assertIn('RUNNER_MEMORY_GB=15', startup)
+
     def test_adoption_enforces_boot_and_data_deletion_without_touching_extra_disk(self):
         vm = {'machineType': 'types/n2-standard-32', 'status': 'TERMINATED',
               'scheduling': {'provisioningModel': 'SPOT'},

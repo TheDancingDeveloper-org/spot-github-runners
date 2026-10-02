@@ -3,7 +3,7 @@ services:
     image: ${RUNNER_IMAGE}
     restart: unless-stopped
     init: true
-    cpus: ${RUNNER_CPU:-7}
+    cpu_shares: 1024
     mem_limit: ${RUNNER_MEMORY_GB:-27}g
     environment:
       GITHUB_RUNNER_URL: https://github.com/swack-tools
