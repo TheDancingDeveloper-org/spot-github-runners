@@ -41,3 +41,7 @@ dist/
 .dmypy.json
 dmypy.json
 pip-wheel-metadata/
+
+# Documentation lint configuration; downloaded styles stay local.
+!.vale.ini
+.vale/styles/
