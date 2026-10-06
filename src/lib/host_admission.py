@@ -172,7 +172,7 @@ def legacy_owner_for_worker(owner):
 
 
 class LeasePool:
-    def __init__(self,path,limit_gib,*,alive,capacity=None,owner_kind=None,retain=None,removal_fence=None):
+    def __init__(self,path,limit_gib,*,alive,capacity=None,owner_kind=None,retain=None,removal_fence=None,heavy_builder_isolation=False):
         self.path = Path(path)
         if not math.isfinite(limit_gib) or limit_gib <= 0:
             raise ValueError('Invalid aggregate memory budget')
@@ -182,6 +182,7 @@ class LeasePool:
         if removal_fence is not None and not callable(removal_fence):raise ValueError('Invalid removal effect fence')
         if retain is not None and not callable(retain):raise ValueError('Invalid reservation retention policy')
         self.capacity=capacity;self.owner_kind=owner_kind
+        self.heavy_builder_isolation=heavy_builder_isolation
         if capacity is not None:
             execution_limits(capacity)
             if limit_gib!=28 or not callable(owner_kind):raise ValueError('Unknown builder pool')
@@ -215,7 +216,13 @@ class LeasePool:
             # that exact row under this one ledger lock, with no double count.
             legacy_value=rows.pop(legacy_owner,None) if legacy_owner is not None else None
             accepted = True
-            if amount is not None and legacy_value is not None and legacy_value!=amount:
+            if (amount is not None and self.heavy_builder_isolation and owner.startswith('host:')
+                and any(key.startswith('runner:') and value==32 for key,value in rows.items())):
+                accepted=False
+            elif (amount==32 and self.heavy_builder_isolation and owner.startswith('runner:')
+                  and any(key.startswith('host:') for key in rows)):
+                accepted=False
+            elif amount is not None and legacy_value is not None and legacy_value!=amount:
                 # A container may still have its old, larger memory cap.
                 # Never reduce its aggregate reservation by renaming the row.
                 accepted=False
@@ -492,6 +499,55 @@ def peer_owner(pid,uid,config):
     return worker_owner(pid,identity,row['State']['StartedAt']),'runner'
 
 
+def heavy_runner_policy(config):
+    """An absent policy preserves the ordinary 15-GiB deployment."""
+    if 'heavy_runner' not in config:return None
+    policy=config['heavy_runner']
+    if (not isinstance(policy,dict) or set(policy)!={'name','memory_gib','cpus'}
+        or type(policy['name']) is not str or not policy['name']
+        or type(policy['memory_gib']) is not int or policy['memory_gib']!=32
+        or type(policy['cpus']) is not int or policy['cpus']!=8
+        or policy['name'] not in config['runner_names']
+        or type(config['runner_gib']) not in (int,float)
+        or not math.isfinite(config['runner_gib']) or not 0<config['runner_gib']<32
+        or type(config['work_gib']) not in (int,float)
+        or not math.isfinite(config['work_gib']) or config['work_gib']<32):
+        raise ValueError('Invalid single heavy runner policy')
+    return policy
+
+
+def runner_reservation(owner,config):
+    """Verify the exact live Worker/container and actual caps before grant."""
+    policy=heavy_runner_policy(config)
+    if policy is None:return config['runner_gib']
+    match=re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)',owner)
+    if match is None:raise ValueError('Invalid Worker lease identity')
+    cid,started,pid,ticks=match.groups()
+    actual,row=docker_identity(cid)
+    if actual!=f'container:{cid}:{started}' or row['Id']!=cid:
+        raise ValueError('Runner identity changed before admission')
+    if row['Name'].lstrip('/') not in config['runner_names']:
+        raise ValueError('Runner left this deployment')
+    if not owner_alive(owner):raise OrphanRunnerHook('Runner Worker exited before grant')
+    if row['Name']=='/'+policy['name']:
+        amount=32
+        caps=row['HostConfig']
+        expected=int(amount*1024**3)
+        if (type(caps.get('Memory')) is not int or caps['Memory']!=expected
+            or type(caps.get('MemorySwap')) is not int or caps['MemorySwap']!=expected):
+            raise ValueError('Runner memory cap differs from reservation')
+        if type(caps.get('NanoCpus')) is not int or caps['NanoCpus']!=8_000_000_000:
+            raise ValueError('Heavy runner CPU cap differs from policy')
+        return amount
+    caps=row['HostConfig']
+    expected=int(config['runner_gib']*1024**3)
+    if (type(caps.get('Memory')) is not int or not 0<caps['Memory']<=expected
+        or type(caps.get('MemorySwap')) is not int
+        or not caps['Memory']<=caps['MemorySwap']<=2*expected):
+        raise ValueError('Ordinary runner memory cap exceeds reservation')
+    return config['runner_gib']
+
+
 def request(action,kind='runner'):
     with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
         client.settimeout(30)
@@ -547,7 +603,10 @@ def serve():
                         raise ValueError('Admission kind does not match peer identity')
                     limit=config['work_gib']
                     retain=_benchmark_module().ImageMaintenancePolicy(config) if config.get('role')=='benchmark-builder' else None
-                    pool = LeasePool(ledger/'leases.json',config['work_gib'],alive=owner_alive,retain=retain,removal_fence=retain.finalize if retain is not None else None)
+                    policy=heavy_runner_policy(config) if config.get('role') in (None,'runner') else None
+                    if 'heavy_runner' in config and config.get('role') not in (None,'runner'):
+                        raise ValueError('Heavy runner policy on unsupported host role')
+                    pool = LeasePool(ledger/'leases.json',config['work_gib'],alive=owner_alive,retain=retain,removal_fence=retain.finalize if retain is not None else None,heavy_builder_isolation=policy is not None)
                     if config.get('role')=='benchmark-builder':pool.refresh()
                     if message['action']=='acquire':
                         if config.get('role') in ('builder','benchmark-builder') or time.time()-measured_at>=60:
@@ -567,7 +626,8 @@ def serve():
                             else:pool.release(owner)
                         accepted = True
                     elif message['action'] == 'acquire':
-                        if limit<config[kind+'_gib'] or (kind == 'builder' and (LOCK_ROOT/'oxidex-build-draining').exists()):
+                        amount=runner_reservation(owner,config) if kind=='runner' else config[kind+'_gib']
+                        if limit<amount or (kind == 'builder' and (policy is not None or (LOCK_ROOT/'oxidex-build-draining').exists())):
                             accepted = False
                         else:
                             pool.limit=limit
@@ -584,8 +644,8 @@ def serve():
                                     retain.canary_grant.observe(actor)
                                     return role
                                 pool.owner_kind=benchmark_owner
-                            accepted = (pool.acquire_runner(owner,config[kind+'_gib']) if kind=='runner'
-                                        else pool.acquire(owner,config[kind+'_gib']))
+                            accepted = (pool.acquire_runner(owner,amount) if kind=='runner'
+                                        else pool.acquire(owner,amount))
                             if accepted and kind=='runner' and not owner_alive(owner):
                                 # The Worker may have exited between peer
                                 # authentication and the ledger write.

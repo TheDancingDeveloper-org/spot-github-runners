@@ -76,6 +76,8 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
                 if fail_limits and path==builder.with_suffix('.tmp'):
                     raise OSError('Builder config disk write failed')
                 return original_replace(path,target)
+            # Simulate controller-first rollout against the previously
+            # deployed host module, which has no heavy_runner_policy symbol.
             module=SimpleNamespace(observed_envelope=lambda _:envelope,request=root_request)
             stdout=io.StringIO();status=0
             with patch.dict(sys.modules,{'host_admission':module}),patch('subprocess.run',side_effect=docker),\
@@ -88,6 +90,24 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
 
     def owner(self,letter):
         return 'container:'+letter*64+':2026-10-04T00:00:00Z'
+
+    def test_heavy_override_holds_global_growth_and_preserves_exact_slot(self):
+        configuration=dict(work_gib=57,runner_gib=15,builder_gib=25,
+            runner_names=['r1','r2'],heavy_runner=dict(name='r1',memory_gib=32,cpus=8))
+        records={name:dict(Id=letter*64,Name='/'+name,
+            State=dict(Running=True,StartedAt='2026-10-04T00:00:00Z'),
+            HostConfig=dict(Memory=memory*GIB,MemorySwap=memory*GIB,NanoCpus=cpu))
+            for name,letter,memory,cpu in [('r1','a',32,8_000_000_000),('r2','b',15,0)]}
+        resumed=dict(config=configuration,records=records,ledger={},builder=dict(memory_gib=25,cpus=8))
+        result=self.run_program(resume=resumed,envelope=57,kind='runner')
+        self.assertEqual(result['status'],76)
+        self.assertEqual(result['config']['runner_gib'],15)
+        self.assertEqual(result['updates'],[])
+        self.assertEqual(result['records']['r1']['HostConfig']['Memory'],32*GIB)
+        builder=self.run_program(resume=resumed,envelope=57,kind='builder')
+        self.assertEqual(builder['status'],75)
+        self.assertEqual(builder['config']['builder_gib'],25)
+        self.assertEqual(builder['updates'],[])
 
     def test_active_job_keeps_original_cap_and_reservation_while_idle_runner_grows(self):
         leases={self.owner('a'):2,'host:999:1':6}
