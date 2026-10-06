@@ -554,7 +554,13 @@ def request(action,kind='runner'):
         client.connect(ADMISSION_SOCKET)
         client.sendall((json.dumps(dict(action=action,kind=kind))+'\n').encode())
         client.shutdown(socket.SHUT_WR)
-        response = json.loads(client.recv(4096))
+        reply = client.recv(4096)
+    try:
+        response = json.loads(reply)
+    except (ValueError,UnicodeDecodeError) as error:
+        # A service restart can close the socket after the request was sent.
+        # Acquire retries transport errors without abandoning an assigned job.
+        raise OSError('Admission reply lost or incomplete') from error
     if isinstance(response,dict) and response.get('code')=='orphaned-runner-hook':
         raise OrphanRunnerHook(response.get('error','Runner hook lost its Worker ancestry'))
     if 'error' in response:
