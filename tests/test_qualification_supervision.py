@@ -71,10 +71,10 @@ with open(root+'/diagnostics','w+b') as output:wait_guardian(command,tuple(locks
                 wait_for(lambda: (root/'child').exists() and (root/'grandchild').exists())
                 pids = [int((root/name).read_text()) for name in ('child', 'grandchild')]
                 self.assertTrue(all(running(pid) for pid in pids))
-                fds = []
-                try:
-                    for name in ('build', 'namespace', 'import'):
-                        fds.append(os.open(root/name, os.O_RDWR))
+                with (open(root/'build', 'r+b') as build_lock,
+                      open(root/'namespace', 'r+b') as namespace_lock,
+                      open(root/'import', 'r+b') as import_lock):
+                    fds = [build_lock.fileno(), namespace_lock.fileno(), import_lock.fileno()]
                     for fd in fds:
                         with self.assertRaises(BlockingIOError):fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     if termination is not None:os.kill(owner.pid, termination)
@@ -86,8 +86,6 @@ with open(root+'/diagnostics','w+b') as output:wait_guardian(command,tuple(locks
                     wait_for(released)
                     self.assertFalse(any(running(pid) for pid in pids), (root/'diagnostics').read_text())
                     owner.wait(timeout=3)
-                finally:
-                    for fd in fds:os.close(fd)
             finally:
                 if owner.poll() is None:owner.kill();owner.wait(timeout=3)
                 for pid in pids:
