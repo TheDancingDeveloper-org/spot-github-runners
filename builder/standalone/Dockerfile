@@ -4,7 +4,7 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential clang cmake curl git jq libssl-dev make pkg-config python3 python3-pip \
       perl cpanminus libarchive-zip-perl zlib1g-dev libzstd-dev libarchive-dev ca-certificates \
-      unzip zip xz-utils zstd procps util-linux \
+      unzip zip xz-utils zstd procps util-linux openssh-client gnupg \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1001 runner \
     && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner
