@@ -547,6 +547,10 @@ def replacements_healthy(fleet,runners,args,state,state_path,include_retained=Tr
 def staged_retirement_safe(vms,runners,args,state,state_path,operation):
     """Prove current survivors can carry all demand before scoped source retirement."""
     from . import spot_runner_autoscaler as controller
+    if controller.runner_inventory_stale(state) or any(
+            vm.instance_id==operation.get('vm',{}).get('instance_id')
+            for vm in controller.protected_heavy_routes(vms,runners,state)):
+        return False
     migration=state.get('migration',{})
     scope=operation.get('staged_retirement',{})
     record=operation.get('vm',{})
@@ -629,6 +633,8 @@ def guard_staged_retirement(vms,runners,args,state,state_path):
         controller.observe_vms(current_vms,state)
         record_missing_sources(current_vms,state)
         fresh=controller.list_github_runners(args.org)
+        state['runner_inventory_observed_at']=time.time()
+        controller.protected_heavy_routes(current_vms,fresh,state)
         from .tier_controller import evidence_for
         evidence_for(current_vms,fresh,args,state)
         if safe(current_vms,fresh,args,state,state_path,operation):return True
@@ -687,6 +693,10 @@ def restore_missing_destinations(fleet,state,state_path):
 def retirement_safe(vms,runners,args,state,state_path,operation):
     """Recheck real destination health and capacity through every retirement retry."""
     from . import spot_runner_autoscaler as controller
+    if controller.runner_inventory_stale(state) or any(
+            vm.instance_id==operation.get('vm',{}).get('instance_id')
+            for vm in controller.protected_heavy_routes(vms,runners,state)):
+        return False
     migration=state.get('migration',{});record=operation.get('vm',{})
     scope=operation.get('migration_retirement',{})
     if (not migration.get('sources') or scope.get('started_at')!=migration.get('started_at')

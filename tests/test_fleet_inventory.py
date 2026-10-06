@@ -28,9 +28,9 @@ class FleetInventoryTests(unittest.TestCase):
               'scheduling': {'provisioningModel': 'SPOT'},
               'disks': [{'source': source, 'diskSizeGb': '20', 'boot': True, 'autoDelete': True}],
               'guestAccelerators': [{'acceleratorType': 'nvidia-tesla-t4', 'acceleratorCount': 1}]}
-        payloads = [SimpleNamespace(stdout=json.dumps([vm, {**vm, 'name': 'oxidex-runners-test2'}])),
-                    SimpleNamespace(stdout=json.dumps([{'selfLink': source, 'id': '7', 'type': 'diskTypes/pd-ssd'}])),
-                    SimpleNamespace(stdout=json.dumps({'guestCpus': 8, 'memoryMb': 16384}))]
+        payloads = [SimpleNamespace(stderr='',stdout=json.dumps([vm, {**vm, 'name': 'oxidex-runners-test2'}])),
+                    SimpleNamespace(stderr='',stdout=json.dumps([{'selfLink': source, 'id': '7', 'type': 'diskTypes/pd-ssd'}])),
+                    SimpleNamespace(stderr='',stdout=json.dumps({'guestCpus': 8, 'memoryMb': 16384}))]
         with patch('lib.runner_fleet.subprocess.run', side_effect=payloads) as command:
             vms = list_gcloud_vms('p', name_prefix='oxidex-runners-')
         self.assertEqual(command.call_count, 3)  # Shared shape queried once per snapshot.
@@ -44,7 +44,7 @@ class FleetInventoryTests(unittest.TestCase):
         vm = {'name': 'oxidex-runners-test', 'zone': 'zones/us-central1-a', 'status': 'RUNNING',
               'machineType': 'machineTypes/n2-standard-32', 'scheduling': {'provisioningModel': 'SPOT'}}
         error = subprocess.CalledProcessError(1, ['gcloud'], stderr='permission denied\nretry later')
-        with patch('lib.runner_fleet.subprocess.run', side_effect=[SimpleNamespace(stdout=json.dumps([vm])), error, error]), \
+        with patch('lib.runner_fleet.subprocess.run', side_effect=[SimpleNamespace(stderr='',stdout=json.dumps([vm])), error, error]), \
                 self.assertLogs('spot_runner_autoscaler', 'WARNING'):
             vms = list_gcloud_vms('p')
         self.assertEqual(len(vms), 1)

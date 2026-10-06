@@ -21,28 +21,35 @@ def api(org, method, path, body=None, paginate=False):
     return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
+def guarded_api(guard,*args,**kwargs):
+    method=args[1] if len(args)>1 else kwargs['method']
+    if method!='GET' and guard is not None:guard()
+    return api(*args,**kwargs)
+
+
 def pages(result, collection):
     if not isinstance(result, list):
         raise RuntimeError('Invalid paginated GitHub drain inventory')
     return [row for page in result for row in page[collection]]
 
 
-def isolated_group(operation, org, save):
+def isolated_group(operation, org, save, mutation_guard=None):
+    request=lambda *a,**kw:guarded_api(mutation_guard,*a,**kw)
     name = operation['drain_group_name']
     if not operation.get('drain_group_id'):
-        groups = pages(api(org, 'GET', f'orgs/{org}/actions/runner-groups', paginate=True), 'runner_groups')
+        groups = pages(request(org, 'GET', f'orgs/{org}/actions/runner-groups', paginate=True), 'runner_groups')
         found = [group for group in groups if group['name'] == name]
         if len(found) > 1:
             raise RuntimeError('Ambiguous drain group identity')
-        group = found[0] if found else api(org, 'POST', f'orgs/{org}/actions/runner-groups',
+        group = found[0] if found else request(org, 'POST', f'orgs/{org}/actions/runner-groups',
             {'name': name, 'visibility': 'selected', 'selected_repository_ids': [],
              'allows_public_repositories': False})
         operation['drain_group_id'] = int(group['id'])
         save()
     group_id = operation['drain_group_id']
     path = f'orgs/{org}/actions/runner-groups/{group_id}'
-    group = api(org, 'GET', path)
-    repositories = pages(api(org, 'GET', path + '/repositories', paginate=True), 'repositories')
+    group = request(org, 'GET', path)
+    repositories = pages(request(org, 'GET', path + '/repositories', paginate=True), 'repositories')
     if (group.get('name') != name or group.get('visibility') != 'selected'
             or group.get('default') or group.get('inherited')
             or group.get('allows_public_repositories') is not False or repositories):
@@ -64,10 +71,11 @@ def jobs_finished(vm, state, org):
     return True
 
 
-def drain_runners(operation, vm, args, state, save, assigned):
+def drain_runners(operation, vm, args, state, save, assigned,mutation_guard=None):
+    request=lambda *a,**kw:guarded_api(mutation_guard,*a,**kw)
     """Return true only after fresh observations prove all draining runners absent."""
     legacy_group = operation.get('drain_mode') != 'label_only'
-    path = isolated_group(operation, args.org, save) if legacy_group else None
+    path = isolated_group(operation, args.org, save,mutation_guard) if legacy_group else None
     recorded = operation.setdefault('runner_names', {})
     done = set(operation.get('deregistered_runner_ids', []))
     changed = not operation.get('runners_isolated')
@@ -83,17 +91,17 @@ def drain_runners(operation, vm, args, state, save, assigned):
         if runner.runner_id in done:
             raise RuntimeError('A deregistered runner appeared again during drain')
     if legacy_group:
-        members = {row['id'] for row in pages(api(args.org, 'GET', path + '/runners', paginate=True), 'runners')}
+        members = {row['id'] for row in pages(request(args.org, 'GET', path + '/runners', paginate=True), 'runners')}
         if members - set(operation['runner_ids']):
             raise RuntimeError('Drain group contains unrelated runners')
     for runner in assigned:
         if set(runner.labels) - DEFAULT_RUNNER_LABELS:
-            result = api(args.org, 'DELETE', f'orgs/{args.org}/actions/runners/{runner.runner_id}/labels')
+            result = request(args.org, 'DELETE', f'orgs/{args.org}/actions/runners/{runner.runner_id}/labels')
             if any(label.get('type') != 'read-only' for label in result['labels']):
                 raise RuntimeError('Custom scheduling labels remain after removal')
             changed = True
         if legacy_group and runner.runner_id not in members:
-            api(args.org, 'PUT', path + f'/runners/{runner.runner_id}')
+            request(args.org, 'PUT', path + f'/runners/{runner.runner_id}')
             changed = True
     if changed:
         operation['runners_isolated'] = True
@@ -118,13 +126,13 @@ def drain_runners(operation, vm, args, state, save, assigned):
         return False
     if assigned:
         for runner in assigned:
-            fresh = api(args.org, 'GET', f'orgs/{args.org}/actions/runners/{runner.runner_id}')
+            fresh = request(args.org, 'GET', f'orgs/{args.org}/actions/runners/{runner.runner_id}')
             if fresh.get('name') != runner.name or fresh.get('busy') is not False or fresh.get('status') != 'online':
                 LOG.info('Drain waits for fresh idle confirmation on runner %s; %s', runner.name, vm_details(vm))
                 return False
             operation['deregistering_runner_id'] = runner.runner_id
             save()
-            api(args.org, 'DELETE', f'orgs/{args.org}/actions/runners/{runner.runner_id}')
+            request(args.org, 'DELETE', f'orgs/{args.org}/actions/runners/{runner.runner_id}')
             done.add(runner.runner_id)
             operation['deregistered_runner_ids'] = sorted(done)
             operation.pop('deregistering_runner_id', None)
@@ -133,18 +141,19 @@ def drain_runners(operation, vm, args, state, save, assigned):
     return True
 
 
-def cleanup_group(operation, org):
+def cleanup_group(operation, org,mutation_guard=None):
+    request=lambda *a,**kw:guarded_api(mutation_guard,*a,**kw)
     if not operation.get('drain_group_id'):
         return
     path = f"orgs/{org}/actions/runner-groups/{operation['drain_group_id']}"
     try:
-        group = api(org, 'GET', path)
+        group = request(org, 'GET', path)
     except subprocess.CalledProcessError as exc:
         if 'HTTP 404' in (exc.stderr or ''):
             return
         raise
     if group.get('name') != operation['drain_group_name'] or group.get('default') or group.get('inherited'):
         raise RuntimeError('Refusing to remove a drain group with changed identity')
-    if pages(api(org, 'GET', path + '/runners', paginate=True), 'runners'):
+    if pages(request(org, 'GET', path + '/runners', paginate=True), 'runners'):
         raise RuntimeError('Drain group still contains runners')
-    api(org, 'DELETE', path)
+    request(org, 'DELETE', path)

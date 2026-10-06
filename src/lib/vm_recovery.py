@@ -113,7 +113,7 @@ def record_loss_restoration_target(vms, state, state_path):
 def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
     """Share a persisted restoration target with price recovery; launch each deficit once."""
     from .spot_runner_autoscaler import (begin_host_operation, reconcile_prices,
-                                        write_scale_state)
+                                        write_scale_state,protected_heavy_routes,runner_inventory_stale,heavy_route_capacity_hold)
 
     pending = state.get('pending_vm_recovery', {})
     if not pending:
@@ -125,6 +125,10 @@ def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
         if record.get('_cleanup_complete'):
             continue
         vm = vm_from_record(record)
+        if runner_inventory_stale(state) or any(
+                item.instance_id==vm.instance_id for item in protected_heavy_routes(vms,runners,state)):
+            LOG.warning('Lost-host recovery held: live heavy route or stale runner inventory')
+            return True
         begin_host_operation('recovery', vm, runners,
                              [vm, *[other for other in vms if other.name != vm.name]], state, state_path,
                              recovery_key=key)
@@ -137,5 +141,8 @@ def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
         return True  # Finish this cleanup and deregistration before touching another host.
     if getattr(args,'scaling_mode','resource')=='tiered':
         return False  # Tier orchestration now owns exact-topology restoration.
+    protected_heavy_routes(vms,runners,state)
+    if heavy_route_capacity_hold(state) or runner_inventory_stale(state):
+        return False
     reconcile_prices(vms, runners, args, state, state_path)
     return True

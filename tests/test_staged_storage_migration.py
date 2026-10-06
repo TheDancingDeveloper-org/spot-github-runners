@@ -2,6 +2,7 @@ import copy
 import json
 import tempfile
 import unittest
+import time
 from dataclasses import asdict,replace
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +14,16 @@ from lib.runner_fleet import GceVm,GitHubRunner
 
 
 class StagedStorageMigrationTests(unittest.TestCase):
+    def poll_host_operation(self,*args):
+        # These controls supply a newly mocked complete roster for each poll,
+        # bypassing _run_controller(), which stamps the real API response.
+        args[3]['runner_inventory_observed_at']=time.time()
+        return controller.reconcile_host_operation(*args)
+
+    def poll_lost_vms(self,*args):
+        args[3]['runner_inventory_observed_at']=time.time()
+        return controller.reconcile_lost_vms(*args)
+
     def setUp(self):
         verified_disks=patch('lib.vm_recovery.cleanup_lost_vm',return_value=True)
         verified_disks.start();self.addCleanup(verified_disks.stop)
@@ -48,6 +59,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
         return vm
 
     def refresh(self,tick):
+        self.state['runner_inventory_observed_at']=tick  # New mocked poll supplies self.runners.
         for row in self.state['latest_resources']:row['observed_at']=tick
         for row in self.state['host_health'].values():row['observed_at']=tick
 
@@ -99,7 +111,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
              patch('lib.tier_controller.evidence_for',return_value=(None,None,3100)),\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=3100):
-            controller.reconcile_host_operation(self.hosts,[],self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,[],self.args,self.state,self.path)
             delete.assert_not_called()
         self.assertEqual(self.state['host_operation']['vm']['instance_id'],'2')
         self.state['latest_resources'][0]['peak_cpu_cores']=11.7
@@ -109,7 +121,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
              patch.object(controller,'builder_ready',return_value=True),\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=3100):
-            controller.reconcile_host_operation(self.hosts,[],self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,[],self.args,self.state,self.path)
             # No registered destination runners means readiness proof must hold.
             delete.assert_not_called()
 
@@ -121,7 +133,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
              patch.object(controller,'list_github_runners',return_value=self.runners),\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=3100):
-            controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
             delete.assert_not_called()
         self.assertNotIn('host_operation',self.state)
         self.assertEqual(self.state['migration']['paused_retirement'],saved)
@@ -132,7 +144,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
     def test_confirmed_early_absence_launches_second_within_64_cpu_then_waits_for_both(self):
         self.staged();self.state['host_operation'].update(kind='delete',drained=True)
         self.hosts=[vm for vm in self.hosts if vm.instance_id!='2']
-        controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+        self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
         self.assertIn('2',self.state['migration']['completed_retirements'])
         self.state['latest_resources']=[row for row in self.state['latest_resources'] if row['instance_id']!='2']
         offer=SimpleNamespace(total_daily_usd=Decimal('2.9'))
@@ -177,7 +189,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
              patch.object(controller,'builder_ready',return_value=True),\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=3100):
-            controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
             inventory.assert_called_once();evidence.assert_called_once()
             delete.assert_called_once()
             self.assertEqual(asdict(delete.call_args.args[0]),operation['vm'])
@@ -194,7 +206,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
              patch.object(controller,'quiesce_remote_builder') as quiesce,\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=3100):
-            controller.reconcile_host_operation(self.hosts,runners,self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,runners,self.args,self.state,self.path)
             drain.assert_called_once();self.assertTrue(drain.call_args.args[-1][0].busy)
             quiesce.assert_not_called();delete.assert_not_called()
         self.assertEqual(self.state['host_operation']['kind'],'drain')
@@ -214,7 +226,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
                      patch('lib.tier_controller.evidence_for',return_value=(None,None,3100)),\
                      patch.object(controller,'write_scale_state',side_effect=write),\
                      patch('lib.fleet_migration.time.time',return_value=3100):
-                    with self.assertRaises(OSError):controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                    with self.assertRaises(OSError):self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
                 restarted=json.loads(self.path.read_text())
                 self.assertEqual(restarted['host_operation']['vm']['instance_id'],saved['vm']['instance_id'])
                 if fail_at==2:self.assertEqual(restarted['migration']['paused_retirement'],restarted['host_operation'])
@@ -223,7 +235,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
                      patch.object(controller,'list_github_runners',return_value=self.runners),\
                      patch('lib.tier_controller.evidence_for',return_value=(None,None,3100)),\
                      patch('lib.fleet_migration.time.time',return_value=3100):
-                    controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                    self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
                 self.assertNotIn('host_operation',self.state)
                 self.assertEqual(self.state['migration']['paused_retirement']['vm']['instance_id'],'2')
 
@@ -236,7 +248,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
              patch.object(controller,'list_github_runners',return_value=self.runners),\
              patch('lib.tier_controller.evidence_for',return_value=(None,None,3100)),\
              patch('lib.fleet_migration.time.time',return_value=3100):
-            controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
         # A real cleanup receipt remains a barrier until every recorded disk is absent.
         self.state['pending_vm_recovery']={'old':dict(self.state['migration']['sources'][0],_cleanup_complete=False)}
         with patch.object(controller,'scale_up') as launch:
@@ -274,7 +286,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
             self.assertTrue(migration.guard_staged_retirement(self.hosts,self.runners,self.args,self.state,self.path))
         self.state['host_operation'].pop('staged_retirement')
         with patch.object(controller,'delete_drained_vm') as delete:
-            controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
             delete.assert_not_called()
 
     def test_final_incomplete_duplicate_or_missing_replacement_receipt_holds(self):
@@ -346,13 +358,13 @@ class StagedStorageMigrationTests(unittest.TestCase):
                 self.setUp();self.staged();self.state['host_operation'].update(kind='delete',drained=True)
                 self.hosts=[vm for vm in self.hosts if vm.instance_id!='2']
                 self.state['latest_resources']=[row for row in self.state['latest_resources'] if row['instance_id']!='2']
-                controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
                 self.add_destination('4');self.reconcile(3400);self.reconcile(3700)
                 self.assertEqual(self.state['host_operation']['vm']['instance_id'],'1')
                 self.state['host_operation'].update(kind='delete',drained=True)
                 self.hosts=[vm for vm in self.hosts if vm.instance_id!='1']
                 self.state['latest_resources']=[row for row in self.state['latest_resources'] if row['instance_id']!='1']
-                controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
                 self.state=json.loads(self.path.read_text())
                 self.assertEqual(set(self.state['migration']['completed_retirements']),{'1','2'})
                 self.refresh(4000)

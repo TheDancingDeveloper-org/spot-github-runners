@@ -114,6 +114,8 @@ class SequentialScalingTests(unittest.TestCase):
         commands = []
         def command(args, **kwargs):
             commands.append(args[:4])
+            if args[:2]==['gh','api']:
+                return SimpleNamespace(returncode=0,stdout=json.dumps([{'total_count':0,'runners':[]}]),stderr='')
             if args[:3] == ['gcloud', 'compute', 'zones']:
                 return SimpleNamespace(returncode=0, stdout='asia-south2-a\nasia-south2-b\n')
             if args[:4] == ['gcloud', 'compute', 'instances', 'delete']:
@@ -128,7 +130,7 @@ class SequentialScalingTests(unittest.TestCase):
                 patch('lib.spot_runner_autoscaler.list_gcloud_vms', side_effect=inventory):
             self.assertEqual(controller.scale_up(3, [offer, offer], self.args, state, self.path), 0)
         self.assertEqual(commands[-1], ['gcloud', 'compute', 'instances', 'delete'])
-        self.assertEqual(len(commands), 3)  # Zones, one manager run, then deletion; no second zone yet.
+        self.assertEqual(len(commands), 4)  # Zones, manager, fresh runner inventory, deletion; no second zone.
         self.assertIn('host_operation', state)
         self.assertIn(f"asia-south2-a/{state['host_operation']['vm']['name']}", state['intentional_deletions'])
 
@@ -261,6 +263,8 @@ class SequentialScalingTests(unittest.TestCase):
         state = {}
         present = []
         def command(args, **kwargs):
+            if args[:2]==['gh','api']:
+                return SimpleNamespace(returncode=0,stdout=json.dumps([{'total_count':0,'runners':[]}]),stderr='')
             if args[:3] == ['gcloud', 'compute', 'zones']:
                 return SimpleNamespace(returncode=0, stdout='asia-south2-a\n')
             if args[:4] == ['gcloud', 'compute', 'instances', 'delete']:

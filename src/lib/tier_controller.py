@@ -74,6 +74,11 @@ def check_tiers(vms,runners,args,state,state_path):
     from . import spot_runner_autoscaler as controller
     fleet=controller.spot_instances(vms)
     evidence,signals,timestamp=evidence_for(vms,runners,args,state)
+    controller.protected_heavy_routes(vms,runners,state)
+    if controller.heavy_route_capacity_hold(state) or controller.runner_inventory_stale(state):
+        LOG.warning('Tier changes held: protected heavy route or stale runner inventory; metrics retained')
+        controller.write_scale_state(state_path,state)
+        return
     if state.get('migration'):
         reconcile_migration(vms,runners,args,state,state_path)
         controller.write_scale_state(state_path,state)

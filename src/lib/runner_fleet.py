@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -96,7 +97,10 @@ class ScaleOutPlan:
 
 def _command_json(args: Sequence[str]) -> object:
     try:
-        result = subprocess.run(args, check=True, text=True, capture_output=True)
+        strict={'env':dict(os.environ,CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR='false')} if len(args)>1 and args[1]=='compute' else {}
+        result = subprocess.run(args, check=True, text=True, capture_output=True,timeout=60,**strict)
+        if strict and result.stderr.strip():
+            raise RuntimeError('Provider inventory returned diagnostics; completeness unknown')
     except FileNotFoundError as exc:
         raise RuntimeError(f"Required command not found: {args[0]}") from exc
     except subprocess.CalledProcessError as exc:
@@ -124,37 +128,42 @@ def count_active_github_runners(
 
 def list_github_runners(org: str = "swack-tools", *, gh_binary: str = "gh") -> tuple[GitHubRunner, ...]:
     """List all organization self-hosted runners using the authenticated gh command-line tool."""
-    command = [
-        gh_binary,
-        "api",
-        "--paginate",
-        f"orgs/{org}/actions/runners",
-        "--jq",
-        ".runners[] | @json",
-    ]
+    command = [gh_binary, "api", "--paginate", "--slurp",
+               f"orgs/{org}/actions/runners?per_page=100"]
     try:
-        result = subprocess.run(command, check=True, text=True, capture_output=True)
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Required command not found: {gh_binary}") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout).strip()
-        raise RuntimeError(f"Unable to list GitHub runners for {org}: {detail}") from exc
+        result = subprocess.run(command, check=True, text=True, capture_output=True, timeout=60)
+        if result.stderr.strip():raise ValueError("GitHub inventory diagnostic")
+        pages=json.loads(result.stdout)
+        if not isinstance(pages,list) or not pages or not isinstance(pages[0],dict):
+            raise ValueError("Missing runner pages")
+        total=pages[0].get('total_count')
+        if type(total) is not int or total<0:raise ValueError("Invalid runner total")
+        items=[]
+        for page in pages:
+            if (not isinstance(page,dict) or page.get('total_count')!=total
+                or not isinstance(page.get('runners'),list)):
+                raise ValueError("Incomplete runner page")
+            items.extend(page['runners'])
+        if (len(items)!=total or len(pages)!=max(1,(total+99)//100)
+            or any(len(page['runners'])!=min(100,max(0,total-index*100))
+                   for index,page in enumerate(pages))):
+            raise ValueError("Partial runner inventory")
+        runners=[];seen=set()
+        for item in items:
+            if (not isinstance(item,dict) or type(item.get('id')) is not int
+                or item['id'] in seen or type(item.get('name')) is not str
+                or item.get('status') not in ('online','offline')
+                or type(item.get('busy')) is not bool or not isinstance(item.get('labels'),list)
+                or any(not isinstance(label,dict) or type(label.get('name')) is not str
+                       for label in item['labels'])):
+                raise ValueError("Malformed or duplicate runner")
+            seen.add(item['id'])
+            runners.append(GitHubRunner(item['id'],item['name'],item['status'],item['busy'],
+                                        tuple(label['name'] for label in item['labels'])))
+        return tuple(runners)
+    except (FileNotFoundError,subprocess.SubprocessError,ValueError,TypeError,KeyError) as exc:
+        raise RuntimeError(f"Complete GitHub runner inventory unavailable for {org}") from exc
 
-    runners: list[GitHubRunner] = []
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            continue
-        item = json.loads(line)
-        runners.append(
-            GitHubRunner(
-                runner_id=int(item["id"]),
-                name=str(item["name"]),
-                status=str(item.get("status", "unknown")),
-                busy=bool(item.get("busy", False)),
-                labels=tuple(str(label["name"]) for label in item.get("labels", [])),
-            )
-        )
-    return tuple(runners)
 
 
 def list_gcloud_vms(

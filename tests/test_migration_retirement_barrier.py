@@ -2,6 +2,7 @@ import copy
 import json
 import tempfile
 import unittest
+import time
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,16 @@ def host(name,cpu,ram,identity):
 
 
 class MigrationRetirementBarrierTests(unittest.TestCase):
+    def poll_host_operation(self,*args):
+        # These controls supply a newly mocked complete roster for each poll,
+        # bypassing _run_controller(), which stamps the real API response.
+        args[3]['runner_inventory_observed_at']=time.time()
+        return controller.reconcile_host_operation(*args)
+
+    def poll_lost_vms(self,*args):
+        args[3]['runner_inventory_observed_at']=time.time()
+        return controller.reconcile_lost_vms(*args)
+
     def setUp(self):
         verified_disks=patch('lib.vm_recovery.cleanup_lost_vm',return_value=True)
         verified_disks.start();self.addCleanup(verified_disks.stop)
@@ -29,6 +40,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
         self.runners=[GitHubRunner(i,f'gha-{self.large.name}-{i}','online',False,()) for i in range(1,9)]
 
     def evidence(self,tick):
+        self.state['runner_inventory_observed_at']=tick  # New mocked poll supplies self.runners.
         self.state['latest_workload']={'complete':True}
         self.state['latest_resources']=[dict(instance_id=vm.instance_id,zone=vm.zone,observed_at=tick,windows=6,
             peak_cpu_cores=1,peak_ram_gib=2,cpu_fraction=.1,memory_fraction=.1,io_complete=True,
@@ -55,7 +67,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
              patch.object(controller,'quiesce_remote_builder',return_value=True),\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=1600):
-            controller.reconcile_host_operation(self.hosts,[],self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,[],self.args,self.state,self.path)
         delete.assert_not_called()
         self.assertNotIn('host_operation',self.state)
         self.assertEqual(self.state['migration']['paused_retirement']['vm']['instance_id'],'2')
@@ -111,7 +123,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
                      patch.object(controller,'builder_ready',return_value=True),\
                      patch.object(controller,'delete_drained_vm') as delete,\
                      patch('lib.fleet_migration.time.time',return_value=1600):
-                    for _ in range(2):controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                    for _ in range(2):self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
                 delete.assert_not_called()
                 self.assertGreaterEqual(provider.call_count,1);self.assertEqual(provider.call_count,telemetry.call_count)
 
@@ -124,7 +136,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
              patch('lib.tier_controller.evidence_for',return_value=(None,None,1600)),\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=1600):
-            controller.reconcile_host_operation(self.hosts,[],self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,[],self.args,self.state,self.path)
         delete.assert_not_called();self.assertNotIn('host_operation',self.state)
         self.state=json.loads(self.path.read_text())
         self.state['pending_vm_recovery']={'lost':dict(instance_id='1',_cleanup_complete=False)}
@@ -156,7 +168,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
              patch.object(controller,'builder_ready',return_value=True),\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=2200):
-            controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
         delete.assert_called_once();self.assertEqual(delete.call_args.args[0].instance_id,'2')
 
     def test_recorded_same_boot_global_source_can_retire_only_as_larger_ram_oom_response(self):
@@ -239,15 +251,16 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
              patch('lib.tier_controller.evidence_for',return_value=(None,None,1600)),\
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=1600):
-            controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
         delete.assert_not_called();self.assertNotIn('host_operation',self.state)
         self.state=json.loads(self.path.read_text())
         with patch('lib.vm_recovery.cleanup_lost_vm',return_value=True) as cleanup,\
-             patch.object(controller,'scale_up') as launch:
-            controller.reconcile_lost_vms(self.hosts,self.runners,self.args,self.state,self.path)
+             patch.object(controller,'scale_up') as launch,\
+             patch('lib.fleet_migration.time.time',return_value=1600):
+            self.poll_lost_vms(self.hosts,self.runners,self.args,self.state,self.path)
             self.assertEqual(self.state['host_operation']['kind'],'recovery')
             self.assertEqual(cleanup.call_args.args[0].instance_id,'3')
-            controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+            self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
             self.assertNotIn('host_operation',self.state)
             self.assertTrue(all(record.get('_cleanup_complete') for record in self.state['pending_vm_recovery'].values()))
             with patch('lib.fleet_migration.time.time',return_value=1600),patch.object(controller,'builder_ready',return_value=True):
@@ -258,6 +271,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
         self.assertEqual(self.state['host_operation']['vm']['instance_id'],'2')
 
     def fresh_evidence(self,tick):
+        self.state['runner_inventory_observed_at']=tick  # Fresh mocked API roster for this poll.
         from datetime import datetime,timezone
         from job_coverage_fixtures import complete_job_tracking
         self.state['job_tracking']=complete_job_tracking(self.args.org+'/oxidex',datetime.fromtimestamp(tick,timezone.utc).isoformat())
@@ -291,7 +305,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
              patch.object(controller,'delete_drained_vm') as delete,\
              patch('lib.fleet_migration.time.time',return_value=1600):
             # refreshed() calls the real evidence function, only provider/SSH inputs are mocked.
-            controller.reconcile_host_operation(stale,self.runners,self.args,self.state,self.path)
+            self.poll_host_operation(stale,self.runners,self.args,self.state,self.path)
         delete.assert_not_called();self.assertNotIn('host_operation',self.state)
         self.assertEqual(next(iter(self.state['pending_vm_recovery'].values()))['instance_id'],'3')
         self.assertEqual(self.state['migration']['paused_retirement']['vm']['instance_id'],'2')
@@ -312,7 +326,9 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
         self.state=json.loads(json.dumps(self.state));self.hosts=[new]
         self.runners=[GitHubRunner(i,f'gha-{new.name}-{i}','online',False,()) for i in range(1,9)]
         self.state['host_deployments']['z/3']=dict(tier='large',expected_runner_count=8,runner_memory_gib=15)
-        controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+        self.state['runner_inventory_observed_at']=1600
+        with patch('lib.fleet_migration.time.time',return_value=1600):
+            self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
         self.state=json.loads(self.path.read_text())
         for tick,builder in ((1900,False),(2200,True),(2500,True)):
             self.fresh_evidence(tick)
@@ -333,7 +349,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
                 migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
         operation=self.state['host_operation'];operation.update(kind='delete',drained=True)
         self.hosts=[sibling,self.large]
-        controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+        self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
         self.state=json.loads(self.path.read_text());source=self.state['migration']['sources'][0]
         saved=copy.deepcopy(self.state)
         self.assertTrue(migration.source_absence_proven(source,self.state))
@@ -362,7 +378,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
             with self.subTest(defect=defect):
                 self.setUp();self.removal()
                 self.state['host_operation'].update(kind='delete',drained=True);self.hosts=[self.large]
-                controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                self.poll_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
                 self.state=json.loads(self.path.read_text());self.fresh_evidence(1600)
                 if defect=='jobs':self.state['latest_workload']['complete']=False
                 if defect=='io':self.state['latest_resources'][0]['io_complete']=False
