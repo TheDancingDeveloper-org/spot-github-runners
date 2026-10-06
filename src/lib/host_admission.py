@@ -23,6 +23,10 @@ LEDGER_ROOT = Path('/var/lib/gha-admission')
 BENCHMARK_CONFIG = None
 
 
+class OrphanRunnerHook(ValueError):
+    """The requesting hook has outlived its GitHub-assigned Worker."""
+
+
 def lock_file(path):
     return open(path,'a',opener=lambda name,flags:os.open(name,flags|os.O_NOFOLLOW,0o600))
 
@@ -160,6 +164,13 @@ def observed_builder_envelope(config):
         raise ValueError('Malformed aggregate builder evidence') from error
 
 
+def legacy_owner_for_worker(owner):
+    match=re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)',owner)
+    if match is None:
+        raise ValueError('Invalid Worker lease identity')
+    return f'container:{match[1]}:{match[2]}'
+
+
 class LeasePool:
     def __init__(self,path,limit_gib,*,alive,capacity=None,owner_kind=None,retain=None,removal_fence=None):
         self.path = Path(path)
@@ -183,7 +194,11 @@ class LeasePool:
                 raise ValueError('Unknown/legacy builder reservation')
         return len(requested)<=1 and sum(requested.values())<=self.limit
 
-    def _change(self,owner,amount):
+    def _change(self,owner,amount,legacy_owner=None):
+        if legacy_owner is not None:
+            if (self.capacity is not None or self.retain is not None
+                or legacy_owner!=legacy_owner_for_worker(owner)):
+                raise ValueError('Invalid runner lease transition')
         self.path.parent.mkdir(parents=True,exist_ok=True)
         # Lock a separate inode: the data file is atomically replaced.
         fd = os.open(str(self.path)+'.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
@@ -195,8 +210,16 @@ class LeasePool:
             # is distinct from liveness, and only explicit cleanup unprotects it.
             protected={key for key,value in rows.items() if self.retain is not None and self.retain(key,value)}
             rows = {key:value for key,value in rows.items() if key in protected or self.alive(key)}
+            # An upgraded hook names the Worker while an older daemon may
+            # have reserved the same persistent container. Transfer/release
+            # that exact row under this one ledger lock, with no double count.
+            legacy_value=rows.pop(legacy_owner,None) if legacy_owner is not None else None
             accepted = True
-            if amount is None:
+            if amount is not None and legacy_value is not None and legacy_value!=amount:
+                # A container may still have its old, larger memory cap.
+                # Never reduce its aggregate reservation by renaming the row.
+                accepted=False
+            elif amount is None:
                 if owner in protected:raise ValueError('Owned maintenance cleanup proof required before release')
                 rows.pop(owner,None)
             elif owner in rows:
@@ -205,6 +228,8 @@ class LeasePool:
                 rows[owner] = amount
             else:
                 accepted = False
+            if not accepted and legacy_value is not None:
+                rows[legacy_owner]=legacy_value
             temporary = self.path.with_suffix('.tmp')
             fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
             with os.fdopen(fd,'w') as target:
@@ -227,6 +252,14 @@ class LeasePool:
     def release(self,owner):
         self._change(owner,None)
 
+    def acquire_runner(self,owner,amount):
+        if not math.isfinite(amount) or not 0 < amount <= self.limit:
+            raise ValueError('Request exceeds host memory budget')
+        return self._change(owner,amount,legacy_owner_for_worker(owner))
+
+    def release_runner(self,owner):
+        self._change(owner,None,legacy_owner_for_worker(owner))
+
     def refresh(self):
         # Reclaim only independently dead owners, never another live lease.
         self._change(None,None)
@@ -235,6 +268,57 @@ class LeasePool:
 def process_identity(pid):
     stat = Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
     return f'host:{pid}:{stat[19]}'
+
+
+def process_record(pid):
+    root = Path(f'/proc/{pid}')
+    stat = (root/'stat').read_text().rsplit(')',1)[1].split()
+    return int(stat[1]),stat[19],(root/'comm').read_text().strip(),(root/'cgroup').read_text()
+
+
+def runner_cgroup(cgroup):
+    ids = re.findall(r'(?:docker[-/])([a-f0-9]{64})(?:\.scope)?',cgroup)
+    return next(iter(set(ids))) if len(set(ids)) == 1 else None
+
+
+def worker_owner(pid,container_id,container_started):
+    """Bind a hook to its live Worker, not its persistent runner container."""
+    seen=set()
+    for _ in range(32):
+        if pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        try:
+            parent,start,comm,cgroup=process_record(pid)
+        except FileNotFoundError as error:
+            raise OrphanRunnerHook('Runner hook lost its Worker ancestry') from error
+        if runner_cgroup(cgroup)!=container_id:
+            raise OrphanRunnerHook('Runner hook left its container')
+        if comm=='Runner.Worker':
+            return f'runner:{container_id}:{container_started}:{pid}:{start}'
+        pid=parent
+    raise OrphanRunnerHook('Runner hook has no live Worker ancestor')
+
+
+def legacy_runner_idle(record):
+    """Reclaim old container leases only on a complete baseline-only process list."""
+    container_id=record['Id']
+    output=subprocess.run(['/usr/bin/docker','top',container_id,'-eo','pid,comm'],
+                          check=True,capture_output=True,text=True,timeout=10).stdout.splitlines()
+    if not output or output[0].split()!=['PID','COMMAND']:
+        return False
+    rows=[line.split() for line in output[1:]]
+    if (len(rows)!=3 or any(len(row)!=2 or not row[0].isdigit() for row in rows)
+        or {row[1] for row in rows}!={'run.sh','run-helper.sh','Runner.Listener'}):
+        return False
+    pids={comm:int(pid) for pid,comm in rows}
+    if record['State'].get('Pid')!=pids['run.sh']:
+        return False
+    for comm,parent in (('run-helper.sh','run.sh'),('Runner.Listener','run-helper.sh')):
+        actual_parent,_,actual_comm,cgroup=process_record(pids[comm])
+        if actual_parent!=pids[parent] or actual_comm!=comm or runner_cgroup(cgroup)!=container_id:
+            return False
+    return True
 
 
 def docker_identity(container):
@@ -246,6 +330,19 @@ def docker_identity(container):
 
 def owner_alive(owner):
     try:
+        if owner.startswith('runner:'):
+            match=re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)',owner)
+            if match is None:
+                return True
+            container_id,container_started,pid,start=match.groups()
+            try:
+                _,actual_start,comm,cgroup=process_record(int(pid))
+            except FileNotFoundError:
+                return False
+            if comm!='Runner.Worker' or actual_start!=start or runner_cgroup(cgroup)!=container_id:
+                return False
+            actual,row=docker_identity(container_id)
+            return actual==f'container:{container_id}:{container_started}'
         kind,identity,start = owner.split(':',2)
         if kind == 'host':
             if process_identity(int(identity)) == owner:
@@ -253,10 +350,17 @@ def owner_alive(owner):
             return builders_running()  # PID reuse cannot free a surviving build.
         row=json.loads(subprocess.run(['/usr/bin/docker','inspect',identity],
             check=True,capture_output=True,text=True,timeout=10).stdout)[0]
-        return (row['State']['Running'] and row['Id']==identity
-                and row['State']['StartedAt']==start)
+        if not (row['State']['Running'] and row['Id']==identity
+                and row['State']['StartedAt']==start):
+            return False
+        # Old versions used the lifetime of a persistent runner container as
+        # the lease lifetime. Keep any uncertain process; only a complete
+        # baseline-only inventory proves its old job has ended.
+        return not legacy_runner_idle(row)
     except (OSError,ValueError,KeyError,IndexError,subprocess.SubprocessError):
-        if owner.startswith('host:'):
+        if owner.startswith(('host:','runner:')):
+            if owner.startswith('runner:'):
+                return True  # Unknown Docker/process state is not proof of idleness.
             return builders_running()
         try:
             rows=subprocess.run(['/usr/bin/docker','ps','-a','--no-trunc','--format','{{.ID}}'],
@@ -379,13 +483,13 @@ def peer_owner(pid,uid,config):
     if uid != 1001:
         raise ValueError('Unauthorized admission peer')
     cgroup = Path(f'/proc/{pid}/cgroup').read_text()
-    ids = re.findall(r'(?:docker[-/])([a-f0-9]{64})(?:\.scope)?',cgroup)
-    if len(set(ids)) != 1:
+    identity = runner_cgroup(cgroup)
+    if identity is None:
         raise ValueError('Runner must belong to a Docker cgroup')
-    owner,row = docker_identity(ids[0])
+    _,row = docker_identity(identity)
     if row['Name'].lstrip('/') not in config['runner_names']:
         raise ValueError('Container is outside this runner deployment')
-    return owner,'runner'
+    return worker_owner(pid,identity,row['State']['StartedAt']),'runner'
 
 
 def request(action,kind='runner'):
@@ -395,6 +499,8 @@ def request(action,kind='runner'):
         client.sendall((json.dumps(dict(action=action,kind=kind))+'\n').encode())
         client.shutdown(socket.SHUT_WR)
         response = json.loads(client.recv(4096))
+    if isinstance(response,dict) and response.get('code')=='orphaned-runner-hook':
+        raise OrphanRunnerHook(response.get('error','Runner hook lost its Worker ancestry'))
     if 'error' in response:
         raise RuntimeError(response['error'])
     return response['accepted']
@@ -457,7 +563,8 @@ def serve():
                     builders_present=builders_running()
                     if message['action'] == 'release':
                         if kind!='builder' or not builders_present:
-                            pool.release(owner)
+                            if kind=='runner':pool.release_runner(owner)
+                            else:pool.release(owner)
                         accepted = True
                     elif message['action'] == 'acquire':
                         if limit<config[kind+'_gib'] or (kind == 'builder' and (LOCK_ROOT/'oxidex-build-draining').exists()):
@@ -477,12 +584,23 @@ def serve():
                                     retain.canary_grant.observe(actor)
                                     return role
                                 pool.owner_kind=benchmark_owner
-                            accepted = pool.acquire(owner,config[kind+'_gib'])
+                            accepted = (pool.acquire_runner(owner,config[kind+'_gib']) if kind=='runner'
+                                        else pool.acquire(owner,config[kind+'_gib']))
+                            if accepted and kind=='runner' and not owner_alive(owner):
+                                # The Worker may have exited between peer
+                                # authentication and the ledger write.
+                                pool.release_runner(owner)
+                                accepted=False
                     else:
                         raise ValueError('Unknown admission action')
                     answer = dict(accepted=accepted)
                 except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as exc:
                     answer = dict(error=str(exc)[:200])
+                    if isinstance(exc,OrphanRunnerHook):
+                        answer['code']='orphaned-runner-hook'
+                        # Old container clients decode only the error string.
+                        # The upgraded completed hook recognizes this prefix.
+                        answer['error']='ORPHAN_RUNNER_HOOK: '+str(exc)[:180]
                 try:
                     client.sendall(json.dumps(answer).encode())
                 except OSError:

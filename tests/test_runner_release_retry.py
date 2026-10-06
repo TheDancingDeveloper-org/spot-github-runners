@@ -31,7 +31,7 @@ class RunnerReleaseRetryTests(unittest.TestCase):
             if isinstance(reply,Exception):raise reply
             client=MagicMock();client.__enter__.return_value=client;client.recv.return_value=reply
             clients.append(client);return client
-        with patch('runpy.run_path',return_value={'request':host_admission.request}),\
+        with patch('runpy.run_path',return_value={'request':host_admission.request,'OrphanRunnerHook':host_admission.OrphanRunnerHook}),\
              patch.object(host_admission.socket,'socket',side_effect=socket),\
              patch('time.sleep',side_effect=delays.append),redirect_stderr(io.StringIO()):
             exec(self.program(),{})
@@ -59,7 +59,7 @@ class RunnerReleaseRetryTests(unittest.TestCase):
                 waiting.append(seconds)
                 self.assertEqual(len(requests),1)
                 self.assertEqual(json.loads(pool.path.read_text()),{})
-            with patch('runpy.run_path',return_value={'request':host_admission.request}),\
+            with patch('runpy.run_path',return_value={'request':host_admission.request,'OrphanRunnerHook':host_admission.OrphanRunnerHook}),\
                  patch.object(host_admission.socket,'socket',side_effect=socket),\
                  patch('time.sleep',side_effect=retry),redirect_stderr(io.StringIO()):
                 exec(self.program(),{})
@@ -69,10 +69,48 @@ class RunnerReleaseRetryTests(unittest.TestCase):
     def test_long_daemon_outage_does_not_drop_the_release_obligation(self):
         request=MagicMock(side_effect=[OSError('restoring')]*25+[True])
         output=io.StringIO()
-        with patch('runpy.run_path',return_value={'request':request}),patch('time.sleep') as sleep,redirect_stderr(output):
+        with patch('runpy.run_path',return_value={'request':request,'OrphanRunnerHook':host_admission.OrphanRunnerHook}),patch('time.sleep') as sleep,redirect_stderr(output):
             exec(self.program(),{})
         self.assertEqual(request.call_count,26);self.assertEqual(sleep.call_count,25)
         self.assertEqual(len(output.getvalue().splitlines()),3,'retry diagnostics must remain rate limited')
+
+    def test_orphan_response_is_terminal_and_never_runs_stale_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);events=root/'events.json';events.write_text('[]')
+            driver=root/'python3'
+            driver.write_text('#!'+sys.executable+'\n'+'''import json,os,runpy,sys
+from pathlib import Path
+p=Path(os.environ['TEST_RELEASE_EVENTS'])
+values=json.loads(p.read_text());values.append('cleanup' if sys.argv[1].endswith('gha-runner-clean-target.py') else 'release');p.write_text(json.dumps(values))
+class OrphanRunnerHook(ValueError):pass
+def request(action):raise OrphanRunnerHook('Runner hook has no live Worker ancestor')
+runpy.run_path=lambda *args,**kwargs:{'request':request,'OrphanRunnerHook':OrphanRunnerHook}
+exec(sys.stdin.read(),{})
+''')
+            driver.chmod(0o755)
+            result=subprocess.run(['bash',str(ROOT/'runner/job-completed.sh')],
+                env={**os.environ,'PATH':str(root)+os.pathsep+os.environ.get('PATH',''),
+                     'TEST_RELEASE_EVENTS':str(events),'GHA_ADMISSION_REQUIRED':'1'},
+                capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,75,result.stderr)
+            self.assertEqual(json.loads(events.read_text()),['release'])
+
+    def test_tagged_orphan_protocol_preserves_generic_retry_errors(self):
+        client=MagicMock();client.__enter__.return_value=client
+        client.recv.return_value=b'{"code":"orphaned-runner-hook","error":"Runner hook has no live Worker ancestor"}'
+        with patch.object(host_admission.socket,'socket',return_value=client):
+            with self.assertRaises(host_admission.OrphanRunnerHook):
+                host_admission.request('release')
+
+    def test_upgraded_hook_exits_on_terminal_prefix_from_old_client(self):
+        request=MagicMock(side_effect=RuntimeError('ORPHAN_RUNNER_HOOK: Runner hook has no live Worker ancestor'))
+        with patch('runpy.run_path',return_value={'request':request}), \
+             patch('time.sleep') as sleep,redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as status:
+                exec(self.program(),{})
+        self.assertEqual(status.exception.code,75)
+        request.assert_called_once_with('release')
+        sleep.assert_not_called()
 
     def test_complete_shell_hook_runs_cleanup_only_after_ack_and_preserves_opt_out(self):
         for required,expected in [('1',['release','retry','release','cleanup']),('0',['cleanup'])]:
@@ -90,7 +128,8 @@ def request(action):
 if sys.argv[1].endswith('gha-runner-clean-target.py'):
     event('cleanup')
 else:
-    runpy.run_path=lambda *args,**kwargs:{'request':request}
+    class OrphanRunnerHook(ValueError):pass
+    runpy.run_path=lambda *args,**kwargs:{'request':request,'OrphanRunnerHook':OrphanRunnerHook}
     time.sleep=lambda seconds:event('retry')
     exec(sys.stdin.read(),{})
 ''')

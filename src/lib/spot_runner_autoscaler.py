@@ -671,7 +671,8 @@ try:
             else:
                 for name,before in records.items():
                     identity=before['Id']
-                    if any(owner.startswith('container:'+identity+':') for owner in rows):
+                    if any(owner.startswith(prefix+identity+':')
+                           for owner in rows for prefix in ('container:','runner:')):
                         if before['HostConfig']['Memory']<next_limit*GIB:
                             pending_runner_ids.append(identity)
                         continue  # Preserve active/stale lease amounts and caps.

@@ -101,6 +101,17 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
         self.assertEqual(result['receipt']['reserved_gib'],8)
         self.assertEqual(result['receipt']['pending_runner_ids'],['a'*64])
 
+    def test_worker_bound_job_keeps_original_cap_and_reservation(self):
+        worker='runner:'+'a'*64+':2026-10-04T00:00:00Z:123:456'
+        leases={worker:2}
+        result=self.run_program(leases=leases)
+        self.assertEqual(result['status'],75)
+        self.assertEqual(result['ledger'],leases)
+        self.assertEqual(result['records']['r1']['HostConfig'],dict(Memory=2*GIB,MemorySwap=4*GIB))
+        self.assertEqual(result['records']['r2']['HostConfig']['Memory'],4*GIB)
+        self.assertEqual(result['updates'],['b'*64])
+        self.assertEqual(result['receipt']['pending_runner_ids'],['a'*64])
+
     def test_controller_retains_seen_oom_until_a_second_pass_observes_all_caps(self):
         from lib import spot_runner_autoscaler as controller
         from lib import tier_controller
