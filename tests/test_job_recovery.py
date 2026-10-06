@@ -44,11 +44,12 @@ class FakeGitHub:
         if '/actions/jobs/' in endpoint:
             return copy.deepcopy(self.job)
         if '/jobs' in endpoint:
-            return [{'jobs': copy.deepcopy(self.jobs)}] if paginate else {'jobs': copy.deepcopy(self.jobs)}
+            return [{'total_count':len(self.jobs),'jobs': copy.deepcopy(self.jobs)}] if paginate else {'total_count':len(self.jobs),'jobs': copy.deepcopy(self.jobs)}
         if '/actions/runs/7' in endpoint:
             return copy.deepcopy(self.run)
         if '/actions/runs?' in endpoint:
-            return [{'workflow_runs': [copy.deepcopy(self.run)]}]
+            matches=parse_qs(urlparse(endpoint).query)['status'][0]==self.run['status']
+            return [{'total_count':int(matches),'workflow_runs': [copy.deepcopy(self.run)] if matches else []}]
         raise AssertionError(endpoint)
 
     def post(self, endpoint):
@@ -81,7 +82,7 @@ class FilteredGitHub(FakeGitHub):
             matches = query['status'][0] == self.run['status']
             if 'created' in query:
                 matches = matches and job_recovery.instant(self.created) >= job_recovery.instant(query['created'][0][2:])
-            return [{'workflow_runs': [copy.deepcopy(self.run)] if matches else []}]
+            return [{'total_count':int(matches),'workflow_runs': [copy.deepcopy(self.run)] if matches else []}]
         if '/actions/runs/' in endpoint and '/jobs' not in endpoint:
             return copy.deepcopy(self.run)
         return super().get(endpoint, paginate=paginate)

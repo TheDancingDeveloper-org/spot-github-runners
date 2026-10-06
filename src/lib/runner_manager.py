@@ -29,6 +29,7 @@ from .log_format import configure_logging, error_detail, single_line
 from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, JOB_COMPLETED, RUNNER_DOCKERFILE,
                             RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
+from .builder_assets import BUILDER_DOCKERFILE, BUILDER_ENTRYPOINT, HOST_LAUNCHER
 
 ROOT = Path(__file__).resolve().parents[2]
 PROJECT = "homelab-424523"
@@ -100,12 +101,39 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--registration-timeout-seconds", type=int, default=1200,
                         help="Fail when bootstrap has not finished this long after deployment starts")
     parser.add_argument("--apply", action="store_true", help="Run provisioning and startup-script deployment")
+    parser.add_argument('--remote-builder', action='store_true', help='Install dedicated Rust 1.97.1 remote builder and CI tools')
+    parser.add_argument('--resource-monitoring', action='store_true', help='Install metrics-only Ops Agent memory monitoring')
+    parser.add_argument('--tier', choices=('small','starting','expanded','large','bulky'))
+    parser.add_argument('--tier-slots',type=int)
+    parser.add_argument('--tier-job-memory-gib',type=float,default=15,
+                        help='Per-job cap/reservation; default 15 GiB is a verified compatible workload cap, not a measured peak')
+    parser.add_argument('--host-overhead-gib',type=float,default=2)
     return parser
 
 
 def select_sizing(args: argparse.Namespace) -> None:
+    if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
+        raise RuntimeError('Remote builders require a tier host with shared memory admission')
     configure_storage(args)
     configure_cpu_platform(args)
+    if getattr(args,'tier',None):
+        from .runner_tiers import TIERS
+        from .host_admission import admission_budget
+        tier = TIERS[args.tier]
+        if (args.cpu,args.ram) != (tier.vcpu,tier.ram_gib):
+            raise RuntimeError('Tier shape does not match requested host')
+        args.runner_count = args.tier_slots or tier.initial_slots
+        budget = admission_budget(tier,args.host_overhead_gib,args.tier_job_memory_gib,slots=args.runner_count)
+        args.admission_work_gib = budget['work_gib']
+        args.runner_memory_gb = args.tier_job_memory_gib
+        args.runner_cpu = 0
+        args.fixed_runner_sizing = False
+        args.builder_memory_gib = min(int(args.ram*.4),int(budget['work_gib']))
+        if args.max_total_daily_usd is None or args.max_total_daily_usd > tier.max_daily_usd:
+            args.max_total_daily_usd = tier.max_daily_usd
+        if len(f'{args.runner_prefix}-{args.instance_name}-{args.runner_count}') > 64:
+            raise RuntimeError('GitHub runner name exceeds64 characters')
+        return
     if not args.fixed_runner_sizing:
         if args.cpu < 4:
             raise RuntimeError("At least 4 host vCPUs are required for one runner")
@@ -156,6 +184,9 @@ def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:
         configure_storage(args)
         args.storage_monthly_usd = monthly
         total_daily = hourly * 24 + monthly_to_daily(monthly)
+        args.verified_price=dict(compute_daily_usd=str(hourly*24),storage_daily_usd=str(monthly_to_daily(monthly)),
+                                total_daily_usd=str(total_daily),quoted_at=time.time(),
+                                boot_disk_type=boot,data_disk_type=data,boot_gib=40,data_gib=args.disk_size_gb)
         LOG.info('Live total estimate: %s; $%.6f/day compute + $%.6f/day storage = $%.6f/day total',
                  deployment_details(args), hourly * 24, monthly_to_daily(monthly), total_daily)
         if args.max_total_daily_usd is not None and total_daily >= args.max_total_daily_usd:
@@ -213,7 +244,12 @@ def cleanup_orphan_runner_disks(zone: str) -> list[str]:
 
 
 def render_startup(args: argparse.Namespace, token: str, group_name: str, deployment_id: str) -> str:
+    if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
+        raise RuntimeError('Remote builders require a tier host with shared memory admission')
     source = STARTUP_SCRIPT
+    tiered = bool(getattr(args,'tier',None))
+    admission_source = Path(__file__).with_name('host_admission.py').read_bytes()
+    evidence_source = Path(__file__).with_name('host_evidence.py').read_bytes()
     replacements = {
         "DISK_DEVICE": f"/dev/disk/by-id/google-{args.disk_device_name}",
         "DOCKERFILE_B64": base64.b64encode(RUNNER_DOCKERFILE.encode()).decode("ascii"),
@@ -221,7 +257,7 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "JOB_COMPLETED_B64": base64.b64encode(JOB_COMPLETED.encode()).decode("ascii"),
         "CLEAN_TARGET_B64": base64.b64encode(CLEAN_TARGET.encode()).decode("ascii"),
         "RUNNER_VERSION": "2.337.0",
-        "ORG": ORG,
+        "ORG": getattr(args,'org',ORG),
         "RUNNER_LABELS": f"{args.runner_label},{args.instance_type},{args.region}",
         "RUNNER_GROUP": group_name,
         "RUNNER_PREFIX": args.runner_prefix,
@@ -231,6 +267,19 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "RUNNER_CPU_LIMIT": str(args.runner_cpu) if getattr(args, "fixed_runner_sizing", False) else "",
         "INSTANCE_NAME": args.instance_name,
         "DEPLOYMENT_ID": deployment_id,
+        "REMOTE_BUILDER": '1' if getattr(args, 'remote_builder', False) else '0',
+        "RESOURCE_MONITORING": '1' if getattr(args, 'resource_monitoring', False) else '0',
+        "BUILDER_DOCKERFILE_B64": base64.b64encode(BUILDER_DOCKERFILE.encode()).decode('ascii'),
+        "BUILDER_ENTRYPOINT_B64": base64.b64encode(BUILDER_ENTRYPOINT.encode()).decode('ascii'),
+        "HOST_LAUNCHER_B64": base64.b64encode(HOST_LAUNCHER.encode()).decode('ascii'),
+        "BUILDER_CPUS": str(max(1, getattr(args, 'cpu', 32) - 4)),
+        "BUILDER_MEMORY_GIB": str(getattr(args,'builder_memory_gib',max(1, getattr(args, 'ram', 128) - 24))),
+        "ADMISSION_B64":base64.b64encode(admission_source).decode(),
+        "DOCKER_ADMISSION_B64":base64.b64encode((ROOT/'builder/docker-admission.py').read_bytes()).decode(),
+        "EVIDENCE_B64":base64.b64encode(evidence_source).decode(),
+        "JOB_STARTED_B64":base64.b64encode((ROOT/'runner/job-started.sh').read_bytes()).decode(),
+        "TIERED":'1' if tiered else '0',
+        "ADMISSION_WORK_GIB":str(getattr(args,'admission_work_gib',0)),
     }
     for key, value in replacements.items():
         source = source.replace("{{" + key + "}}", value)
@@ -248,7 +297,11 @@ def write_deployment_receipt(args: argparse.Namespace, vm: GceVm) -> None:
     path = args.deployment_receipt
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as temp:
-        json.dump(asdict(vm), temp)
+        record = asdict(vm)
+        record.update(expected_runner_count=args.runner_count,tier=getattr(args,'tier',None),
+                      admission_work_gib=getattr(args,'admission_work_gib',None),
+                      runner_memory_gib=args.runner_memory_gb,price=getattr(args,'verified_price',None))
+        json.dump(record, temp)
         temp.flush()
         os.fsync(temp.fileno())
         temporary = Path(temp.name)

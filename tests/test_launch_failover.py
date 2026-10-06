@@ -153,6 +153,21 @@ class LaunchFailoverTests(unittest.TestCase):
         self.assertEqual(len(deleted), 1)
         self.assertIn(f'us-west4-a/{deleted[0]}', state['intentional_deletions'])
 
+    def test_tier_image_bootstrap_deadline_matches_actual_builder_install(self):
+        offer=replace(candidate('us-west4-a','n4-standard-16'),vcpu=16,ram_gib=64,hourly_usd=.095)
+        self.args.scaling_mode='tiered';self.args.launch_tier='large'
+        self.cloud.outcomes={'us-west4-a':'uncertain'}
+        for enabled,deadline in ((True,2400),(False,600)):
+            with self.subTest(remote_builder=enabled):
+                self.args.remote_builder=enabled
+                state={};self.cloud.commands.clear()
+                controller.scale_up(1,[offer],self.args,state,self.path)
+                self.assertEqual(state['host_operation']['deadline_seconds'],deadline)
+                command=next(c for c in self.cloud.commands if '--registration-timeout-seconds' in c)
+                self.assertEqual('--remote-builder' in command,enabled)
+                self.assertEqual(command[command.index('--registration-timeout-seconds')+1],str(deadline))
+                self.cloud.vms.clear();self.cloud.runners.clear();self.cloud.disks.clear()
+
     def test_uncertain_launch_holds_until_the_deadline_then_cleans_up(self):
         first, second = candidate('us-west4-a'), candidate('us-west4-b')
         self.cloud.outcomes = {'us-west4-a': 'uncertain'}
@@ -160,7 +175,11 @@ class LaunchFailoverTests(unittest.TestCase):
         self.assertEqual(controller.scale_up(1, [first, second], self.args, state, self.path, refresh=lambda: [first, second]), 0)
         self.assertEqual(state['host_operation']['kind'], 'launch')
         self.assertEqual(self.cloud.launched, ['us-west4-a'])
-        self.clock[0] += controller.LAUNCH_DEADLINE_SECONDS - 60
+        self.assertEqual(state['host_operation']['deadline_seconds'], 600)
+        command=next(c for c in self.cloud.commands if '--registration-timeout-seconds' in c)
+        self.assertNotIn('--remote-builder',command)
+        self.assertEqual(command[command.index('--registration-timeout-seconds')+1],'600')
+        self.clock[0] += state['host_operation']['deadline_seconds'] - 60
         self.assertTrue(controller.reconcile_host_operation([], [], self.args, state, self.path))
         self.assertIn('host_operation', state)
         self.clock[0] += 120

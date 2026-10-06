@@ -1,4 +1,4 @@
-"""Compare compatible boot and runner disks using full monthly charges."""
+"""Price the cheapest boot disk and SSD-backed build data within strict caps."""
 from decimal import Decimal
 from .billing_catalog import catalog_skus, unit_price
 from .machine_profiles import machine_profile
@@ -62,9 +62,9 @@ def cheapest_storage(machine_type: str, size_gib: int, rates: dict) -> tuple[str
         raise RuntimeError(f'Unsupported storage machine type {machine_type}')
     modern = profile.disk_type == 'hyperdisk-balanced'
     boot_types = ['hyperdisk-balanced'] if modern else ['pd-standard', 'pd-balanced', 'pd-ssd']
-    data_types = list(boot_types)
-    if size_gib >= 2048 and machine_type.split('-', 1)[0] in {'c4', 'c4d', 'n4', 'n4d', 'n2', 'n2d'}:
-        data_types.append('hyperdisk-throughput')
+    # Cargo caches and concurrent CI have random IO. Cheap spinning PD and
+    # sequential-throughput Hyperdisk are not substitutes for this data floor.
+    data_types = ['hyperdisk-balanced'] if modern else ['pd-balanced','pd-ssd']
     def choose(kinds, size):
         choices = []
         for kind in kinds:
@@ -98,3 +98,24 @@ def observed_storage_monthly(disks, rates: dict) -> Decimal:
                                    iops=int(disk.get('provisionedIops', 3000)),
                                    throughput=int(disk.get('provisionedThroughput', 140)))
     return total
+
+
+def observed_data_storage(disks,device_name,minimum_size_gib):
+    """Return healthy / incompatible / incomplete from exact attached data evidence."""
+    data=[disk for disk in disks or [] if disk.get('deviceName')==device_name and disk.get('boot') is False]
+    if len(data)!=1:return 'incomplete'
+    disk=data[0]
+    if not disk.get('source') or not disk.get('diskId'):return 'incomplete'
+    kind=disk.get('diskType')
+    try:
+        size=int(disk['diskSizeGb'])
+        if size<=0:return 'incomplete'
+        if kind not in ('pd-standard','pd-balanced','pd-ssd','hyperdisk-balanced','hyperdisk-throughput'):
+            return 'incomplete'
+        if size<minimum_size_gib or kind in ('pd-standard','hyperdisk-throughput'):
+            return 'incompatible'
+        if kind=='hyperdisk-balanced':
+            if 'provisionedIops' not in disk or 'provisionedThroughput' not in disk:return 'incomplete'
+            if int(disk['provisionedIops'])<3000 or int(disk['provisionedThroughput'])<140:return 'incompatible'
+    except (KeyError,TypeError,ValueError,OverflowError):return 'incomplete'
+    return 'healthy'

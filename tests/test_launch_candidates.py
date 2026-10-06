@@ -87,11 +87,11 @@ class LaunchCandidateTests(unittest.TestCase):
         platforms = {'region-a': ['Intel Ice Lake']}
         quotas = inventory().region_quotas['region']
         selected, _ = launchable_candidates(ranked(n2), inventory(platforms_by_zone=platforms,
-            region_quotas={'region': {**quotas, 'DISKS_TOTAL_GB': (4096.0, 4000.0)}}), 100)
-        self.assertEqual(selected, [])  # pd-standard boot 40 GiB + data 100 GiB do not fit.
+            region_quotas={'region': {**quotas, 'DISKS_TOTAL_GB': (4096.0, 4060.0)}}), 100)
+        self.assertEqual(selected, [])  # The 40 GiB standard boot does not fit.
         selected, _ = launchable_candidates(ranked(n2), inventory(platforms_by_zone=platforms,
             region_quotas={'region': {**quotas, 'SSD_TOTAL_GB': (0.0, 0.0)}}), 100)
-        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected, [])  # Balanced data requires 100 GiB SSD quota.
 
     def test_spot_vms_use_preemptible_cpu_quota_when_the_project_has_one(self):
         quotas = {**inventory().region_quotas['region'], 'CPUS': (0.0, 0.0), 'PREEMPTIBLE_CPUS': (64.0, 0.0)}

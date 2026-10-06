@@ -23,3 +23,28 @@ def vm_count_for_floor(current_runners: int, minimum_runners: int, runners_per_v
         raise ValueError("runner counts must be nonnegative and capacities must be positive")
     deficit = max(0, minimum_runners - current_runners)
     return math.ceil(deficit / runners_per_vm)
+
+
+def resource_decision(samples, state: dict, timestamp: float) -> str:
+    """Two distinct five-minute checks: either >75% grows, all <75% shrinks.
+
+    Unknown data breaks the streak; equality holds. Never mask a hot node
+    with a fleet average. Caller enforces lifecycle, price and host bounds.
+    """
+    if not samples or any(not math.isfinite(v) or not 0 <= v <= 1
+                          for pair in samples for v in pair):
+        state.clear()
+        return 'wait'
+    previous = state.get('timestamp')
+    if previous is not None and timestamp - previous < 300:
+        return 'wait'
+    direction = ('up' if any(cpu > .75 or memory > .75 for cpu, memory in samples)
+                 else 'down' if all(cpu < .75 and memory < .75 for cpu, memory in samples)
+                 else 'wait')
+    streak = state.get('streak', 0) + 1 if (state.get('direction') == direction
+             and previous is not None and timestamp - previous <= 450) else 1
+    state.update(timestamp=timestamp, direction=direction, streak=streak)
+    if direction != 'wait' and streak >= 2:
+        state['streak'] = 0
+        return direction
+    return 'wait'

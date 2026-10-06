@@ -6,14 +6,18 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
       perl cpanminus libarchive-zip-perl zlib1g-dev libzstd-dev libarchive-dev ca-certificates unzip zip xz-utils \
       zstd \
     && rm -rf /var/lib/apt/lists/* \
-    && install -d -o runner -g runner /runner-state /work
+    && install -d -o runner -g runner /runner-state /work \
+    && install -m 0444 /dev/null /run/oxidex-spot-runner
 COPY entrypoint.sh /usr/local/bin/gha-runner-entrypoint
 COPY job-completed.sh /usr/local/bin/gha-runner-job-completed.sh
+COPY job-started.sh /usr/local/bin/gha-runner-job-started.sh
+COPY host_admission.py /usr/local/bin/gha-host-admission.py
 COPY clean_target.py /usr/local/bin/gha-runner-clean-target.py
-RUN chmod 0755 /usr/local/bin/gha-runner-entrypoint /usr/local/bin/gha-runner-job-completed.sh
+RUN chmod 0755 /usr/local/bin/gha-runner-job-started.sh /usr/local/bin/gha-runner-entrypoint /usr/local/bin/gha-runner-job-completed.sh
 USER runner
 WORKDIR /work
 ENV RUNNER_STATE=/runner-state
 ENV OXIDEX_CLEAN_TARGET=1
+ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh
 ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh
 ENTRYPOINT ["/usr/local/bin/gha-runner-entrypoint"]

@@ -12,50 +12,139 @@ for the two ARM64 runners through the OrbStack socket.
 
 ## How the fleet works
 
-```mermaid
-flowchart TD
-    A[Read jobs, runners, VMs and prices] --> P{Host operation pending?}
-    P -- Yes --> W[Continue launch, drain or deletion confirmation]
-    W --> A
-    P -- No --> R{Loss cleanup or price replacement pending?}
-    R -- Yes --> S[Clean, delete or launch one host]
-    S --> A
-    R -- No --> B{Busy share above 50% and at most 25 workers?}
-    B -- Yes --> C[Launch one host]
-    C --> A
-    B -- No --> E{Below 50% busy for two checks?}
-    E -- Yes --> F[Drain one idle host]
-    F --> A
-    E -- No --> A
+The installed controller can use `--scaling-mode tiered` to choose VM size and
+runner density from complete five-minute CPU/RAM windows, compatible queued job
+waits, successful job timings and host/container OOM events. It changes one host
+at a time. Missing evidence holds optimization. Two hot windows grow capacity;
+six low windows and projected peak demand are required before shrinking. A new
+host OOM bypasses the debounce; a container-only OOM increases its memory limit
+on an idle host before adding compute.
+
+| Tier | vCPU | RAM GiB | Initial / maximum slots | Daily cap including all disks |
+| --- | ---: | ---: | ---: | ---: |
+| small | 4 | 16 | 4 / 8 | $0.60 |
+| starting | 8 | 16 | 8 / 8 | $1.25 |
+| expanded | 8 | 32 | 8 / 16 | $1.25 |
+| large | 16 | 64 | 20 / 20 | $3.00 |
+| bulky | 32 | 128 | 16 / 20 | $4.50 |
+
+Price must be strictly below the tier cap. Normal queue growth follows
+16, 16+4, 16+8, 16+16, and repeats the small tail up to five hosts. Measured CPU
+or memory pressure can instead expand a 16-vCPU host to 32 vCPU. The fleet stays
+within five hosts, 80 vCPU and 100 registered slots, including replacement overlap.
+The reverse ladder reaches one 4-vCPU host. Queues with resource headroom increase
+slots first. Registered slots are distinct from admitted simultaneous jobs.
+
+All runners share CPU weights. A root-owned memory admission service reserves
+space for host processes and listeners, admits each CI job in its pre-job hook,
+and shares its ledger with dedicated remote build containers. Docker/cgroup OOM
+events are distinct from whole-host OOM; exit 137 alone is insufficient evidence.
+The CI containers have no host Docker socket. Docker-specific workflow jobs and
+native ARM64 jobs retain their separate placement requirements.
+
+Replacement records retain exact provider VM and disk identities. A replacement
+must register its expected runner names and pass two complete healthy windows and
+a real builder canary before the source is isolated in a GitHub runner group with
+no repository access. Already assigned jobs finish admission and execution. Drain
+waits for fresh idle runners, completed tracked jobs, absent runner registrations,
+and no active remote build before deleting the exact VM and its attached disks.
+A five-host fleet holds replacement until measured remaining capacity permits a
+safe drain first. Price-driven replacements follow these same readiness gates.
+
+Use `--migrate-oversized` for gradual conversion of an existing fleet and
+`--dry-run --once --scaling-mode tiered` for provider/state read-only planning.
+`--scaling-mode resource` retains the former uniform-host CPU/RAM policy;
+`--scaling-mode legacy` retains runner-occupancy scaling. The existing CLI default
+is `resource`; deployment must explicitly select `tiered`.
+
+Memory telemetry requires the VM service account to have
+`roles/monitoring.metricWriter` and the Monitoring write scope. Provisioning
+installs the metrics-only Ops Agent when resource monitoring is enabled; CPU
+utilization comes from the built-in Compute Engine metric.
+
+## Remote Rust builds
+
+Install Cargo command shims directly from this checkout:
+
+```bash
+python3 src/install_remote_commands.py
 ```
 
-The autoscaler scales the GCP Spot fleet with observed job usage. Docker builds
-run on GitHub-hosted workers, so Spot runners no longer receive the `docker`
-label or host Docker socket. GitHub adds the standard `self-hosted`, `Linux`,
-and `X64` labels to Spot runners, which also receive `spot` and optional machine
-and region labels. Separate `oxidex-m4air` runners remain managed by their own
-configuration. The autoscaler changes one host at a time and checks again
-every five minutes. When more than half of the online GCP runners are busy and 25 or fewer are online, it adds one
-Spot VM. It waits for that host's eight runner slots to be online, then checks
-fresh utilization before another change. Lower demand cancels further scale-up.
-When fewer than half are busy for two consecutive checks, it drains one host
-and waits for both the VM and its assigned GitHub runner records to be absent.
-It repeats the two-check debounce before another reduction, keeping at least
-one Spot VM. It selects a host only after observing all eight runner slots online
-and idle. It removes all custom scheduling labels and moves the host's runners into a temporary
-group with no repository access. This also blocks assignments using GitHub's
-built-in labels. Existing jobs can finish while the host remains running.
-Fresh observations must show every runner idle and every tracked CI job
-completed before deregistration. The controller then requires a fresh inventory
-with all assigned runner records absent and verifies the VM identity before
-deleting it and its attached disks. It removes the empty temporary group after
-confirming VM absence. GitHub group and label management require organization
-self-hosted runner write permissions through `gh`.
-Each added host contributes eight Spot runner containers. The VM budget includes
-compute and boot/data disk capacity and provisioned performance charges. Network
-use is billed separately.
+The shims run `src/auto_remote_build.py` and `src/cargo_remote.py` from this
+repository. Worker selection is in `src/lib/worker_selection.py`; source sync
+and execution are in `src/lib/remote_build.py`. Keep this checkout in place.
+`oxidex-ops` stores build evidence, not executable copies of these scripts.
 
-Every loop fetches current regional Spot prices and checks each running managed
+
+The configured laptop checkout supports `just build-debug` and
+`just build-release`. Both invoke the automatic worker selector, export
+`OXIDEX_REMOTE_INSTANCE`/`OXIDEX_REMOTE_ZONE` for that invocation, then run
+`cargo remote-build` through SSH. The older external selector considers running
+`oxidex-runners-*` and `oxidex-buildbench-*` VMs; OxiDex uses its repository-owned
+client, whose runner-only routing is coordinated separately, ranks complete CPU/memory
+windows by available capacity (free cores and free RAM at four GiB per core),
+and requires both utilizations below 75%. An SSH probe verifies the dedicated
+builder is installed and the host is not draining. Job/build counts do not
+influence placement. Every attempt refreshes inventory and CPU/RAM metrics.
+SSH disconnects, killed containers and draining hosts trigger reselection on
+another VM, source resync and a fresh build, with three attempts by default
+(`cargo remote-debug --max-attempts 5` overrides this). Compiler and header
+validation errors stop immediately. Missing metrics or no eligible VM are
+reported explicitly. Selection is not an exclusive capacity reservation.
+The downloaded binary is checksum verified and stored in
+`target/remote-linux/debug/oxidex` or `target/remote-linux/release/oxidex`.
+These are Linux executables. The original local all-features release recipe is
+available as `just build-release-local` in the configured OxiDex checkout.
+
+
+New tiered autoscaler hosts install a separate `oxidex-remote-builder:1.97.1` image by
+default (`--no-remote-builder` opts out). Manual provisioning enables it with
+`--tier` and `--remote-builder`; resource and legacy modes do not install an
+unadmitted builder. It inherits the runner's Linux dependencies and adds Rust
+1.97.1, rustfmt, clippy, just, cargo-nextest, cbindgen 0.29.2, uv, Python 3.11,
+rsync and GNU time. GNU ld remains available, matching OxiDex's checked-in linker
+configuration. Checksum-verified Zig 0.15.2 and cargo-zigbuild 0.23.4 support
+x86_64 and ARM64 musl compilation with persistent cross-tool caches. Installation
+reports actual tool versions in the bootstrap log. Darwin SDKs are not installed.
+
+SSH lands on the host. The root-owned `/usr/local/bin/oxidex-remote-build`
+launcher accepts simple worktree identifiers and an allowlist of build commands,
+then runs an unprivileged UID 1001 container without a Docker socket, capabilities
+or privilege escalation. CPU is capped at host vCPU minus four (minimum one). On tier hosts the
+builder memory cap is 40% of RAM, bounded by the admitted work envelope. The
+root-owned `/etc/oxidex-remote-build.json` controls those limits.
+Do not set them above observed host capacity.
+
+Source snapshots are replaced before compilation. Cargo downloads and separate worktree targets persist below
+`/mnt/runner-data/remote-build/{sources,cargo,targets}`. A shared host lock protects
+active builds from utilization scale-down; draining sets a marker under that
+lock to prevent new builds. The container also carries a label so an orphaned
+build is visible to the drain guard. These safeguards do not prevent Spot loss
+or Spot interruptions. Tier price retirement waits for work to drain; the
+older resource/legacy modes retain their forced price eviction behavior.
+
+From the laptop:
+
+```bash
+python3 src/remote_rust_build.py \
+  --source ~/git/oxidex_refactor \
+  --instance YOUR_INSTANCE --zone YOUR_ZONE --project homelab-424523 \
+  --worktree-id oxidex-refactor-YOUR_BRANCH \
+  --evidence-dir ~/oxidex-ops/evidence/remote-build-YOUR_RUN
+```
+
+The client packages current tracked working files, excludes credentials, agent
+configuration and build caches, transfers with `gcloud compute scp`, verifies
+the archive checksum, and fetches dependencies before timing
+`cargo build --release --locked --bin oxidex`. Release builds also run the
+pinned `just cbindgen-check` inside the container before compiling; a header
+mismatch stops the build. Evidence includes source hashes,
+Git revision/status, transfer/fetch/build wall times and GNU time output. Use a
+new worktree identifier for a cold build; reusing one retains its target cache.
+It compiles Linux artifacts, not macOS executables. Git registration and full
+ExifTool qualification are independent of this compilation proof.
+
+In resource/legacy modes, every loop fetches current regional Spot prices and checks each running managed
 VM against `--max-daily-usd` (default: $10 per VM per day for compute and attached storage).
 Prices are shared within one loop for VMs of the same family and region, then
 fetched again on the next loop. The launch price is not a price guarantee.
@@ -93,7 +182,8 @@ its observed free space requires it.
 
 ## Runner sizing
 
-Runner count depends on vCPU capacity: one runner per four vCPU. Reserve
+Manual hosts without `--tier` retain this sizing. Tier hosts use the table and
+shared admission ledger above. For manual hosts, runner count depends on vCPU capacity: one runner per four vCPU. Reserve
 8 GiB of host RAM, then divide the remaining memory evenly:
 
 ```text
@@ -221,7 +311,7 @@ Run one check and scale pass:
 python3 src/spot_runner_autoscaler.py --once
 ```
 
-Run continuously with a target of 25 online runners across the Spot and Docker
+For the older resource/legacy modes, run continuously with a target of 25 online runners across the Spot and Docker
 pools, two Docker hosts, a five-minute interval, and a $10 per-VM daily compute and storage
 cap:
 
@@ -229,7 +319,7 @@ cap:
 python3 src/spot_runner_autoscaler.py
 ```
 
-The autoscaler considers supported x86 Spot offers with exactly 32 vCPU and
+The resource/legacy autoscaler considers supported x86 Spot offers with exactly 32 vCPU and
 at least 110 GiB of RAM that cost less than the daily total cost cap. It prefers
 C4D (AMD Turin), N4D (AMD Turin), C4 (Intel Granite Rapids),
 C4 (Intel Emerald Rapids), N4 (Intel Emerald Rapids), C2D (AMD Milan),
@@ -374,14 +464,14 @@ requests deletion remains eligible for interruption recovery. Deletion retries
 target the same host; stale runner removal after loss requires
 fresh VM absence and offline, idle runner records.
 
-A launch must register all eight runners within 10 minutes of starting.
+A launch must register its expected runner count (eight on legacy hosts) within 10 minutes of starting.
 Healthy hosts take 5 to 8 minutes. The manager stops waiting for bootstrap at
-that deadline. If the controller still sees fewer than eight online runners, or
+that deadline. If the controller still sees fewer than its expected count of online runners, or
 observes a CPU platform below the requested minimum, it deletes the VM with its
 disks and deregisters its runner records. It then records the candidate as failed
-and moves on. A host whose manager already confirmed eight online runners is
+and moves on. A host whose manager already confirmed the expected online runner count is
 exempt, so a runner restart later cannot delete a busy host. If the manager hangs
-past the deadline, the controller keeps the host when GitHub shows all eight
+past the deadline, the controller keeps the host when GitHub shows the expected runner names
 runners online. When a launch request times out and no VM exists, the controller
 waits until the deadline before trusting that absence. Launches saved before
 this deadline existed expire 10 minutes after the controller restarts. A leftover
@@ -447,3 +537,23 @@ jobs to macOS hosts; the Spot VMs in this fleet run Linux. Before changing CI to
 across both pools for 10 minutes, and verify that runner filesystem checks pass.
 Docker build jobs should use
 `runs-on: [self-hosted, linux, x64, docker]`.
+
+## Tier deployment and cache lifetime
+
+Run `python3 src/spot_runner_autoscaler.py --scaling-mode tiered --migrate-oversized`
+with the existing organization, repository list, state and log arguments. Add
+`--dry-run --once` first to inspect evidence and qualifying offers. The launch
+manager rechecks the exact shape and all-disk cost before creation; receipts carry
+the tier, expected runner count, memory envelope and verified price breakdown.
+
+The existing persistent data block device holds Docker storage and the dedicated
+`remote-build` Cargo downloads/targets. Worktree target reuse avoids deleting
+cache on each build; source synchronization must be serialized for a stable
+worktree identifier. This disk persists between builds on that VM. Cache is lost
+when the VM and its auto-deleted disks are retired or interrupted; no cross-VM
+cache survival is claimed. A separate additional cache disk would need to fit
+the same all-disk price cap.
+
+## Dedicated OxiDex builders
+
+For the runner-free Rust 1.99 Spot host, complete startup payload and single-command launch, see [dedicated builder provisioning](docs/dedicated-builders.md). Dedicated builder capacity and cache/draining are separate from GitHub runner hosts.

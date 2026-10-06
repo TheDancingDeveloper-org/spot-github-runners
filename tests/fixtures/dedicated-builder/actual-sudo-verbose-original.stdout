@@ -1,0 +1,10 @@
+Matching Defaults entries for oxidex-uploader on builder-oxidex-rust199-20261005-01:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin, use_pty
+
+User oxidex-uploader may run the following commands on builder-oxidex-rust199-20261005-01:
+
+Sudoers entry: /etc/sudoers.d/oxidex-build
+    RunAsUsers: root
+    Options: !authenticate
+    Commands:
+	/usr/local/bin/oxidex-remote-build

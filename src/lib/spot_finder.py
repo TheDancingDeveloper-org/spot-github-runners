@@ -35,7 +35,9 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
                , billing_api_key: str | None = None
                , runners: int | None = None
                , catalog_rates: dict | None = None
+               , status: dict | None = None
                ) -> tuple[list[Offer], int, int, list[str]]:
+    if status is not None:status.update(complete=False,inventory_complete=False,missing_compute_scopes=[])
     await wait_for_quota_cooldown(auth.project)
     api = AsyncGoogleApi(auth.token, concurrency)
     inventory_started = time.perf_counter()
@@ -54,6 +56,7 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
     if unreachable_zones:
         LOG.warning("aggregated machine inventory could not reach %d zone scope(s): %s",
                     len(unreachable_zones), ", ".join(unreachable_zones[:10]))
+    if status is not None:status['inventory_complete']=not unreachable_zones
     region_names = {item["name"] for item in regions}
     shapes: dict[tuple[str, str], tuple[int, float]] = {}
     shape_zones: dict[tuple[str, str], set[str]] = {}
@@ -79,6 +82,7 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
             debug("qualifying %s/%s: %d vCPU, %.1f GiB", region, machine, vcpu, ram)
 
     if not shapes:
+        if status is not None:status['complete']=not unreachable_zones
         return [], len(region_names), 0, []
 
     offers: list[Offer] = []
@@ -138,6 +142,9 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
     if catalog_rates is not None:
         # Callers that supply catalog rates deploy only catalog-priced shapes.
         log(1, "%d shapes have no catalog Spot price and are excluded", len(missing_spot_prices))
+        if status is not None:
+            status['missing_compute_scopes']=[dict(region=region,machine_type=machine,vcpu=shapes[(region,machine)][0],
+                ram_gib=shapes[(region,machine)][1]) for region,machine in missing_spot_prices]
         missing_spot_prices = []
     pending = missing_spot_prices
     for sweep in range(2):
@@ -196,6 +203,7 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
     debug("completed %d price requests in %.2fs (%.1f requests/s)", completed, elapsed,
           completed / elapsed if elapsed else 0.0)
     offers.sort(key=lambda offer: (offer.hourly_usd, offer.region, offer.machine_type))
+    if status is not None:status['complete']=not unreachable_zones and not errors and not status['missing_compute_scopes']
     return offers[:top], len(region_names), total, errors
 
 

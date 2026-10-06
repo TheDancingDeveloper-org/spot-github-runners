@@ -17,7 +17,8 @@ class RunnerDrainTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / 'state.json'
-        self.args = controller.args_parser().parse_args(['--state-file', str(self.path)])
+        self.args = controller.args_parser().parse_args(['--state-file', str(self.path),
+                                                        '--scaling-mode', 'legacy', '--no-remote-builder'])
         self.vm = GceVm('oxidex-runners-test', 'asia-south2-a', 'RUNNING', 'n2-standard-32', True, instance_id='123')
         self.other = replace(self.vm, name='oxidex-runners-other', instance_id='456')
         self.runners = [GitHubRunner(i, f'gha-{self.vm.name}-{i}', 'online', False,
@@ -39,6 +40,9 @@ class RunnerDrainTests(unittest.TestCase):
         self.external.start()
         self.addCleanup(self.external.stop)
         self.inventory = patch('lib.spot_runner_autoscaler.list_github_runners', side_effect=lambda *a, **k: tuple(self.live))
+        self.builder_guard=patch('lib.spot_runner_autoscaler.quiesce_remote_builder',return_value=True)
+        self.builder_guard.start()
+        self.addCleanup(self.builder_guard.stop)
         self.inventory.start()
         self.addCleanup(self.inventory.stop)
 
@@ -118,6 +122,40 @@ class RunnerDrainTests(unittest.TestCase):
     def reconcile(self, vms=None):
         controller.reconcile_host_operation(vms if vms is not None else [self.vm,self.other],
                                             list(self.live),self.args,self.state,self.path)
+
+    def test_resource_mode_quarantines_builtin_labels_and_checks_remote_builder(self):
+        self.args.scaling_mode='resource'
+        self.args.remote_builder=True
+        with patch('lib.spot_runner_autoscaler.quiesce_remote_builder', return_value=True) as guard:
+            self.begin()
+        guard.assert_called_once()
+        self.assertEqual(self.state['host_operation']['drain_mode'], 'isolated_group')
+        self.assertEqual(self.members, {r.runner_id for r in self.runners})
+        self.assertEqual(self.repo_access, [])
+
+    def test_resource_drain_rechecks_builder_before_provider_delete(self):
+        self.args.scaling_mode='resource';self.args.remote_builder=True
+        with patch('lib.spot_runner_autoscaler.quiesce_remote_builder', return_value=True):
+            self.begin()
+        self.reconcile()
+        with patch('lib.spot_runner_autoscaler.quiesce_remote_builder', return_value=False) as guard:
+            self.reconcile()
+        guard.assert_called_once()
+        self.assertEqual(self.state['host_operation']['kind'], 'drain')
+        self.assertFalse(any(c[:4]==['gcloud','compute','instances','delete'] for c in self.commands))
+
+    def test_disabled_future_builder_install_still_blocks_active_source_drain(self):
+        self.args.remote_builder=False
+        with patch('lib.spot_runner_autoscaler.quiesce_remote_builder',return_value=False) as guard:
+            self.begin()
+            self.assertNotIn('host_operation',self.state)
+        guard.assert_called_once()
+        self.begin();self.reconcile()
+        with patch('lib.spot_runner_autoscaler.quiesce_remote_builder',return_value=False) as guard:
+            self.reconcile()
+        guard.assert_called_once()
+        self.assertEqual(self.state['host_operation']['kind'],'drain')
+        self.assertFalse(any(c[:4]==['gcloud','compute','instances','delete'] for c in self.commands))
 
     def test_labels_are_removed_before_waiting_and_deletion_requires_fresh_absence(self):
         self.begin()

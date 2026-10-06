@@ -24,6 +24,12 @@ class RecoveryTests(unittest.TestCase):
                         disks=({'source': SOURCE, 'boot': True, 'autoDelete': True, 'diskSizeGb': '40', 'diskId': '456'},))
         self.args = args_parser().parse_args(['--project', 'project', '--once'])
 
+    def test_cleaned_tier_loss_returns_control_without_legacy_price_actions(self):
+        args=args_parser().parse_args(['--scaling-mode','tiered'])
+        state={'pending_vm_recovery':{'z/name':{'_cleanup_complete':True,'_target_recorded':True}}}
+        with patch('lib.spot_runner_autoscaler.reconcile_prices',side_effect=AssertionError('legacy side effect')):
+            self.assertFalse(vm_recovery.reconcile_lost_vms([],[],args,state,Path('/tmp/unused')))
+
     def run_cleanup(self, instances, disks):
         calls = []
         def command(args, **kwargs):

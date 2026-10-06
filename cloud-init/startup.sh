@@ -19,7 +19,7 @@ Dir::State::lists "$MOUNT_POINT/apt/lists";
 Dir::Cache "$MOUNT_POINT/apt/cache";
 EOF
 
-required_packages=(ca-certificates curl gnupg git jq xfsprogs util-linux)
+required_packages=(ca-certificates curl gnupg git jq xfsprogs util-linux rsync)
 missing_packages=()
 for package in "${required_packages[@]}"; do
   dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing_packages+=("$package")
@@ -73,12 +73,91 @@ rm -rf /var/lib/containerd/* /var/lib/docker/* /var/lib/apt/lists/* /var/cache/a
 apt-get clean
 
 install -d -m 0755 /opt/gha-runners/build
+RESOURCE_MONITORING={{RESOURCE_MONITORING}}
+if [[ "$RESOURCE_MONITORING" == 1 ]]; then
+  curl --proto '=https' --tlsv1.2 -fsS https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o /run/install-ops-agent.sh
+  bash /run/install-ops-agent.sh --also-install
+  rm /run/install-ops-agent.sh
+  cat >/etc/google-cloud-ops-agent/config.yaml <<'METRICS'
+logging:
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: []
+metrics:
+  receivers:
+    hostmetrics:
+      type: hostmetrics
+      collection_interval: 60s
+  processors:
+    metrics_filter:
+      type: exclude_metrics
+      metrics_pattern:
+        - agent.googleapis.com/cpu/*
+        - agent.googleapis.com/disk/*
+        - agent.googleapis.com/interface/*
+        - agent.googleapis.com/network/*
+        - agent.googleapis.com/swap/*
+        - agent.googleapis.com/processes/*
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [hostmetrics]
+        processors: [metrics_filter]
+METRICS
+  systemctl restart google-cloud-ops-agent
+fi
 printf '%s' '{{DOCKERFILE_B64}}' | base64 -d >/opt/gha-runners/build/Dockerfile
 printf '%s' '{{ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/build/entrypoint.sh
 printf '%s' '{{JOB_COMPLETED_B64}}' | base64 -d >/opt/gha-runners/build/job-completed.sh
 printf '%s' '{{CLEAN_TARGET_B64}}' | base64 -d >/opt/gha-runners/build/clean_target.py
+printf '%s' '{{ADMISSION_B64}}' | base64 -d >/opt/gha-runners/build/host_admission.py
+printf '%s' '{{JOB_STARTED_B64}}' | base64 -d >/opt/gha-runners/build/job-started.sh
+printf '%s' '{{EVIDENCE_B64}}' | base64 -d >/opt/gha-runners/host_evidence.py
+TIERED={{TIERED}}
+if [[ "$TIERED" == 1 ]]; then
+  install -d -m 0755 /run/gha-admission
+  cp /opt/gha-runners/build/host_admission.py /opt/gha-runners/host_admission.py
+  printf '%s' '{{DOCKER_ADMISSION_B64}}' | base64 -d >/usr/local/bin/docker
+  chmod 0755 /usr/local/bin/docker
+  python3 - <<'ADMISSION_CONFIG'
+import json, socket
+names = ['{{RUNNER_PREFIX}}-'+socket.gethostname().split('.')[0]+'-'+str(i) for i in range(1,{{RUNNER_COUNT}}+1)]
+with open('/etc/gha-admission.json','w') as target:
+    json.dump(dict(work_gib={{ADMISSION_WORK_GIB}},runner_gib={{RUNNER_MEMORY_GB}},builder_gib={{BUILDER_MEMORY_GIB}},runner_names=names),target)
+ADMISSION_CONFIG
+  chmod 0644 /etc/gha-admission.json
+  cat >/etc/systemd/system/gha-admission.service <<'ADMISSION_SERVICE'
+[Unit]
+Description=Shared runner and builder memory admission
+After=docker.service
+Requires=docker.service
+[Service]
+ExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+ADMISSION_SERVICE
+  systemctl daemon-reload
+  systemctl enable --now gha-admission
+  for attempt in $(seq 1 30); do [[ ! -S /run/gha-admission/socket ]] || break; sleep 1; done
+  [[ -S /run/gha-admission/socket ]] || exit 1
+fi
 chmod 0755 /opt/gha-runners/build/entrypoint.sh
 docker build --pull -t oxidex-self-hosted-runner:{{RUNNER_VERSION}} /opt/gha-runners/build
+
+REMOTE_BUILDER={{REMOTE_BUILDER}}
+if [[ "$REMOTE_BUILDER" == 1 ]]; then
+  install -d -m 0755 /opt/gha-runners/builder
+  printf '%s' '{{BUILDER_DOCKERFILE_B64}}' | base64 -d >/opt/gha-runners/builder/Dockerfile
+  printf '%s' '{{BUILDER_ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/builder/entrypoint.py
+  printf '%s' '{{HOST_LAUNCHER_B64}}' | base64 -d >/usr/local/bin/oxidex-remote-build
+  chmod 0755 /usr/local/bin/oxidex-remote-build
+  printf '%s\n' '{"cpus":{{BUILDER_CPUS}},"memory_gib":{{BUILDER_MEMORY_GIB}}}' >/etc/oxidex-remote-build.json
+  chmod 0644 /etc/oxidex-remote-build.json
+  docker build -t oxidex-remote-builder:1.97.1 /opt/gha-runners/builder
+fi
 
 ORG_URL=https://github.com/{{ORG}}
 RUNNER_LABELS='{{RUNNER_LABELS}}'
@@ -116,6 +195,9 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     --name "$name" -e RUNNER_NAME="$name" -e RUNNER_LABELS="$runner_labels" \
     -e RUNNER_GROUP_NAME="$RUNNER_GROUP" -e GITHUB_RUNNER_URL="$ORG_URL" \
     -e RUNNER_STATE=/runner-state -v "$state:/runner-state" -v "$work:/work")
+  if [[ "$TIERED" == 1 ]]; then
+    docker_args+=(-e GHA_ADMISSION_REQUIRED=1 -v /run/gha-admission:/run/gha-admission:ro)
+  fi
   [[ -z "$RUNNER_CPU_LIMIT" ]] || docker_args+=(--cpus="$RUNNER_CPU_LIMIT")
   docker_args+=(oxidex-self-hosted-runner:{{RUNNER_VERSION}})
   docker run "${docker_args[@]}"

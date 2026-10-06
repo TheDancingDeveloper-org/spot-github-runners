@@ -8,6 +8,18 @@ from lib import spot_runner_autoscaler as controller
 
 
 class StorageSelectionTests(unittest.TestCase):
+    def test_actual_data_floor_distinguishes_cheap_boot_unknown_and_underprovisioned_data(self):
+        from lib.storage_selection import observed_data_storage
+        boot=dict(source='boot',diskId='1',boot=True,deviceName='root',diskType='pd-standard',diskSizeGb=40)
+        data=dict(source='data',diskId='2',boot=False,deviceName='runner-data-example',diskType='pd-balanced',diskSizeGb=100)
+        self.assertEqual(observed_data_storage([boot,data],'runner-data-example',100),'healthy')
+        self.assertEqual(observed_data_storage([boot,{**data,'diskType':'pd-standard'}],'runner-data-example',100),'incompatible')
+        self.assertEqual(observed_data_storage([boot,{**data,'diskId':None}],'runner-data-example',100),'incomplete')
+        hyper={**data,'diskType':'hyperdisk-balanced'}
+        self.assertEqual(observed_data_storage([hyper],'runner-data-example',100),'incomplete')
+        self.assertEqual(observed_data_storage([{**hyper,'provisionedIops':3000,'provisionedThroughput':140}],'runner-data-example',100),'healthy')
+        self.assertEqual(observed_data_storage([{**hyper,'provisionedIops':1000,'provisionedThroughput':140}],'runner-data-example',100),'incompatible')
+
     def test_old_family_defaults_to_standard_pd(self):
         args = manager.args_parser().parse_args(['--max-cost', '.2'])
         manager.select_sizing(args)
@@ -21,8 +33,8 @@ class StorageSelectionTests(unittest.TestCase):
         boot, data, monthly = cheapest_storage('n4-standard-32', 100, rates)
         self.assertEqual((boot, data, monthly), ('hyperdisk-balanced', 'hyperdisk-balanced', Decimal('15.680')))
         boot, data, monthly = cheapest_storage('n4-standard-32', 2048, rates)
-        self.assertEqual((boot, data), ('hyperdisk-balanced', 'hyperdisk-throughput'))
-        self.assertEqual(monthly, Decimal('25.816'))
+        self.assertEqual((boot, data), ('hyperdisk-balanced', 'hyperdisk-balanced'))
+        self.assertEqual(monthly, Decimal('233.856'))
         rates['hyperdisk-throughput:throughput'] = Decimal('20')
         self.assertEqual(cheapest_storage('n4-standard-32', 2048, rates)[1], 'hyperdisk-balanced')
 

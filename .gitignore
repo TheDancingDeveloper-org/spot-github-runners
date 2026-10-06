@@ -27,6 +27,7 @@ venv/
 htmlcov/
 *.log
 .firecrawl/
+/docs/superpowers/
 
 # Python packaging and tooling artifacts
 *.egg

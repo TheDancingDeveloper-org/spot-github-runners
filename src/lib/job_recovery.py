@@ -7,11 +7,13 @@ import logging
 import re
 import subprocess
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor,wait
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 from urllib.parse import urlencode
 
 from .runner_fleet import GceVm
+from .fleet_evidence import ACTIVE_RUN_STATUSES
 
 LOG = logging.getLogger('spot_runner_autoscaler')
 
@@ -88,6 +90,34 @@ class JobRecovery:
         self.data.setdefault('jobs', {})
         self.data.setdefault('runs', {})
         self.data.setdefault('last_poll_by_repository', {})
+        self.scan_complete={}
+
+    def begin_scan(self,repository,now):
+        self.scan_complete[repository]=False
+        self.data.setdefault('active_coverage_by_repository',{})[repository]=dict(
+            schema=1,observed_at=now,complete=False,enumerated_statuses=[],unavailable_run_ids=[])
+        self.save()
+
+    def finish_scan(self,repository):
+        receipt=self.data['active_coverage_by_repository'][repository]
+        receipt['complete']=(self.scan_complete.get(repository) is True and not receipt['unavailable_run_ids']
+                             and receipt.get('inventory_truncated',False) is False)
+
+    @staticmethod
+    def page_rows(pages,field,*,complete=True,capped=False):
+        if not isinstance(pages,list) or not pages:raise ValueError('Missing paginated GitHub scope')
+        totals=[];rows=[]
+        for page in pages:
+            if (not isinstance(page,dict) or type(page.get('total_count')) is not int
+                    or page['total_count']<0 or not isinstance(page.get(field),list)):
+                raise ValueError('Malformed paginated GitHub scope')
+            totals.append(page['total_count']);rows.extend(page[field])
+        if (any(not isinstance(row,dict) or type(row.get('id')) is not int or row['id']<=0 for row in rows)
+                or len({row['id'] for row in rows})!=len(rows)
+                or (complete and (len(set(totals))!=1 or totals[0]!=len(rows)))
+                or (capped and max(totals)>=1000)):
+            raise ValueError('Incomplete or capped paginated GitHub scope')
+        return rows
 
     def poll(self, vms: list[GceVm]) -> None:
         """Keep attribution even if GitHub is unavailable during a VM loss."""
@@ -121,7 +151,10 @@ class JobRecovery:
         posted_runs = set()
         for repository in self.repositories:
             try:
+                self.begin_scan(repository,now)
                 runs, jobs = self._scan(repository, now)
+                from .fleet_evidence import remember_jobs
+                remember_jobs(self.data, repository, runs, jobs, now)
                 self._remember(repository, jobs, current, previous, now)
                 self.save()
                 for key, record in list(self.data['jobs'].items()):
@@ -145,6 +178,7 @@ class JobRecovery:
                     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
                         LOG.warning('Crash-job investigation is pending for %s: %s', one_line(record['job'].get('html_url', '')), error_text(exc))
                 self.data['last_poll_by_repository'][repository] = now
+                self.finish_scan(repository)
                 self.save()
             except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
                 LOG.warning('Job tracking for %s is pending; retrying next loop: %s', repository, error_text(exc))
@@ -153,15 +187,24 @@ class JobRecovery:
         lookback = self.data['last_poll_by_repository'].get(repo) or self.data.get('last_poll_at') or (instant(now) - timedelta(hours=1)).isoformat()
         # In-progress enumeration includes older runs; tracked jobs keep their
         # run IDs even when the run completes outside the discovery window.
-        queries = [{'status': 'in_progress', 'per_page': 100},
+        receipt=self.data['active_coverage_by_repository'][repo]
+        queries = [dict(status=status,per_page=100) for status in ACTIVE_RUN_STATUSES]+[
                    {'status': 'completed', 'per_page': 100,
                     'created': '>=' + (instant(lookback) - timedelta(minutes=10)).isoformat()}]
+        endpoints=[f'repos/{repo}/actions/runs?{urlencode(query)}' for query in queries]
+        # Only readonly API calls run concurrently. Wait for every submitted
+        # scope before publishing any partial batch or mutating saved ledgers.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures=[pool.submit(self.api.get,endpoint,paginate=True) for endpoint in endpoints]
+            wait(futures)
+            responses=[future.result() for future in futures]
         runs = {}
-        for query in queries:
-            pages = self.api.get(f'repos/{repo}/actions/runs?{urlencode(query)}', paginate=True)
-            for page in pages:
-                for run in page['workflow_runs']:
-                    runs[run['id']] = run
+        for query,pages in zip(queries,responses):
+            active=query['status'] in ACTIVE_RUN_STATUSES
+            for run in self.page_rows(pages,'workflow_runs',complete=active,capped=active):
+                if run.get('status')!=query['status']:raise ValueError('Workflow run status differs from enumerated scope')
+                runs[run['id']] = run
+            if active:receipt['enumerated_statuses'].append(query['status'])
         tracked_ids = {record['run_id'] for record in self.data['runs'].values()
                        if record['repository'] == repo}
         tracked_ids.update(record['job']['run_id'] for record in self.data['jobs'].values()
@@ -174,21 +217,26 @@ class JobRecovery:
             except subprocess.CalledProcessError as exc:
                 if not re.search(r'HTTP 404', error_text(exc)):
                     raise
+                receipt['unavailable_run_ids'].append(run_id)
                 LOG.warning('Saved workflow run %s/%s is unavailable; skipping this run and retaining its records until expiry: %s', repo, run_id, error_text(exc))
         for run_id, run in runs.items():
+            if (run.get('id')!=run_id or run.get('status') not in (*ACTIVE_RUN_STATUSES,'completed')):
+                raise ValueError('Unknown tracked workflow run status or identity')
             key = f'{repo}/{run_id}'
             if run['status'] != 'completed':
                 self.data['runs'][key] = {'repository': repo, 'run_id': run_id, 'observed_at': now}
         jobs = {}
         for run_id, run in runs.items():
             pages = self.api.get(f'repos/{repo}/actions/runs/{run_id}/jobs?per_page=100', paginate=True)
-            for page in pages:
-                for job in page['jobs']:
-                    jobs[job['id']] = {**job, 'run_id': run_id,
-                                       'run_attempt': job.get('run_attempt', run.get('run_attempt', 1))}
+            for job in self.page_rows(pages,'jobs'):
+                if job.get('status') not in (*ACTIVE_RUN_STATUSES,'completed'):raise ValueError('Unknown workflow job status')
+                jobs[job['id']] = {**job, 'run_id': run_id,
+                                   'run_attempt': job.get('run_attempt', run.get('run_attempt', 1))}
             if run['status'] == 'completed':
                 # Drop the active run only after its terminal jobs were read.
                 self.data['runs'].pop(f'{repo}/{run_id}', None)
+        receipt['unavailable_run_ids'].sort()
+        self.scan_complete[repo]=not receipt['unavailable_run_ids']
         return runs, jobs
 
     def _remember(self, repo: str, jobs: dict, current: dict, previous: dict, now: str) -> None:

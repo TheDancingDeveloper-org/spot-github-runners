@@ -135,5 +135,7 @@ def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning('Recovery pending for %s; retrying next loop: %s', vm_details(vm), error_detail(exc))
         return True  # Finish this cleanup and deregistration before touching another host.
+    if getattr(args,'scaling_mode','resource')=='tiered':
+        return False  # Tier orchestration now owns exact-topology restoration.
     reconcile_prices(vms, runners, args, state, state_path)
     return True

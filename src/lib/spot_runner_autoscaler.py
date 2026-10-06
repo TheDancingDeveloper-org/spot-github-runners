@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -18,7 +19,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
 
-from .autoscaling_policy import affordable_offers
+from .autoscaling_policy import affordable_offers, resource_decision
+from .resource_metrics import read_utilization
 from .machine_profiles import MINIMUM_RAM_GIB, machine_profile, CpuOffer, platform_preferences, cpu_platform_satisfies
 from .compute_api import get_auth
 from .environment import load_env
@@ -34,6 +36,7 @@ from .storage_selection import storage_rates, cheapest_storage
 from .billing_catalog import catalog_skus, clear_catalog_cache, monthly_to_daily
 from .launch_candidates import LaunchInventory, candidate_key, launchable_candidates
 from .spot_pricing import parse_component_rates
+from .runner_tiers import tier_for_shape
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = logging.getLogger("spot_runner_autoscaler")
@@ -113,7 +116,7 @@ def fleet_summary(vms, runners, state: dict) -> str:
         pending = f"pending {operation['kind']} of {operation['vm']['name']}"
         if operation["kind"] == "launch" and "started_at" in operation:
             minutes, seconds = divmod(int(now() - operation["started_at"]), 60)
-            pending += f" for {minutes}m {seconds}s of the {LAUNCH_DEADLINE_SECONDS // 60}m limit"
+            pending += f" for {minutes}m {seconds}s of the {operation.get('deadline_seconds', LAUNCH_DEADLINE_SECONDS) // 60}m limit"
     return (f"Fleet: GitHub runners {len(online)} online ({sum(runner.busy for runner in online)} busy), "
             f"{len(managed_online_runners(runners))} on Spot VMs, {len(runners) - len(online)} offline; "
             f"Spot VMs {len(fleet)}{': ' + hosts if hosts else ''}; {pending}")
@@ -137,7 +140,7 @@ def log_hourly_spend(vms, args: argparse.Namespace, state: dict, state_path: Pat
     write_scale_state(state_path, state)
 
 
-def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner]) -> list[GceVm]:
+def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner], state=None) -> list[GceVm]:
     """Choose complete, idle Spot VMs for scale-down."""
     candidates = []
     fleet = spot_instances(vms)
@@ -146,7 +149,8 @@ def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner]) -> list[Gc
         names = {runner.name for runner in assigned}
         marker = f"-{vm.name}-"
         prefixes = {name.rsplit(marker, 1)[0] for name in names if marker in name}
-        complete = any(prefix and {f"{prefix}-{vm.name}-{slot}" for slot in range(1, 9)}.issubset(names)
+        from .fleet_migration import expected_slots
+        complete = any(prefix and {f"{prefix}-{vm.name}-{slot}" for slot in range(1, expected_slots(vm,state or {})+1)}.issubset(names)
                        for prefix in prefixes)
         if (not vm.instance_id or not complete
                 or any(not runner.online or runner.busy for runner in assigned)):
@@ -208,6 +212,9 @@ def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
         raise RuntimeError("A previous host operation is still pending")
     state["host_operation"] = {"kind": kind, "vm": asdict(vm),
                                "runner_ids": [runner.runner_id for runner in host_runners(vm, runners, vms)], **metadata}
+    if kind == 'launch' and state.get('migration'):
+        # Persist the migration/launch link in the same write as provider intent.
+        state['migration']['awaiting_launch']=asdict(vm)
     if kind == "delete":
         key = f"{vm.zone}/{vm.name}"
         if key not in state.setdefault("intentional_deletions", []):
@@ -224,13 +231,24 @@ def import_deployment_receipt(state, state_path):
             or not receipt or not Path(receipt).exists()):
         return False
     from .fleet_logging import vm_from_record
-    actual = vm_from_record(json.loads(Path(receipt).read_text()))
+    record = json.loads(Path(receipt).read_text())
+    actual = vm_from_record(record)
     planned = vm_from_record(operation["vm"])
     if (not actual.instance_id or not actual.spot or actual.name != planned.name
             or actual.zone != planned.zone or actual.machine_type != planned.machine_type
             or (planned.instance_id and actual.instance_id != planned.instance_id)):
         raise RuntimeError("Deployment receipt does not match the pending host identity")
+    if record.get('tier'):
+        tier = tier_for_shape(actual.vcpu,actual.ram_gib)
+        if not tier or tier.name != record['tier'] or not 1 <= record.get('expected_runner_count',0) <= tier.maximum_slots:
+            raise RuntimeError('Deployment receipt contains unsafe tier/slot settings')
+        operation['expected_runner_count']=record['expected_runner_count']
+        state.setdefault('host_deployments',{})[f'{actual.zone}/{actual.instance_id}']={
+            key:record.get(key) for key in ('tier','expected_runner_count','admission_work_gib','runner_memory_gib','price')}
     operation["vm"] = asdict(actual)
+    awaiting=state.get('migration',{}).get('awaiting_launch',{})
+    if awaiting.get('name')==actual.name and awaiting.get('zone')==actual.zone:
+        state['migration']['awaiting_launch']=asdict(actual)
     operation["receipt_imported"] = True
     state.setdefault("observed_vms", {})[f"{actual.zone}/{actual.name}"] = asdict(actual)
     write_scale_state(state_path, state)
@@ -251,6 +269,9 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         return True
     if current and not vm.instance_id:
         operation["vm"] = asdict(current)
+        awaiting=state.get('migration',{}).get('awaiting_launch',{})
+        if awaiting.get('name')==current.name and awaiting.get('zone')==current.zone:
+            state['migration']['awaiting_launch']=asdict(current)
         vm = current
         write_scale_state(state_path, state)
     assigned = host_runners(vm, runners, [vm, *[item for item in vms if item.name != vm.name]])
@@ -260,13 +281,25 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                          drain_mode="label_only")
         write_scale_state(state_path, state)
     if operation["kind"] == "drain":
+        if (getattr(args, 'scaling_mode', 'legacy') in ('resource','tiered')
+                and operation.get('drain_mode') == 'label_only'):
+            operation.update(drain_mode='isolated_group', runners_isolated=False)
+            operation.setdefault('drain_group_name', f'spot-drain-{vm.name}-{vm.instance_id}')
+            write_scale_state(state_path, state)
         if current and current.running:
+            from .fleet_migration import guard_staged_retirement
+            if not guard_staged_retirement(vms,runners,args,state,state_path):
+                return True
             try:
                 from .runner_drain import drain_runners
                 fresh = list_github_runners(args.org)
                 assigned = host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]])
                 if drain_runners(operation, vm, args, state,
                                  lambda: write_scale_state(state_path, state), assigned):
+                    if not quiesce_remote_builder(vm, args):
+                        return True
+                    if not guard_staged_retirement(vms,runners,args,state,state_path):
+                        return True
                     def before_delete():
                         operation.update(kind="delete", drained=True)
                         key = f"{vm.zone}/{vm.name}"
@@ -306,7 +339,8 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
             # Launches recorded before deadlines existed expire relative to this restart.
             operation["started_at"] = now()
             write_scale_state(state_path, state)
-        expected = {f"gha-{vm.name}-{slot}" for slot in range(1, 9)}
+        count = operation.get('expected_runner_count',8)
+        expected = {f"gha-{vm.name}-{slot}" for slot in range(1, count+1)}
         online_names = {runner.name for runner in assigned if runner.online}
         requested = operation.get('requested_cpu_platform')
         platform_ok = not requested or (current is not None and cpu_platform_satisfies(
@@ -315,14 +349,15 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
             operation.setdefault("abandon", f"observed CPU platform {current.cpu_platform} "
                                             f"does not satisfy requested minimum {requested}")
         elif current and current.running and platform_ok and expected.issubset(online_names):
-            LOG.info("Host operation complete: all eight runners registered for %s", vm_details(current))
+            LOG.info("Host operation complete: all %d runners registered for %s",count,vm_details(current))
             state.pop("host_operation")
             write_scale_state(state_path, state)
             return True
         # A manager-confirmed host keeps its jobs even if one runner briefly restarts later.
-        if not operation.get("registered") and now() - operation["started_at"] >= LAUNCH_DEADLINE_SECONDS:
-            operation.setdefault("abandon", f"all eight runners did not register within "
-                                            f"{LAUNCH_DEADLINE_SECONDS // 60} minutes")
+        deadline = operation.get('deadline_seconds', LAUNCH_DEADLINE_SECONDS)
+        if not operation.get("registered") and now() - operation["started_at"] >= deadline:
+            operation.setdefault("abandon", f"all {count} runners did not register within "
+                                            f"{deadline // 60} minutes")
         if operation.get("abandon"):
             try:
                 abandon_launch(args, state, state_path)
@@ -347,7 +382,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 record_loss_restoration_target(vms, state, state_path)
                 operation.update(kind="recovery", vm=record, recovery_key=key)
                 write_scale_state(state_path, state)
-            LOG.info("Fleet scaling waits for eight online runner slots on %s", vm_details(vm))
+            LOG.info("Fleet scaling waits for %d online runner slots on %s",count,vm_details(vm))
         return True
     if operation["kind"] in ("recovery", "delete_cleanup") and not operation.get("drives_deleted"):
         from .vm_recovery import cleanup_lost_vm
@@ -378,11 +413,14 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 delete_overpriced_vm(current, args.project)
             else:
                 if operation.get("drained"):
+                    from .fleet_migration import guard_staged_retirement
+                    if not guard_staged_retirement(vms,runners,args,state,state_path):
+                        return True
                     fresh = list_github_runners(args.org)
                     if host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]]):
                         LOG.warning("Deletion waits: runner records reappeared for %s", vm_details(vm))
                         return True
-                    delete_drained_vm(current, args)
+                    delete_drained_vm(vm, args)
                 else:
                     terminate_spot_vm(current, args.project, args.org, runners, vms)
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -403,8 +441,14 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 LOG.warning("Deregistration pending for %s: %s", runner.name, error_detail(exc))
                 break
         return True  # Require another inventory proving the records are absent.
-    if operation["kind"] == "recovery":
-        state["pending_vm_recovery"][operation["recovery_key"]]["_cleanup_complete"] = True
+    from .fleet_migration import confirm_migration_source_drives
+    try:
+        if not confirm_migration_source_drives(operation,args,state):
+            LOG.warning("Migration completion waits for recorded disk absence: %s", vm_details(vm))
+            return True
+    except (RuntimeError, ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+        LOG.warning("Migration source disk verification remains pending: %s", error_detail(exc))
+        return True
     if operation.get("drain_group_id"):
         from .runner_drain import cleanup_group
         try:
@@ -412,6 +456,13 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning("Drain group cleanup remains pending: %s", error_detail(exc))
             return True
+    if operation["kind"] == "recovery":
+        record=state["pending_vm_recovery"][operation["recovery_key"]]
+        record["_cleanup_complete"] = True
+        if operation.get('migration_source_disks_absent') is True:
+            record['_disks_absent']=True
+    from .fleet_migration import record_retirement_completion
+    record_retirement_completion(operation,state)
     state.pop("host_operation")
     write_scale_state(state_path, state)
     LOG.info("Host operation complete: VM and assigned runner records absent for %s", vm_details(vm))
@@ -446,17 +497,221 @@ def clear_rejected_deletion(vm: GceVm, exc: Exception, state: dict | None, state
 
 
 def delete_drained_vm(vm, args, before_delete=None):
+    tiered=getattr(args,'scaling_mode',None)=='tiered'
     observed = subprocess.run(["gcloud", "compute", "instances", "describe", vm.name,
-                               f"--zone={vm.zone}", f"--project={args.project}", "--format=value(id)"],
+                               f"--zone={vm.zone}", f"--project={args.project}",
+                               '--format=json(id,disks)' if tiered else '--format=value(id)'],
                               check=True, text=True, capture_output=True, timeout=60)
-    if not vm.instance_id or observed.stdout.strip() != vm.instance_id:
+    inventory=json.loads(observed.stdout) if tiered else {}
+    identity=str(inventory.get('id','')) if tiered else observed.stdout.strip()
+    if not vm.instance_id or identity != vm.instance_id:
         raise RuntimeError("Refusing drained deletion: provider instance identity changed")
+    if tiered:
+        recorded={disk.get('source'):str(disk.get('diskId','')) for disk in vm.disks}
+        attached={disk.get('source') for disk in inventory.get('disks',[])}
+        if not recorded or None in recorded or attached!=set(recorded) or not all(recorded.values()):
+            raise RuntimeError('Refusing drained deletion: attached disk identity changed or unknown')
+        result=subprocess.run(['gcloud','compute','disks','list',f'--project={args.project}',
+                               '--format=json(selfLink,id)'],check=True,text=True,capture_output=True,timeout=60)
+        disks={row['selfLink']:str(row['id']) for row in json.loads(result.stdout)}
+        if any(disks.get(source)!=disk_id for source,disk_id in recorded.items()):
+            raise RuntimeError('Refusing drained deletion: provider disk identity changed')
     if before_delete is not None:
         before_delete()
     subprocess.run(["gcloud", "compute", "instances", "delete", vm.name,
                     f"--zone={vm.zone}", f"--project={args.project}", "--delete-disks=all", "--quiet"],
                    check=True, text=True, capture_output=True, timeout=180)
     LOG.info("Deleted drained Spot VM %s and its attached disks", vm_details(vm))
+
+
+def quiesce_remote_builder(vm, args):
+    """Hold new builds off a host only after its running builds have finished."""
+    if not vm.instance_id:return False
+    from . import host_admission
+    # The source is embedded here because older supported hosts may not have
+    # the latest admission CLI (or any installed admission module). Execute
+    # only its definitions and reconciler under the inherited global EX lock.
+    source = Path(host_admission.__file__).read_text()
+    code = ("namespace={'__name__':'oxidex_drain'}\n"
+            "exec("+repr(source)+",namespace)\n"
+            "raise SystemExit(75 if namespace['builders_running'](global_lock_held=True) else 0)\n")
+    script = ('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
+              +shlex.quote(vm.instance_id)+' || exit 75; '
+              '/usr/bin/python3 -I -c '+shlex.quote(code)+
+              ' || exit 75; touch /run/oxidex-build-draining')
+    command = 'sudo flock -n -E 75 /run/oxidex-build.lock sh -c ' + shlex.quote(script)
+    try:
+        result = subprocess.run(['gcloud', 'compute', 'ssh', vm.name, f'--zone={vm.zone}',
+                                 f'--project={args.project}', '--quiet', '--command='+command],
+                                text=True, capture_output=True, timeout=60)
+        if result.returncode:
+            LOG.info('Drain waits: remote builder active or inaccessible on %s', vm_details(vm))
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def builder_ready(vm,args):
+    """Run a bounded builder canary with the exact installed launcher revision."""
+    import hashlib
+    from .builder_assets import HOST_LAUNCHER
+    digest=hashlib.sha256(HOST_LAUNCHER.encode()).hexdigest()
+    setup = """from pathlib import Path
+p=Path('/mnt/runner-data/remote-build/sources/admission-canary')
+(p/'rust-toolchain.toml').write_text('[toolchain]\\nchannel = "1.97.1"\\n')
+(p/'Cargo.toml').write_text('[package]\\nname="oxidex-admission-canary"\\nversion="0.1.0"\\nedition="2021"\\n')
+(p/'Cargo.lock').write_text('version = 4\\n\\n[[package]]\\nname="oxidex-admission-canary"\\nversion="0.1.0"\\n')
+(p/'src').mkdir(exist_ok=True)
+(p/'src'/'main.rs').write_text('fn main() { println!("builder-ready"); }\\n')
+"""
+    command=(f'test -S /run/gha-admission/socket && test -f /etc/oxidex-remote-build.json && '
+        f'test "$(sha256sum /usr/local/bin/oxidex-remote-build | cut -d" " -f1)" = {digest} && '
+        'test ! -e /run/oxidex-build-draining && '
+        'test "$(command -v docker)" = /usr/local/bin/docker && '
+        'docker image inspect oxidex-remote-builder:1.97.1 >/dev/null && '
+        '/usr/local/bin/oxidex-remote-build admission-canary prepare >/dev/null && '
+        'python3 -c '+shlex.quote(setup)+' && '
+        '/usr/local/bin/oxidex-remote-build admission-canary cargo run --locked >/dev/null')
+    result=subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',
+        f'--project={args.project}','--quiet','--command=sudo sh -c '+shlex.quote(command)],
+        capture_output=True,text=True,timeout=120)
+    return result.returncode==0
+
+
+def adjust_admission(vm,args,kind='runner'):
+    """Raise future reservations, then update only lease-free container caps."""
+    if kind not in ('runner','builder') or not vm.instance_id:return False
+    program='kind='+repr(kind)+'\n'+'''import fcntl, json, math, os, re, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0,'/opt/gha-runners')
+from host_admission import observed_envelope, request
+GIB=1024**3
+changed=[]
+pending_runner_ids=[]
+ledger_deadline=None
+envelope=next_limit=reserved=None
+def docker_timeout():
+    if ledger_deadline is None:return 5
+    remaining=ledger_deadline-time.monotonic()
+    if remaining<=0:raise RuntimeError('Budget update slice exhausted; remaining caps deferred')
+    return min(5,remaining)
+def write_config(path,value):
+    temporary=path.with_suffix('.tmp')
+    with temporary.open('w') as target:
+        json.dump(value,target);target.flush();os.fsync(target.fileno())
+    temporary.replace(path)
+def inspect(identity,name=None):
+    rows=json.loads(subprocess.run(['/usr/bin/docker','inspect',identity],
+        check=True,capture_output=True,text=True,timeout=docker_timeout()).stdout)
+    if not isinstance(rows,list) or len(rows)!=1:raise ValueError('Incomplete runner inventory')
+    row=rows[0]
+    if (not re.fullmatch('[0-9a-f]{64}',row['Id']) or row['State']['Running'] is not True
+        or not row['State']['StartedAt'] or (name is not None and row['Name']!='/'+name)
+        or (name is None and row['Id']!=identity)):
+        raise ValueError('Runner identity changed')
+    if not isinstance(row['HostConfig']['Memory'],int) or row['HostConfig']['Memory']<=0:
+        raise ValueError('Runner memory must have an existing finite cap')
+    return row
+try:
+    # Serialize budget changes independently of the lease lock. The service
+    # must remain available to finish hooks and to process the config barrier.
+    fd=os.open('/run/gha-admission-adjust.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'a') as operation:
+        fcntl.flock(operation,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        p=Path('/etc/gha-admission.json');config=json.loads(p.read_text())
+        current=config[kind+'_gib']
+        if not math.isfinite(current) or current<=0:raise ValueError('Invalid reservation')
+        envelope=observed_envelope(config)
+        if not math.isfinite(envelope) or envelope<=0:raise ValueError('Unknown memory envelope')
+        ceiling=int(min(config['work_gib'],envelope)*.95)
+        builder=Path('/etc/oxidex-remote-build.json')
+        if kind=='builder':
+            limits=json.loads(builder.read_text())
+            existing=limits['memory_gib']
+            if not math.isfinite(existing) or existing<=0 or existing>current:
+                raise ValueError('Builder limit exceeds its reservation')
+            lagging=existing<current
+        else:
+            names=config['runner_names']
+            if not isinstance(names,list) or not names or len(set(names))!=len(names):
+                raise ValueError('Invalid runner deployment inventory')
+            records={name:inspect(name,name) for name in names}
+            if len({row['Id'] for row in records.values()})!=len(names):
+                raise ValueError('Runner identities are not unique')
+            if any(row['HostConfig']['Memory']>current*GIB for row in records.values()):
+                raise ValueError('Runner limit exceeds its reservation')
+            lagging=any(row['HostConfig']['Memory']<current*GIB for row in records.values())
+        next_limit=current if lagging else min(current*2,ceiling)
+        if next_limit>ceiling or (not lagging and next_limit<=current):
+            print(json.dumps(dict(kind=kind,status='capacity',reservation_gib=current,observed_work_gib=envelope)))
+            raise SystemExit(76)
+        if next_limit>current:
+            config[kind+'_gib']=next_limit
+            write_config(p,config)
+        # serve() is single-threaded and reads config before locking leases.
+        # Its root release reply guarantees every old-config request has
+        # finished. New requests reserve the higher amount before any cap rises.
+        if not request('release','builder'):raise RuntimeError('Admission barrier rejected')
+        leases=Path('/var/lib/gha-admission/leases.json')
+        fd=os.open(str(leases)+'.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'a') as ledger_lock:
+            fcntl.flock(ledger_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            # Hooks wait at most30 seconds. Bound this critical section so a
+            # large deployment cannot strand releases while Docker is slow.
+            ledger_deadline=time.monotonic()+10
+            if json.loads(p.read_text())!=config:raise ValueError('Admission config changed')
+            rows=json.loads(leases.read_text()) if leases.exists() else {}
+            if not isinstance(rows,dict) or any(not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0 for value in rows.values()):
+                raise ValueError('Invalid reservation ledger')
+            reserved=sum(rows.values())
+            if kind=='builder':
+                if json.loads(builder.read_text())!=limits:raise ValueError('Builder config changed')
+                limits['memory_gib']=next_limit;write_config(builder,limits)
+                changed.append('future-builder')
+            else:
+                for name,before in records.items():
+                    identity=before['Id']
+                    if any(owner.startswith('container:'+identity+':') for owner in rows):
+                        if before['HostConfig']['Memory']<next_limit*GIB:
+                            pending_runner_ids.append(identity)
+                        continue  # Preserve active/stale lease amounts and caps.
+                    row=inspect(identity,name)
+                    if (row['Id']!=identity or row['State']['StartedAt']!=before['State']['StartedAt']
+                        or row['HostConfig']['Memory']!=before['HostConfig']['Memory']):
+                        raise ValueError('Runner changed during budget update')
+                    if row['HostConfig']['Memory']>=next_limit*GIB:continue
+                    subprocess.run(['/usr/bin/docker','update','--memory='+str(next_limit)+'g',
+                        '--memory-swap='+str(next_limit)+'g',identity],check=True,capture_output=True,timeout=docker_timeout())
+                    after=inspect(identity,name)
+                    if (after['Id']!=identity or after['State']['StartedAt']!=before['State']['StartedAt']
+                        or after['HostConfig']['Memory']!=next_limit*GIB
+                        or after['HostConfig']['MemorySwap']!=next_limit*GIB):
+                        raise ValueError('Runner limit update was not observed')
+                    changed.append(identity)
+            print(json.dumps(dict(kind=kind,status='waiting-for-lease-free-runner' if pending_runner_ids or not changed else 'updated',
+                reservation_gib=next_limit,observed_work_gib=envelope,
+                reserved_gib=reserved,unreserved_gib=max(0,envelope-reserved),updated=changed,pending_runner_ids=pending_runner_ids)))
+            # Success clears the controller's already-seen OOM obligation.
+            # Keep it pending until every skipped lagging cap has caught up.
+            if pending_runner_ids or not changed:raise SystemExit(75)
+except (OSError,ValueError,KeyError,TypeError,RuntimeError,subprocess.SubprocessError) as error:
+    # Never roll back a higher reservation after a potentially applied Docker
+    # update. Unknown/partial updates stay over-reserved for safe retries.
+    print(json.dumps(dict(kind=kind,status='deferred',updated=changed,pending_runner_ids=pending_runner_ids,error=str(error)[:200],
+        reservation_gib=next_limit,observed_work_gib=envelope,reserved_gib=reserved,
+        unreserved_gib=max(0,envelope-reserved) if reserved is not None else None)))
+    raise SystemExit(75)
+'''
+    shell=('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
+           +shlex.quote(vm.instance_id)+' || exit 75; '
+           'python3 -c '+shlex.quote(program))
+    try:
+        result=subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',
+            f'--project={args.project}','--quiet','--command=sudo sh -c '+shlex.quote(shell)],
+            capture_output=True,text=True,timeout=60)
+    except (OSError,subprocess.SubprocessError):return False
+    if getattr(result,'stdout','').strip():LOG.info('Admission budget update on %s: %s',vm_details(vm),result.stdout.strip())
+    return 'capacity' if result.returncode==76 else result.returncode==0
 
 
 def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace,
@@ -470,11 +725,16 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     if not candidates:
         LOG.info("Scale-down waits: no complete idle host is available")
         return 0
-    vm = candidates[0]
+    # Existing builder presence is independent of future installation settings.
+    vm = next((vm for vm in candidates if quiesce_remote_builder(vm, args)), None)
+    if vm is None:
+        return 0
     assigned = host_runners(vm, runners, vms)
     begin_host_operation("drain", vm, runners, vms, state, state_path,
                          runner_names={str(runner.runner_id): runner.name for runner in assigned},
-                         drain_mode="label_only")
+                         drain_group_name=f'spot-drain-{vm.name}-{vm.instance_id}',
+                         drain_mode=('isolated_group' if getattr(args, 'scaling_mode', 'legacy') == 'resource'
+                                     else 'label_only'))
     reconcile_host_operation(vms, runners, args, state, state_path)
     return 0  # Host removal is counted only after the drain completes.
 
@@ -646,6 +906,61 @@ def load_launch_inventory(project: str) -> LaunchInventory:
         global_quotas=quotas(gcloud_json('project-info', 'describe', '--format=json(quotas)').get('quotas')))
 
 
+def eligible_tier_offers(offers, tier, prices, disk_size_gb=100, job_memory_gib=15):
+    from .tier_policy import reservation_fits
+    if not reservation_fits((tier.name,),job_memory_gib):
+        return []
+    candidates = []
+    for offer in offers:
+        if (offer.vcpu,offer.ram_gib) != (tier.vcpu,tier.ram_gib) or machine_profile(offer.machine_type) is None:
+            continue
+        try:
+            boot,data,monthly = cheapest_storage(offer.machine_type,disk_size_gb,prices.get(offer.region,{}))
+        except RuntimeError:
+            continue
+        if data not in ('pd-balanced','pd-ssd','hyperdisk-balanced'):
+            continue  # Tier build caches require SSD-backed random-IO storage.
+        for rank,platform in platform_preferences(offer.machine_type):
+            candidate = CpuOffer(offer.region,offer.machine_type,offer.vcpu,offer.ram_gib,
+                                 offer.hourly_usd,platform,rank,boot,data,monthly,zones=offer.zones)
+            if tier.affordable(candidate.total_daily_usd):
+                candidates.append(candidate)
+    return sorted(candidates,key=lambda row:(row.cpu_rank,row.total_daily_usd,row.region,row.machine_type))
+
+
+def discover_tier_offers(project,tier,disk_size_gb=100,job_memory_gib=15,*,status=None):
+    if status is not None:status['complete']=False
+    discovery={}
+    clear_catalog_cache()
+    offers,_,_,errors = asyncio.run(find(get_auth(project),min_vcpu=tier.vcpu,
+        min_ram=tier.ram_gib,top=None,concurrency=200,
+        catalog_rates=parse_component_rates(catalog_skus()),status=discovery))
+    if errors:
+        LOG.warning('Tier discovery has %d incomplete price results',len(errors))
+    prices = {region:storage_rates(region) for region in {row.region for row in offers
+              if (row.vcpu,row.ram_gib) == (tier.vcpu,tier.ram_gib)}}
+    ranked = eligible_tier_offers(offers,tier,prices,disk_size_gb,job_memory_gib)
+    candidates,skipped = launchable_candidates(ranked,load_launch_inventory(project),disk_size_gb)
+    if status is not None:
+        def required(machine,vcpu,ram):
+            return ((vcpu,ram)==(tier.vcpu,tier.ram_gib) and machine_profile(machine) is not None
+                    and bool(platform_preferences(machine)))
+        missing=any(required(row['machine_type'],row['vcpu'],row['ram_gib'])
+                    for row in discovery.get('missing_compute_scopes',[]))
+        quotes_complete=True
+        for offer in offers:
+            if not required(offer.machine_type,offer.vcpu,offer.ram_gib):continue
+            kinds=('hyperdisk-balanced',) if machine_profile(offer.machine_type).disk_type=='hyperdisk-balanced' else ('pd-standard','pd-balanced','pd-ssd')
+            try:
+                values=[Decimal(str(prices[offer.region][kind+':capacity'])) for kind in kinds]
+                quotes_complete &= all(value.is_finite() and value>=0 for value in values)
+            except (KeyError,ValueError,ArithmeticError):quotes_complete=False
+        status['complete']=(discovery.get('inventory_complete') is True and not errors and not missing and quotes_complete)
+    LOG.info('Tier %s: %d launchable candidates strictly below $%s/day with40+%d GiB disks',
+             tier.name,len(candidates),tier.max_daily_usd,disk_size_gb)
+    return candidates
+
+
 def eligible_offers(offers, max_daily_usd: Decimal, *, storage_rates=None, disk_size_gb: int = 100):
     """Rank explicitly requested platforms, then regional compute price."""
     shapes = [offer for offer in offers if offer.vcpu == 32 and offer.ram_gib >= MINIMUM_RAM_GIB
@@ -708,7 +1023,23 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
     cpu_rank = next((rank for rank, platform in preferences if platform == cpu_platform), None)
     if cpu_rank is None:
         raise RuntimeError(f'Unsupported CPU platform {cpu_platform} for {offer.machine_type}')
-    hourly_limit = args.max_daily_usd / Decimal(24)
+    tier = tier_for_shape(offer.vcpu,offer.ram_gib) if getattr(args,'scaling_mode','resource')=='tiered' else None
+    if getattr(args,'scaling_mode','resource')=='tiered':
+        if not tier or tier.name != getattr(args,'launch_tier',None):
+            raise RuntimeError('Automatic tier launch rejects forbidden or mismatched shape')
+        if not tier.affordable(getattr(offer,'total_daily_usd',None)):
+            raise RuntimeError('Tier launch requires a strict full-disk quote')
+    if tier:
+        from math import isfinite
+        try:
+            job_memory=float(getattr(args,'tier_job_memory_gib',getattr(args,'launch_job_memory_gib',15)))
+        except (TypeError,ValueError) as error:
+            raise RuntimeError('Tier job memory must be finite and positive') from error
+        if not isfinite(job_memory) or job_memory<=0:
+            raise RuntimeError('Tier job memory must be finite and positive')
+    daily_limit = tier.max_daily_usd if tier else args.max_daily_usd
+    slots = getattr(args,'launch_slots',tier.initial_slots) if tier else 8
+    hourly_limit = daily_limit / Decimal(24)
     preflighted_zone = getattr(offer, 'zone', '')
     if preflighted_zone:
         zones = [preflighted_zone]
@@ -737,14 +1068,14 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         suffix = f"{offer.region.replace('-', '')}-{letter}-{int(time.time())}"
         instance_name = f"oxidex-runners-{suffix}"
         runner_prefix = "gha"
-        longest_name = maximum_runner_name_length(runner_prefix, instance_name, 8)
+        longest_name = maximum_runner_name_length(runner_prefix, instance_name, slots)
         if longest_name > 64:
             raise RuntimeError(f"Generated GitHub runner name would be {longest_name} characters (maximum 64)")
         command = [
             sys.executable, str(ROOT / "src" / "spot_runner_manager.py"),
             "--project", args.project, "--org", args.org,
             "--max-cost", str(hourly_limit), "--instance-type", offer.machine_type,
-            '--max-total-daily-usd', str(args.max_daily_usd), '--cheapest-storage',
+            '--max-total-daily-usd', str(daily_limit), '--cheapest-storage',
             "--min-cpu-platform", cpu_platform,
             "--region", offer.region, "--zone", zone,
             "--cpu", str(offer.vcpu), "--ram", str(int(offer.ram_gib)),
@@ -754,6 +1085,13 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             "--runner-prefix", runner_prefix,
             "--runner-label", args.label, "--apply",
         ]
+        if tier:
+            command.extend(['--tier',tier.name,'--tier-slots',str(slots),
+                            '--tier-job-memory-gib',str(job_memory)])
+        if tier and getattr(args, 'remote_builder', False):
+            command.append('--remote-builder')
+        if getattr(args, 'scaling_mode', 'resource') in ('resource','tiered'):
+            command.append('--resource-monitoring')
         if getattr(args, 'billing_export_table', None):
             command.extend(['--billing-export-table', args.billing_export_table])
         profile = machine_profile(offer.machine_type)
@@ -773,18 +1111,20 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
                  offer.region, vm_details(vm), cpu_rank + 1, offer.hourly_usd * 24,
                  storage_daily, Decimal(str(offer.hourly_usd)) * 24 + storage_daily)
         receipt = state_path.parent / f"{instance_name}-{uuid.uuid4().hex}-deployment.json"
+        deadline = 2400 if tier and getattr(args, 'remote_builder', False) else LAUNCH_DEADLINE_SECONDS
         command.extend(["--deployment-receipt", str(receipt),
-                        "--registration-timeout-seconds", str(LAUNCH_DEADLINE_SECONDS)])
+                        "--registration-timeout-seconds", str(deadline)])
         begin_host_operation("launch", vm, [], [], state, state_path,
                              requested_cpu_platform=cpu_platform, deployment_receipt=str(receipt),
                              candidate_key=f"{zone}/{offer.machine_type}/{cpu_platform}",
-                             data_disk_name=f"runner-data-{suffix}", started_at=now())
+                             data_disk_name=f"runner-data-{suffix}", started_at=now(),
+                             deadline_seconds=deadline,expected_runner_count=slots)
         started = time.monotonic()
         manager_hung = False
         try:
             # The manager enforces the registration deadline; this backstop covers a hung manager.
             result = subprocess.run(command, check=False, text=True, capture_output=True,
-                                    timeout=LAUNCH_DEADLINE_SECONDS + 120)
+                                    timeout=deadline + 120)
         except subprocess.TimeoutExpired:
             manager_hung = True
             result = SimpleNamespace(returncode=-9, stdout="",
@@ -794,7 +1134,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             for line in (output or "").splitlines():
                 if line.strip():
                     LOG.info("Deployment diagnostics: %s; %s", vm_details(vm), error_detail(line))
-        if manager_hung and registered_host(vm, args):
+        if manager_hung and registered_host(vm, args,slots):
             LOG.warning("Deployment manager hung after all eight runners registered; keeping %s", vm_details(vm))
             result = SimpleNamespace(returncode=0, stdout="", stderr="")
         if result.returncode == 0:
@@ -823,14 +1163,14 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
     raise RuntimeError(f"No zone accepted {offer.machine_type} in {offer.region}")
 
 
-def registered_host(vm: GceVm, args: argparse.Namespace) -> bool:
+def registered_host(vm: GceVm, args: argparse.Namespace, count=8) -> bool:
     """Return whether the launched VM is running with all eight runners online."""
     current = next((item for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
                     if item.zone == vm.zone and item.name == vm.name), None)
     if not current or not current.running:
         return False
     online = {runner.name for runner in host_runners(vm, list_github_runners(args.org), [vm]) if runner.online}
-    return {f"gha-{vm.name}-{slot}" for slot in range(1, 9)}.issubset(online)
+    return {f"gha-{vm.name}-{slot}" for slot in range(1, count+1)}.issubset(online)
 
 
 def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> bool:
@@ -848,6 +1188,37 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
     key = f"{vm.zone}/{vm.name}"
     current = next((item for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
                     if item.zone == vm.zone and item.name == vm.name), None)
+    if getattr(args,'scaling_mode','resource')=='tiered':
+        if current:
+            if not vm.instance_id or current.instance_id!=vm.instance_id:
+                LOG.error('Tier launch cleanup holds: missing or changed provider identity')
+                return False
+            assigned=host_runners(vm,list_github_runners(args.org),[vm])
+            operation.update(kind='drain',runner_ids=[r.runner_id for r in assigned],
+                runner_names={str(r.runner_id):r.name for r in assigned},
+                drain_mode='isolated_group',drain_group_name=f'spot-drain-{vm.name}-{vm.instance_id}')
+            write_scale_state(state_path,state)
+            LOG.warning('Failed tier launch will isolate and drain before deleting %s',vm.name)
+            return False
+        if (operation.get('outcome_uncertain') and now()-operation.get('started_at',now())
+                <operation.get('deadline_seconds',LAUNCH_DEADLINE_SECONDS)):
+            return False
+        # Missing hosts use the same recorded disk-ID cleanup as Spot recovery.
+        if not vm.instance_id:
+            names={vm.name,operation.get('data_disk_name') or vm.name.replace('oxidex-runners-','runner-data-',1)}
+            inventory=subprocess.run(['gcloud','compute','disks','list',f'--project={args.project}',
+                f'--zones={vm.zone}','--format=json(name,id)'],check=True,text=True,capture_output=True,timeout=60)
+            if (any(row.get('name') in names for row in json.loads(inventory.stdout))
+                    or host_runners(vm,list_github_runners(args.org),[vm])):
+                LOG.warning('Tier launch cleanup holds until receipt proves orphan resource identity')
+                return False
+            state.pop('host_operation')
+            write_scale_state(state_path,state)
+            return True  # Failed create proven absent; no deletion was authorized.
+
+        operation.update(kind='delete_cleanup')
+        write_scale_state(state_path,state)
+        return False
     if current:
         if key not in state.setdefault("intentional_deletions", []):
             state["intentional_deletions"].append(key)
@@ -862,7 +1233,7 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
                for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")):
             return False
     elif (operation.get("outcome_uncertain")
-          and now() - operation.get("started_at", now()) < LAUNCH_DEADLINE_SECONDS):
+          and now() - operation.get("started_at", now()) < operation.get('deadline_seconds', LAUNCH_DEADLINE_SECONDS)):
         LOG.info("Launch cleanup waits until the deadline confirms %s was never created: %s",
                  vm.name, reason)
         write_scale_state(state_path, state)
@@ -923,6 +1294,11 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
     }
     for repo in args.job_repository or []:
         plist["ProgramArguments"].extend(["--job-repository", repo])
+    plist['ProgramArguments'].extend(['--scaling-mode', args.scaling_mode, '--maximum-hosts', str(args.maximum_hosts)])
+    plist['ProgramArguments'].extend(['--tier-job-memory-gib',str(getattr(args,'tier_job_memory_gib',15))])
+    plist['ProgramArguments'].append('--remote-builder' if args.remote_builder else '--no-remote-builder')
+    if getattr(args,'github_user',None):plist['ProgramArguments'].extend(['--github-user',args.github_user])
+    if getattr(args,'migrate_oversized',False):plist['ProgramArguments'].append('--migrate-oversized')
     if getattr(args, 'billing_export_table', None):
         plist['ProgramArguments'].extend(['--billing-export-table', args.billing_export_table])
     plist_path.write_bytes(plistlib.dumps(plist))
@@ -933,12 +1309,28 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
 def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default="swack-tools")
+    parser.add_argument("--github-user",help="Select an existing gh account without persisting its credential")
     parser.add_argument("--project", default="homelab-424523")
     parser.add_argument("--minimum-runners", type=int, default=25)
     parser.add_argument("--label", default="spot")
     parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("10"),
                         help='Maximum daily compute plus boot/data storage cost per VM')
     parser.add_argument("--interval-seconds", type=int, default=300)
+    parser.add_argument('--scaling-mode', choices=('tiered','resource', 'legacy'), default='resource',
+                        help='Resource: two 5-minute checks above/below 75%% CPU/memory; legacy: runner occupancy')
+    parser.add_argument('--maximum-hosts', type=int, default=5)
+    def job_memory(value):
+        from math import isfinite
+        value=float(value)
+        if not isfinite(value) or value<=0:
+            raise argparse.ArgumentTypeError('Job memory must be finite and positive')
+        return value
+    parser.add_argument('--tier-job-memory-gib',type=job_memory,default=15,
+                        help='Per-job cap/reservation; default 15 GiB is a verified compatible workload cap, not a measured peak')
+    parser.add_argument('--dry-run',action='store_true',help='Read-only tier decision; never mutate providers or controller state')
+    parser.add_argument('--migrate-oversized',action='store_true',help='Gradually replace existing oversized owned hosts')
+    parser.add_argument('--remote-builder', action=argparse.BooleanOptionalAction, default=True,
+                        help='Install dedicated remote Rust builders on new nodes (default enabled)')
     parser.add_argument("--disk-size-gb", type=int, default=100)
     parser.add_argument('--billing-export-table', help='Billing export project.dataset.table for launch cost logs (or GCP_BILLING_EXPORT_TABLE)')
     parser.add_argument("--log-file", type=Path, default=Path.home() / "spot-ghrunner.log")
@@ -959,7 +1351,14 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("runner floors, interval, and disk size must be positive")
     if args.max_daily_usd <= 0:
         raise ValueError("max daily VM cost must be positive")
+    if (args.maximum_hosts < 1 or (args.scaling_mode in ('resource','tiered') and args.interval_seconds != 300)
+            or (args.scaling_mode=='tiered' and args.maximum_hosts>5)):
+        raise ValueError('Resource mode requires 300-second checks and a positive maximum host count')
     load_env(ROOT / ".env")
+    if args.github_user:
+        secret=subprocess.check_output(["gh","auth","token","--user",args.github_user],text=True).strip()
+        if not secret:raise RuntimeError("Missing requested GitHub account credential")
+        os.environ["GH_TOKEN"]=secret
     args.billing_export_table = args.billing_export_table or os.environ.get('GCP_BILLING_EXPORT_TABLE')
     if args.install_launch_agent:
         print(f"Installed LaunchAgent at {install_launch_agent(args)}")
@@ -989,6 +1388,9 @@ def _run_controller(args: argparse.Namespace) -> int:
     """Run fleet checks until interrupted or a single check completes."""
     state_path = args.state_file.expanduser()
     state = read_scale_state(state_path)
+    if getattr(args,'dry_run',False):
+        from .tier_controller import dry_run
+        return dry_run(args,state)
     jobs = JobRecovery(state, lambda: write_scale_state(state_path, state),
                        args.job_repository or [f"{args.org}/oxidex"])
     args.cpu_platforms_by_zone = None
@@ -1014,7 +1416,7 @@ def _run_controller(args: argparse.Namespace) -> int:
         log_hourly_spend(vms, args, state, state_path)
         operation_work = reconcile_host_operation(vms, runners, args, state, state_path)
         recovery_work = False if operation_work else reconcile_lost_vms(vms, runners, args, state, state_path)
-        price_work = False if recovery_work or operation_work else reconcile_prices(vms, runners, args, state, state_path)
+        price_work = False if recovery_work or operation_work or args.scaling_mode=='tiered' else reconcile_prices(vms, runners, args, state, state_path)
         if operation_work or price_work or recovery_work:
             if args.once:
                 return 0
@@ -1024,9 +1426,35 @@ def _run_controller(args: argparse.Namespace) -> int:
         current, busy = utilization_counts(runners)
         LOG.info("Managed GCP runners: %d online, %d busy; %d Spot VMs",
                  current, busy, len(fleet_vms))
-        action, host_count, idle_loops, scale_up_active = scaling_decision(
-            current, busy, len(fleet_vms), state["idle_loops"],
-            state["scale_up_active"], args.minimum_runners)
+        if args.scaling_mode=='tiered':
+            from .tier_controller import check_tiers
+            from .poll_cadence import tier_poll_delay
+            check_started_at = time.time()
+            check_tiers(vms,runners,args,state,state_path)
+            if args.once:return 0
+            time.sleep(tier_poll_delay(state,args.interval_seconds,check_started_at,time.time()))
+            continue
+        if args.scaling_mode == 'resource':
+            roster = sorted(f'{vm.zone}/{vm.instance_id}' for vm in fleet_vms)
+            if state.get('resource_roster') != roster:
+                state['resource_evidence'] = {}
+                state['resource_roster'] = roster
+            try:
+                observed = read_utilization(args.project, fleet_vms)
+            except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                LOG.warning('Resource metrics unavailable; optimization waits: %s', error_detail(exc))
+                observed = None
+            action = resource_decision(observed, state.setdefault('resource_evidence', {}), time.time())
+            LOG.info('Resource check: CPU/memory fractions=%s; decision=%s; threshold=75%%, two 5-minute checks', observed, action)
+            if action == 'up' and len(fleet_vms) >= args.maximum_hosts:
+                action = 'wait'
+            if action == 'down' and len(fleet_vms) <= 1:
+                action = 'wait'
+            host_count, idle_loops, scale_up_active = (1 if action in ('up', 'down') else 0), 0, False
+        else:
+            action, host_count, idle_loops, scale_up_active = scaling_decision(
+                current, busy, len(fleet_vms), state["idle_loops"],
+                state["scale_up_active"], args.minimum_runners)
         if state["scale_up_active"] and not scale_up_active and action == "hold":
             LOG.info("Scale-up complete: online capacity is above %d runners", args.minimum_runners)
         state["scale_up_active"] = scale_up_active
@@ -1042,7 +1470,7 @@ def _run_controller(args: argparse.Namespace) -> int:
                     LOG.error("Could not launch Spot capacity below $%s/day", args.max_daily_usd)
         elif action == "down":
             state["idle_loops"] = idle_loops
-            LOG.info("Low usage persisted for two checks; removing up to %d Spot hosts", host_count)
+            LOG.info("Low usage persisted for two checks; draining up to %d Spot hosts", host_count)
             removed = scale_down(vms, runners, args, state=state, state_path=state_path)
             LOG.info("Scale-down step removed %d hosts", removed)
         else:
