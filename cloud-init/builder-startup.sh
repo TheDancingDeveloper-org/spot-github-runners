@@ -53,7 +53,7 @@ FRESH_DESTINATION
 [[ "$ID" == debian && "$VERSION_CODENAME" == trixie ]]
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl gnupg rsync python3 jq util-linux sudo
+apt-get install -y ca-certificates curl gnupg git openssh-client rsync python3 jq util-linux sudo
 install -d -m0755 /etc/apt/keyrings
 curl --proto '=https' --tlsv1.2 -fsS https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
 chmod 0644 /etc/apt/keyrings/docker.asc
@@ -103,7 +103,12 @@ chmod 0710 "$MOUNT_POINT" "$MOUNT_POINT/remote-build"
 install -d -o0 -g1001 -m0710 "$MOUNT_POINT/remote-build/targets"
 install -d -m0755 /opt/gha-runners /opt/oxidex-builder/image
 install -d -m0700 /var/lib/oxidex-builder
+install -d -o root -g root -m 0755 /opt/oxidex-builder/qualification_trust /etc/oxidex-remote-build
+install -d -o root -g root -m 0755 "$MOUNT_POINT/remote-build/qualification-sealed"
 {{ASSET_WRITES}}
+chmod 0444 /etc/oxidex-remote-build/qualification-maintainer.allowed_signers /etc/oxidex-remote-build/qualification.gitconfig
+chmod 0644 /opt/oxidex-builder/qualification_trust/*.py
+chmod 0555 /opt/oxidex-builder/qualification_trust/runtime_git.py
 printf '%s\n' '{{BUILD_CONFIG}}' >/etc/oxidex-remote-build.json
 printf '%s\n' '{{ADMISSION_CONFIG}}' >/etc/gha-admission.json
 printf '%s\n' '{{UPLOADER_CONFIG}}' >/etc/oxidex-builder-uploader.json

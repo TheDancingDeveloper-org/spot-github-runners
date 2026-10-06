@@ -143,7 +143,7 @@ def _observed_builder_envelope(config):
     for cid in inventory:
         owner,row=docker_identity(cid);state=row['State'];caps=row['HostConfig']
         if any(not isinstance(v,dict) for v in (state,caps,row['Config'])):raise ValueError('Malformed builder inventory')
-        if (row['Id']!=cid or builder_cache_identity(row) is None or row['Config'].get('Image')!='oxidex-remote-builder:1.99.0'
+        if (row['Id']!=cid or builder_cache_identity(row,host_config=config) is None or row['Config'].get('Image')!='oxidex-remote-builder:1.99.0'
             or row['Config'].get('User')!='1001:1001' or caps.get('NanoCpus')!=16*10**9
             or caps.get('Memory')!=28*1024**3 or caps.get('MemorySwap')!=28*1024**3):raise ValueError('Unmatched aggregate builder caps/identity')
         pid=state['Pid']
@@ -378,7 +378,7 @@ def owner_alive(owner):
             return True  # Unknown state cannot reclaim a live runner lease.
 
 
-def builder_cache_identity(record):
+def builder_cache_identity(record,*,host_config=None):
     """Recognize only the root adapter's exact name, labels and bind mounts."""
     config=record.get('Config') or {}
     if not isinstance(config,dict):return None
@@ -394,6 +394,27 @@ def builder_cache_identity(record):
     mounts=record.get('Mounts',[])
     if not isinstance(mounts,list) or any(not isinstance(mount,dict) for mount in mounts):
         return None
+    if project.startswith('qualification-'):
+        # The shared launcher accepts this prefix as an ordinary cache name.
+        # Only fixed root configuration (or its trusted caller snapshot) selects
+        # the dedicated contract; container labels never select host authority.
+        if host_config is None:host_config=json.loads(CONFIG_PATH.read_text())
+        if not isinstance(host_config,dict):raise ValueError('Malformed admission role configuration')
+        role=host_config.get('role')
+        if role not in (None,'runner','builder','benchmark-builder'):
+            raise ValueError('Unknown admission host role')
+        # The separate legacy benchmark producer does not install this package.
+        # Its role retains the existing private-root ordinary mount contract.
+        if role=='builder':
+            if not re.fullmatch(r'qualification-[0-9a-f]{12}-[0-9a-f]{32}',project):return None
+            sys.path.insert(0, '/opt/oxidex-builder')
+            try:
+                from qualification_trust.mounts import check_inspected_mounts
+            except ImportError as error:
+                raise ValueError('Dedicated qualification mount contract unavailable') from error
+            try:check_inspected_mounts(mounts, BUILD_ROOT, project)
+            except (ValueError, TypeError, KeyError):return None
+            return project,run
     for destination,folder in (('/src','sources'),('/target','targets')):
         matching=[mount for mount in mounts if mount.get('Destination')==destination]
         if (len(matching)!=1 or matching[0].get('Type')!='bind'

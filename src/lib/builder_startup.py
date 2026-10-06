@@ -1,5 +1,6 @@
 """Fresh builder-only startup renderer. No GitHub credentials or registration."""
 import base64
+import gzip
 import hashlib
 import json
 import re
@@ -14,7 +15,9 @@ READINESS='/var/lib/oxidex-builder-readiness.json'
 
 
 def builder_guest_sources():
-    return {**ASSETS,'/opt/gha-runners/host_admission.py':Path(__file__).with_name('host_admission.py').read_text(),
+    trust={f'/opt/oxidex-builder/qualification_trust/{path.name}':path.read_text()
+           for path in Path(__file__).with_name('qualification_trust').glob('*.py')}
+    return {**ASSETS,**trust,'/opt/gha-runners/host_admission.py':Path(__file__).with_name('host_admission.py').read_text(),
             '/opt/gha-runners/builder_access.py':Path(__file__).with_name('builder_access.py').read_text()}
 
 
@@ -51,7 +54,11 @@ def render_builder_startup(args,deployment_id):
     replacements['BUILD_CONFIG']=json.dumps(config,separators=(',',':'),sort_keys=True)
     replacements['ADMISSION_CONFIG']=json.dumps(admission,separators=(',',':'),sort_keys=True)
     sources=builder_guest_sources()
-    replacements['ASSET_WRITES']='\n'.join("printf '%s' '"+base64.b64encode(source.encode()).decode()+"' | base64 -d >"+path for path,source in sources.items())
+    # The complete current admission + qualification sources exceed GCP's
+    # 256 KiB metadata limit when only base64 encoded. Compress deterministic
+    # transport bytes; installed bytes and readiness hashes remain canonical.
+    decoder = "python3 -c 'import gzip,sys;sys.stdout.buffer.write(gzip.decompress(sys.stdin.buffer.read()))'"
+    replacements['ASSET_WRITES']='\n'.join("install -d -o root -g root -m 0755 "+str(Path(path).parent)+"\nprintf '%s' '"+base64.b64encode(gzip.compress(source.encode(),mtime=0)).decode()+"' | base64 -d | "+decoder+" >"+path for path,source in sources.items())
     hashes={path:hashlib.sha256(source.encode()).hexdigest() for path,source in sources.items()}
     replacements['READINESS_SOURCE']=readiness_source(deployment_id,hashes,args.disk_device_name)
     result=STARTUP
@@ -66,6 +73,9 @@ def readiness_source(deployment_id,hashes,disk_device_name='builder-cache'):
 from pathlib import Path
 import runpy
 module=runpy.run_path('/opt/gha-runners/host_admission.py',run_name='builder_readiness')
+for executable in ('/usr/bin/git','/usr/bin/ssh-keygen','/usr/bin/python3'):
+    if not os.access(executable,os.X_OK):raise SystemExit('Host verifier dependency unavailable')
+subprocess.run(['/usr/bin/git','--version'],check=True,timeout=10,stdout=subprocess.DEVNULL)
 expected_hashes='''+repr(hashes)+'''
 for path,expected in expected_hashes.items():
     if hashlib.sha256(Path(path).read_bytes()).hexdigest()!=expected:raise SystemExit('Installed builder source differs')

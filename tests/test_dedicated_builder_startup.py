@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from lib.builder_access import canonical_sha, approved_mapping, restricted_group_guard
 from lib.builder_only_assets import ASSETS, STARTUP
-from lib.builder_startup import render_builder_startup
+from lib.builder_startup import render_builder_startup, builder_guest_sources
 from lib.host_admission import builder_memory_budget, builder_capacity_record, execution_limits
 from render_builder_startup import render_files
 
@@ -46,6 +47,25 @@ class DedicatedBuilderStartupTests(unittest.TestCase):
         for path, content in ASSETS.items():
             if path.startswith('/opt/oxidex-builder/image/'):
                 self.assertEqual(content, (ROOT / 'builder/standalone' / Path(path).name).read_text())
+
+    def test_actual_asset_write_pipelines_restore_all_canonical_bytes(self):
+        script = render_builder_startup(SimpleNamespace(**inputs()), 'unit-test')
+        self.assertEqual(script, render_builder_startup(SimpleNamespace(**inputs()), 'unit-test'))
+        observed = {}
+        # Execute only each emitted decoding pipeline; never parent-directory
+        # creation, final absolute-path redirection or any startup side effect.
+        for line in script.splitlines():
+            if " | base64 -d | python3 -c " not in line:
+                continue
+            pipeline, destination = line.rsplit(' >', 1)
+            self.assertNotIn(destination, observed)
+            observed[destination] = subprocess.check_output(
+                ['bash', '-euo', 'pipefail', '-c', pipeline], timeout=5)
+        expected = {path: source.encode() for path, source in builder_guest_sources().items()}
+        self.assertEqual(observed, expected)
+        self.assertIn(b'openssh-client gnupg', observed['/opt/oxidex-builder/image/Dockerfile'])
+        self.assertIn(b'Admission reply lost or incomplete', observed['/opt/gha-runners/host_admission.py'])
+        self.assertIn(b'check_inspected_mounts', observed['/opt/gha-runners/host_admission.py'])
 
     def test_rendered_cloud_config_and_one_command_are_same_payload(self):
         with tempfile.TemporaryDirectory() as parent:
