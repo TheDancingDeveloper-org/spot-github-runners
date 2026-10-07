@@ -13,8 +13,15 @@ This guide describes the source on `main`. Merging source does not update a
 running controller, container, or VM. Inspect the deployed configuration and
 actual tool versions before routing work to a host.
 
-For the shortest OxiDex setup and build workflow, see
-[Simplify OxiDex remote builds](docs/simplification.md).
+## Start a dedicated builder
+
+Use the [dedicated builder setup](docs/dedicated-builders.md): fill the deployment
+identity and public SSH mapping, render the startup payload, and run the generated
+launch command once. Startup installs the toolchain and restricted build launcher.
+Configure the verified endpoint in OxiDex, then use `just build`.
+
+For the simplification target and remaining work, see
+[Simplify remote builds](docs/simplification.md).
 
 ## Choose a workflow
 

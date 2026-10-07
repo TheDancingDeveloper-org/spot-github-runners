@@ -11,8 +11,20 @@ from types import SimpleNamespace
 from lib.builder_startup import render_builder_startup
 
 
+def builder_config(config):
+    """Supply fixed deployment defaults without inventing identity or authority."""
+    defaults = dict(role='builder', cpu=16, ram=32, runner_count=0,
+                    builder_cpus=16, builder_memory_gib=28,
+                    disk_device_name='builder-cache', disk_size_gb=100,
+                    disk_type='hyperdisk-balanced', data_disk_iops=3000,
+                    data_disk_throughput=140, boot_disk_size_gb=40,
+                    boot_disk_iops=3000, boot_disk_throughput=140)
+    # Explicit values, including invalid ones, still reach the strict validator.
+    return {**defaults, **config}
+
+
 def render_files(config, deployment_id, output_directory):
-    args = SimpleNamespace(**config)
+    args = SimpleNamespace(**builder_config(config))
     script = render_builder_startup(args, deployment_id)
     directory = Path(output_directory).absolute()
     # Refuse reuse: these files describe a fresh host, not an in-place upgrade.

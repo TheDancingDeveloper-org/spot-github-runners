@@ -1,4 +1,4 @@
-# Dedicated OxiDex Spot builders
+# Dedicated remote builders
 
 Dedicated hosts have `builder-` names and register no GitHub runners. The reviewed
 shape is `n4-highcpu-16`: 16 vCPU, 32 GiB RAM, one unprivileged Docker builder
@@ -9,7 +9,7 @@ Cargo downloads while using separate target directories.
 The image installs Rust 1.99.0 (full compiler commit
 `b940084d7eb6a299eb4bfeb8e34901bc051e7ac4`), rustfmt, clippy, Zig 0.15.2,
 cargo-zigbuild 0.23.4, cbindgen 0.29.2, Just, nextest, Python, uv, Perl, rsync,
-LLVM and native build dependencies. Application builds run as UID/GID 1001 and
+LLVM, and native build dependencies. App builds run as UID/GID 1001 and
 receive no Docker socket. SSH lands on the host; the uploader can sudo only the
 fixed `/usr/local/bin/oxidex-remote-build` launcher.
 
@@ -23,30 +23,18 @@ explicitly approved uploader identity/public key. Do not use a private SSH key.
 `public_key_sha256` (SHA-256 of that complete key string). Set
 `authorized_uploader_sha256` to SHA-256 of its sorted, compact JSON representation.
 Identity receipts and key mappings are deployment inputs, not repository defaults.
+The renderer supplies the fixed host, container, and baseline disk settings.
+Explicit settings still pass through the same strict policy checks.
 
 ```json
 {
   "instance_name": "builder-your-unique-name",
   "project": "your-project",
-  "zone": "asia-east2-a",
-  "disk_device_name": "builder-cache",
-  "role": "builder",
-  "runner_count": 0,
-  "cpu": 16,
-  "ram": 32,
-  "builder_cpus": 16,
-  "builder_memory_gib": 28,
-  "disk_type": "hyperdisk-balanced",
-  "disk_size_gb": 100,
-  "data_disk_iops": 3000,
-  "data_disk_throughput": 140,
-  "boot_disk_size_gb": 40,
-  "boot_disk_iops": 3000,
-  "boot_disk_throughput": 140
+  "zone": "asia-east2-a"
 }
 ```
 
-Add the two uploader fields described above, then render locally:
+Add the two uploader fields described in the preceding section, then render locally:
 
 ```bash
 python3 src/render_builder_startup.py --config /private/builder-config.json \
@@ -61,15 +49,15 @@ required. `cloud-config.yaml` contains the equivalent payload for images with a
 cloud-init agent, but that alternative execution path has not been live-tested.
 
 Startup verifies fresh-host identity and the absence of existing runners/work,
-installs Docker, mounts storage before starting Docker/containerd, builds and pins
+installs Docker, mounts storage before starting Docker/containerd, builds, and pins
 the immutable image, starts aggregate admission, checks actual tool/cgroup/cache
-observations, enrolls the approved restricted uploader and writes a completion
+observations, enrolls the approved restricted uploader, and writes a completion
 marker. No manual SSH installation or repository checkout is needed on the host.
 Rendering refuses an existing output directory; fresh-host startup must not be
 replayed to upgrade an occupied VM. Replacements need a new name and matching
 rendered payload.
 
-## Storage, access and draining
+## Storage, access, and draining
 
 The launch command uses a 40 GiB Hyperdisk Balanced boot disk and a 100 GiB
 Hyperdisk Balanced cache disk through NVMe, with 3,000 IOPS and 140 MiB/s baseline
@@ -87,25 +75,25 @@ the account into broader guest permissions and is not the restricted uploader
 transport.
 
 The launcher prepares a project, executes the allowed build command under one
-aggregate lease/cache lock, exports artifacts and cleans only owned source.
+aggregate lease/cache lock, exports artifacts, and cleans only owned source.
 Draining refuses new builds and lets actual active builds, leases and cache/upload
 locks finish before replacement. Persistent Cargo downloads and targets are not
 deleted after each build. GitHub runner drains are separate from this lifecycle.
 
 ## Observed validation
 
-On 2026-10-05, the dedicated host completed concurrent cold Linux native CLI
+On 2026-10-05, the dedicated host completed concurrent cold Linux native command-line
 builds on OxiDex source `429d6f26ec08e703cba2e5a3712b098998d6778d`: debug
 45.15 seconds and release 189.80 seconds, total 190.16 seconds, aggregate charged
-memory peak 7.13 GiB, zero OOM kills and zero throttled CPU periods. Both artifacts
+memory peak 7.13 GiB, zero OOM kills, and zero throttled CPU periods. Both artifacts
 were independently hashed. The ordinary `just build-debug-remote` recipe also
-passed source synchronization, compilation, verified download and source cleanup
+passed source synchronization, compilation, verified download, and source cleanup
 with targets retained on client `01c5b1fcbb30e2938de244addb979e127288a7c8`.
 
 A later monolithic expression-catalog compiler exceeded the 28 GiB cap; its
 chunked-function repair passed the same 608 expressions and 16,821-probe
 population at 6.21 GiB with zero OOM events. These are exact workload proofs,
-not evidence that every CI or Darwin workload fits. The initial launch required
+not evidence that all workloads fit. The initial launch required
 Debian service/sudo parser and target-parent fixes included in the current
 payload. A second untouched launch of that final payload was not performed.
 
