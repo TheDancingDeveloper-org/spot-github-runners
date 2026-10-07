@@ -79,6 +79,23 @@ class DedicatedBuilderStartupTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 render_files(inputs(), 'unit-test', out)
 
+    def test_cli_uses_instance_identity_and_preserves_explicit_override(self):
+        with tempfile.TemporaryDirectory() as parent:
+            parent = Path(parent)
+            config = parent / 'config.json'
+            config.write_text(json.dumps(inputs()))
+            for identity in (None, 'explicit-deployment'):
+                output = parent / ('default' if identity is None else 'override')
+                command = [sys.executable, str(ROOT / 'src/render_builder_startup.py'),
+                           '--config', str(config), '--output-directory', str(output)]
+                if identity is not None:
+                    command.extend(['--deployment-id', identity])
+                result = subprocess.run(command, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.strip(), str(output / 'launch-command.sh'))
+                expected = render_builder_startup(SimpleNamespace(**inputs()),
+                                                  identity or 'builder-test')
+                self.assertEqual((output / 'startup.sh').read_text(), expected)
+
     def test_policy_shape_mapping_and_performance_refusals(self):
         for key, value in [('runner_count', 1), ('cpu', 32), ('ram', 64), ('builder_memory_gib', 32),
                            ('instance_name', 'runner-test'), ('data_disk_iops', True),

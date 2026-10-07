@@ -38,9 +38,12 @@ Add the two uploader fields described in the preceding section, then render loca
 
 ```bash
 python3 src/render_builder_startup.py --config /private/builder-config.json \
-  --deployment-id builder-your-unique-name --output-directory /private/builder-payload
+  --output-directory /private/builder-payload
 bash /private/builder-payload/launch-command.sh
 ```
+
+The deployment identity defaults to `instance_name` in the configuration. Use
+`--deployment-id` only when you need a distinct identity in the startup receipt.
 
 The second command executes **one `gcloud compute instances create` invocation**.
 It passes the complete embedded payload as `startup-script` metadata. The Debian

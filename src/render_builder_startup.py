@@ -79,10 +79,12 @@ def render_files(config, deployment_id, output_directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
-    parser.add_argument('--deployment-id', required=True)
+    parser.add_argument('--deployment-id', help='Override the deployment identity (defaults to instance_name in the configuration)')
     parser.add_argument('--output-directory', type=Path, required=True)
     args = parser.parse_args()
-    directory = render_files(json.loads(args.config.read_text()), args.deployment_id, args.output_directory)
+    config = json.loads(args.config.read_text())
+    deployment_id = args.deployment_id if args.deployment_id is not None else config.get('instance_name')
+    directory = render_files(config, deployment_id, args.output_directory)
     print(directory / 'launch-command.sh')
 
 
