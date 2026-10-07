@@ -96,6 +96,37 @@ class DedicatedBuilderStartupTests(unittest.TestCase):
                                                   identity or 'builder-test')
                 self.assertEqual((output / 'startup.sh').read_text(), expected)
 
+    def test_cli_mapping_file_matches_embedded_config_and_refuses_conflicts(self):
+        with tempfile.TemporaryDirectory() as parent:
+            parent = Path(parent)
+            original = inputs()
+            mapping = parent / 'uploader.json'
+            mapping.write_text(json.dumps(original['authorized_uploader']))
+            config = parent / 'config.json'
+            minimal = {key: value for key, value in original.items()
+                       if key not in ('authorized_uploader', 'authorized_uploader_sha256')}
+            config.write_text(json.dumps(minimal))
+            output = parent / 'payload'
+            command = [sys.executable, str(ROOT / 'src/render_builder_startup.py'),
+                       '--config', str(config), '--uploader-mapping', str(mapping),
+                       '--output-directory', str(output)]
+            subprocess.run(command, capture_output=True, text=True, check=True)
+            self.assertEqual((output / 'startup.sh').read_text(),
+                             render_builder_startup(SimpleNamespace(**original), 'builder-test'))
+            config.write_text(json.dumps(original))
+            conflict_output = parent / 'conflict'
+            command[-1] = str(conflict_output)
+            conflict = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(conflict.returncode, 2)
+            self.assertIn('not both', conflict.stderr)
+            self.assertFalse(conflict_output.exists())
+            config.write_text(json.dumps(minimal))
+            invalid = dict(original['authorized_uploader'], public_key_sha256='0' * 64)
+            mapping.write_text(json.dumps(invalid))
+            refused = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertFalse(conflict_output.exists())
+
     def test_policy_shape_mapping_and_performance_refusals(self):
         for key, value in [('runner_count', 1), ('cpu', 32), ('ram', 64), ('builder_memory_gib', 32),
                            ('instance_name', 'runner-test'), ('data_disk_iops', True),

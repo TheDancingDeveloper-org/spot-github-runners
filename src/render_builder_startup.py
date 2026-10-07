@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from lib.builder_startup import render_builder_startup
+from lib.builder_access import approved_mapping, canonical_sha
 
 
 def builder_config(config):
@@ -79,10 +80,18 @@ def render_files(config, deployment_id, output_directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--uploader-mapping', type=Path,
+                        help='Explicitly approved public uploader mapping JSON; computes its checksum')
     parser.add_argument('--deployment-id', help='Override the deployment identity (defaults to instance_name in the configuration)')
     parser.add_argument('--output-directory', type=Path, required=True)
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
+    if args.uploader_mapping is not None:
+        if 'authorized_uploader' in config or 'authorized_uploader_sha256' in config:
+            parser.error('Choose the uploader mapping file or embedded configuration, not both')
+        mapping = approved_mapping(json.loads(args.uploader_mapping.read_text()))
+        config = {**config, 'authorized_uploader': mapping,
+                  'authorized_uploader_sha256': canonical_sha(mapping)}
     deployment_id = args.deployment_id if args.deployment_id is not None else config.get('instance_name')
     directory = render_files(config, deployment_id, args.output_directory)
     print(directory / 'launch-command.sh')

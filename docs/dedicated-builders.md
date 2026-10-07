@@ -15,13 +15,14 @@ fixed `/usr/local/bin/oxidex-remote-build` launcher.
 
 ## Render once, launch with one command
 
-Prepare a private JSON configuration containing the following shape and your
-explicitly approved uploader identity/public key. Do not use a private SSH key.
-`authorized_uploader` must contain exactly `schema` (`root-approved-ssh-mapping-v1`),
+Prepare the private JSON configuration below and a separate explicitly approved
+public uploader mapping file. Do not use a private SSH key. The mapping must
+contain exactly `schema` (`root-approved-ssh-mapping-v1`),
 `principal`, `username`, numeric `uid` (2000 is the deployment example),
 `identity_receipt_sha256`, the complete single-line Ed25519 `public_key`, and
-`public_key_sha256` (SHA-256 of that complete key string). Set
-`authorized_uploader_sha256` to SHA-256 of its sorted, compact JSON representation.
+`public_key_sha256` (SHA-256 of that complete key string). The renderer validates
+the selected mapping and computes its canonical checksum. Selecting the file
+does not approve a new account or key; use the mapping you already approved.
 Identity receipts and key mappings are deployment inputs, not repository defaults.
 The renderer supplies the fixed host, container, and baseline disk settings.
 Explicit settings still pass through the same strict policy checks.
@@ -34,16 +35,20 @@ Explicit settings still pass through the same strict policy checks.
 }
 ```
 
-Add the two uploader fields described in the preceding section, then render locally:
+Render locally with the approved mapping file:
 
 ```bash
 python3 src/render_builder_startup.py --config /private/builder-config.json \
+  --uploader-mapping /private/approved-uploader.json \
   --output-directory /private/builder-payload
 bash /private/builder-payload/launch-command.sh
 ```
 
 The deployment identity defaults to `instance_name` in the configuration. Use
 `--deployment-id` only when you need a distinct identity in the startup receipt.
+Existing configurations can continue embedding `authorized_uploader` and its
+canonical `authorized_uploader_sha256` instead. The renderer refuses a mapping
+file combined with either embedded field, so it cannot silently replace an identity.
 
 The second command executes **one `gcloud compute instances create` invocation**.
 It passes the complete embedded payload as `startup-script` metadata. The Debian

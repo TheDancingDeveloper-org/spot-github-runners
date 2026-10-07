@@ -419,45 +419,33 @@ export OXIDEX_OPS_DIR="${OXIDEX_OPS_DIR:-$HOME/oxidex-ops}"
 mkdir -p "$OXIDEX_OPS_DIR/launches"
 ```
 
-Create the builder configuration using the approved mapping:
+Create a private builder configuration. The renderer supplies the fixed host,
+container, and disk defaults:
 
-```bash
-PYTHONPATH=src python3 - <<'PY'
-import json
-import os
-from pathlib import Path
-from lib.builder_access import approved_mapping, canonical_sha
-
-root = Path(os.environ['OXIDEX_OPS_DIR'])
-mapping = approved_mapping(json.loads((root / 'authorized-uploader.json').read_text()))
-config = {
-    'role': 'builder', 'cpu': 16, 'ram': 32, 'runner_count': 0,
-    'builder_cpus': 16, 'builder_memory_gib': 28,
-    'disk_size_gb': 100, 'disk_type': 'hyperdisk-balanced',
-    'disk_device_name': 'builder-cache',
-    'data_disk_iops': 3000, 'data_disk_throughput': 140,
-    'boot_disk_size_gb': 40, 'boot_disk_iops': 3000,
-    'boot_disk_throughput': 140,
-    'instance_name': 'builder-oxidex-example',
-    'project': 'YOUR_PROJECT', 'zone': 'asia-east2-a',
-    'authorized_uploader': mapping,
-    'authorized_uploader_sha256': canonical_sha(mapping),
+```json
+{
+  "instance_name": "builder-oxidex-example",
+  "project": "your-project",
+  "zone": "asia-east2-a"
 }
-(root / 'builder-config.json').write_text(json.dumps(config, indent=2) + '\n')
-PY
 ```
 
-Replace `YOUR_PROJECT` with your lowercase GCP project ID before rendering.
-Builder names must start with `builder-`. Cache performance can use either
-3,000 IOPS / 140 MiB/s or the reviewed 4,000 IOPS / 250 MiB/s pair. Price both boot
-and cache storage, including provisioned performance, before choosing a pair.
+Save it as `$OXIDEX_OPS_DIR/builder-config.json`. Pass the approved public uploader
+mapping directly; the renderer validates it and computes its canonical checksum.
+You do not need to copy the mapping into the configuration or calculate that
+checksum yourself.
 
 ```bash
 python3 src/render_builder_startup.py \
   --config "$OXIDEX_OPS_DIR/builder-config.json" \
-  --deployment-id builder-example-001 \
-  --output-directory "$OXIDEX_OPS_DIR/launches/builder-example-001"
+  --uploader-mapping "$OXIDEX_OPS_DIR/authorized-uploader.json" \
+  --output-directory "$OXIDEX_OPS_DIR/launches/builder-oxidex-example"
 ```
+
+The instance name also identifies the deployment receipt. Existing embedded
+mapping configurations and an explicit `--deployment-id` override remain supported.
+See [Dedicated builders](docs/dedicated-builders.md) for storage overrides and
+configuration details.
 
 The output directory must not exist. The renderer produces:
 
@@ -475,7 +463,7 @@ The renderer validates configuration. Check current pricing and quota separately
 confirming the selected zone, quota, network access, and total price, launch:
 
 ```bash
-bash "$OXIDEX_OPS_DIR/launches/builder-example-001/launch-command.sh"
+bash "$OXIDEX_OPS_DIR/launches/builder-oxidex-example/launch-command.sh"
 ```
 
 This command creates billable resources. The dedicated cache disk has
