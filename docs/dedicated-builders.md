@@ -57,6 +57,19 @@ Rendering refuses an existing output directory; fresh-host startup must not be
 replayed to upgrade an occupied VM. Replacements need a new name and matching
 rendered payload.
 
+## Configure the build client
+
+The renderer also writes `cargo-remote-env.toml` with the project, instance name,
+zone, and uploader username. Merge those entries into the existing `[env]` table
+in OxiDex's `.cargo/config.toml`; do not replace unrelated settings.
+
+After startup, add the actual numeric GCE instance ID and the absolute paths to
+your private SSH key and trusted known-hosts file using the commented entries.
+These values cannot be inferred from a launch plan. The snippet contains no key
+material and does not claim the new VM is ready. OxiDex verifies the identity,
+SSH trust, installed launcher, and resource admission before executing work.
+Then use `just build`; use `just build-local` for an explicit local build.
+
 ## Storage, access, and draining
 
 The launch command uses a 40 GiB Hyperdisk Balanced boot disk and a 100 GiB

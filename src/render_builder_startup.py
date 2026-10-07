@@ -52,7 +52,21 @@ def render_files(config, deployment_id, output_directory):
                '--no-service-account', '--no-scopes',
                '--metadata=enable-oslogin=FALSE,block-project-ssh-keys=TRUE',
                '--metadata-from-file=startup-script=' + str(startup)]
+    # Only startup inputs are known before launch. Live ID and SSH trust remain
+    # explicit observations; a template is not permission to start a build.
+    client_env = dict(OXIDEX_REMOTE_PROJECT=args.project,
+                      OXIDEX_REMOTE_INSTANCE=args.instance_name,
+                      OXIDEX_REMOTE_ZONE=args.zone,
+                      OXIDEX_REMOTE_SSH_USER=args.authorized_uploader['username'])
+    client_config = ('# Merge into the existing Cargo [env] table; do not replace it.\n'
+                     '# Complete the commented settings after verifying startup and SSH trust.\n'
+                     '[env]\n' + ''.join(key + ' = ' + json.dumps(value) + '\n'
+                                          for key, value in client_env.items()) +
+                     '# OXIDEX_REMOTE_INSTANCE_ID = "actual numeric GCE instance ID"\n'
+                     '# OXIDEX_REMOTE_SSH_KEY = "/absolute/path/to/private-key"\n'
+                     '# OXIDEX_REMOTE_SSH_KNOWN_HOSTS = "/absolute/path/to/trusted-known-hosts"\n')
     outputs = {'startup.sh': script,
+               'cargo-remote-env.toml': client_config,
                'cloud-config.yaml': '#cloud-config\n' + json.dumps(cloud, indent=2) + '\n',
                'launch-command.sh': '#!/usr/bin/env bash\nset -Eeuo pipefail\nexec ' + shlex.join(command) + '\n'}
     for name, contents in outputs.items():
