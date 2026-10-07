@@ -11,6 +11,8 @@
 !.gitignore
 !.dockerignore
 !README.md
+!builder/standalone/website-package.json
+!builder/standalone/website-package-lock.json
 !docs/builder-runtime-updates.md
 
 # Secrets, generated files, and local-only artifacts

@@ -11,6 +11,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get update && apt-get install -y --no-install-recommends rsync time python3-venv llvm \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/uv && /opt/uv/bin/pip install --no-cache-dir uv
+# Official Node distribution checksum, resolved once and pinned in source.
+RUN curl --proto '=https' --tlsv1.2 -fsS \
+      https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
+    && echo 'fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6  /tmp/node.tar.xz' | sha256sum -c - \
+    && install -d -m 0755 /opt/node \
+    && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node \
+    && rm /tmp/node.tar.xz
+ENV PATH=/opt/node/bin:$PATH
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+COPY website-package.json /opt/playwright/package.json
+COPY website-package-lock.json /opt/playwright/package-lock.json
+# The locked package pins Chromium/headless-shell revision 1243. Dependencies
+# and browser downloads happen during image construction, never job startup.
+RUN cd /opt/playwright \
+    && npm ci --ignore-scripts --no-audit --no-fund \
+    && ./node_modules/.bin/playwright install --with-deps chromium \
+    && chmod -R a+rX /opt/node /opt/playwright /opt/playwright-browsers \
+    && rm -rf /var/lib/apt/lists/* /root/.npm \
+    && test "$(node --version)" = 'v24.21.0' \
+    && test "$(./node_modules/.bin/playwright --version)" = 'Version 1.63.0'
 ENV UV_PYTHON_INSTALL_DIR=/opt/python
 RUN /opt/uv/bin/uv python install 3.11 \
     && mkdir -p /opt/build-tools \
@@ -81,7 +101,7 @@ RUN chmod 0755 /usr/local/bin/oxidex-build-entrypoint \
     && install -m 0444 /dev/null /run/oxidex-build-container
 USER runner
 ENV RUSTUP_HOME=/home/runner/.rustup
-ENV PATH=/home/runner/.cargo/bin:/opt/build-tools:/opt/uv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/home/runner/.cargo/bin:/opt/node/bin:/opt/build-tools:/opt/uv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh \
     && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 \
     && rm /tmp/rustup-init.sh \

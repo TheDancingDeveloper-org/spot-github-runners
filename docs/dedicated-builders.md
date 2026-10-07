@@ -13,6 +13,16 @@ LLVM, and native build dependencies. App builds run as UID/GID 1001 and
 receive no Docker socket. SSH lands on the host; the uploader can sudo only the
 fixed `/usr/local/bin/oxidex-remote-build` launcher.
 
+The website tool additions pin Node 24.21.0 and Playwright 1.63.0, including
+Chromium revision 1243. The package lock verifies npm archives; the official
+Node archive has a fixed SHA-256. Browser downloads and Linux libraries are
+installed during image construction. Browser files live at the read-only
+`/opt/playwright-browsers` path, selected by `PLAYWRIGHT_BROWSERS_PATH`.
+The tool probe checks the browser executable and shared libraries as UID 1001.
+The website audit must separately prove an actual browser launch and rendering. These source additions need a reviewed image build and actual
+tool proof before an existing host is upgraded; they do not establish that
+website tools are installed on previously launched builders.
+
 ## Render once, launch with one command
 
 Prepare the private JSON configuration below and a separate explicitly approved

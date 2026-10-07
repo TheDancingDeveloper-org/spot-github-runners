@@ -4,7 +4,8 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[2]
 ASSETS = {
     '/opt/oxidex-builder/image/' + name: (_ROOT / 'builder/standalone' / name).read_text()
-    for name in ('Dockerfile', 'standalone-entrypoint.py', 'worktree_commands.py', 'toolchain_probe.py')
+    for name in ('Dockerfile', 'standalone-entrypoint.py', 'worktree_commands.py', 'toolchain_probe.py',
+                 'website-package.json', 'website-package-lock.json')
 }
 ASSETS.update({
     '/etc/oxidex-remote-build/qualification.gitconfig': '[safe]\n\tdirectory = /target/checkout\n[core]\n\thooksPath = /dev/null\n\tfsmonitor = false\n[gpg]\n\tprogram = /usr/bin/gpg\n[gpg "ssh"]\n\tprogram = /usr/bin/ssh-keygen\n[protocol]\n\tallow = never\n[protocol "file"]\n\tallow = always\n[protocol "https"]\n\tallow = never\n',
