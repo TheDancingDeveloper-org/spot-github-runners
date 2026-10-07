@@ -11,6 +11,7 @@
 !.gitignore
 !.dockerignore
 !README.md
+!docs/builder-runtime-updates.md
 
 # Secrets, generated files, and local-only artifacts
 .env
