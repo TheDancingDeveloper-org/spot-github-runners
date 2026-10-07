@@ -166,3 +166,143 @@ readable but non-executable (`0644`) through partial updates and reboot. Restori
 `0755` is part of the separately verified client-pin handoff, not automatic
 installation success. Administrative controlled proofs use the authenticated
 root control path; the uploader cannot bypass this hold.
+
+
+### Finish an installed update
+
+After controlled source checks and coordination of the exact client launcher
+pin, capture a new observation with the original installation nonce:
+
+```sh
+python3 -I -B builder_runtime_update.py --capture-assets assets.json \
+  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
+  --finish-nonce "$INSTALLED_NONCE" \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > finish-plan.json
+```
+
+Keep the original installation plan and journal. This capture has its own
+observation time and does not extend or rewrite the original plan. Inspect the
+new plan and select its exact digest through the authenticated root control path.
+First check the selected plan without changing the route:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan finish-plan.json \
+  --plan-sha256 "$FINISH_PLAN_SHA256" \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+```
+
+Then explicitly finish:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan finish-plan.json \
+  --plan-sha256 "$FINISH_PLAN_SHA256" --finish \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+```
+
+Finish verifies the successful installation journal and current host under the
+existing build lock. It keeps the launcher held through final checks and records a durable release
+decision before restoring execution. It then removes its persistent pending
+marker and removes the owned drain last. It returns
+`REOPENED_UNQUALIFIED`, with qualification readiness false. Run one actual
+ordinary OxiDex Just build and the qualification checks afterward. The client
+selector requires an executable launcher and no drain, so this ordinary build
+cannot be a pre-finish check. Do not treat reopening as proof of an app build.
+
+If finish fails, inspect its journal and actual files before recovery. Its
+failure handler attempts to close execution only on the exact installed
+launcher while the build lock remains held. It never rolls back runtime bytes,
+clears leases, stops builds, or modifies unrelated services. A changed or foreign
+file needs explicit recovery.
+
+### Recover an interrupted finish
+
+For an interrupted finish on the same boot and unchanged admission process,
+capture with the recovery action as well as the original nonce and client pin:
+
+```sh
+python3 -I -B builder_runtime_update.py --capture-assets assets.json \
+  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
+  --finish-nonce "$INSTALLED_NONCE" --recover-finish \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > recovery-plan.json
+```
+
+Inspect the new observation and select its digest. Recovery is explicit:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan recovery-plan.json \
+  --plan-sha256 "$RECOVERY_PLAN_SHA256" --recover-finish \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+```
+
+Recovery checks the successful installation and known finish stages under the
+existing exclusive lock. It closes execution only on the selected launcher,
+restores missing owned update markers, and retains the drain. It appends a
+`FINISH_RECOVERED_HELD` record; it does not rewrite the original journal or
+observation time. Capture a fresh finish plan afterward. Never replay apply or
+remove journal entries to retry.
+
+A changed boot, admission process, runtime file, or foreign marker is refused.
+Those cases need a separately reviewed recovery scope. This command does not
+restart services, reopen builds, or declare qualification readiness.
+
+### Complete a committed release after reboot
+
+If reboot interrupted an already committed release, use `--recover-committed`
+in the capture command instead of `--recover-finish`. The new schema-2
+observation preserves the original journal and boot history. It records either
+an exactly inactive unit or the verified PID and start ticks of its running
+admission process. It refuses changed runtime files, image, configuration,
+client pin, or unknown service state.
+
+```sh
+python3 -I -B builder_runtime_update.py --capture-assets assets.json \
+  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
+  --finish-nonce "$INSTALLED_NONCE" --recover-committed \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > reboot-plan.json
+```
+
+After inspecting that fresh observation and selecting its exact digest:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan reboot-plan.json \
+  --plan-sha256 "$REBOOT_PLAN_SHA256" --recover-committed \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+```
+
+Recovery rechecks the durable release decision under the build lock. It retains
+the persistent pending marker and uses an owned current-boot permit to start
+only an inactive admission unit. After verifying its process, socket, and current
+host state, it records a durable checkpoint, removes its markers, and releases
+the drain. A missing pending marker is recreated before startup.
+If the exact process is already running after a partial attempt, recovery checks
+it without another start command. A failed start or postflight retains the persistent marker and owned
+drain; another reboot removes the permit and leaves admission held. Successful recovery remains unqualified until actual OxiDex build and
+gate checks pass.
+
+After reboot, recovery initializes an absent volatile build lock without
+replacing an existing inode. A held post-commit launcher remains recoverable:
+the saved release decision must match every file, with only its execution mode
+held. Recovery restores execution through the verified descriptor while the
+owned drain remains. It rechecks freshness after publishing its checkpoint and
+before drain release.
+
+Permission transitions publish durable intent before changing the selected
+launcher. Recovery checks both sides of that transition against the same inode
+and bytes. Slow recovery observations must pass the selected plan's freshness
+check again before any permission change.
+
+The release journal distinguishes the observed held files from the authorized
+executable state. A committed decision is permission to complete that transition,
+not evidence that it already happened. A completed re-hold keeps that authority
+for checked recovery after another reboot.
+
+If unlink succeeded but directory sync failed, the helper reports
+`RELEASE_UNLINKED_SYNC_UNCONFIRMED` and exits75. It states that the drain was
+removed and does not claim a protective hold or close launcher execution.
+Inspect actual jobs, leases and files before any further recovery; do not replay
+apply or treat this result as a held installation.
+
+The transaction pins the authorized journal identity and complete prefix. Only
+verified writes by that transaction advance the pin. Unexpected replacement or
+appended history is preserved and refused, including during failure holding.
+Selected reboot plans must match the complete schema before recovery effects.

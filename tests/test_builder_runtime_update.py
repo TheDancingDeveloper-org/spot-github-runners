@@ -208,7 +208,13 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory).resolve()/'launcher';path.write_bytes(b'#!/bin/sh\nexit 0\n');path.chmod(0o755)
             before=path.stat();raw=path.read_bytes()
-            close_launcher_execution(path)
+            with self.assertRaises(ValueError):close_launcher_execution(path)
+            self.assertEqual(path.stat().st_mode & 0o777,0o755)
+            expected=dict(sha256=hashlib.sha256(raw).hexdigest(),mode=0o755,
+                          uid=before.st_uid,gid=before.st_gid,device=before.st_dev,inode=before.st_ino)
+            from unittest.mock import patch
+            with patch('lib.builder_runtime_update.authenticate_ancestor_custody'):
+                close_launcher_execution(path,expected=expected)
             self.assertEqual(path.read_bytes(),raw)
             self.assertEqual(path.stat().st_ino,before.st_ino)
             self.assertEqual(path.stat().st_mode & 0o777,0o644)
