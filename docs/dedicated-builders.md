@@ -111,3 +111,58 @@ Debian service/sudo parser and target-parent fixes included in the current
 payload. A second untouched launch of that final payload was not performed.
 
 The canceled 24-hour runner monitoring study is not part of this provisioning.
+
+## Runtime updates
+
+Use the standalone `src/lib/builder_runtime_update.py` helper through the existing
+authenticated root control path for an occupied dedicated builder. Its default
+mode checks a reviewed plan without writing files. Capture mode records the
+actual VM, boot, runtime files, and admission process; plans expire after
+120 seconds. It does not provision a VM or rebuild an image.
+
+The maintainer supplies a root-owned asset JSON file containing exactly the
+fifteen runtime targets and their reviewed bytes and hashes. Capture a fresh
+plan after source review and builder handback:
+
+```bash
+python3 -I -B builder_runtime_update.py --capture-assets assets.json \
+  --assets-sha256 ASSET_FILE_SHA256 --source-main REVIEWED_SOURCE_COMMIT
+```
+
+Save the returned plan as a private root-owned file and record its SHA-256.
+Check it before applying:
+
+```bash
+python3 -I -B builder_runtime_update.py --plan plan.json \
+  --plan-sha256 PLAN_FILE_SHA256
+python3 -I -B builder_runtime_update.py --plan plan.json \
+  --plan-sha256 PLAN_FILE_SHA256 --apply
+```
+
+Applying takes the existing build lock, refuses active builds and uploads,
+creates an owned drain, backs up old files, and replaces only the fixed runtime
+file set. It restarts admission alone. It preserves the image, build limits,
+source worktrees, and caches. A partial failure retains the drain and backups
+for explicit recovery. Success verifies installed bytes and the new admission
+process while retaining the owned drain.
+
+Coordinate the exact OxiDex launcher pin before this update. The helper does not
+change clients or declare qualification ready. Run the reviewed Linux gate and
+ordinary build checks before routing qualification work to the updated host. A successful installation
+returns `INSTALLED_DRAINED`; it keeps the route off until an independently
+verified client-pin handoff authorizes removal of the exact owned drain. The
+updater never reopens the route automatically.
+
+The update also installs a fixed admission-service boot guard and a persistent
+pending marker. A private permit in `/run` allows only the current maintenance
+boot to restart admission while that marker exists. Reboot removes the permit,
+so admission stays off until explicit recovery or the verified handoff. The
+pending marker and volatile drain are separate from build leases.
+
+Preparation only writes private backups and leaves the live runtime unchanged.
+The first live cutover removes launcher execution permission and persists that
+mode before runtime replacement. Both the previous and installed launcher stay
+readable but non-executable (`0644`) through partial updates and reboot. Restoring
+`0755` is part of the separately verified client-pin handoff, not automatic
+installation success. Administrative controlled proofs use the authenticated
+root control path; the uploader cannot bypass this hold.
