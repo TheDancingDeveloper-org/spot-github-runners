@@ -2,12 +2,47 @@
 """Actual tool and browser dependency evidence; no application builds or installs."""
 import hashlib
 import json
+import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
 
 COMPILER=Path('/home/runner/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc')
 COMMIT='b940084d7eb6a299eb4bfeb8e34901bc051e7ac4'
+WEBSITE_PATH='/opt/node/bin:/usr/bin:/bin'
+
+
+def website_environment():
+    return {'PATH': WEBSITE_PATH, 'HOME': '/home/runner', 'LANG': 'C',
+            'LC_ALL': 'C', 'TZ': 'UTC'}
+
+
+def root_owned_runtime_path(path):
+    try:
+        resolved = path.resolve(strict=True)
+        for selected in (path, resolved):
+            for component in (selected, *selected.parents):
+                info = component.lstat()
+                if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
+                    return False
+        return True
+    except OSError:
+        return False
+
+
+def verify_runtime_tools():
+    for directory in WEBSITE_PATH.split(':'):
+        path = Path(directory)
+        if not path.is_dir() or not root_owned_runtime_path(path):
+            raise ValueError('Website runtime directory is not root-owned: ' + directory)
+    for name in ('node', 'npm', 'git', 'bash'):
+        selected = shutil.which(name, path=WEBSITE_PATH)
+        if not selected or not root_owned_runtime_path(Path(selected)):
+            raise ValueError('Website runtime tool is not root-owned: ' + name)
+        info = Path(selected).stat()
+        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+            raise ValueError('Website runtime tool is not executable: ' + name)
 
 
 def validate_website_tools(row):
@@ -18,12 +53,15 @@ def validate_website_tools(row):
             or row.get('browser_path') != '/opt/playwright-browsers'
             or type(row.get('uid')) is not int or row.get('uid') != 1001
             or row.get('executable_readable') is not True
+            or row.get('root_owned_runtime') is not True
+            or row.get('runtime_path') != WEBSITE_PATH
             or row.get('libraries_available') is not True):
         raise ValueError('Actual website tools differ from pins or libraries are unavailable')
     return row
 
 
 def website_tools():
+    verify_runtime_tools()
     script = r"""
 const fs = require('fs');
 const cp = require('child_process');
@@ -39,11 +77,15 @@ console.log(JSON.stringify({node: process.version,
   playwright: require('/opt/playwright/node_modules/playwright/package.json').version,
   chromium_revision: revision, chromium_version: version.split(' ').at(-1),
   browser_path: process.env.PLAYWRIGHT_BROWSERS_PATH, uid: process.getuid(),
+  runtime_path: process.env.PATH,
   executable_readable: true, libraries_available: true}));
 """
+    env = {**website_environment(), 'PLAYWRIGHT_BROWSERS_PATH': '/opt/playwright-browsers'}
     output = subprocess.check_output(['/opt/node/bin/node', '-e', script],
-                                     text=True, timeout=15)
-    return validate_website_tools(json.loads(output))
+                                     text=True, timeout=15, env=env)
+    evidence = json.loads(output)
+    evidence['root_owned_runtime'] = True
+    return validate_website_tools(evidence)
 
 
 def main():
@@ -63,9 +105,9 @@ def main():
     if (any(not tools[name].startswith(prefix) for name,prefix in expected.items())
         or tools['zig']!='0.15.2' or tools['cargo_zigbuild']!='cargo-zigbuild 0.23.4'):
         raise ValueError('Actual development tool versions differ from pin')
-    tools['node'] = subprocess.check_output(['/opt/node/bin/node', '--version'], text=True, timeout=15).strip()
-    tools['npm'] = subprocess.check_output(['/opt/node/bin/npm', '--version'], text=True, timeout=15).strip()
     website = website_tools()
+    tools['node'] = subprocess.check_output(['/opt/node/bin/node', '--version'], text=True, timeout=15, env=website_environment()).strip()
+    tools['npm'] = subprocess.check_output(['/opt/node/bin/npm', '--version'], text=True, timeout=15, env=website_environment()).strip()
     rows=Path('/proc/self/cgroup').read_text().splitlines()
     paths=[line[3:] for line in rows if line.startswith('0::')]
     if len(paths)!=1 or not paths[0].startswith('/') or '..' in paths[0].split('/'):

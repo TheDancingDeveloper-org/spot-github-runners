@@ -16,7 +16,9 @@ RUN curl --proto '=https' --tlsv1.2 -fsS \
       https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
     && echo 'fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6  /tmp/node.tar.xz' | sha256sum -c - \
     && install -d -m 0755 /opt/node \
-    && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node \
+    && tar -xJf /tmp/node.tar.xz --no-same-owner --strip-components=1 -C /opt/node \
+    && chown -hR 0:0 /opt/node \
+    && chmod -R go-w /opt/node \
     && rm /tmp/node.tar.xz
 ENV PATH=/opt/node/bin:$PATH
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
