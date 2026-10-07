@@ -13,6 +13,9 @@ This guide describes the source on `main`. Merging source does not update a
 running controller, container, or VM. Inspect the deployed configuration and
 actual tool versions before routing work to a host.
 
+For the shortest OxiDex setup and build workflow, see
+[Simplify OxiDex remote builds](docs/simplification.md).
+
 ## Choose a workflow
 
 | Goal | Entry point | Creates or changes resources? |
