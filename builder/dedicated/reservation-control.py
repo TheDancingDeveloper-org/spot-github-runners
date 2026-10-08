@@ -8,6 +8,47 @@ import stat
 import sys
 import signal
 import subprocess
+import hashlib
+
+
+RECONCILE_LOG=b'Actual owned quiescence observed; no sources/targets/evidence removed.\n'
+
+
+def reconcile_log(path):
+    """Create or authenticate the one deterministic root cleanup observation."""
+    flags=os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK
+    try:
+        fd=os.open(path,flags)
+    except FileNotFoundError:
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'wb') as output:
+            output.write(RECONCILE_LOG);output.flush();os.fsync(output.fileno())
+        parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(parent)
+        finally:os.close(parent)
+        fd=os.open(path,flags)
+    try:
+        before=os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid!=0 or before.st_nlink!=1
+                or before.st_mode&0o022 or before.st_size>len(RECONCILE_LOG)):
+            raise ValueError('Retained reconciliation log differs')
+        existing=os.read(fd,len(RECONCILE_LOG)+1)
+        if len(existing)!=before.st_size or not RECONCILE_LOG.startswith(existing):
+            raise ValueError('Retained reconciliation log differs')
+        after=os.fstat(fd)
+        if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):
+            raise ValueError('Reconciliation log changed during observation')
+        if len(existing)<len(RECONCILE_LOG):
+            remainder=RECONCILE_LOG[len(existing):]
+            if os.write(fd,remainder)!=len(remainder):
+                raise ValueError('Reconciliation log completion failed')
+            os.fsync(fd)
+        os.lseek(fd,0,os.SEEK_SET)
+        if (os.fstat(fd).st_size!=len(RECONCILE_LOG)
+                or os.read(fd,len(RECONCILE_LOG)+1)!=RECONCILE_LOG):
+            raise ValueError('Reconciliation log completion differs')
+        return hashlib.sha256(RECONCILE_LOG).hexdigest()
+    finally:os.close(fd)
 
 
 def inspection_fence():
@@ -65,7 +106,6 @@ def main():
                 if args.scope_sha256 is None:parser.error('Exact reviewed scope digest required')
                 raw=sys.stdin.buffer.read(65537)
                 if len(raw)>65536:raise ValueError('Bounded reviewed scope required')
-                import hashlib
                 if hashlib.sha256(raw).hexdigest()!=args.scope_sha256:
                     raise ValueError('Reviewed scope bytes differ')
                 scope=json.loads(raw,object_pairs_hook=pairs)
@@ -92,6 +132,8 @@ def main():
         fd=os.open('/run/oxidex-build.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
         try:
             fcntl.flock(fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
+            # Reobserve the mounted cache under the active SH fence.
+            if enrollment() is None:raise ValueError('Active reservation requires enrolled storage')
             if args.operation=='export':
                 engine.export(args.project,args.reservation,sys.stdout.buffer)
             else:
@@ -123,11 +165,9 @@ def main():
                     actor=current_actor(),argv=request['argv'][7],quiescent=lambda:engine.idle(args.project))
                 # Custody cleanup observes state only; no deletion or child restart.
                 log=path/'reconcile-cleanup.log'
-                with log.open('xb') as output:
-                    output.write(b'Actual owned quiescence observed; no sources/targets/evidence removed.\n')
-                    output.flush();os.fsync(output.fileno())
+                log_sha256=reconcile_log(log)
                 result=Store().finish(args.reservation,7,host=host_identity(),actor=current_actor(),
-                    exit_code=0,log_sha256=engine.file_digest(log),quiescent=lambda:engine.idle(args.project))
+                    exit_code=0,log_sha256=log_sha256,quiescent=lambda:engine.idle(args.project))
             print(json.dumps(result,sort_keys=True));return 0
         record=None
         if ROOT.exists() or ROOT.is_symlink():

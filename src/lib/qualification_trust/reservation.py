@@ -378,7 +378,18 @@ class Store:
             if record['next_ordinal'] >= len(record['stages']) or digest(argv) != stage['argv_sha256']:
                 raise ValueError('Owned cleanup already finished or command differs')
             if record['active'] is not None and record['active']['command'] == 'cleanup':
-                raise ValueError('Uncertain cleanup cannot be repeated')
+                if record['state'] != 'RECOVERING':
+                    raise ValueError('Uncertain cleanup cannot be repeated')
+                previous = record['active']['actor']
+                if previous == actor or not actor_exited(previous):
+                    raise ValueError('Prior cleanup actor remains or cannot be excluded')
+                if len(record['events']) >= 126:
+                    raise ValueError('Recovery event budget exhausted')
+                record['events'].append({**record['active'], 'exit_code': None,
+                                         'log_sha256': None, 'disposition': 'INTERRUPTED'})
+                record['active'] = dict(ordinal=ordinal, actor=actor, command='cleanup')
+                self.write(record)
+                return record
             if record['active'] is not None:
                 record['events'].append({**record['active'], 'exit_code': None,
                                          'log_sha256': None, 'disposition': 'INTERRUPTED'})
@@ -429,6 +440,20 @@ def process(pid):
 
 def current_actor():
     return process(os.getpid())[0]
+
+
+def actor_exited(actor):
+    """Only a missing, zombie, or reused Linux PID excludes the recorded actor."""
+    validate_actor(actor)
+    try:
+        observed, _ = process(actor['pid'])
+    except FileNotFoundError:
+        return True
+    except ValueError as error:
+        if str(error) == 'Stage owner exited':
+            return True
+        raise
+    return observed != actor
 
 
 def ancestor_matches(actor, pid):

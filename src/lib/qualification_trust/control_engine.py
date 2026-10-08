@@ -80,14 +80,14 @@ def stage_unit_processes():
 def stop_stage_children(process):
     """On excess output, stop the process group and every remaining unit child."""
     try:os.killpg(process.pid,signal.SIGKILL)
-    except ProcessLookupError:pass
+    except ProcessLookupError:pass  # The process exited between scope observation and kill.
     deadline=time.monotonic()+5
     while True:
         others=stage_unit_processes()-{os.getpid()}
         if not others:break
         for pid in others:
             try:os.kill(pid,signal.SIGKILL)
-            except ProcessLookupError:pass
+            except ProcessLookupError:pass  # A listed child may exit before signaling.
         if time.monotonic()>=deadline:
             raise ValueError('Stage descendants remain after output limit; retain custody')
         time.sleep(.02)
