@@ -45,7 +45,8 @@ if helper.name=='builder_access_15asset.py':
     assert legacy, 'Retained installed helper bytes changed'
 if legacy:
     assert b'def uploader_policy_bytes' not in helper_raw
-assert len(globals_['TARGETS'])==24
+assert len(globals_['TARGETS'])==25
+assert globals_['TARGETS'][globals_['QUALIFICATION']+'control_fault.py']==0o644
 assert hashlib.sha256(helper_raw).hexdigest() in globals_['TRUSTED_BUILDER_ACCESS_SHA256']
 def root_read(path):
     if str(path)=='/opt/gha-runners/builder_access.py':
