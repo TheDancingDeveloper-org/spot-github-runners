@@ -545,8 +545,11 @@ class ProofRepairControls(unittest.TestCase):
 
     def test_policy_recovery_preserves_foreign_file(self):
         nonce='a'*32;boot='old-boot';target=next(iter(update.POLICY_TARGETS))
+        helper='/opt/gha-runners/builder_access.py';reviewed_helper=b'reviewed helper\n'
+        helper_state={'sha256':hashlib.sha256(reviewed_helper).hexdigest(),
+                      'mode':update.TARGETS[helper],'uid':0,'gid':0}
         plan={'nonce':nonce,'boot':boot,'source_main':'b'*40,'vm_id':'123',
-              'config_sha256':'c'*64,'assets':{},'before':{target:None},'observed_at':1.0}
+              'config_sha256':'c'*64,'assets':{},'before':{target:None,helper:None},'observed_at':1.0}
         journal=b'{"stage":"BACKUPS_COMPLETE"}\n'
         def read(path):
             name=str(path)
@@ -561,31 +564,45 @@ class ProofRepairControls(unittest.TestCase):
             name=str(path)
             if name.endswith('oxidex-builder-uploader.json'):return {'sha256':'mapping'}
             if name.endswith('oxidex-remote-build.json'):return {'sha256':'c'*64}
+            if name==helper:return dict(helper_state)
             if name==target:return {'sha256':'f'*64,'mode':0o644,'uid':0,'gid':0}
             return None
         def command(argv):return '123' if argv[0]=='/usr/bin/curl' else ''
         def finish(lock,drain,token,check,action,**kwargs):
             kwargs['lock_bound'](lambda:None)
             check();result=action();check();return result
+        selected=[]
+        @contextmanager
+        def selection(path,expected,read_state):
+            if str(path)==helper:
+                self.assertEqual(expected,helper_state)
+                selected.append((str(path),expected['sha256']))
+            self.assertEqual(read_state(),expected)
+            yield lambda:self.assertEqual(read_state(),expected)
         with patch.object(update,'validate_plan'),patch.object(update,'validate_policy_assets'),\
-             patch.object(update,'validate_assets',return_value={target:b'approved'}),\
+             patch.object(update,'validate_assets',return_value={target:b'approved',helper:reviewed_helper}),\
              patch.object(update,'root_file_read',side_effect=read),\
              patch.object(update,'root_file_state',side_effect=state),\
              patch.object(update,'verify_boot_guard'),patch.object(update,'checked_command',side_effect=command),\
              patch.object(update,'observed_work_processes',return_value=[]),\
+             patch.object(update,'retained_file_selection',side_effect=selection),\
              patch.object(update,'finish_owned_drain',side_effect=finish):
             with self.assertRaisesRegex(ValueError,'Foreign policy state'):
                 update.recover_policy_update(plan)
+        self.assertTrue(selected)
 
     def test_policy_recovery_restores_selected_backup_and_is_retryable(self):
         target='/etc/ssh/sshd_config.d/40-oxidex-uploader-fence.conf'
+        helper='/opt/gha-runners/builder_access.py';reviewed_helper=b'reviewed helper\n'
         old=b'old fixed policy\n';new=b'new fixed policy\n'
         sha=lambda raw:hashlib.sha256(raw).hexdigest()
         nonce='a'*32;boot='old-boot';journal=[b'{"stage":"BACKUPS_COMPLETE"}\n']
         before={'sha256':sha(old),'mode':0o644,'uid':0,'gid':0}
         current=[{'sha256':sha(new),'mode':0o644,'uid':0,'gid':0}]
+        helper_state={'sha256':sha(reviewed_helper),'mode':update.TARGETS[helper],
+                      'uid':0,'gid':0}
         plan={'nonce':nonce,'boot':boot,'source_main':'b'*40,'vm_id':'123',
-              'config_sha256':'c'*64,'assets':{},'before':{target:before},'observed_at':1.0}
+              'config_sha256':'c'*64,'assets':{},'before':{target:before,helper:None},'observed_at':1.0}
         def read(path):
             name=str(path)
             if name.endswith('/plan.json'):return {'sha256':'saved'},json.dumps(plan).encode()
@@ -600,6 +617,7 @@ class ProofRepairControls(unittest.TestCase):
             name=str(path)
             if name.endswith('oxidex-builder-uploader.json'):return {'sha256':'mapping'}
             if name.endswith('oxidex-remote-build.json'):return {'sha256':'c'*64}
+            if name==helper:return dict(helper_state)
             return current[0] if name==target else None
         def command(argv):return '123' if argv[0]=='/usr/bin/curl' else ''
         def write(path,raw,mode,**kwargs):
@@ -613,11 +631,17 @@ class ProofRepairControls(unittest.TestCase):
         def finish(lock,drain,token,check,action,**kwargs):
             kwargs['lock_bound'](lambda:None)
             check();result=action();check();return result
+        selected=[]
         @contextmanager
-        def selection(*args,**kwargs):yield lambda:None
-        with patch.object(update,'TARGETS',{target:0o644}),patch.object(update,'POLICY_TARGETS',{target:0o644}),\
+        def selection(path,expected,read_state):
+            if str(path)==helper:
+                self.assertEqual(expected,helper_state)
+                selected.append((str(path),expected['sha256']))
+            self.assertEqual(read_state(),expected)
+            yield lambda:self.assertEqual(read_state(),expected)
+        with patch.object(update,'TARGETS',{target:0o644,helper:0o644}),patch.object(update,'POLICY_TARGETS',{target:0o644}),\
              patch.object(update,'validate_plan'),patch.object(update,'validate_policy_assets'),\
-             patch.object(update,'validate_assets',return_value={target:new}),\
+             patch.object(update,'validate_assets',return_value={target:new,helper:reviewed_helper}),\
              patch.object(update,'root_file_read',side_effect=read),patch.object(update,'root_file_state',side_effect=state),\
              patch.object(update,'verify_boot_guard'),patch.object(update,'checked_command',side_effect=command),\
              patch.object(update,'observed_work_processes',return_value=[]),\
@@ -627,6 +651,8 @@ class ProofRepairControls(unittest.TestCase):
              patch.object(update,'append_journal_record',side_effect=append):
             self.assertEqual(update.recover_policy_update(plan)['status'],'POLICY_ROLLED_BACK_HELD')
             self.assertEqual(update.recover_policy_update(plan)['status'],'POLICY_ROLLED_BACK_HELD')
+        self.assertGreaterEqual(len(selected),2)
+        self.assertEqual(set(selected),{(helper,sha(reviewed_helper))})
 
     def test_reboot_reconcile_resumes_published_evidence_and_refuses_tamper(self):
         with tempfile.TemporaryDirectory() as directory:
