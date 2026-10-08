@@ -39,12 +39,12 @@ TARGETS = {
     **{QUALIFICATION + name + '.py': 0o644 for name in (
         '__init__', 'git_sandbox', 'host_gate', 'import_supervisor',
         'launcher_contract', 'mounts', 'qualification_source', 'runtime', 'reservation',
-        'task20_receiver', 'control_observation', 'control_engine', 'task20_runtime')},
+        'task20_receiver', 'control_observation', 'control_engine', 'control_fault', 'task20_runtime')},
     QUALIFICATION + 'runtime_git.py': 0o555,
     **POLICY_TARGETS,
 }
 
-# The installed 15-target helper and this release's 24-target helper are the
+# The installed 15-target helper and this release's 25-target helper are the
 # only reviewed policy code that may run before the replacement is held.
 TRUSTED_BUILDER_ACCESS_SHA256 = frozenset({
     '463b7887505c9593d400ed8534b7a792038129690b7a4ad08bc5649533022e36',

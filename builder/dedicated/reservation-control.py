@@ -24,19 +24,57 @@ def inspection_fence():
     return fd
 
 
+def active_fence():
+    """Join an active stage's SH fence without creating or replacing it."""
+    fd=os.open('/run/oxidex-build.lock',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1 or info.st_mode&0o022:
+            raise ValueError('Untrusted canonical build fence')
+        fcntl.flock(fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd);raise
+    return fd
+
+
 def main():
     if os.geteuid()!=0:raise RuntimeError('Root-authenticated control transport required')
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation',choices=['inspect','reserve','stage','submit-stage','export','reconcile','reconcile-reboot','release'])
+    parser.add_argument('operation',choices=['inspect','reserve','stage','submit-stage','export','reconcile','reconcile-reboot','release','observe-owned','interrupt-owned'])
     parser.add_argument('--project')
     parser.add_argument('--reservation')
     parser.add_argument('--ordinal',type=int)
     parser.add_argument('--expected-old-boot')
+    parser.add_argument('--installation-nonce')
+    parser.add_argument('--scope-sha256')
     args=parser.parse_args()
     sys.path.insert(0,'/opt/oxidex-builder')
     from qualification_trust.reservation import ROOT,Store,enrollment,host_identity
     from qualification_trust import control_engine as engine
     from qualification_trust.reservation import pairs,current_actor
+    if args.operation in ('observe-owned','interrupt-owned'):
+        from qualification_trust import control_fault
+        if args.project is None or args.reservation is None or args.installation_nonce is None:
+            parser.error('Exact project, reservation and installation nonce required')
+        fd=active_fence()
+        try:
+            if args.operation=='observe-owned':
+                if args.scope_sha256 is not None:parser.error('Scope digest belongs to interruption only')
+                result=control_fault.observe(args.project,args.reservation,args.installation_nonce)
+            else:
+                if args.scope_sha256 is None:parser.error('Exact reviewed scope digest required')
+                raw=sys.stdin.buffer.read(65537)
+                if len(raw)>65536:raise ValueError('Bounded reviewed scope required')
+                import hashlib
+                if hashlib.sha256(raw).hexdigest()!=args.scope_sha256:
+                    raise ValueError('Reviewed scope bytes differ')
+                scope=json.loads(raw,object_pairs_hook=pairs)
+                if (scope.get('project')!=args.project or scope.get('reservation')!=args.reservation
+                        or scope.get('installation_nonce')!=args.installation_nonce):
+                    raise ValueError('Selected scope arguments differ')
+                result=control_fault.interrupt_owned(scope)
+            print(json.dumps(result,sort_keys=True));return 0
+        finally:os.close(fd)
     if args.operation=='submit-stage':
         if args.project is None or args.reservation is None or args.ordinal is None:parser.error('Stage identity required')
         engine.selected(args.project,args.reservation)
