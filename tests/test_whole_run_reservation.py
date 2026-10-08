@@ -334,6 +334,7 @@ class ReservationTests(unittest.TestCase):
         with patch.object(reservation, 'process', side_effect=lambda pid: rows[pid]):
             with self.assertRaises(ValueError):
                 reservation.ancestor_matches(actor, 300)
+
         calls = {300:0,200:0,100:0}
         rows[200] = (dict(pid=200,start=150),100)
         def changed(pid):
@@ -345,3 +346,26 @@ class ReservationTests(unittest.TestCase):
              patch.object(reservation.Path, 'read_text', return_value='Uid:\t0\t0\t0\t0\n'):
             with self.assertRaises(ValueError):
                 reservation.ancestor_matches(actor, 300)
+
+    def test_canonical_enrollment_is_accepted_by_admission_and_bad_field_refused(self):
+        import json
+        sys.path.insert(0, str(MODULE.parents[2]))
+        from lib import host_admission as admission
+        config = dict(role='builder', host_cpus=16, builder_cpus=16, work_gib=28,
+                      runner_gib=0, builder_gib=28, runner_names=[])
+        actual = dict(role='builder',cpus=16,memory_gib=28,image='oxidex-remote-builder:1.99.0',approved_image_id='sha256:'+'a'*64)
+        for policy in [dict(schema=1,enabled=False,uuid=None,device=None),
+                       dict(schema=1,enabled=True,uuid=self.host[1],device=66308)]:
+            with patch.object(admission.os,'cpu_count',return_value=16), \
+                 patch.object(admission,'process_identity',return_value='host:100:200'), \
+                 patch.object(admission.Path,'read_text',return_value=json.dumps({**actual,'reservation_enrollment':policy})), \
+                 patch.dict(sys.modules, {'qualification_trust':SimpleNamespace(),
+                     'qualification_trust.reservation':SimpleNamespace(validate_enrollment=reservation.validate_enrollment)}):
+                self.assertEqual(admission.builder_owner_kind('host:100:200',config),'builder')
+        with patch.object(admission.os,'cpu_count',return_value=16), \
+             patch.object(admission,'process_identity',return_value='host:100:200'), \
+             patch.object(admission.Path,'read_text',return_value=json.dumps({**actual,'reservation_enrollment':{'enabled':True}})), \
+             patch.dict(sys.modules, {'qualification_trust':SimpleNamespace(),
+                 'qualification_trust.reservation':SimpleNamespace(validate_enrollment=reservation.validate_enrollment)}):
+            with self.assertRaises(ValueError):
+                admission.builder_owner_kind('host:100:200',config)

@@ -127,7 +127,11 @@ def builder_owner_kind(owner,config):
         return 'builder'
     actual=json.loads(Path('/etc/oxidex-remote-build.json').read_text())
     pin=actual.get('approved_image_id')
-    if ({k:v for k,v in actual.items() if k!='approved_image_id'}!={'role':'builder','cpus':16,'memory_gib':28,'image':'oxidex-remote-builder:1.99.0'}
+    if 'reservation_enrollment' in actual:
+        sys.path.insert(0, '/opt/oxidex-builder')
+        from qualification_trust.reservation import validate_enrollment
+        validate_enrollment(actual['reservation_enrollment'])
+    if ({k:v for k,v in actual.items() if k not in ('approved_image_id','reservation_enrollment')}!={'role':'builder','cpus':16,'memory_gib':28,'image':'oxidex-remote-builder:1.99.0'}
         or not isinstance(pin,str) or not re.fullmatch('sha256:[0-9a-f]{64}',pin)):
         raise ValueError('Actual builder launcher policy differs from reservation')
     return 'builder'

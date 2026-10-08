@@ -6,7 +6,7 @@ Implemented: bounded durable custody store, strict session/stage binding,
 detached signature verification through the existing source trust anchor,
 PID/start ancestry and metadata VM/boot observations, launcher/Docker/admission
 read-side gates, startup/runtime-update enrollment, retained uncertainty,
-interrupted-stage recovery and archived release tombstones. Twenty-seven focused
+interrupted-stage recovery and archived release tombstones. Twenty-eight focused
 synthetic controls pass, including a real file-descriptor admission lock test.
 Custody resides in a private directory on persistent cache storage. Released
 namespaces stay fenced; finalization requires the submitted exact ordinal and

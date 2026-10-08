@@ -434,6 +434,19 @@ def ancestor_matches(actor, pid):
     raise ValueError('Stage ancestry bound exceeded')
 
 
+def validate_enrollment(policy):
+    """Pure schema check shared by custody and admission validators."""
+    if not isinstance(policy, dict) or set(policy) != {'schema', 'enabled', 'uuid', 'device'} or type(policy['schema']) is not int or policy['schema'] != 1 or type(policy['enabled']) is not bool:
+        raise ValueError('Unknown reservation enrollment')
+    if not policy['enabled']:
+        if policy['uuid'] is not None or policy['device'] is not None:
+            raise ValueError('Unenrolled policy has unexpected storage identity')
+        return None
+    if not isinstance(policy['uuid'], str) or not re.fullmatch('[0-9a-f-]{36}', policy['uuid']) or type(policy['device']) is not int or policy['device'] <= 0:
+        raise ValueError('Enrolled storage identity missing')
+    return policy
+
+
 def enrollment():
     """Read trusted boot configuration; absent enrolled cache is not idleness."""
     fd = os.open(CONFIG, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -452,15 +465,9 @@ def enrollment():
             and (config.get('approved_image_id') is None or isinstance(config['approved_image_id'], str)
                  and re.fullmatch('sha256:[0-9a-f]{64}', config['approved_image_id']))):
         return None  # Explicitly recognized historical configuration schema.
-    policy = config.get('reservation_enrollment') if isinstance(config, dict) else None
-    if not isinstance(policy, dict) or set(policy) != {'schema', 'enabled', 'uuid', 'device'} or type(policy['schema']) is not int or policy['schema'] != 1 or type(policy['enabled']) is not bool:
-        raise ValueError('Unknown reservation enrollment')
-    if not policy['enabled']:
-        if policy['uuid'] is not None or policy['device'] is not None:
-            raise ValueError('Unenrolled policy has unexpected storage identity')
+    policy = validate_enrollment(config.get('reservation_enrollment') if isinstance(config, dict) else None)
+    if policy is None:
         return None
-    if not isinstance(policy['uuid'], str) or not re.fullmatch('[0-9a-f-]{36}', policy['uuid']) or type(policy['device']) is not int or policy['device'] <= 0:
-        raise ValueError('Enrolled storage identity missing')
     mounted = subprocess_storage()
     if mounted != (policy['uuid'], policy['device']):
         raise ValueError('Enrolled cache mount unavailable or replaced; custody held')
