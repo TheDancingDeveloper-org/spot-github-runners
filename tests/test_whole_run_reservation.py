@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import os
+import pwd
 import fcntl
 import sys
 from contextlib import ExitStack
@@ -18,8 +19,10 @@ spec.loader.exec_module(reservation)
 
 class ReservationTests(unittest.TestCase):
     def setUp(self):
-        # Avoid world-writable /tmp; production nofollow ancestor rules apply.
-        self.folder = tempfile.TemporaryDirectory(dir=Path.cwd())
+        # Use the actual account home, not the uploaded source's foreign-owned
+        # working directory or an environment-controlled HOME or /tmp.
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        self.folder = tempfile.TemporaryDirectory(dir=home)
         self.store = reservation.Store(self.folder.name, owner_uid=os.getuid())
         self.head = 'a'*40
         self.project = 'qualification-'+self.head[:12]+'-'+'b'*32
@@ -124,6 +127,36 @@ class ReservationTests(unittest.TestCase):
         (Path(self.folder.name)/'record.json').symlink_to(outside)
         with self.assertRaises(OSError):
             self.store.read()
+
+    def test_untrusted_reservation_paths_are_refused(self):
+        owner = os.getuid()
+        if owner == 0:
+            self.fail('Reservation fixture must run as the unprivileged builder account')
+        for root in (Path('/tmp'), Path(self.folder.name)):
+            with self.subTest(root=root):
+                if root == Path(self.folder.name):
+                    # A deliberately wrong expected owner rejects the real
+                    # fixture UID without falsifying os.stat or running root.
+                    expected_owner = owner + 1
+                else:
+                    expected_owner = owner
+                with self.assertRaises(ValueError):
+                    with reservation.Store(root, owner_uid=expected_owner).locked():
+                        pass
+        unsafe = Path(self.folder.name)/'world-writable'
+        unsafe.mkdir(mode=0o700)
+        unsafe.chmod(0o777)
+        try:
+            with self.assertRaises(ValueError):
+                with reservation.Store(unsafe, owner_uid=owner).locked():
+                    pass
+        finally:
+            unsafe.chmod(0o700)
+        link = Path(self.folder.name)/'symlink-root'
+        link.symlink_to(unsafe, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            with reservation.Store(link, owner_uid=owner).locked():
+                pass
 
     def test_foreign_stage_actor_and_changed_boot_refuse(self):
         record = self.claim()
