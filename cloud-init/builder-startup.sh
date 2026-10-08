@@ -128,6 +128,7 @@ with path.open('w') as output:
     json.dump(config,output,sort_keys=True);output.flush();os.fsync(output.fileno())
 RESERVATION_ENROLLMENT
 chmod 0755 /usr/local/bin/oxidex-remote-build /usr/local/bin/docker
+chmod 0700 /usr/local/sbin/oxidex-reservation-control
 python3 - <<'HOST_HEADROOM'
 import os,runpy
 from pathlib import Path

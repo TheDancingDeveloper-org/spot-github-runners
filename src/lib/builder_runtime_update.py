@@ -25,13 +25,15 @@ QUALIFICATION = '/opt/oxidex-builder/qualification_trust/'
 TARGETS = {
     '/usr/local/bin/oxidex-remote-build': 0o755,
     '/usr/local/bin/docker': 0o755,
+    '/usr/local/sbin/oxidex-reservation-control': 0o700,
     '/opt/gha-runners/host_admission.py': 0o600,
     '/opt/gha-runners/builder_access.py': 0o644,
     '/etc/oxidex-remote-build/qualification.gitconfig': 0o444,
     '/etc/oxidex-remote-build/qualification-maintainer.allowed_signers': 0o444,
     **{QUALIFICATION + name + '.py': 0o644 for name in (
         '__init__', 'git_sandbox', 'host_gate', 'import_supervisor',
-        'launcher_contract', 'mounts', 'qualification_source', 'runtime', 'reservation')},
+        'launcher_contract', 'mounts', 'qualification_source', 'runtime', 'reservation',
+        'task20_receiver', 'control_observation')},
     QUALIFICATION + 'runtime_git.py': 0o555,
 }
 

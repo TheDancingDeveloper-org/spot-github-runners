@@ -12,6 +12,7 @@ ASSETS.update({
 
     '/usr/local/bin/oxidex-remote-build': (_ROOT / 'builder/dedicated/host-launcher.py').read_text(),
     '/usr/local/bin/docker': (_ROOT / 'builder/dedicated/docker-admission.py').read_text(),
+    '/usr/local/sbin/oxidex-reservation-control': (_ROOT / 'builder/dedicated/reservation-control.py').read_text(),
     '/etc/oxidex-remote-build/qualification-maintainer.allowed_signers': 'swackhamer@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKyzTK7pVP3daBqt3csludP15zyIBcTL25JqGYgnRzl/\n',
 })
 STARTUP = (_ROOT / 'cloud-init/builder-startup.sh').read_text()
