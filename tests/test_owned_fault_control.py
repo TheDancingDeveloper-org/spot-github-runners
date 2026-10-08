@@ -151,7 +151,11 @@ class OwnedFaultTests(unittest.TestCase):
         record={'reservation_id':IDENTITY,'host':list(HOST),'state':'SOURCE_VERIFIED',
                 'active':{'ordinal':4,'command':'task20-execute','actor':ACTOR}}
         store=Mock();store.locked.return_value=nullcontext();store.read.return_value=record
-        fd=os.open('/dev/null',os.O_RDONLY)
+        opened=[]
+        def open_selected(*args):
+            selected=os.open('/dev/null',os.O_RDONLY)
+            opened.append(selected)
+            return selected
         def join(*args):
             clock[0]=121.0
             return BASE['cgroup']
@@ -162,20 +166,25 @@ class OwnedFaultTests(unittest.TestCase):
              patch.object(fault.engine,'write') as intent, \
              patch.object(fault,'unit_identity',side_effect=join), \
              patch.object(fault.time,'time',side_effect=lambda:clock[0]), \
-             patch.object(fault.os,'pidfd_open',return_value=fd,create=True), \
+             patch.object(fault.os,'pidfd_open',side_effect=open_selected,create=True), \
              patch.object(fault.signal,'pidfd_send_signal',create=True) as send:
             with self.assertRaisesRegex(ValueError,'Stale fault scope'):
                 fault.interrupt_owned(scope)
         self.assertEqual(record['state'],'HELD')
         intent.assert_called_once();store.write.assert_called_once();send.assert_not_called()
-        with self.assertRaises(OSError):os.fstat(fd)
+        self.assertEqual(len(opened),1)
+        with self.assertRaises(OSError):os.fstat(opened[0])
 
     def test_interruption_is_fixed_pidfd_signal_after_durable_hold(self):
         scope=self.scope()
         record={'reservation_id':IDENTITY,'host':list(HOST),'state':'SOURCE_VERIFIED',
                 'active':{'ordinal':4,'command':'task20-execute','actor':ACTOR}}
         store=Mock();store.locked.return_value=nullcontext();store.read.return_value=record
-        fd=os.open('/dev/null',os.O_RDONLY)
+        opened=[]
+        def open_selected(*args):
+            selected=os.open('/dev/null',os.O_RDONLY)
+            opened.append(selected)
+            return selected
         try:
             with patch.object(fault.custody,'Store',return_value=store), \
                  patch.object(fault.custody,'host_identity',return_value=HOST), \
@@ -183,19 +192,21 @@ class OwnedFaultTests(unittest.TestCase):
                  patch.object(fault.engine,'dossier',return_value=Path('/uninstalled/source-test')), \
                  patch.object(fault.engine,'write') as write, \
                  patch.object(fault,'unit_identity',return_value=BASE['cgroup']), \
-                 patch.object(fault.os,'pidfd_open',return_value=fd,create=True) as pidfd_open, \
+                 patch.object(fault.os,'pidfd_open',side_effect=open_selected,create=True) as pidfd_open, \
                  patch.object(fault.signal,'pidfd_send_signal',create=True) as send:
                 result=fault.interrupt_owned(scope)
             self.assertEqual(result['status'],'INTERRUPTION_REQUESTED_HELD')
             self.assertEqual(record['state'],'HELD')
             self.assertEqual(snapshot.call_count,2)
             self.assertEqual(pidfd_open.call_args.args,(ACTOR['pid'],0))
-            self.assertEqual(send.call_args.args,(fd,signal.SIGKILL,None,0))
+            self.assertEqual(send.call_args.args,(opened[0],signal.SIGKILL,None,0))
             self.assertEqual(write.call_count,1)
             self.assertEqual(store.write.call_count,1)
         finally:
-            # interrupt_owned closed the selected descriptor.
-            pass
+            # The mock allocates only at the selected pidfd_open call; the
+            # production handler owns and closes that descriptor immediately.
+            if opened:
+                with self.assertRaises(OSError):os.fstat(opened[0])
 
     def test_reused_actor_refuses_without_hold_or_signal(self):
         scope=self.scope()
@@ -239,14 +250,14 @@ class OwnedFaultTests(unittest.TestCase):
 
     def test_runtime_nonce_requires_committed_boot_and_exact_installed_assets(self):
         assets={};files={}
-        for path in (fault.CONTROL,fault.ENGINE,fault.FAULT):
+        for path in (fault.CONTROL,fault.ENGINE,fault.FAULT,fault.RESERVATION,fault.OBSERVATION,fault.RECEIVER,fault.PACKAGE):
             raw=('reviewed '+path.name).encode();sha=hashlib.sha256(raw).hexdigest()
             assets[str(path)]={'data':base64.b64encode(raw).decode(),'sha256':sha}
             files[str(path)]={'sha256':sha};files[path]=raw
         plan={'schema':1,'nonce':NONCE,'vm_id':HOST[0],'boot':HOST[1],'assets':assets}
         journal=[{'stage':'FILES_AND_SERVICE_VERIFIED'},
                  {'stage':'FINISH_RELEASE_COMMITTED','qualification_ready':False,'files':{
-                     str(path):files[str(path)] for path in (fault.CONTROL,fault.ENGINE,fault.FAULT)}}]
+                     str(path):files[str(path)] for path in (fault.CONTROL,fault.ENGINE,fault.FAULT,fault.RESERVATION,fault.OBSERVATION,fault.RECEIVER,fault.PACKAGE)}}]
         backup=fault.RUNTIME/('runtime-update-'+NONCE)
         files[backup/'plan.json']=json.dumps(plan).encode()
         files[backup/'journal.jsonl']=b'\n'.join(json.dumps(row).encode() for row in journal)+b'\n'
@@ -256,6 +267,12 @@ class OwnedFaultTests(unittest.TestCase):
                              hashlib.sha256(files[fault.custody.CONFIG]).hexdigest())
             with self.assertRaisesRegex(ValueError,'Committed installation custody'):
                 fault.runtime_binding(NONCE,(HOST[0],'other-boot'))
+            for imported in (fault.RESERVATION,fault.OBSERVATION,fault.RECEIVER,fault.PACKAGE):
+                original=files[imported]
+                files[imported]=b'drifted selected actor dependency'
+                with self.subTest(imported=imported), self.assertRaisesRegex(ValueError,'Installed control asset differs'):
+                    fault.runtime_binding(NONCE,HOST)
+                files[imported]=original
 
     def test_root_control_active_fence_uses_shared_noncreating_lock(self):
         script=Path(__file__).resolve().parents[1]/'builder/dedicated/reservation-control.py'

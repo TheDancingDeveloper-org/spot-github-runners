@@ -120,10 +120,12 @@ import json,os,sys
 from pathlib import Path
 sys.path.insert(0,'/opt/oxidex-builder')
 from qualification_trust.reservation import subprocess_storage
-uuid,device=subprocess_storage()
+device='/dev/disk/by-id/google-{{DISK_DEVICE_NAME}}'
+observed=subprocess_storage(device)
 path=Path('/etc/oxidex-remote-build.json')
 config=json.loads(path.read_text())
-config['reservation_enrollment']={'schema':1,'enabled':True,'uuid':uuid,'device':device}
+config['reservation_enrollment']={'schema':2,'enabled':True,
+    'uuid':observed['uuid'],'by_id':observed['by_id'],'serial':observed['serial']}
 with path.open('w') as output:
     json.dump(config,output,sort_keys=True);output.flush();os.fsync(output.fileno())
 RESERVATION_ENROLLMENT
@@ -172,11 +174,7 @@ chmod 0444 /mnt/runner-data/remote-build/sources/bootstrap-tools/rust-toolchain.
 python3 - <<'OBSERVED_READINESS'
 {{READINESS_SOURCE}}
 OBSERVED_READINESS
-# Startup enrolls only the root-bound authoritative public SSH mapping.
-printf '%%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build\n' >/etc/sudoers.d/oxidex-build
-chmod 0440 /etc/sudoers.d/oxidex-build
-visudo -cf /etc/sudoers.d/oxidex-build
-python3 -B /opt/gha-runners/builder_access.py /etc/oxidex-builder-uploader.json '{{UPLOADER_SHA}}' >/var/lib/oxidex-builder/uploader-observed.json
+# Install and activate the SSH restriction before the uploader account or key exists.
 python3 -B - <<'UPLOAD_FENCE'
 import json
 from pathlib import Path
@@ -184,15 +182,36 @@ import runpy
 mapping=json.loads(Path('/etc/oxidex-builder-uploader.json').read_text())
 policy=runpy.run_path('/opt/gha-runners/builder_access.py')['uploader_policy_bytes'](mapping)
 for name,raw in policy.items():Path(name).write_bytes(raw)
+Path('/etc/ssh/sshd_config.d/40-oxidex-uploader-fence.conf').chmod(0o644)
 Path('/etc/sudoers.d/oxidex-uploader-session').chmod(0o440)
 UPLOAD_FENCE
 /usr/sbin/sshd -t
 /usr/sbin/visudo -cf /etc/sudoers.d/oxidex-uploader-session
+systemctl reload ssh
+python3 -B - <<'ACTIVE_UPLOAD_FENCE'
+import subprocess
+mapping_name='{{UPLOADER_USERNAME}}'
+subprocess.run(['systemctl','is-active','--quiet','ssh'],check=True,timeout=10)
+result=subprocess.run(['/usr/sbin/sshd','-T','-C',
+    'user='+mapping_name+',host=localhost,addr=127.0.0.1'],
+    check=True,capture_output=True,text=True,timeout=10)
+if result.stderr:raise SystemExit('Uploader SSH effective fence observation incomplete')
+rows=[row.split(' ',1) for row in result.stdout.splitlines() if row]
+required={'forcecommand':'/usr/local/sbin/oxidex-uploader-session',
+          'disableforwarding':'yes','permittty':'no'}
+for name,value in required.items():
+    if [item[1] for item in rows if len(item)==2 and item[0]==name]!=[value]:
+        raise SystemExit('Uploader SSH effective fence differs before key publication')
+ACTIVE_UPLOAD_FENCE
+# Only after the active fence is observed may the account gain sudo and its key.
+printf '%%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build\n' >/etc/sudoers.d/oxidex-build
+chmod 0440 /etc/sudoers.d/oxidex-build
+visudo -cf /etc/sudoers.d/oxidex-build
+python3 -B /opt/gha-runners/builder_access.py /etc/oxidex-builder-uploader.json '{{UPLOADER_SHA}}' >/var/lib/oxidex-builder/uploader-observed.json
 python3 -B - <<'UPLOAD_POLICY_CHECK'
 import runpy
 policy=runpy.run_path('/opt/gha-runners/builder_access.py')
 policy['effective_sudo_guard']('{{UPLOADER_USERNAME}}',require_uploader_session=True)
 UPLOAD_POLICY_CHECK
-systemctl reload ssh
 printf '%s\n' '{{DEPLOYMENT_ID}}' >/var/lib/oxidex-builder-bootstrap.complete
 chmod 0444 /var/lib/oxidex-builder-bootstrap.complete

@@ -21,6 +21,10 @@ RUNTIME=Path('/var/lib/oxidex-builder')
 CONTROL=Path('/usr/local/sbin/oxidex-reservation-control')
 ENGINE=Path('/opt/oxidex-builder/qualification_trust/control_engine.py')
 FAULT=Path('/opt/oxidex-builder/qualification_trust/control_fault.py')
+RESERVATION=Path('/opt/oxidex-builder/qualification_trust/reservation.py')
+OBSERVATION=Path('/opt/oxidex-builder/qualification_trust/control_observation.py')
+RECEIVER=Path('/opt/oxidex-builder/qualification_trust/task20_receiver.py')
+PACKAGE=Path('/opt/oxidex-builder/qualification_trust/__init__.py')
 SCOPE_FIELDS={'schema','vm_id','boot','installation_nonce','project','reservation',
               'actor_pid','actor_start_ticks','cgroup','observed_at','deadline',
               'enrollment_sha256'}
@@ -76,7 +80,7 @@ def runtime_binding(nonce, host):
     if not isinstance(assets,dict):raise ValueError('Installed asset inventory unavailable')
     committed=commits[-1][1].get('files')
     if not isinstance(committed,dict):raise ValueError('Committed file inventory unavailable')
-    for path in (CONTROL,ENGINE,FAULT):
+    for path in (CONTROL,ENGINE,FAULT,RESERVATION,OBSERVATION,RECEIVER,PACKAGE):
         entry=assets.get(str(path))
         if not isinstance(entry,dict) or set(entry)!={'data','sha256'}:
             raise ValueError('Selected control asset absent from installation')

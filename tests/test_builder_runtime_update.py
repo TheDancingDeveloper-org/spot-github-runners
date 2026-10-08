@@ -20,6 +20,9 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
         decoded=validate_assets(self.assets())
         self.assertEqual(set(decoded),set(TARGETS))
         self.assertEqual(len(decoded),25)
+        guide=(Path(__file__).resolve().parents[1]/'docs/builder-runtime-updates.md').read_text()
+        self.assertIn('25 fixed runtime targets',guide)
+        self.assertNotIn('24 fixed runtime targets',guide)
 
     def test_unknown_missing_or_tampered_asset_refused(self):
         for kind in ('unknown','missing','tampered'):

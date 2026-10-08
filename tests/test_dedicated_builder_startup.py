@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
@@ -45,11 +46,45 @@ class DedicatedBuilderStartupTests(unittest.TestCase):
         self.assertLess(script.index('mount "$DEVICE" "$MOUNT_POINT"'), script.index('DOCKER_BUILDKIT=0'))
         self.assertIn('--memory=28g --memory-swap=28g --cpu-period=100000 --cpu-quota=1600000', script)
         self.assertIn('install -d -o0 -g1001 -m0710 "$MOUNT_POINT/remote-build/targets"', script)
+        self.assertLess(script.index("systemctl reload ssh"),
+                        script.index("python3 -B /opt/gha-runners/builder_access.py"))
+        self.assertLess(script.index("ACTIVE_UPLOAD_FENCE"),
+                        script.index("python3 -B /opt/gha-runners/builder_access.py"))
+        self.assertLess(script.index("systemctl reload ssh"),
+                        script.index("%%oxidex-build ALL=(root)"))
+        self.assertIn("'schema':2,'enabled':True", script)
+        self.assertIn("'by_id':observed['by_id'],'serial':observed['serial']",script)
         self.assertNotIn('usermod -aG docker', script)
         self.assertNotIn('--privileged', script)
         for path, content in ASSETS.items():
             if path.startswith('/opt/oxidex-builder/image/'):
                 self.assertEqual(content, (ROOT / 'builder/standalone' / Path(path).name).read_text())
+
+    def test_rendered_active_ssh_fence_refuses_missing_or_wrong_policy(self):
+        script = render_builder_startup(SimpleNamespace(**inputs()), 'unit-test')
+        guard = script.split("python3 -B - <<'ACTIVE_UPLOAD_FENCE'\n", 1)[1].split(
+            "\nACTIVE_UPLOAD_FENCE", 1)[0]
+        correct = ("forcecommand /usr/local/sbin/oxidex-uploader-session\n"
+                   "disableforwarding yes\npermittty no\n")
+        def run_for(output, active=True):
+            def observed(argv, **kwargs):
+                if argv[:2] == ['systemctl', 'is-active']:
+                    if not active:raise subprocess.CalledProcessError(3, argv)
+                    return SimpleNamespace(stderr='', stdout='')
+                self.assertEqual(argv[:2], ['/usr/sbin/sshd', '-T'])
+                self.assertIn('user=oxidex-uploader', argv[-1])
+                return SimpleNamespace(stderr='', stdout=output)
+            with patch.object(subprocess, 'run', side_effect=observed):
+                exec(compile(guard, '<rendered active uploader fence>', 'exec'), {})
+        run_for(correct)
+        for changed in (correct.replace('forcecommand /usr/local/sbin/oxidex-uploader-session',
+                                        'forcecommand none'),
+                        correct.replace('disableforwarding yes', 'disableforwarding no'),
+                        correct.replace('permittty no', 'permittty yes')):
+            with self.subTest(changed=changed), self.assertRaisesRegex(SystemExit, 'fence differs'):
+                run_for(changed)
+        with self.assertRaises(subprocess.CalledProcessError):
+            run_for(correct, active=False)
 
     def test_actual_asset_write_pipelines_restore_all_canonical_bytes(self):
         script = render_builder_startup(SimpleNamespace(**inputs()), 'unit-test')

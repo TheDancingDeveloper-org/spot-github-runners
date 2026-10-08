@@ -460,16 +460,39 @@ def ancestor_matches(actor, pid):
 
 
 def validate_enrollment(policy):
-    """Pure schema check shared by custody and admission validators."""
-    if not isinstance(policy, dict) or set(policy) != {'schema', 'enabled', 'uuid', 'device'} or type(policy['schema']) is not int or policy['schema'] != 1 or type(policy['enabled']) is not bool:
+    """Require stable disk identity; enabled boot-local st_dev records need migration."""
+    if not isinstance(policy, dict) or type(policy.get('schema')) is not int or type(policy.get('enabled')) is not bool:
+        raise ValueError('Unknown reservation enrollment')
+    if policy['schema'] == 1:
+        if (set(policy) != {'schema', 'enabled', 'uuid', 'device'}
+                or policy['enabled'] or policy['uuid'] is not None or policy['device'] is not None):
+            raise ValueError('Legacy device-number enrollment requires reviewed migration')
+        return None
+    if policy['schema'] != 2 or set(policy) != {'schema', 'enabled', 'uuid', 'by_id', 'serial'}:
         raise ValueError('Unknown reservation enrollment')
     if not policy['enabled']:
-        if policy['uuid'] is not None or policy['device'] is not None:
+        if any(policy[key] is not None for key in ('uuid', 'by_id', 'serial')):
             raise ValueError('Unenrolled policy has unexpected storage identity')
         return None
-    if not isinstance(policy['uuid'], str) or not re.fullmatch('[0-9a-f-]{36}', policy['uuid']) or type(policy['device']) is not int or policy['device'] <= 0:
-        raise ValueError('Enrolled storage identity missing')
+    try:
+        canonical_uuid = str(uuid.UUID(policy['uuid'])) == policy['uuid']
+    except (ValueError, AttributeError, TypeError):
+        canonical_uuid = False
+    if (not canonical_uuid or not isinstance(policy['by_id'], str)
+            or not re.fullmatch(r'/dev/disk/by-id/google-[a-z][a-z0-9-]{0,62}', policy['by_id'])
+            or not isinstance(policy['serial'], str) or not 1 <= len(policy['serial']) <= 256
+            or any(ord(char) < 33 or ord(char) > 126 for char in policy['serial'])):
+        raise ValueError('Stable enrolled storage identity missing')
     return policy
+
+
+def storage_matches(policy, observed):
+    """Compare cross-boot stable identity; st_dev remains a current-boot fact."""
+    if (not isinstance(observed, dict) or set(observed) != {'uuid', 'by_id', 'serial', 'mount_device'}
+            or type(observed['mount_device']) is not int or observed['mount_device'] <= 0
+            or any(observed[key] != policy[key] for key in ('uuid', 'by_id', 'serial'))):
+        raise ValueError('Enrolled cache mount unavailable or replaced; custody held')
+    return observed
 
 
 def enrollment():
@@ -493,20 +516,32 @@ def enrollment():
     policy = validate_enrollment(config.get('reservation_enrollment') if isinstance(config, dict) else None)
     if policy is None:
         return None
-    mounted = subprocess_storage()
-    if mounted != (policy['uuid'], policy['device']):
-        raise ValueError('Enrolled cache mount unavailable or replaced; custody held')
+    storage_matches(policy, subprocess_storage(policy['by_id']))
     return policy
 
 
-def subprocess_storage():
+def subprocess_storage(by_id):
+    """Observe approved by-id block device, UUID, serial, and current mount."""
     import subprocess
-    result = subprocess.run(['/usr/bin/findmnt', '-n', '-o', 'TARGET,UUID,FSTYPE', '--mountpoint', '/mnt/runner-data'],
+    if not isinstance(by_id, str) or not re.fullmatch(r'/dev/disk/by-id/google-[a-z][a-z0-9-]{0,62}', by_id):
+        raise ValueError('Approved cache by-id path required')
+    device = Path(by_id).resolve(strict=True)
+    if not stat.S_ISBLK(device.stat().st_mode):
+        raise ValueError('Enrolled cache by-id target is not a block device')
+    result = subprocess.run(['/usr/bin/findmnt', '-n', '-o', 'TARGET,SOURCE,UUID,FSTYPE', '--mountpoint', '/mnt/runner-data'],
                             check=True, capture_output=True, text=True, timeout=5)
     fields = result.stdout.split()
-    if result.stderr or len(fields) != 3 or fields[0] != '/mnt/runner-data' or fields[2] != 'ext4':
+    if (result.stderr or len(fields) != 4 or fields[0] != '/mnt/runner-data'
+            or fields[3] != 'ext4' or Path(fields[1]).resolve(strict=True) != device):
         raise ValueError('Complete expected cache mount required')
-    return fields[1], Path('/mnt/runner-data').stat().st_dev
+    uuid_actual = subprocess.check_output(['/usr/sbin/blkid', '-s', 'UUID', '-o', 'value', by_id],
+                                          text=True, timeout=5).strip()
+    serial = subprocess.check_output(['/usr/bin/lsblk', '-dn', '-o', 'SERIAL', by_id],
+                                     text=True, timeout=5).strip()
+    if not uuid_actual or fields[2] != uuid_actual or not serial:
+        raise ValueError('Enrolled cache by-id/UUID/serial differs from mount')
+    return {'uuid': uuid_actual, 'by_id': by_id, 'serial': serial,
+            'mount_device': Path('/mnt/runner-data').stat().st_dev}
 
 
 def host_identity():

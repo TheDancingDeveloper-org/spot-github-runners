@@ -380,6 +380,54 @@ class ReservationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 reservation.ancestor_matches(actor, 300)
 
+    def test_storage_observation_binds_by_id_uuid_serial_and_current_mount(self):
+        import subprocess
+        device='/dev/disk/by-id/google-builder-cache'
+        output=SimpleNamespace(stdout=f'/mnt/runner-data {device} 0b99c4d2-ca5f-4471-bf84-ff4ab8dbefd3 ext4\n',stderr='')
+        def stat_result(_path):
+            return SimpleNamespace(st_mode=0o060000,st_dev=303)
+        with patch.object(reservation.Path,'resolve',lambda self,strict=False:self), \
+             patch.object(reservation.Path,'stat',stat_result), \
+             patch.object(subprocess,'run',return_value=output) as mounted, \
+             patch.object(subprocess,'check_output',side_effect=[self.host[1]+'\n','builder-cache\n']) as disk:
+            observed=reservation.subprocess_storage(device)
+        self.assertEqual(observed,dict(uuid=self.host[1],by_id=device,serial='builder-cache',mount_device=303))
+        self.assertEqual(mounted.call_args.args[0][:2],['/usr/bin/findmnt','-n'])
+        self.assertEqual(disk.call_args_list[0].args[0][-1],device)
+        self.assertEqual(disk.call_args_list[1].args[0][-1],device)
+        wrong=SimpleNamespace(stdout=f'/mnt/runner-data {device} 00000000-0000-0000-0000-000000000001 ext4\n',stderr='')
+        with patch.object(reservation.Path,'resolve',lambda self,strict=False:self), \
+             patch.object(reservation.Path,'stat',stat_result), \
+             patch.object(subprocess,'run',return_value=wrong), \
+             patch.object(subprocess,'check_output',side_effect=[self.host[1]+'\n','builder-cache\n']):
+            with self.assertRaisesRegex(ValueError,'by-id/UUID/serial'):
+                reservation.subprocess_storage(device)
+        foreign=SimpleNamespace(stdout=f'/mnt/runner-data /dev/disk/by-id/google-foreign {self.host[1]} ext4\n',stderr='')
+        with patch.object(reservation.Path,'resolve',lambda self,strict=False:self), \
+             patch.object(reservation.Path,'stat',stat_result), \
+             patch.object(subprocess,'run',return_value=foreign), \
+             self.assertRaisesRegex(ValueError,'Complete expected cache mount'):
+            reservation.subprocess_storage(device)
+
+    def test_stable_enrollment_survives_mount_number_change_and_refuses_foreign_disk(self):
+        policy=dict(schema=2,enabled=True,uuid=self.host[1],
+                    by_id='/dev/disk/by-id/google-builder-cache',serial='builder-cache')
+        self.assertEqual(reservation.validate_enrollment(policy),policy)
+        for number in (101,303):
+            observed=dict(uuid=self.host[1],by_id=policy['by_id'],
+                          serial=policy['serial'],mount_device=number)
+            self.assertEqual(reservation.storage_matches(policy,observed),observed)
+        for change in (dict(uuid='00000000-0000-0000-0000-000000000001'),
+                       dict(by_id='/dev/disk/by-id/google-foreign'),dict(serial='foreign'),
+                       dict(mount_device=0)):
+            observed=dict(uuid=policy['uuid'],by_id=policy['by_id'],serial=policy['serial'],mount_device=101)
+            observed.update(change)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError,'custody held'):
+                reservation.storage_matches(policy,observed)
+        with self.assertRaisesRegex(ValueError,'migration'):
+            reservation.validate_enrollment(dict(schema=1,enabled=True,uuid=self.host[1],device=101))
+        self.assertIsNone(reservation.validate_enrollment(dict(schema=1,enabled=False,uuid=None,device=None)))
+
     def test_canonical_enrollment_is_accepted_by_admission_and_bad_field_refused(self):
         import json
         sys.path.insert(0, str(MODULE.parents[2]))
@@ -387,8 +435,9 @@ class ReservationTests(unittest.TestCase):
         config = dict(role='builder', host_cpus=16, builder_cpus=16, work_gib=28,
                       runner_gib=0, builder_gib=28, runner_names=[])
         actual = dict(role='builder',cpus=16,memory_gib=28,image='oxidex-remote-builder:1.99.0',approved_image_id='sha256:'+'a'*64)
-        for policy in [dict(schema=1,enabled=False,uuid=None,device=None),
-                       dict(schema=1,enabled=True,uuid=self.host[1],device=66308)]:
+        for policy in [dict(schema=2,enabled=False,uuid=None,by_id=None,serial=None),
+                       dict(schema=2,enabled=True,uuid=self.host[1],
+                            by_id='/dev/disk/by-id/google-builder-cache',serial='builder-cache')]:
             with patch.object(admission.os,'cpu_count',return_value=16), \
                  patch.object(admission,'process_identity',return_value='host:100:200'), \
                  patch.object(admission.Path,'read_text',return_value=json.dumps({**actual,'reservation_enrollment':policy})), \
