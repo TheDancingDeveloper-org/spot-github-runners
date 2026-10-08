@@ -716,6 +716,21 @@ Inside the admitted remote test container, run:
 PYTHONPATH=src python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
+The source recipe `just infra-python-tests` runs that exact command only in
+the admitted non-root Linux builder container. It accepts no arguments.
+`rust-toolchain.toml` pins 1.99.0 because the existing OxiDex remote client
+verifies that toolchain before every Just payload, including this Python-only
+one; it does not make this repository's Python tests a Rust build or test.
+
+For an unattended full-suite request, set `OXIDEX_CONTROL_REPO` to the
+reviewed OxiDex control checkout and run `just test` here. That public recipe
+calls its `test-infra-remote` recipe with this checkout's absolute path. Until
+the control checkout supplies the signed, exact-HEAD infrastructure source
+profile and that recipe, `just test` refuses; it never runs the suite locally.
+The remote control path uses configured `OXIDEX_OPS_DIR` and builder settings
+for durable evidence and worker selection. A fresh full-suite Linux result is
+pending an actual admitted worker run and its receipt.
+
 Retain exact source, VM, image, exit, cleanup, and lease evidence. Source tests,
 CI success, merge, deployment, and actual workload acceptance are separate results.
 
