@@ -46,7 +46,7 @@ class ReservationTests(unittest.TestCase):
     def step(self, record, ordinal, **changes):
         identity = record['reservation_id']
         self.store.begin(identity, ordinal, host=self.host, actor=self.actor, argv=self.argv[ordinal])
-        return self.store.finish(identity, **{**dict(host=self.host, actor=self.actor,
+        return self.store.finish(identity, ordinal, **{**dict(host=self.host, actor=self.actor,
                             exit_code=0, log_sha256='f'*64, quiescent=lambda: True,
                             binding=self.session if ordinal == 2 else None), **changes})
 
@@ -77,7 +77,7 @@ class ReservationTests(unittest.TestCase):
         record = self.claim()
         self.store.begin(record['reservation_id'], 0, host=self.host, actor=self.actor, argv=self.argv[0])
         with self.assertRaises(ValueError):
-            self.store.finish(record['reservation_id'], host=self.host, actor=self.actor,
+            self.store.finish(record['reservation_id'], 0, host=self.host, actor=self.actor,
                               exit_code=0, log_sha256='f'*64, quiescent=lambda: None)
         self.assertIsNotNone(self.store.read()['active'])
 
@@ -134,7 +134,7 @@ class ReservationTests(unittest.TestCase):
         self.store.begin(identity, 0, host=self.host, actor=self.actor, argv=self.argv[0])
         self.store.cleanup_after_failure(identity, host=self.host, actor=self.actor,
                                          argv=self.argv[-1], quiescent=lambda: True)
-        self.store.finish(identity, host=self.host, actor=self.actor, exit_code=0,
+        self.store.finish(identity, 7, host=self.host, actor=self.actor, exit_code=0,
                           log_sha256='f'*64, quiescent=lambda: True)
         result = self.store.release(identity, host=self.host, quiescent=lambda: True)
         self.assertIsNone(result['events'][0]['exit_code'])
@@ -162,7 +162,7 @@ class ReservationTests(unittest.TestCase):
         record = self.claim()
         self.store.cleanup_after_failure(record['reservation_id'], host=self.host,
                                          actor=self.actor, argv=self.argv[-1], quiescent=lambda: True)
-        self.store.finish(record['reservation_id'], host=self.host, actor=self.actor,
+        self.store.finish(record['reservation_id'], 7, host=self.host, actor=self.actor,
                           exit_code=1, log_sha256='f'*64, quiescent=lambda: True)
         with self.assertRaises(ValueError):
             self.store.release(record['reservation_id'], host=self.host, quiescent=lambda: True)
@@ -246,3 +246,50 @@ class ReservationTests(unittest.TestCase):
         sys.path.insert(0, str(MODULE.parents[2]))
         from lib.builder_runtime_update import TARGETS
         self.assertEqual(TARGETS['/opt/oxidex-builder/qualification_trust/reservation.py'], 0o644)
+
+    def test_released_and_archived_namespaces_cannot_execute_or_delete(self):
+        record = self.claim()
+        for ordinal in range(len(self.argv)):
+            self.step(record, ordinal)
+        self.store.release(record['reservation_id'], host=self.host, quiescent=lambda: True)
+        old_project = self.project
+        with self.assertRaises(ValueError):
+            self.store.route(old_project, host=self.host, actor_matches=lambda actor: True)
+        self.store.route('ordinary-unrelated', host=self.host, actor_matches=lambda actor: False)
+        self.project = 'qualification-'+self.head[:12]+'-'+'c'*32
+        self.session = {**self.session, 'project': self.project}
+        self.claim()
+        with self.assertRaises(ValueError):
+            self.store.route(old_project, host=self.host, actor_matches=lambda actor: True)
+
+    def test_refused_finish_cannot_reopen_stage_or_overflow_events(self):
+        record = self.claim()
+        identity = record['reservation_id']
+        self.store.begin(identity, 0, host=self.host, actor=self.actor, argv=self.argv[0])
+        for _ in range(130):
+            with self.assertRaises(ValueError):
+                self.store.finish(identity, 0, host=self.host, actor=self.actor,
+                                  exit_code=0, log_sha256='f'*64, quiescent=lambda: False)
+        retained = self.store.read()
+        self.assertEqual(retained['state'], 'HELD')
+        self.assertEqual(len(retained['events']), 1)
+        with self.assertRaises(ValueError):
+            self.store.finish(identity, 0, host=self.host, actor=self.actor,
+                              exit_code=0, log_sha256='f'*64, quiescent=lambda: True)
+
+    def test_delayed_result_cannot_finalize_next_stage_with_same_owner(self):
+        record = self.claim()
+        self.step(record, 0)
+        self.store.begin(record['reservation_id'], 1, host=self.host, actor=self.actor, argv=self.argv[1])
+        with self.assertRaises(ValueError):
+            self.store.finish(record['reservation_id'], 0, host=self.host, actor=self.actor,
+                              exit_code=0, log_sha256='f'*64, quiescent=lambda: True)
+        self.assertEqual(self.store.read()['active']['ordinal'], 1)
+
+    def test_oversized_event_publication_preserves_existing_record(self):
+        record = self.claim()
+        before = self.store.read()
+        record['events'] = [{}]*129
+        with self.assertRaises(ValueError):
+            self.store.write(record)
+        self.assertEqual(self.store.read(), before)

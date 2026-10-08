@@ -74,7 +74,7 @@ claim digest; retry cannot allocate a second reservation. The reservation ID
 is an identifier, not a bearer authorization token.
 
 Stage results record actual launched PID/start, full container ID when present,
-exit status, log hash and descendant quiescence. `inspect` and `reconcile` never
+submitted exact ordinal, exit status, log hash and descendant quiescence. `inspect` and `reconcile` never
 execute a missing stage or infer success from process absence. Unknown process,
 Docker, upload/export lock or host identity observations retain HELD custody.
 
@@ -88,3 +88,6 @@ All heavy launcher, Docker admission, source import, upload and result-export
 entrypoints must check the reservation. Until that enrollment is complete,
 the API cannot claim whole-run exclusion. VM/boot replacement refuses old stage
 tokens and records interruption; explicit reconciliation precedes new ownership.
+Custody records and tombstones live in the private persistent cache directory
+`/mnt/runner-data/remote-build/qualification-reservations`, not the disposable
+boot disk. A replaced VM encounters the original identity-bound hold.

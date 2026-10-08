@@ -16,7 +16,7 @@ import stat
 import uuid
 import urllib.request
 
-ROOT = Path('/var/lib/oxidex-builder/whole-run')
+ROOT = Path('/mnt/runner-data/remote-build/qualification-reservations')
 LIMIT = 65536
 COMMANDS = frozenset({'prepare', 'upload', 'verify-source', 'bootstrap',
                       'execute', 'pack', 'replay', 'cleanup'})
@@ -143,7 +143,7 @@ class Store:
             validate_session(record['session'], record['stages'])
             if (not isinstance(record['reservation_id'], str) or not re.fullmatch('[0-9a-f]{32}', record['reservation_id'])
                     or record['host'] != [record['session']['expected_vm_id'], record['session']['expected_boot']]
-                    or record['state'] not in ('CLAIMED', 'SOURCE_VERIFIED', 'HELD', 'RELEASED')
+                    or record['state'] not in ('CLAIMED', 'SOURCE_VERIFIED', 'HELD', 'RECOVERING', 'RELEASED')
                     or type(record['next_ordinal']) is not int or not 0 <= record['next_ordinal'] <= len(record['stages'])
                     or not isinstance(record['events'], list) or len(record['events']) > 128):
                 raise ValueError('Malformed reservation custody')
@@ -184,6 +184,8 @@ class Store:
 
     def write(self, record, filename='record.json'):
         record_name(filename)
+        if not isinstance(record.get('events'), list) or len(record['events']) > 128:
+            raise ValueError('Reservation event budget exceeded before publication')
         raw = canonical(record)
         if len(raw) > LIMIT:
             raise ValueError('Reservation record bound exceeded')
@@ -251,13 +253,17 @@ class Store:
             self.write(record)
             return record
 
-    def finish(self, identity, *, host, actor, exit_code, log_sha256, quiescent, binding=None):
+    def finish(self, identity, ordinal, *, host, actor, exit_code, log_sha256, quiescent, binding=None):
         with self.locked():
             record = self.read()
             self.match(record, identity, host)
             active = record['active']
-            if active is None or active['actor'] != actor:
+            if type(ordinal) is not int or active is None or active['actor'] != actor or active['ordinal'] != ordinal:
                 raise ValueError('Exact active stage owner required')
+            refused = any(event.get('disposition') == 'FINISH_REFUSED' and event['ordinal'] == ordinal
+                          for event in record['events'])
+            if refused or record['state'] == 'HELD':
+                raise ValueError('Refused stage requires explicit recovery, not finalization retry')
             if type(exit_code) is not int or not isinstance(log_sha256, str) or not re.fullmatch('[0-9a-f]{64}', log_sha256):
                 raise ValueError('Actual terminal status and log digest required')
             try:
@@ -270,8 +276,9 @@ class Store:
                     record['state'] = 'SOURCE_VERIFIED'
             except Exception as error:
                 record['state'] = 'HELD'
-                record['events'].append({**active, 'exit_code': None, 'log_sha256': log_sha256,
-                                         'disposition': 'FINISH_REFUSED', 'reason': str(error)[:200]})
+                if len(record['events']) < 126:
+                    record['events'].append({**active, 'exit_code': None, 'log_sha256': log_sha256,
+                                             'disposition': 'FINISH_REFUSED', 'reason': str(error)[:200]})
                 self.write(record)
                 raise
             if exit_code != 0:
@@ -294,7 +301,7 @@ class Store:
             self.match(record, identity, host)
             if record['state'] == 'RELEASED':
                 return record  # durable lost-ack answer, no repeated effects
-            if (record['state'] not in ('SOURCE_VERIFIED', 'HELD') or record['active'] is not None
+            if (record['state'] not in ('SOURCE_VERIFIED', 'RECOVERING') or record['active'] is not None
                     or record['next_ordinal'] != len(record['stages'])
                     or not record['events'] or record['events'][-1]['command'] != 'cleanup'
                     or record['events'][-1]['exit_code'] != 0):
@@ -322,7 +329,7 @@ class Store:
             if record['active'] is not None:
                 record['events'].append({**record['active'], 'exit_code': None,
                                          'log_sha256': None, 'disposition': 'INTERRUPTED'})
-            record['state'] = 'HELD'
+            record['state'] = 'RECOVERING'
             record['next_ordinal'] = ordinal
             record['active'] = dict(ordinal=ordinal, actor=actor, command='cleanup')
             self.write(record)
@@ -336,12 +343,26 @@ class Store:
     def route(self, project, *, host, actor_matches):
         with self.locked():
             record = self.read()
+            self.fence_released(project, record)
             if record is None or record['state'] == 'RELEASED':
                 return
-            if record['host'] != list(host) or record['session']['project'] != project or record['active'] is None or (record['state'] == 'HELD' and record['active']['command'] != 'cleanup'):
+            if record['host'] != list(host) or record['session']['project'] != project or record['active'] is None or record['state'] == 'HELD':
                 raise ValueError('Host reserved; no matching active stage')
             if not actor_matches(record['active']['actor']):
                 raise ValueError('Host reserved for another actual stage process')
+
+    def fence_released(self, project, record):
+        if project is None or not isinstance(project, str) or not project.startswith('qualification-'):
+            return
+        if not re.fullmatch('qualification-[0-9a-f]{12}-[0-9a-f]{32}', project):
+            raise ValueError('Malformed qualification namespace')
+        if record is not None and record['state'] == 'RELEASED' and record['session']['project'] == project:
+            raise ValueError('Released run cannot execute or delete preserved source')
+        archived = self.read('released-'+project+'.json')
+        if archived is not None:
+            if archived['state'] != 'RELEASED' or archived['session']['project'] != project:
+                raise ValueError('Malformed namespace tombstone')
+            raise ValueError('Archived released run cannot execute or clean up')
 
 
 def process(pid):
@@ -393,9 +414,10 @@ def route_guard(project=None, *, pid=None, argv=None):
     store = Store()
     with store.locked():
         record = store.read()
+        store.fence_released(project, record)
         if record is None or record['state'] == 'RELEASED':
             return
-        if record['host'] != list(host_identity()) or record['active'] is None or (record['state'] == 'HELD' and record['active']['command'] != 'cleanup'):
+        if record['host'] != list(host_identity()) or record['active'] is None or record['state'] == 'HELD':
             raise ValueError('Host has retained or identity-mismatched whole-run custody')
         if project is not None and record['session']['project'] != project:
             raise ValueError('Host reserved for another project')
