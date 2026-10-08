@@ -141,7 +141,12 @@ def stage(project,identity,ordinal,stream,*,protective_fds=()):
                 # Fixed root runtime and descriptor-derived argv only.
                 proof={'schema':1,'reservation_id':identity,'session':record['session'],
                        'stage':ordinal,'host':list(host),'actor':actor,
-                       'descriptor_sha256':custody.digest(request),'container':None}
+                       'descriptor_sha256':custody.digest(request),'container':None,
+                       'command':record['stages'][ordinal]['command'],
+                       'argv_sha256':record['stages'][ordinal]['argv_sha256'],
+                       'custody_state':'SOURCE_VERIFIED','active_ordinal':ordinal,
+                       'purpose':'execute' if ordinal==4 else 'bootstrap' if ordinal==3 else 'diagnostic',
+                       'seal_sha256':file_digest(BUILD/'qualification-sealed'/project/'execution-binding.json')}
                 artifact=path/('host-proof-'+str(ordinal)+'.json')
                 write(artifact,proof)
                 # Prior stage proof remains immutable. No container survives this
@@ -213,6 +218,8 @@ def publish_container(project,created):
     proof=root_json(path)
     if proof['reservation_id']!=record['reservation_id'] or proof['stage']!=record['active']['ordinal']:
         raise ValueError('Created proof differs from actual stage')
+    if record['state']!='SOURCE_VERIFIED' or proof['command']!=record['active']['command'] or proof['argv_sha256']!=record['stages'][proof['stage']]['argv_sha256']:
+        raise ValueError('Actual custody/command projection differs')
     proof['container']={key:created[key] for key in ('container_id','image_id','created','caps','labels','state')}
     # Docker captured this inode before start. Keep the inode, publish only while
     # the container is still CREATED; the unprivileged reader has not started.
