@@ -86,6 +86,10 @@ def source_not_mounted(source,target):
 
 
 def project_action(root,project,arguments,config,uploader,benchmark,*,protective_fds=()):
+    if config.get('role') == 'builder':
+        sys.path.insert(0, '/opt/oxidex-builder')
+        from qualification_trust.reservation import route_guard
+        route_guard(project, argv=arguments)
     def request_gate():
         if benchmark:
             import benchmark_admission

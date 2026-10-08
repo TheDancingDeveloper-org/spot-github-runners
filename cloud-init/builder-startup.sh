@@ -103,6 +103,7 @@ chmod 0710 "$MOUNT_POINT" "$MOUNT_POINT/remote-build"
 install -d -o0 -g1001 -m0710 "$MOUNT_POINT/remote-build/targets"
 install -d -m0755 /opt/gha-runners /opt/oxidex-builder/image
 install -d -m0700 /var/lib/oxidex-builder
+install -d -o root -g root -m0700 /var/lib/oxidex-builder/whole-run
 install -d -o root -g root -m 0755 /opt/oxidex-builder/qualification_trust /etc/oxidex-remote-build
 install -d -o root -g root -m 0755 "$MOUNT_POINT/remote-build/qualification-sealed"
 {{ASSET_WRITES}}

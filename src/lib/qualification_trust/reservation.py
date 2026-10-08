@@ -1,0 +1,372 @@
+"""Durable whole-run custody; no uploaded code, timer reclamation or deletion.
+
+Callers must hold the existing global build lock before entering this store.
+Acquire/release require EX; stage and route checks retain SH until completion.
+This module supplies custody only. Production control/transfer enrollment must
+be completed before enabling acquisition on a real host.
+"""
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import uuid
+import urllib.request
+
+ROOT = Path('/var/lib/oxidex-builder/whole-run')
+LIMIT = 65536
+COMMANDS = frozenset({'prepare', 'upload', 'verify-source', 'bootstrap',
+                      'execute', 'pack', 'replay', 'cleanup'})
+FIELDS = {'schema', 'project', 'attempt', 'expected_vm_id', 'expected_boot',
+          'head', 'tree', 'bundle_sha256', 'attestation_sha256',
+          'attestation_namespace', 'stages_sha256'}
+
+
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError('Duplicate reservation JSON key')
+        result[key] = value
+    return result
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+def digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def validate_actor(actor):
+    if not isinstance(actor, dict) or set(actor) != {'pid', 'start'} or any(type(actor[key]) is not int or actor[key] <= 0 for key in actor):
+        raise ValueError('Actual PID and start tick identity required')
+
+
+def record_name(filename):
+    if filename != 'record.json' and not re.fullmatch('released-qualification-[0-9a-f]{12}-[0-9a-f]{32}\\.json', filename):
+        raise ValueError('Fixed reservation record filename required')
+
+
+def validate_session(session, stages):
+    if not isinstance(session, dict) or set(session) != FIELDS or type(session['schema']) is not int or session['schema'] != 1:
+        raise ValueError('Unknown reservation session schema')
+    for key, size in (('head', 40), ('tree', 40), ('bundle_sha256', 64),
+                      ('attestation_sha256', 64), ('stages_sha256', 64)):
+        if not isinstance(session[key], str) or not re.fullmatch('[0-9a-f]{'+str(size)+'}', session[key]):
+            raise ValueError('Malformed reservation source identity')
+    if (not isinstance(session['project'], str) or not re.fullmatch(
+            'qualification-'+session['head'][:12]+'-[0-9a-f]{32}', session['project'])
+            or not isinstance(session['attempt'], str) or not re.fullmatch('final-r[1-9][0-9]{0,5}', session['attempt'])
+            or not isinstance(session['expected_vm_id'], str) or not re.fullmatch('[0-9]{1,20}', session['expected_vm_id'])
+            or not isinstance(session['expected_boot'], str) or not re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', session['expected_boot'])
+            or session['attestation_namespace'] != 'oxidex-qualification-source-v1'):
+        raise ValueError('Malformed reservation host/run identity')
+    if not isinstance(stages, list) or not 1 <= len(stages) <= 64:
+        raise ValueError('Bounded ordered stages required')
+    for ordinal, stage in enumerate(stages):
+        if (not isinstance(stage, dict) or set(stage) != {'ordinal', 'command', 'argv_sha256'}
+                or type(stage['ordinal']) is not int or stage['ordinal'] != ordinal
+                or stage['command'] not in COMMANDS or not isinstance(stage['argv_sha256'], str)
+                or not re.fullmatch('[0-9a-f]{64}', stage['argv_sha256'])):
+            raise ValueError('Unknown stage descriptor')
+    names = [stage['command'] for stage in stages]
+    if names[:3] != ['prepare', 'upload', 'verify-source'] or names[-1] != 'cleanup':
+        raise ValueError('Source verification must precede execution and cleanup must finish')
+    if any(command in names[3:] for command in ('prepare', 'upload', 'verify-source')):
+        raise ValueError('Source admission cannot be replayed')
+    if digest(stages) != session['stages_sha256']:
+        raise ValueError('Root-reviewed stage descriptor differs')
+
+
+def authenticate_claim(document, signature, session):
+    """Verify detached control bytes with the existing root source trust anchor."""
+    import tempfile
+    from .host_gate import preauthenticate
+    if not isinstance(document, bytes) or not isinstance(signature, bytes) or len(document) > LIMIT or len(signature) > 16384:
+        raise ValueError('Bounded detached source document and signature required')
+    if hashlib.sha256(document).hexdigest() != session['attestation_sha256']:
+        raise ValueError('Source claim document digest differs')
+    facts = json.loads(document, object_pairs_hook=pairs)
+    if not isinstance(facts, dict) or any(facts.get(key) != session[key] for key in ('head', 'tree', 'bundle_sha256')) or facts.get('run_id') != session['project']:
+        raise ValueError('Detached source claim binding differs')
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder)
+        (path/'document.json').write_bytes(document)
+        (path/'document.sig').write_bytes(signature)
+        preauthenticate(path, session['head'], session['bundle_sha256'], session['project'])
+    return {**facts, 'attestation_sha256': session['attestation_sha256']}
+
+
+class Store:
+    def __init__(self, root=ROOT, *, owner_uid=0):
+        self.root = Path(root)
+        self.owner_uid = owner_uid
+
+    @contextmanager
+    def locked(self):
+        # Production startup owns creation. Never repair untrusted ancestors.
+        for path in (self.root, *self.root.parents):
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, self.owner_uid) or info.st_mode & 0o022:
+                raise ValueError('Untrusted reservation directory')
+        fd = os.open(self.root/'lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid or info.st_nlink != 1 or info.st_mode & 0o077:
+                raise ValueError('Untrusted reservation lock')
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        finally:
+            os.close(fd)
+
+    def read(self, filename='record.json'):
+        record_name(filename)
+        try:
+            fd = os.open(self.root/filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > LIMIT:
+                raise ValueError('Untrusted reservation record')
+            raw = os.read(fd, LIMIT+1)
+            if len(raw) != info.st_size:
+                raise ValueError('Reservation record changed or oversized')
+            record = json.loads(raw, object_pairs_hook=pairs)
+            if not isinstance(record, dict) or set(record) != {'schema', 'reservation_id', 'session', 'stages', 'host', 'owner', 'state', 'next_ordinal', 'active', 'events'} or type(record.get('schema')) is not int or record['schema'] != 1:
+                raise ValueError('Unknown reservation record schema')
+            validate_session(record['session'], record['stages'])
+            if (not isinstance(record['reservation_id'], str) or not re.fullmatch('[0-9a-f]{32}', record['reservation_id'])
+                    or record['host'] != [record['session']['expected_vm_id'], record['session']['expected_boot']]
+                    or record['state'] not in ('CLAIMED', 'SOURCE_VERIFIED', 'HELD', 'RELEASED')
+                    or type(record['next_ordinal']) is not int or not 0 <= record['next_ordinal'] <= len(record['stages'])
+                    or not isinstance(record['events'], list) or len(record['events']) > 128):
+                raise ValueError('Malformed reservation custody')
+            validate_actor(record['owner'])
+            if record['active'] is not None:
+                if not isinstance(record['active'], dict) or set(record['active']) != {'ordinal', 'actor', 'command'}:
+                    raise ValueError('Malformed active stage')
+                validate_actor(record['active']['actor'])
+                if record['active']['ordinal'] != record['next_ordinal'] or record['active']['command'] != record['stages'][record['next_ordinal']]['command']:
+                    raise ValueError('Active stage ordinal differs')
+            if record['state'] == 'RELEASED' and (record['active'] is not None or record['next_ordinal'] != len(record['stages']) or not record['events'] or record['events'][-1].get('command') != 'cleanup' or record['events'][-1].get('exit_code') != 0):
+                raise ValueError('Release tombstone lacks terminal cleanup')
+            return record
+        finally:
+            os.close(fd)
+
+    def write(self, record, filename='record.json'):
+        record_name(filename)
+        raw = canonical(record)
+        if len(raw) > LIMIT:
+            raise ValueError('Reservation record bound exceeded')
+        temporary = self.root/('.record-'+uuid.uuid4().hex)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.root/filename)
+            directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def acquire(self, session, stages, *, host, owner, authenticate, quiescent):
+        validate_session(session, stages)
+        validate_actor(owner)
+        if host != (session['expected_vm_id'], session['expected_boot']):
+            raise ValueError('Actual host differs from reservation claim')
+        # authenticate verifies actual detached bytes/signature, never a boolean
+        # from a request. quiescent must perform complete host observations.
+        facts = authenticate(session)
+        if not isinstance(facts, dict) or any(facts.get(key) != session[key] for key in
+                ('head', 'tree', 'bundle_sha256', 'attestation_sha256')) or facts.get('run_id') != session['project']:
+            raise ValueError('Detached signed source claim differs')
+        with self.locked():
+            current = self.read()
+            if current is not None:
+                if current['state'] != 'RELEASED' or current['session']['project'] == session['project']:
+                    raise ValueError('Reservation or same-run release tombstone exists; inspect only')
+                archive = 'released-'+current['session']['project']+'.json'
+                previous = self.read(archive)
+                if previous is not None and previous != current:
+                    raise ValueError('Release tombstone differs; custody held')
+                if previous is None:
+                    self.write(current, archive)
+            if self.read('released-'+session['project']+'.json') is not None:
+                raise ValueError('Released run cannot be reacquired')
+            if quiescent() is not True:
+                raise ValueError('Complete actual quiescence required')
+            record = dict(schema=1, reservation_id=uuid.uuid4().hex, session=session,
+                          stages=stages, host=list(host), owner=owner, state='CLAIMED',
+                          next_ordinal=0, active=None, events=[])
+            self.write(record)
+            return record
+
+    def begin(self, identity, ordinal, *, host, actor, argv):
+        validate_actor(actor)
+        with self.locked():
+            record = self.read()
+            self.match(record, identity, host)
+            if type(ordinal) is not int or not 0 <= ordinal < len(record['stages']) or record['state'] in ('HELD', 'RELEASED') or record['active'] is not None or ordinal != record['next_ordinal']:
+                raise ValueError('Stage replay, gap or uncertain prior stage')
+            stage = record['stages'][ordinal]
+            if digest(argv) != stage['argv_sha256']:
+                raise ValueError('Stage argv differs from reviewed command')
+            if stage['command'] not in ('prepare', 'upload', 'verify-source', 'cleanup') and record['state'] != 'SOURCE_VERIFIED':
+                raise ValueError('Actual source verification required before execution')
+            record['active'] = dict(ordinal=ordinal, actor=actor, command=stage['command'])
+            self.write(record)
+            return record
+
+    def finish(self, identity, *, host, actor, exit_code, log_sha256, quiescent, binding=None):
+        with self.locked():
+            record = self.read()
+            self.match(record, identity, host)
+            active = record['active']
+            if active is None or active['actor'] != actor:
+                raise ValueError('Exact active stage owner required')
+            if type(exit_code) is not int or not isinstance(log_sha256, str) or not re.fullmatch('[0-9a-f]{64}', log_sha256):
+                raise ValueError('Actual terminal status and log digest required')
+            if quiescent() is not True:
+                raise ValueError('Complete actual stage quiescence required')
+            if active['command'] == 'verify-source' and exit_code == 0:
+                expected = record['session']
+                if not isinstance(binding, dict) or any(binding.get(key) != expected[key] for key in ('head', 'tree', 'bundle_sha256', 'attestation_sha256')):
+                    raise ValueError('Actual sealed source differs from reserved claim')
+                record['state'] = 'SOURCE_VERIFIED'
+            if exit_code != 0:
+                record['state'] = 'HELD'
+            record['events'].append({**active, 'exit_code': exit_code, 'log_sha256': log_sha256})
+            record['active'] = None
+            record['next_ordinal'] += 1
+            self.write(record)
+            return record
+
+    def release(self, identity, *, host, quiescent):
+        with self.locked():
+            record = self.read()
+            self.match(record, identity, host)
+            if record['state'] == 'RELEASED':
+                return record  # durable lost-ack answer, no repeated effects
+            if (record['state'] not in ('SOURCE_VERIFIED', 'HELD') or record['active'] is not None
+                    or record['next_ordinal'] != len(record['stages'])
+                    or not record['events'] or record['events'][-1]['command'] != 'cleanup'
+                    or record['events'][-1]['exit_code'] != 0):
+                raise ValueError('Complete same-run terminal and cleanup required')
+            if quiescent() is not True:
+                raise ValueError('Complete actual release quiescence required')
+            record['state'] = 'RELEASED'
+            self.write(record)  # custody only; never delete source/cache/evidence
+            return record
+
+    def cleanup_after_failure(self, identity, *, host, actor, argv, quiescent):
+        """Explicit root recovery; never report an uncertain stage as successful."""
+        validate_actor(actor)
+        with self.locked():
+            record = self.read()
+            self.match(record, identity, host)
+            if record['state'] == 'RELEASED' or quiescent() is not True:
+                raise ValueError('Actual same-run child/transfer quiescence required')
+            ordinal = len(record['stages'])-1
+            stage = record['stages'][ordinal]
+            if record['next_ordinal'] >= len(record['stages']) or digest(argv) != stage['argv_sha256']:
+                raise ValueError('Owned cleanup already finished or command differs')
+            if record['active'] is not None and record['active']['command'] == 'cleanup':
+                raise ValueError('Uncertain cleanup cannot be repeated')
+            if record['active'] is not None:
+                record['events'].append({**record['active'], 'exit_code': None,
+                                         'log_sha256': None, 'disposition': 'INTERRUPTED'})
+            record['state'] = 'HELD'
+            record['next_ordinal'] = ordinal
+            record['active'] = dict(ordinal=ordinal, actor=actor, command='cleanup')
+            self.write(record)
+            return record
+
+    @staticmethod
+    def match(record, identity, host):
+        if record is None or record.get('reservation_id') != identity or record.get('host') != list(host):
+            raise ValueError('Reservation/host identity differs')
+
+    def route(self, project, *, host, actor_matches):
+        with self.locked():
+            record = self.read()
+            if record is None or record['state'] == 'RELEASED':
+                return
+            if record['host'] != list(host) or record['session']['project'] != project or record['active'] is None:
+                raise ValueError('Host reserved; no matching active stage')
+            if not actor_matches(record['active']['actor']):
+                raise ValueError('Host reserved for another actual stage process')
+
+
+def process(pid):
+    """Read Linux identity; exited/zombie/unknown is never a stage owner."""
+    raw = Path('/proc/'+str(pid)+'/stat').read_text()
+    fields = raw[raw.rfind(')')+2:].split()
+    if fields[0] in ('Z', 'X'):
+        raise ValueError('Stage owner exited')
+    return {'pid': pid, 'start': int(fields[19])}, int(fields[1])
+
+
+def current_actor():
+    return process(os.getpid())[0]
+
+
+def ancestor_matches(actor, pid):
+    validate_actor(actor)
+    for _ in range(64):
+        if pid <= 0:
+            return False
+        observed, parent = process(pid)
+        if observed == actor:
+            status = Path('/proc/'+str(pid)+'/status').read_text()
+            uid = next(line for line in status.splitlines() if line.startswith('Uid:')).split()[1:]
+            return uid == ['0', '0', '0', '0'] and process(pid)[0] == actor
+        if process(pid) != (observed, parent):
+            raise ValueError('Stage ancestry changed during observation')
+        pid = parent
+    raise ValueError('Stage ancestry bound exceeded')
+
+
+def host_identity():
+    request = urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/id',
+                                     headers={'Metadata-Flavor': 'Google'})
+    with urllib.request.urlopen(request, timeout=3) as response:
+        if response.headers.get('Metadata-Flavor') != 'Google':
+            raise ValueError('Unknown metadata identity response')
+        identity = response.read(32).decode().strip()
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if not re.fullmatch('[0-9]{1,20}', identity) or not re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot):
+        raise ValueError('Actual VM/boot identity unavailable')
+    return identity, boot
+
+
+def route_guard(project=None, *, pid=None, argv=None):
+    """Read-side enrollment; caller retains global SH around all guarded work."""
+    if not ROOT.exists() and not ROOT.is_symlink():
+        return  # Historical installation, no reservation feature provisioned.
+    store = Store()
+    with store.locked():
+        record = store.read()
+        if record is None or record['state'] == 'RELEASED':
+            return
+        if record['host'] != list(host_identity()) or record['active'] is None or (record['state'] == 'HELD' and record['active']['command'] != 'cleanup'):
+            raise ValueError('Host has retained or identity-mismatched whole-run custody')
+        if project is not None and record['session']['project'] != project:
+            raise ValueError('Host reserved for another project')
+        if not ancestor_matches(record['active']['actor'], os.getpid() if pid is None else pid):
+            raise ValueError('Host reserved for another actual stage process')
+        if argv is not None and digest(argv) != record['stages'][record['active']['ordinal']]['argv_sha256']:
+            raise ValueError('Stage command differs from root-reviewed descriptor')
+        if argv == ['cleanup']:
+            raise ValueError('Reservation cleanup is custody-only; preserve source and evidence')

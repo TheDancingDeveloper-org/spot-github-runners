@@ -636,6 +636,10 @@ def serve():
                     pool = LeasePool(ledger/'leases.json',config['work_gib'],alive=owner_alive,retain=retain,removal_fence=retain.finalize if retain is not None else None,heavy_builder_isolation=policy is not None)
                     if config.get('role')=='benchmark-builder':pool.refresh()
                     if message['action']=='acquire':
+                        if config.get('role') == 'builder':
+                            sys.path.insert(0, '/opt/oxidex-builder')
+                            from qualification_trust.reservation import route_guard
+                            route_guard(pid=pid)
                         if config.get('role') in ('builder','benchmark-builder') or time.time()-measured_at>=60:
                             try:
                                 envelope=observed_envelope(config)

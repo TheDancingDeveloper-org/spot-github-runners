@@ -261,6 +261,10 @@ def run_build(arguments,admission,*,role_config=None):
             try:
                 global_lock,active=stack.enter_context(build_lock_files(project))
                 fcntl.flock(global_lock,fcntl.LOCK_SH|fcntl.LOCK_NB)
+                if role_config is not None and role_config.get('role') == 'builder':
+                    sys.path.insert(0, '/opt/oxidex-builder')
+                    from qualification_trust.reservation import route_guard
+                    route_guard(project)
                 # Reconcile before taking our own cache lock: otherwise that
                 # lock could protect a stopped orphan whose old lease blocks us.
                 admission.reconcile_stopped_builders()
