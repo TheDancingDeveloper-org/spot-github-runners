@@ -1434,9 +1434,9 @@ def recover_policy_update(plan):
     """
     import time
     validate_plan(plan, plan['observed_at'])
-    validate_policy_assets(plan['assets'])
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
-    _, saved = root_file_read(backup/'plan.json')
+    saved_plan = root_file_read(backup/'plan.json')
+    _, saved = saved_plan
     if json.loads(saved) != plan:
         raise ValueError('Recovery plan differs from root-saved update')
     journal_state, journal_raw = root_file_read(backup/'journal.jsonl')
@@ -1454,6 +1454,9 @@ def recover_policy_update(plan):
     lock_guard, bind_lock = transaction_lock_guard()
     decoded = validate_assets(plan['assets'])
     mapping_sha = root_file_state('/etc/oxidex-builder-uploader.json')['sha256']
+    helper_target = '/opt/gha-runners/builder_access.py'
+    candidate_sha = hashlib.sha256(decoded[helper_target]).hexdigest()
+    helper_selection = []
 
     def check():
         lock_guard()
@@ -1467,12 +1470,34 @@ def recover_policy_update(plan):
                 or json.loads(root_file_read(PENDING_UPDATE)[1]) !=
                    dict(nonce=plan['nonce'],boot=plan['boot'],source_main=plan['source_main'])):
             raise ValueError('Policy rollback host or hold changed')
-        if (json.loads(root_file_read('/var/lib/gha-admission/leases.json')[1]) != {}
-                or checked_command(['/usr/bin/docker','ps','-aq','--no-trunc'])
-                or observed_work_processes()):
-            raise ValueError('Policy rollback requires actual idle host')
+        if root_file_read(backup/'plan.json') != saved_plan:
+            raise ValueError('Policy rollback saved plan changed')
         if root_file_read(backup/'journal.jsonl') != journal_selection[0]:
             raise ValueError('Policy rollback journal changed')
+        verify_boot_guard()
+        # Only the authenticated held transaction can select candidate code.
+        # Keep that actual file/phase fixed through all recovery observations.
+        current = root_file_state(helper_target)
+        if not helper_selection:
+            if (current is not None and current['sha256'] == candidate_sha
+                    and current['mode'] == TARGETS[helper_target]):
+                selected_sha = candidate_sha
+            elif current is not None and current == plan['before'][helper_target]:
+                selected_sha = None  # Still subject to the historical trust set.
+            else:
+                raise ValueError('Foreign policy recovery helper')
+            helper_selection.append((current, selected_sha))
+        selected, selected_sha = helper_selection[0]
+        if current != selected:
+            raise ValueError('Policy recovery helper changed')
+        with retained_file_selection(helper_target, selected,
+                                     lambda:root_file_state(helper_target)) as verify_helper:
+            validate_policy_assets(plan['assets'], installed=selected_sha is not None)
+            if (json.loads(root_file_read('/var/lib/gha-admission/leases.json')[1]) != {}
+                    or checked_command(['/usr/bin/docker','ps','-aq','--no-trunc'])
+                    or observed_work_processes(selected_helper_sha256=selected_sha)):
+                raise ValueError('Policy rollback requires actual idle host')
+            verify_helper()
 
     def restore():
         check()

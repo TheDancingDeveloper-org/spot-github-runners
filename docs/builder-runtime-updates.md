@@ -57,7 +57,11 @@ the selected newly installed bytes. It validates sshd and sudoers, reloads SSH,
 records `POLICY_ROLLED_BACK_HELD`, and remains held. A crash after publication
 can repeat the same recovery command; a foreign policy file is preserved and
 refused. Runtime files and the launcher still need separately reviewed
-recovery. This command never reopens admission.
+recovery. Policy rollback authenticates the saved plan, journal, and owned hold
+before loading either the unchanged historical helper or the exact reviewed
+helper already installed by that update. It retains that file identity and
+trust phase through policy and work-process checks; foreign helper bytes are
+refused. This command never reopens admission.
 
 Coordinate the exact OxiDex launcher pin before this update. The helper does not
 change clients or declare qualification ready. Run the reviewed Linux gate and
