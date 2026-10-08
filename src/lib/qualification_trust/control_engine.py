@@ -421,31 +421,93 @@ def export(project,identity,output):
         return export_locked(project,identity,output)
 
 
+def export_pack_observation(path,project):
+    observed=root_json(path/'pack-observed.json')
+    if (not isinstance(observed,dict) or set(observed)!={'schema','project','archive_sha256','archive_bytes'}
+            or type(observed['schema']) is not int or observed['schema']!=1
+            or observed['project']!=project or type(observed['archive_bytes']) is not int
+            or not 0<observed['archive_bytes']<=2*1024**3
+            or not isinstance(observed['archive_sha256'],str)
+            or not custody.re.fullmatch('[0-9a-f]{64}',observed['archive_sha256'])):
+        raise ValueError('Actual pack observation differs from selected result')
+    return observed
+
+
+def prior_export_receipt(path,project,identity,observed):
+    """Reuse only a complete root-owned receipt for this selected archive."""
+    receipt_path=path/'export-result.json'
+    try:receipt=root_json(receipt_path)
+    except FileNotFoundError:return None
+    expected={'schema':1,'reservation_id':identity,'project':project,
+              'sha256':observed['archive_sha256'],'bytes':observed['archive_bytes']}
+    if (not isinstance(receipt,dict) or set(receipt)!=set(expected)
+            or type(receipt['schema']) is not int or type(receipt['bytes']) is not int
+            or receipt!=expected):
+        raise ValueError('Retained export receipt differs from selected pack and custody')
+    return receipt
+
+
+def hold_export_uncertainty(project,identity):
+    """Keep ambiguous export evidence from advancing replay or cleanup."""
+    store=custody.Store();host=custody.host_identity()
+    with store.locked():
+        record=store.read();store.match(record,identity,host)
+        if (record['session']['project']!=project or record['state']!='SOURCE_VERIFIED'
+                or record['active'] is not None or record['next_ordinal'] not in (6,7)):
+            raise ValueError('Selected export custody changed; retain unknown state')
+        record['state']='HELD';store.write(record)
+
+
 def export_locked(project,identity,output):
     path,request,record=selected(project,identity)
     if record['state']!='SOURCE_VERIFIED' or record['active'] is not None or record['next_ordinal'] not in (6,7):
         raise ValueError('Actual pack terminal required before result export')
     idle(project)
     source=BUILD/'targets'/project/'task20-results.tar.gz'
-    expected=root_json(path/'pack-observed.json')
+    try:expected=export_pack_observation(path,project)
+    except Exception:
+        hold_export_uncertainty(project,identity)
+        raise
     with activity(project,'export'):
-        fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        try:previous=prior_export_receipt(path,project,identity,expected)
+        except Exception:
+            hold_export_uncertainty(project,identity)
+            raise
+        try:fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        except Exception:
+            hold_export_uncertainty(project,identity)
+            raise
         try:
             before=os.fstat(fd)
             if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_size>2*1024**3:
+                hold_export_uncertainty(project,identity)
                 raise ValueError('Bounded regular result archive required')
             digest=hashlib.sha256();count=0
             while True:
                 block=os.read(fd,1024*1024)
                 if not block:break
-                output.write(block);digest.update(block);count+=len(block)
+                if output.write(block)!=len(block):
+                    raise ValueError('Export stream did not accept complete archive bytes')
+                digest.update(block);count+=len(block)
+            output.flush()
             after=os.fstat(fd)
             if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns) or count!=before.st_size:
+                hold_export_uncertainty(project,identity)
                 raise ValueError('Export bytes changed; never replay automatically')
             if expected['archive_sha256']!=digest.hexdigest() or expected['archive_bytes']!=count:
+                hold_export_uncertainty(project,identity)
                 raise ValueError('Export differs from actual retained pack bytes')
             receipt={'schema':1,'reservation_id':identity,'project':project,'sha256':digest.hexdigest(),'bytes':count}
-            write(path/'export-result.json',receipt)
+            if previous is None:
+                # A file appearing under our exclusive export lock is unknown
+                # state, not a reason to replace a prior publication.
+                try:write(path/'export-result.json',receipt)
+                except Exception:
+                    hold_export_uncertainty(project,identity)
+                    raise
+            elif previous!=receipt:
+                hold_export_uncertainty(project,identity)
+                raise ValueError('Retained export receipt differs from streamed archive')
             return receipt
         finally:os.close(fd)
 

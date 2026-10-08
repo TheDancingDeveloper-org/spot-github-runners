@@ -1,11 +1,13 @@
 """Bounded synthetic profile/control checks, no VM or application commands."""
 import hashlib
+import io
 import json
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from lib.qualification_trust import reservation as r
 from lib.qualification_trust import host_gate
@@ -85,3 +87,112 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(actual['archive_bytes'],archive.stat().st_size)
             archive.unlink();archive.symlink_to(proof/'pack-observed.json')
             with patch.object(engine,'BUILD',base),self.assertRaises(OSError):engine.capture_pack(project,proof)
+
+    def test_export_lost_ack_reuses_only_selected_completed_receipt(self):
+        from lib.qualification_trust import control_engine as engine
+        project=self.claim()['project'];identity='1'*32;payload=b'actual root-observed pack bytes'
+        with tempfile.TemporaryDirectory() as folder:
+            base=Path(folder);proof=base/'proof';proof.mkdir()
+            target=base/'targets'/project;target.mkdir(parents=True)
+            archive=target/'task20-results.tar.gz';archive.write_bytes(payload)
+            observed={'schema':1,'project':project,'archive_sha256':hashlib.sha256(payload).hexdigest(),
+                      'archive_bytes':len(payload)}
+            (proof/'pack-observed.json').write_text(json.dumps(observed))
+            record={'state':'SOURCE_VERIFIED','active':None,'next_ordinal':6,'owner':{'pid':101,'start':1}}
+            def fixture_json(path):return json.loads(Path(path).read_text())
+            with patch.object(engine,'BUILD',base),patch.object(engine,'selected',return_value=(proof,{},record)) as selected, \
+                 patch.object(engine,'idle',return_value=True),patch.object(engine,'activity',return_value=nullcontext()), \
+                 patch.object(engine,'root_json',side_effect=fixture_json),patch.object(engine,'write',wraps=engine.write) as write, \
+                 patch.object(engine,'hold_export_uncertainty') as hold:
+                class ShortStream(io.BytesIO):
+                    def write(self, block):return 0
+                with self.assertRaisesRegex(ValueError,'Export stream did not accept'):
+                    engine.export_locked(project,identity,ShortStream())
+                self.assertFalse((proof/'export-result.json').exists())
+                class FlushFail(io.BytesIO):
+                    def flush(self):raise BrokenPipeError('lost transport')
+                with self.assertRaises(BrokenPipeError):
+                    engine.export_locked(project,identity,FlushFail())
+                self.assertFalse((proof/'export-result.json').exists())
+                write.assert_not_called();hold.assert_not_called()
+                first=io.BytesIO();self.assertEqual(engine.export_locked(project,identity,first)['bytes'],len(payload))
+                self.assertEqual(first.getvalue(),payload)
+                self.assertEqual(write.call_count,1)
+                hold.assert_not_called()
+                # The first stream's transport acknowledgement disappears.
+                # A second root-owned caller may resend bytes, but publishes
+                # no second receipt or stage/custody effect.
+                record['owner']={'pid':202,'start':2};record['next_ordinal']=7
+                retry=io.BytesIO();self.assertEqual(engine.export_locked(project,identity,retry),
+                                                      json.loads((proof/'export-result.json').read_text()))
+                self.assertEqual(retry.getvalue(),payload)
+                self.assertEqual(write.call_count,1)
+                hold.assert_not_called()
+                self.assertEqual(selected.call_args_list[-1].args,(project,identity))
+                self.assertEqual(record['state'],'SOURCE_VERIFIED')
+                self.assertEqual(record['next_ordinal'],7)
+                # A retained receipt for another reservation cannot authorize
+                # even the first byte of another export.
+                receipt_path=proof/'export-result.json';receipt_path.chmod(0o600)
+                foreign=json.loads(receipt_path.read_text());foreign['reservation_id']='2'*32
+                receipt_path.write_text(json.dumps(foreign))
+                refused=io.BytesIO()
+                with self.assertRaisesRegex(ValueError,'Retained export receipt'):
+                    engine.export_locked(project,identity,refused)
+                self.assertEqual(refused.getvalue(),b'')
+                hold.assert_called_once_with(project,identity);hold.reset_mock()
+                foreign['reservation_id']=identity;receipt_path.write_text(json.dumps(foreign))
+                changed={**observed,'archive_sha256':'0'*64}
+                (proof/'pack-observed.json').write_text(json.dumps(changed))
+                with self.assertRaisesRegex(ValueError,'Retained export receipt'):
+                    engine.export_locked(project,identity,io.BytesIO())
+                hold.assert_called_once_with(project,identity);hold.reset_mock()
+                (proof/'pack-observed.json').write_text(json.dumps(observed))
+                receipt_path.write_text('{')
+                with self.assertRaises(json.JSONDecodeError):engine.export_locked(project,identity,io.BytesIO())
+                hold.assert_called_once_with(project,identity);hold.reset_mock()
+                receipt_path.write_text(json.dumps(foreign))
+                archive.write_bytes(b'changed archive, same number byte')
+                with self.assertRaisesRegex(ValueError,'Export differs'):
+                    engine.export_locked(project,identity,io.BytesIO())
+                hold.assert_called_once_with(project,identity);hold.reset_mock()
+                record['state']='HELD'
+                with self.assertRaisesRegex(ValueError,'Actual pack terminal'):
+                    engine.export_locked(project,identity,io.BytesIO())
+                hold.assert_not_called()
+
+    def test_export_receipt_reader_refuses_nonroot_and_symlink(self):
+        from lib.qualification_trust import control_engine as engine
+        from lib.qualification_trust.control_observation import root_json
+        project=self.claim()['project'];identity='1'*32
+        observed={'schema':1,'project':project,'archive_sha256':'a'*64,'archive_bytes':1}
+        with tempfile.TemporaryDirectory() as folder:
+            proof=Path(folder);receipt=proof/'export-result.json'
+            receipt.write_text(json.dumps({'schema':1,'reservation_id':identity,'project':project,
+                                           'sha256':'a'*64,'bytes':1}))
+            with self.assertRaises(ValueError):
+                engine.prior_export_receipt(proof,project,identity,observed)
+            receipt.unlink();receipt.symlink_to(proof/'other.json')
+            with self.assertRaises(OSError):root_json(receipt)
+
+    def test_uncertain_export_holds_only_exact_selected_custody(self):
+        from lib.qualification_trust import control_engine as engine
+        project=self.claim()['project'];identity='1'*32
+        host=('438','0b99c4d2-ca5f-4471-bf84-ff4ab8dbefd3')
+        record={'reservation_id':identity,'host':list(host),'session':{'project':project},
+                'state':'SOURCE_VERIFIED','active':None,'next_ordinal':6}
+        store=Mock();store.locked.return_value=nullcontext();store.read.return_value=record
+        store.match.side_effect=r.Store.match
+        with patch.object(engine.custody,'Store',return_value=store), \
+             patch.object(engine.custody,'host_identity',return_value=host):
+            engine.hold_export_uncertainty(project,identity)
+            self.assertEqual(record['state'],'HELD')
+            store.write.assert_called_once_with(record)
+            store.write.reset_mock()
+            with self.assertRaisesRegex(ValueError,'Selected export custody changed'):
+                engine.hold_export_uncertainty(project,identity)
+            store.write.assert_not_called()
+            record['state']='SOURCE_VERIFIED'
+            with self.assertRaisesRegex(ValueError,'Reservation/host identity differs'):
+                engine.hold_export_uncertainty(project,'2'*32)
+            store.write.assert_not_called()
