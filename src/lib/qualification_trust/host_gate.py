@@ -127,7 +127,19 @@ def copy_sealed(source, destination):
         os.close(top)
 
 
-def validate_upload_layout(incoming):
+def validate_upload_layout(incoming, *, profile='task19-v1', session=None):
+    if profile=='task20-v1':
+        from .task20_receiver import MEMBERS
+        files={str(path.relative_to(incoming)) for path in incoming.rglob('*') if not path.is_dir()}
+        if files!=MEMBERS or any(path.is_symlink() for path in incoming.rglob('*')):
+            raise ValueError('Exact twelve-member Task20 profile required')
+        if not isinstance(session,dict):raise ValueError('Root Task20 claim required')
+        claim=json.loads(regular_bytes(incoming/'task20-round.json',4096),object_pairs_hook=verifier._pairs)
+        expected=dict(schema=1,round=session['attempt'],head=session['head'],tree=session['tree'],
+                      run_id=session['project'],bundle_sha256=session['bundle_sha256'])
+        if claim!=expected:raise ValueError('Task20 round differs from root claim')
+        return incoming/'source-attestation'
+    if profile!='task19-v1':raise ValueError('Unknown root source profile')
     required = {'repository.bundle', 'maintainer.allowed_signers', 'rust-toolchain.toml',
                 'qualification_bootstrap.py', 'qualification_source.py', 'reference'}
     names = {p.name for p in incoming.iterdir()}
@@ -278,7 +290,7 @@ def tree_manifest(root):
     return result
 
 
-def verify_sealed(stage, head, bundle_sha, run_id):
+def verify_sealed(stage, head, bundle_sha, run_id, *, profile='task19-v1', session=None):
     """Stage is host-created; incoming is the only uploader-controlled subtree."""
     validate_identity(head, bundle_sha, run_id)
     if digest(Path(verifier.__file__).read_bytes()) != MODULE_SHA:
@@ -287,7 +299,7 @@ def verify_sealed(stage, head, bundle_sha, run_id):
     if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o222:
         raise ValueError('Anchor must be root-owned readonly')
     incoming = stage / 'incoming'
-    attestation = validate_upload_layout(incoming)
+    attestation = validate_upload_layout(incoming,profile=profile,session=session)
     bundle = incoming / 'repository.bundle'
     # Intake bounded this file; digest streaming avoids another compressed-input allocation.
     if verifier._sha_file(bundle) != bundle_sha:
@@ -296,21 +308,28 @@ def verify_sealed(stage, head, bundle_sha, run_id):
     facts = sandbox_import(stage, head, bundle_sha, run_id, attestation)
     work = stage / 'importer'
     checkout = work / 'checkout'
-    for uploaded, tracked in [('qualification_bootstrap.py', 'tools/remote-build/qualification_bootstrap.py'),
+    bootstrap='task20_bootstrap.py' if profile=='task20-v1' else 'qualification_bootstrap.py'
+    for uploaded, tracked in [(bootstrap, 'tools/remote-build/'+bootstrap),
                               ('qualification_source.py', 'tools/remote-build/qualification_source.py'),
                               ('rust-toolchain.toml', 'rust-toolchain.toml')]:
         if regular_bytes(incoming / uploaded) != regular_bytes(checkout / tracked):
             raise ValueError('Uploaded executable/pin differs from authenticated tree: ' + uploaded)
     # .git is an empty mountpoint, never uploaded content. Metadata is prepared separately.
     (checkout / '.git').mkdir(mode=0o755)
+    if profile=='task20-v1':
+        for name in ('task20_worker.py','task20_results.py','task20_context.py','task20_gates.py'):
+            regular_bytes(checkout/'tools/remote-build'/name,MAX_FILE)
+        if facts.get('tree')!=session['tree']:raise ValueError('Task20 selected tree differs')
     checkout.rename(stage / 'checkout')
     (work / 'repository.git').rename(stage / 'repository.git')
     shutil.rmtree(work)
     for path in (stage / 'checkout', stage / 'repository.git', incoming):
         seal_owned_tree(path)
-    return {'schema': 2, 'head': head, 'bundle_sha256': bundle_sha, 'run_id': run_id,
+    result={'schema': 2, 'head': head, 'bundle_sha256': bundle_sha, 'run_id': run_id,
             'source_identity': facts,
             'uploaded_signers_sha256': digest(regular_bytes(incoming / 'maintainer.allowed_signers', 16384))}
+    if profile=='task20-v1':result['profile']=profile
+    return result
 
 
 def execution_arguments(arguments, binding):

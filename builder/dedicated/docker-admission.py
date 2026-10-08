@@ -237,6 +237,10 @@ def record_created_container(name,project,run):
         with os.fdopen(fd,'w') as target:
             json.dump(record,target,sort_keys=True);target.flush();os.fsync(target.fileno())
         os.replace(temporary,directory/'last-created-container.json')
+        if not BENCHMARK:
+            sys.path.insert(0,'/opt/oxidex-builder')
+            from qualification_trust.control_engine import publish_container
+            publish_container(project,record)
     finally:temporary.unlink(missing_ok=True)
 
 

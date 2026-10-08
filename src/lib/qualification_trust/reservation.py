@@ -20,7 +20,8 @@ ROOT = Path('/mnt/runner-data/remote-build/qualification-reservations')
 CONFIG = Path('/etc/oxidex-remote-build.json')
 LIMIT = 65536
 COMMANDS = frozenset({'prepare', 'upload', 'verify-source', 'bootstrap',
-                      'execute', 'pack', 'replay', 'cleanup'})
+                      'execute', 'pack', 'replay', 'cleanup', 'upload-receive',
+                      'task20-bootstrap','task20-execute','task20-pack','task20-replay'})
 FIELDS = {'schema', 'project', 'attempt', 'expected_vm_id', 'expected_boot',
           'head', 'tree', 'bundle_sha256', 'attestation_sha256',
           'attestation_namespace', 'stages_sha256'}
@@ -53,6 +54,17 @@ def command_arguments(command, argv, session):
     if not isinstance(argv, list) or any(not isinstance(arg, str) for arg in argv):
         raise ValueError('Fixed stage argument list required')
     head = session['head']; project = session['project']; bundle = session['bundle_sha256']
+    if session.get('profile')=='task20-v1':
+        identity=['--round',session['attempt'],'--expected-head',head,'--run-id',project]
+        base=['python3','/target/checkout/tools/remote-build/']
+        fixed20={'prepare':['prepare'],'upload-receive':['upload-receive'],'cleanup':['cleanup'],
+            'verify-source':['verify-source','--head',head,'--bundle-sha256',bundle,'--run-id',project],
+            'task20-bootstrap':['python3',base[1]+'task20_bootstrap.py'],
+            'task20-execute':['python3',base[1]+'task20_worker.py',*identity],
+            'task20-pack':['python3',base[1]+'task20_results.py','--pack',*identity],
+            'task20-replay':['python3',base[1]+'task20_results.py','--replay',*identity]}
+        if command in fixed20 and argv==fixed20[command]:return
+        raise ValueError('Task20 command differs from fixed profile arguments')
     output = '/target/ops/evidence/remote-qualification/'+project
     base = ['python3', '/target/checkout/tools/remote-build/qualification.py']
     fixed = {
@@ -78,8 +90,11 @@ def record_name(filename):
 
 
 def validate_session(session, stages):
-    if not isinstance(session, dict) or set(session) != FIELDS or type(session['schema']) is not int or session['schema'] != 1:
+    if not isinstance(session, dict) or type(session.get('schema')) is not int or session['schema'] not in (1,2):
         raise ValueError('Unknown reservation session schema')
+    expected=FIELDS if session['schema']==1 else FIELDS|{'profile'}
+    if set(session)!=expected or (session['schema']==2 and session['profile']!='task20-v1'):
+        raise ValueError('Unknown root-controlled reservation profile')
     for key, size in (('head', 40), ('tree', 40), ('bundle_sha256', 64),
                       ('attestation_sha256', 64), ('stages_sha256', 64)):
         if not isinstance(session[key], str) or not re.fullmatch('[0-9a-f]{'+str(size)+'}', session[key]):
@@ -100,7 +115,10 @@ def validate_session(session, stages):
                 or not re.fullmatch('[0-9a-f]{64}', stage['argv_sha256'])):
             raise ValueError('Unknown stage descriptor')
     names = [stage['command'] for stage in stages]
-    if names[:3] != ['prepare', 'upload', 'verify-source'] or names[-1] != 'cleanup':
+    if session['schema']==2:
+        if names!=['prepare','upload-receive','verify-source','task20-bootstrap','task20-execute','task20-pack','task20-replay','cleanup']:
+            raise ValueError('Exactly eight Task20 profile ordinals required')
+    elif names[:3] != ['prepare', 'upload', 'verify-source'] or names[-1] != 'cleanup':
         raise ValueError('Source verification must precede execution and cleanup must finish')
     if any(command in names[3:] for command in ('prepare', 'upload', 'verify-source')):
         raise ValueError('Source admission cannot be replayed')
@@ -163,9 +181,14 @@ class Store:
             if len(raw) != info.st_size:
                 raise ValueError('Reservation record changed or oversized')
             record = json.loads(raw, object_pairs_hook=pairs)
-            if not isinstance(record, dict) or set(record) != {'schema', 'reservation_id', 'session', 'stages', 'host', 'owner', 'state', 'next_ordinal', 'active', 'events'} or type(record.get('schema')) is not int or record['schema'] != 1:
+            if not isinstance(record, dict) or set(record) != {'schema', 'reservation_id', 'session', 'stages', 'host', 'owner', 'state', 'next_ordinal', 'active', 'events','descriptor_sha256'} or type(record.get('schema')) is not int or record['schema'] != 1:
                 raise ValueError('Unknown reservation record schema')
             validate_session(record['session'], record['stages'])
+            descriptor=record['descriptor_sha256']
+            if descriptor is not None and (not isinstance(descriptor,str) or not re.fullmatch('[0-9a-f]{64}',descriptor)):
+                raise ValueError('Malformed root descriptor custody digest')
+            if record['session'].get('profile')=='task20-v1' and descriptor is None:
+                raise ValueError('Actual Task20 reviewed descriptor custody required')
             if (not isinstance(record['reservation_id'], str) or not re.fullmatch('[0-9a-f]{32}', record['reservation_id'])
                     or record['host'] != [record['session']['expected_vm_id'], record['session']['expected_boot']]
                     or record['state'] not in ('CLAIMED', 'SOURCE_VERIFIED', 'HELD', 'RECOVERING', 'RELEASED')
@@ -230,9 +253,11 @@ class Store:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def acquire(self, session, stages, *, host, owner, authenticate, quiescent):
+    def acquire(self, session, stages, *, host, owner, authenticate, quiescent,descriptor_sha256=None):
         validate_session(session, stages)
         validate_actor(owner)
+        if session.get('profile')=='task20-v1' and (not isinstance(descriptor_sha256,str) or not re.fullmatch('[0-9a-f]{64}',descriptor_sha256)):
+            raise ValueError('Root Task20 descriptor digest required')
         if self.root == ROOT and enrollment() is None:
             raise ValueError('Production reservation requires explicit mounted-storage enrollment')
         if host != (session['expected_vm_id'], session['expected_boot']):
@@ -260,7 +285,7 @@ class Store:
                 raise ValueError('Complete actual quiescence required')
             record = dict(schema=1, reservation_id=uuid.uuid4().hex, session=session,
                           stages=stages, host=list(host), owner=owner, state='CLAIMED',
-                          next_ordinal=0, active=None, events=[])
+                          next_ordinal=0, active=None, events=[],descriptor_sha256=descriptor_sha256)
             self.write(record)
             return record
 
@@ -275,7 +300,7 @@ class Store:
             command_arguments(stage['command'], argv, record['session'])
             if digest(argv) != stage['argv_sha256']:
                 raise ValueError('Stage argv differs from reviewed command')
-            if stage['command'] not in ('prepare', 'upload', 'verify-source', 'cleanup') and record['state'] != 'SOURCE_VERIFIED':
+            if stage['command'] not in ('prepare', 'upload', 'upload-receive', 'verify-source', 'cleanup') and record['state'] != 'SOURCE_VERIFIED':
                 raise ValueError('Actual source verification required before execution')
             record['active'] = dict(ordinal=ordinal, actor=actor, command=stage['command'])
             self.write(record)

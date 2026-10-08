@@ -77,7 +77,8 @@ def quiescent(project, *, own_unit=None):
     # Root record itself cannot attest that a transfer or cache owner finished.
     # Acquire only existing canonical locks, never create/reset a lock or state.
     with ExitStack() as locks:
-        for name in ('oxidex-cache-active-'+project+'.lock','oxidex-qualification-'+project+'.lock'):
+        for name in ('oxidex-cache-active-'+project+'.lock','oxidex-qualification-'+project+'.lock',
+                     'oxidex-upload-'+project+'.lock','oxidex-export-'+project+'.lock'):
             try:fd=os.open('/run/'+name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
             except FileNotFoundError:continue
             locks.callback(os.close,fd)
@@ -85,6 +86,16 @@ def quiescent(project, *, own_unit=None):
             if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1 or info.st_mode&0o022:
                 raise ValueError('Untrusted canonical activity lock')
             fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        # Production fixed receiver/export enrollment is not complete yet.
-        # Do not return True from incomplete observations or infer no uploads.
-        raise ValueError('Upload/export process and lock enrollment incomplete')
+        # Independent legacy transports cannot be treated as stage children.
+        for process in Path('/proc').iterdir():
+            if not process.name.isdecimal():continue
+            try:
+                raw=(process/'cmdline').read_bytes().split(b'\0')
+                exe=raw[0].rsplit(b'/',1)[-1] if raw else b''
+                if exe in (b'rsync',b'scp',b'sftp-server',b'tar',b'gzip'):
+                    raise ValueError('Actual transfer/export process remains')
+            except (FileNotFoundError,ProcessLookupError):
+                continue  # Process vanished; no named effect is inferred complete.
+            except PermissionError:
+                raise ValueError('Complete process observation unavailable')
+        return True

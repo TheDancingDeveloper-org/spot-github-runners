@@ -33,7 +33,7 @@ TARGETS = {
     **{QUALIFICATION + name + '.py': 0o644 for name in (
         '__init__', 'git_sandbox', 'host_gate', 'import_supervisor',
         'launcher_contract', 'mounts', 'qualification_source', 'runtime', 'reservation',
-        'task20_receiver', 'control_observation')},
+        'task20_receiver', 'control_observation', 'control_engine', 'task20_runtime')},
     QUALIFICATION + 'runtime_git.py': 0o555,
 }
 

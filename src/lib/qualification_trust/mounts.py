@@ -17,12 +17,21 @@ def expected_mounts(root, project):
     if not qualification_project(project):
         return {**common, '/src': (f'{root}/sources/{project}', True)}
     sealed = f'{root}/qualification-sealed/{project}'
+    from pathlib import Path
+    import json
+    binding=Path(sealed)/'execution-binding.json'
+    task20=False
+    if binding.exists():
+        from .host_gate import regular_bytes
+        task20=json.loads(regular_bytes(binding,32*1024*1024)).get('profile')=='task20-v1'
+    extra={} if not task20 else {'/task20-runtime.py':('/opt/oxidex-builder/qualification_trust/task20_runtime.py',False),
+        '/run/oxidex-task20-reservation':(f'{root}/qualification-reservations/{project}/host-proof.json',False)}
     return {**common, '/src': (sealed + '/incoming', False),
             '/target/checkout': (sealed + '/checkout', False),
             '/target/checkout/.git': (sealed + '/runtime-git', True),
             ANCHOR: (ANCHOR, False), '/etc/gitconfig': (GITCONFIG, False),
             '/qualification-runtime.py': (RUNTIME, False),
-            '/qualification-bin/git': (RUNTIME_GIT, False)}
+            '/qualification-bin/git': (RUNTIME_GIT, False),**extra}
 
 
 def volume_arguments(root, project):

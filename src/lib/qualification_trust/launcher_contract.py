@@ -28,7 +28,7 @@ def load_binding(sealed, project):
     return binding
 
 
-def create_binding(root, project, head, bundle_sha):
+def create_binding(root, project, head, bundle_sha, *, profile='task19-v1', session=None):
     trust = root / 'qualification-sealed'
     trusted_directory(trust)
     sealed = trust / project
@@ -42,7 +42,7 @@ def create_binding(root, project, head, bundle_sha):
     stage.chmod(0o755)
     try:
         copy_sealed(root / 'sources' / project, stage / 'incoming')
-        binding = verify_sealed(stage, head, bundle_sha, project)
+        binding = verify_sealed(stage, head, bundle_sha, project,profile=profile,session=session)
         binding['manifest'] = {name: tree_manifest(stage / name) for name in ('incoming', 'checkout', 'repository.git')}
         # Mutable Git state is separate from the authority repo. It is never read by
         # root Git. All stage execution is UID1001 with immutable source mounts.
@@ -126,6 +126,22 @@ def dispatch(root, project, arguments, container_command, config, execute, *, pr
             execution_arguments(arguments, provisional)
             create_binding(root, project, arguments[3], arguments[7])
         binding = load_binding(sealed, project)
+        if binding.get('profile')=='task20-v1':
+            from .reservation import ROOT as reservations,Store,command_arguments,current_actor,ancestor_matches
+            with Store().locked():record=Store().read()
+            if record is None or record['active'] is None:raise ValueError('Actual Task20 stage custody required')
+            session=record['session'];stage=record['active']['command']
+            command_arguments(stage,arguments,session)
+            if session['project']!=project or not ancestor_matches(record['active']['actor'],os.getpid()):
+                raise ValueError('Task20 actual stage ancestry differs')
+            safe=['python3','-I','-B','/task20-runtime.py',stage,session['head'],project,session['attempt']]
+            invocation=container_command(project,safe,config['cpus'],config['memory_gib'],config['image'],root=root)
+            image_index=invocation.index(config['image']);before=invocation[:image_index]
+            replaced=[];index=0
+            while index<len(before):
+                if before[index]=='-v':index+=2
+                else:replaced.append(before[index]);index+=1
+            return execute(replaced+volume_arguments(root,project)+invocation[image_index:])
         execution_arguments(arguments, binding)
         stage = 'bootstrap' if arguments[1] == '/src/qualification_bootstrap.py' else 'execute'
         safe = ['python3', '-I', '-B', '/qualification-runtime.py', stage, binding['head'], project]

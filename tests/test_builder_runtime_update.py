@@ -19,7 +19,7 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
     def test_exact_runtime_set_and_hashes(self):
         decoded=validate_assets(self.assets())
         self.assertEqual(set(decoded),set(TARGETS))
-        self.assertEqual(len(decoded),19)
+        self.assertEqual(len(decoded),21)
 
     def test_unknown_missing_or_tampered_asset_refused(self):
         for kind in ('unknown','missing','tampered'):
