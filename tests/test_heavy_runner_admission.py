@@ -118,7 +118,7 @@ class StrictHeavyPoolTests(unittest.TestCase):
         row={'Id':CID,'Name':'/'+NAME,'State':{'StartedAt':START},'HostConfig':{'Memory':32*GIB,'MemorySwap':32*GIB,'NanoCpus':8_000_000_000}}
         with patch('lib.host_admission.docker_identity',return_value=(f'container:{CID}:{START}',row)),patch('lib.host_admission.owner_alive',return_value=False):
             with self.assertRaisesRegex(ValueError,'Worker exited'):runner_reservation(OWNER,self.pool_config())
-        for change in [dict(runner_names=None),dict(role='builder'),dict(work_gib=57),dict(heavy_runners=[NAME,NAME])]:
+        for change in [dict(runner_names=None),dict(runner_names=[NAME,OTHER,OTHER]),dict(runner_names=[NAME,{}]),dict(role='builder'),dict(work_gib=57),dict(heavy_runners=[NAME,NAME])]:
             with self.assertRaises(ValueError):heavy_runner_policy(dict(self.pool_config(),**change))
 
     def test_64_gib_budget_admits_two_and_refuses_third(self):

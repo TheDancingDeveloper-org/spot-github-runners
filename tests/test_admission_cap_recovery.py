@@ -91,6 +91,19 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
     def owner(self,letter):
         return 'container:'+letter*64+':2026-10-04T00:00:00Z'
 
+    def test_strict_pool_adjustment_preserves_both_fixed_reservations(self):
+        configuration=dict(role='runner',work_gib=64,runner_gib=32,builder_gib=25,
+            runner_names=['r1','r2'],heavy_runners=['r1','r2'])
+        records={name:dict(Id=letter*64,Name='/'+name,
+            State=dict(Running=True,StartedAt='2026-10-04T00:00:00Z'),
+            HostConfig=dict(Memory=32*GIB,MemorySwap=32*GIB,NanoCpus=8_000_000_000))
+            for name,letter in [('r1','a'),('r2','b')]}
+        resumed=dict(config=configuration,records=records,ledger={},builder=dict(memory_gib=25,cpus=8))
+        result=self.run_program(resume=resumed,envelope=64,kind='runner')
+        self.assertEqual(result['status'],76)
+        self.assertEqual(result['config'],configuration)
+        self.assertEqual(result['updates'],[])
+
     def test_heavy_override_holds_global_growth_and_preserves_exact_slot(self):
         configuration=dict(work_gib=57,runner_gib=15,builder_gib=25,
             runner_names=['r1','r2'],heavy_runner=dict(name='r1',memory_gib=32,cpus=8))

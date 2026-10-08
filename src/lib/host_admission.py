@@ -532,6 +532,8 @@ def heavy_runner_policy(config):
         if ('heavy_runner' in config or not isinstance(names,list) or not 2<=len(names)<=3
             or any(not isinstance(name,str) or not name for name in names)
             or len(set(names))!=len(names) or not isinstance(config.get('runner_names'),list)
+            or any(not isinstance(name,str) or not name for name in config['runner_names'])
+            or len(set(config['runner_names']))!=len(config['runner_names'])
             or set(names)!=set(config['runner_names']) or config.get('role') not in (None,'runner')
             or config.get('runner_gib')!=32 or type(config.get('runner_gib'))is bool
             or type(config.get('work_gib'))not in (int,float)
