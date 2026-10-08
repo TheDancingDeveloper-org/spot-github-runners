@@ -38,6 +38,29 @@ task20-execute, task20-pack, task20-replay, cleanup. Ordinals are zero-based in
 the infrastructure store; the author's mapping table numbers stages from one.
 Do not silently reinterpret result ordinals.
 
+For the proposed Task20 profile, ordinal 1 uses command ID **upload-receive**
+and control arguments `["upload-receive"]`. The current Task19 placeholder
+`upload` stays unchanged and is not an alias for Task20. The control endpoint
+derives the fixed receiver and namespace; this marker never executes an uploaded
+program or accepts an arbitrary SCP/rsync command.
+
+Exactly eight Task20 host ordinals: 0 prepare, 1 upload-receive, 2 verify-source,
+3 task20-bootstrap, 4 task20-execute, 5 task20-pack, 6 task20-replay,
+7 custody cleanup. There is one host execute ordinal. Oracle, regeneration/diff,
+formatting, CI, ignored tests, docs, build and conformance stay inside that
+attested worker with authenticated ordered rows, descendant identities and logs.
+Do not independently rerun the worker or create arbitrary host substep commands.
+
+Proposed sealed entrypoint paths are
+`tools/remote-build/task20_worker.py` and
+`tools/remote-build/task20_results.py`. Worker options are exactly `--round`,
+`--expected-head`, `--run-id`; results use the same identities plus exactly one
+of `--pack` or `--replay`. Bootstrap is the sealed
+`tools/remote-build/task20_bootstrap.py`, zero options, CWD `/src`.
+These programs are not yet authenticated additions and remain unsupported in
+the current host grammar. They must use verified owned `/target/task20-source`
+for execution CWD, never derive writable authority from a sealed `__file__` path.
+
 The Task20 bootstrap must consume and reverify the existing read-only sealed
 checkout, then create only its owned worktree. Its current absent-checkout clone
 contract is incompatible. A root-owned Task20 runtime selects authenticated

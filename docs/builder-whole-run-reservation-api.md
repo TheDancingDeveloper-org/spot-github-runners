@@ -63,8 +63,10 @@ and boot identities, owner UID/PID/start, creation time, state, current ordinal
 and last durable event sequence. These are host observations, not request fields.
 Stages are ordered prepare, upload, verify-source, bootstrap, oracle, regenerate,
 test, measure, pack, replay, cleanup. A reviewed descriptor may omit optional
-stages; it cannot reorder or repeat completed stages. Multiple test substeps
-must be explicit distinct ordinals. The same binding covers nested children.
+stages; it cannot reorder or repeat completed stages. Task20 uses one host execute
+ordinal with authenticated ordered internal step rows and descendant evidence.
+Those internal steps are not independently callable host commands. The same
+binding covers nested children; see the separate Task20 profile proposal.
 
 ## Results and uncertain recovery
 
