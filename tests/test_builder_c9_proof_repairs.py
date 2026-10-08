@@ -34,15 +34,17 @@ PROJECT='qualification-'+'a'*12+'-'+'b'*32
 class ProofRepairControls(unittest.TestCase):
     def test_runtime_updater_isolated_standalone_entry_and_policy_paths(self):
         updater=ROOT/'src/lib/builder_runtime_update.py'
-        helper=ROOT/'src/lib/builder_access.py'
+        helpers=(ROOT/'tests/fixtures/builder_access_15asset.py',
+                 ROOT/'src/lib/builder_access.py')
         probe=ROOT/'tests/isolated_builder_runtime_probe.py'
         with tempfile.TemporaryDirectory() as directory:
             Path(directory,'builder_access.py').write_text('raise RuntimeError("cwd poison")\n')
             environment=dict(os.environ,PYTHONPATH=directory)
-            process=subprocess.run([sys.executable,'-I','-B',str(probe),str(updater),str(helper)],
-                                   cwd=directory,env=environment,capture_output=True,text=True)
-            self.assertEqual(process.returncode,0,process.stdout+process.stderr)
-            self.assertIn('checks: PASS',process.stdout)
+            for helper in helpers:
+                process=subprocess.run([sys.executable,'-I','-B',str(probe),str(updater),str(helper),str(helpers[1])],
+                                       cwd=directory,env=environment,capture_output=True,text=True)
+                self.assertEqual(process.returncode,0,str(helper)+'\n'+process.stdout+process.stderr)
+                self.assertIn('checks: PASS',process.stdout)
             entry=subprocess.run([sys.executable,'-I','-B',str(updater),'--help'],
                                  cwd=directory,env=environment,capture_output=True,text=True)
             self.assertEqual(entry.returncode,0,entry.stdout+entry.stderr)
@@ -289,17 +291,19 @@ class ProofRepairControls(unittest.TestCase):
                     'state':'HELD','active':None,'events':[],'stages':[{'command':'cleanup'}],
                     'next_ordinal':0}
             original_record=copy.deepcopy(record)
+            stored=[record]
             class Store:
                 def __init__(self):self.fail_once=True
                 def locked(self):
                     from contextlib import nullcontext
                     return nullcontext()
-                def read(self):return record
+                def read(self):return copy.deepcopy(stored[0])
                 def write(self,value):
                     if self.fail_once:
                         self.fail_once=False;raise RuntimeError('crash after evidence')
-                    record.update(value)
+                    stored[0]=copy.deepcopy(value)
             store=Store()
+            actors=[{'pid':1,'start':1}]
             original_fstat=os.fstat
             def root_fstat(fd):
                 info=original_fstat(fd);values=list(info);values[4]=0
@@ -307,19 +311,26 @@ class ProofRepairControls(unittest.TestCase):
             with patch.object(engine,'idle',return_value=True),patch.object(engine,'dossier',return_value=path),\
                  patch.object(custody,'Store',return_value=store),patch.object(custody,'host_identity',return_value=host),\
                  patch.object(custody,'enrollment',return_value={}),\
-                 patch.object(custody,'current_actor',return_value={'pid':1,'start':1}),\
+                 patch.object(custody,'current_actor',side_effect=lambda:actors[0]),\
                  patch.object(engine,'root_json',side_effect=lambda file:json.loads(Path(file).read_text())),\
                  patch.object(engine.os,'fstat',side_effect=root_fstat):
                 with self.assertRaisesRegex(RuntimeError,'crash'):
                     engine.reconcile_reboot(PROJECT,'r','old-boot')
                 evidence=(path/'reboot-reconciliation.json').read_bytes()
                 log=(path/'reboot-cleanup.log').read_bytes()
+                actors[0]={'pid':2,'start':2}
                 result=engine.reconcile_reboot(PROJECT,'r','old-boot')
                 self.assertEqual(result['state'],'RELEASED')
+                self.assertEqual(result['events'][-1]['actor'],{'pid':1,'start':1})
                 self.assertEqual((path/'reboot-reconciliation.json').read_bytes(),evidence)
                 self.assertEqual((path/'reboot-cleanup.log').read_bytes(),log)
+                actors[0]={'pid':3,'start':3}
                 self.assertEqual(engine.reconcile_reboot(PROJECT,'r','old-boot')['state'],'RELEASED')
-                record.clear();record.update(original_record)
+                actors[0]={'pid':0,'start':3}
+                with self.assertRaisesRegex(ValueError,'Actual PID'):
+                    engine.reconcile_reboot(PROJECT,'r','old-boot')
+                actors[0]={'pid':3,'start':3}
+                stored[0]=copy.deepcopy(original_record)
                 (path/'reboot-cleanup.log').chmod(0o600)
                 (path/'reboot-cleanup.log').write_bytes(b'foreign\n')
                 with self.assertRaisesRegex(ValueError,'cleanup log differs'):

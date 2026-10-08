@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 updater=Path(sys.argv[1])
 helper=Path(sys.argv[2])
+replacement=Path(sys.argv[3])
 scope=runpy.run_path(str(updater),run_name='isolated_standalone_updater')
 globals_=scope['validate_policy_assets'].__globals__
 assert globals_['__package__'] in (None,'')
@@ -31,14 +32,23 @@ policy={
         b'    DisableForwarding yes\n    PermitTTY no\nMatch all\n',
     '/etc/sudoers.d/oxidex-uploader-session':
         b'oxidex-uploader ALL=(root) NOPASSWD: /usr/local/sbin/oxidex-uploader-session\n'}
-assets={path:{'data':base64.b64encode(policy.get(path,b'fixture')).decode(),
-              'sha256':hashlib.sha256(policy.get(path,b'fixture')).hexdigest()}
+uploaded=b'raise RuntimeError("uploaded Python executed")\n'
+assets={path:{'data':base64.b64encode(policy.get(path,uploaded)).decode(),
+              'sha256':hashlib.sha256(policy.get(path,uploaded)).hexdigest()}
         for path in globals_['TARGETS']}
 helper_raw=helper.read_bytes()
+selected_helper=[helper_raw]
+legacy=hashlib.sha256(helper_raw).hexdigest()==('463b7887505c9593d400ed8534b7a792038129690b7a4ad08bc5649533022e36')
+if helper.name=='builder_access_15asset.py':
+    assert legacy, 'Retained installed helper bytes changed'
+if legacy:
+    assert b'def uploader_policy_bytes' not in helper_raw
+assert len(globals_['TARGETS'])==24
 def root_read(path):
     if str(path)=='/opt/gha-runners/builder_access.py':
-        return ({'sha256':hashlib.sha256(helper_raw).hexdigest(),'mode':0o644,
-                 'uid':0,'gid':0,'device':1,'inode':1},helper_raw)
+        raw=selected_helper[0]
+        return ({'sha256':hashlib.sha256(raw).hexdigest(),'mode':0o644,
+                 'uid':0,'gid':0,'device':1,'inode':1},raw)
     if str(path)=='/etc/oxidex-builder-uploader.json':
         raw=json.dumps(mapping).encode()
         return {'mode':0o600,'sha256':hashlib.sha256(raw).hexdigest()},raw
@@ -76,8 +86,29 @@ with tempfile.TemporaryDirectory() as poison:
             # The capture, apply, and policy recovery paths all call this validator.
             for path in ('capture','update','recovery'):
                 assert globals_['validate_policy_assets'](assets)['uid']==2000,path
+            group.gr_mem=['foreign']
+            try:
+                globals_['validate_policy_assets'](assets)
+            except ValueError as error:
+                assert 'Unapproved restricted build group members' in str(error)
+            else:
+                raise AssertionError('Foreign group member accepted')
+            group.gr_mem=[]
+            wrong=types.SimpleNamespace(pw_name=account.pw_name,pw_uid=2001,pw_gid=1001)
+            with patch.object(pwd,'getpwnam',return_value=wrong):
+                try:globals_['validate_policy_assets'](assets)
+                except ValueError as error:assert 'Enrolled uploader account changed' in str(error)
+                else:raise AssertionError('Wrong NSS UID accepted')
+            target=next(iter(policy))
+            original=assets[target]
+            broadened=b'PermitTTY yes\n'
+            assets[target]={'data':base64.b64encode(broadened).decode(),
+                            'sha256':hashlib.sha256(broadened).hexdigest()}
+            try:globals_['validate_policy_assets'](assets)
+            except ValueError as error:assert 'Uploaded policy differs' in str(error)
+            else:raise AssertionError('Broadened policy accepted')
+            assets[target]=original
             assert globals_['observed_work_processes']()==[]
-            globals_['validate_installed_policy'](assets,mapping)
             asset_raw=json.dumps(assets).encode()
             plan_raw=b'{"selected":"plan"}'
             asset_sha=hashlib.sha256(asset_raw).hexdigest()
@@ -110,6 +141,10 @@ with tempfile.TemporaryDirectory() as poison:
                     with patch.object(sys,'argv',[str(updater),*arguments]),redirect_stdout(io.StringIO()) as output:
                         globals_['main']()
                     assert json.loads(output.getvalue())==expected
+            # The held install replaces the helper only after these pre-update
+            # decisions. Post-install daemon validation then uses the candidate.
+            selected_helper[0]=replacement.read_bytes()
+            globals_['validate_installed_policy'](assets,mapping)
     finally:sys.path.remove(poison)
 # A root-owned fixed-path identity is mandatory before any helper bytes run.
 saved=root_read

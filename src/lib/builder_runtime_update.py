@@ -93,6 +93,23 @@ def validate_assets(assets):
     return result
 
 
+def expected_uploader_policy(mapping):
+    """Fixed update policy, independent of the installed helper's API version.
+
+    The installed 15-asset helper authenticates the mapping and group but has
+    no policy-byte generator. Never execute the candidate asset to fill that
+    gap before the held replacement has completed.
+    """
+    username = mapping['username']
+    return {
+        '/etc/ssh/sshd_config.d/40-oxidex-uploader-fence.conf':
+            ('Match User '+username+'\n    ForceCommand /usr/local/sbin/oxidex-uploader-session\n'
+             '    DisableForwarding yes\n    PermitTTY no\nMatch all\n').encode(),
+        '/etc/sudoers.d/oxidex-uploader-session':
+            (username+' ALL=(root) NOPASSWD: /usr/local/sbin/oxidex-uploader-session\n').encode(),
+    }
+
+
 def validate_policy_assets(assets):
     """Reject policy bytes not derived from the existing root-owned mapping."""
     import pwd
@@ -105,7 +122,9 @@ def validate_policy_assets(assets):
     if account.pw_uid != mapping['uid']:
         raise ValueError('Enrolled uploader account changed')
     access.restricted_group_guard(mapping)
-    expected = access.uploader_policy_bytes(mapping)
+    expected = expected_uploader_policy(mapping)
+    if set(expected) != set(POLICY_TARGETS):
+        raise ValueError('Fixed uploader policy target set differs')
     decoded = validate_assets(assets)
     if any(decoded[path] != raw for path, raw in expected.items()):
         raise ValueError('Uploaded policy differs from fixed root-derived enrollment')

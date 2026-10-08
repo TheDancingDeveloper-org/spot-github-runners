@@ -332,6 +332,7 @@ def reconcile_reboot(project,identity,expected_old_boot):
         if record['host'][0]!=host[0] or record['host'][1]!=expected_old_boot or host[1]==expected_old_boot:
             raise ValueError('Same provider VM and distinct actual reboot required')
         path=dossier(project);actor=custody.current_actor()
+        custody.validate_actor(actor)
         evidence_path=path/'reboot-reconciliation.json';log=path/'reboot-cleanup.log'
         released=record['state']=='RELEASED'
         if evidence_path.exists() or evidence_path.is_symlink():
@@ -390,7 +391,10 @@ def reconcile_reboot(project,identity,expected_old_boot):
             record['events'].append({**record['active'],'exit_code':None,'log_sha256':None,
                                      'disposition':'INTERRUPTED'})
         ordinal=len(record['stages'])-1
-        record['events'].append({'ordinal':ordinal,'command':'cleanup','actor':actor,
+        # The evidence and log may have been published by an earlier caller.
+        # Keep that authenticated publication identity in the terminal receipt;
+        # the current caller was observed independently above.
+        record['events'].append({'ordinal':ordinal,'command':'cleanup','actor':evidence['actor'],
                                  'exit_code':0,'log_sha256':file_digest(log)})
         record.update(state='RELEASED',active=None,next_ordinal=len(record['stages']))
         # Preserve original host and signed claim; separate evidence records the
