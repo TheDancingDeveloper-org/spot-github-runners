@@ -31,14 +31,14 @@ TARGETS = {
     '/etc/oxidex-remote-build/qualification-maintainer.allowed_signers': 0o444,
     **{QUALIFICATION + name + '.py': 0o644 for name in (
         '__init__', 'git_sandbox', 'host_gate', 'import_supervisor',
-        'launcher_contract', 'mounts', 'qualification_source', 'runtime')},
+        'launcher_contract', 'mounts', 'qualification_source', 'runtime', 'reservation')},
     QUALIFICATION + 'runtime_git.py': 0o555,
 }
 
 
 def validate_assets(assets):
     if not isinstance(assets, dict) or set(assets) != set(TARGETS):
-        raise ValueError('Exactly the reviewed fifteen runtime targets are required')
+        raise ValueError('Exactly the reviewed runtime target set is required')
     result = {}
     total = 0
     for target, row in assets.items():

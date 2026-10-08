@@ -2,6 +2,10 @@
 import importlib.util
 from pathlib import Path
 import os
+import fcntl
+import sys
+from contextlib import ExitStack
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -82,7 +86,7 @@ class ReservationTests(unittest.TestCase):
         self.step(record, 0); self.step(record, 1)
         with self.assertRaises(ValueError):
             self.step(record, 2, binding={**self.session, 'tree': '0'*40})
-        self.assertEqual(self.store.read()['state'], 'CLAIMED')
+        self.assertEqual(self.store.read()['state'], 'HELD')
         self.assertIsNotNone(self.store.read()['active'])
 
     def test_release_preserves_evidence_and_returns_tombstone(self):
@@ -149,6 +153,10 @@ class ReservationTests(unittest.TestCase):
         new = self.claim()
         self.assertNotEqual(new['reservation_id'], record['reservation_id'])
         self.assertEqual(self.store.read('released-'+old['project']+'.json')['reservation_id'], record['reservation_id'])
+        retry = self.store.release(record['reservation_id'], host=self.host,
+                                   project=old['project'], quiescent=lambda: None)
+        self.assertEqual(retry['state'], 'RELEASED')
+        self.assertEqual(self.store.read()['reservation_id'], new['reservation_id'])
 
     def test_failed_cleanup_cannot_release(self):
         record = self.claim()
@@ -194,3 +202,47 @@ class ReservationTests(unittest.TestCase):
         self.store.write(record)
         with self.assertRaises(ValueError):
             self.store.read()
+
+    def test_boolean_cleanup_and_missing_log_tombstones_fail_closed(self):
+        record = self.claim()
+        record.update(state='RELEASED', next_ordinal=len(self.argv), active=None)
+        for event in [dict(ordinal=7, command='cleanup', actor=self.actor, exit_code=False, log_sha256='f'*64),
+                      dict(ordinal=7, command='cleanup', actor=self.actor, exit_code=0, log_sha256=None)]:
+            record['events'] = [event]
+            self.store.write(record)
+            with self.assertRaises(ValueError):
+                self.store.read()
+
+    def test_mismatched_finish_durably_closes_actor_access(self):
+        record = self.claim()
+        self.step(record, 0); self.step(record, 1)
+        with self.assertRaises(ValueError):
+            self.step(record, 2, binding={**self.session, 'tree': '0'*40})
+        with patch.object(reservation, 'ROOT', Path(self.folder.name)), \
+             patch.object(reservation, 'Store', return_value=self.store), \
+             patch.object(reservation, 'host_identity', return_value=self.host), \
+             patch.object(reservation, 'ancestor_matches', return_value=True):
+            with self.assertRaises(ValueError):
+                reservation.route_guard(self.project, argv=self.argv[2])
+
+    def test_admission_guard_retains_real_shared_lock_through_grant(self):
+        module_path = MODULE.parents[1]/'host_admission.py'
+        admission_spec = importlib.util.spec_from_file_location('reservation_admission_fixture', module_path)
+        admission = importlib.util.module_from_spec(admission_spec)
+        admission_spec.loader.exec_module(admission)
+        lock = Path(self.folder.name)/'oxidex-build.lock'
+        with patch.object(admission, 'LOCK_ROOT', Path(self.folder.name)), \
+             patch.dict(sys.modules, {'qualification_trust': SimpleNamespace(),
+                                      'qualification_trust.reservation': SimpleNamespace(route_guard=lambda **kwargs: None)}):
+            with ExitStack() as custody:
+                admission.hold_builder_reservation(custody, {'role': 'builder'}, os.getpid())
+                with lock.open('a') as competing:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with lock.open('a') as after_grant:
+                fcntl.flock(after_grant, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_runtime_update_enrolls_new_required_dependency(self):
+        sys.path.insert(0, str(MODULE.parents[2]))
+        from lib.builder_runtime_update import TARGETS
+        self.assertEqual(TARGETS['/opt/oxidex-builder/qualification_trust/reservation.py'], 0o644)

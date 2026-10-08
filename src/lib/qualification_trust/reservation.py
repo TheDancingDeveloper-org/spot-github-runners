@@ -71,7 +71,7 @@ def validate_session(session, stages):
     for ordinal, stage in enumerate(stages):
         if (not isinstance(stage, dict) or set(stage) != {'ordinal', 'command', 'argv_sha256'}
                 or type(stage['ordinal']) is not int or stage['ordinal'] != ordinal
-                or stage['command'] not in COMMANDS or not isinstance(stage['argv_sha256'], str)
+                or not isinstance(stage['command'], str) or stage['command'] not in COMMANDS or not isinstance(stage['argv_sha256'], str)
                 or not re.fullmatch('[0-9a-f]{64}', stage['argv_sha256'])):
             raise ValueError('Unknown stage descriptor')
     names = [stage['command'] for stage in stages]
@@ -148,13 +148,35 @@ class Store:
                     or not isinstance(record['events'], list) or len(record['events']) > 128):
                 raise ValueError('Malformed reservation custody')
             validate_actor(record['owner'])
+            for event in record['events']:
+                required = {'ordinal', 'actor', 'command', 'exit_code', 'log_sha256'}
+                if not isinstance(event, dict) or not required <= set(event) or set(event)-required-{'disposition', 'reason'}:
+                    raise ValueError('Unknown reservation event schema')
+                ordinal = event['ordinal']
+                if type(ordinal) is not int or not 0 <= ordinal < len(record['stages']) or event['command'] != record['stages'][ordinal]['command']:
+                    raise ValueError('Terminal event stage differs')
+                validate_actor(event['actor'])
+                if event.get('disposition') not in (None, 'INTERRUPTED', 'FINISH_REFUSED'):
+                    raise ValueError('Unknown event disposition')
+                if event['exit_code'] is None:
+                    if event.get('disposition') not in ('INTERRUPTED', 'FINISH_REFUSED'):
+                        raise ValueError('Unknown exit requires explicit interruption evidence')
+                elif type(event['exit_code']) is not int:
+                    raise ValueError('Actual integer terminal status required')
+                if event['log_sha256'] is None:
+                    if event.get('disposition') not in ('INTERRUPTED', 'FINISH_REFUSED'):
+                        raise ValueError('Terminal log digest missing')
+                elif not isinstance(event['log_sha256'], str) or not re.fullmatch('[0-9a-f]{64}', event['log_sha256']):
+                    raise ValueError('Malformed terminal log digest')
+                if 'reason' in event and (not isinstance(event['reason'], str) or len(event['reason']) > 200):
+                    raise ValueError('Malformed retained failure reason')
             if record['active'] is not None:
                 if not isinstance(record['active'], dict) or set(record['active']) != {'ordinal', 'actor', 'command'}:
                     raise ValueError('Malformed active stage')
                 validate_actor(record['active']['actor'])
-                if record['active']['ordinal'] != record['next_ordinal'] or record['active']['command'] != record['stages'][record['next_ordinal']]['command']:
+                if record['next_ordinal'] >= len(record['stages']) or type(record['active']['ordinal']) is not int or record['active']['ordinal'] != record['next_ordinal'] or record['active']['command'] != record['stages'][record['next_ordinal']]['command']:
                     raise ValueError('Active stage ordinal differs')
-            if record['state'] == 'RELEASED' and (record['active'] is not None or record['next_ordinal'] != len(record['stages']) or not record['events'] or record['events'][-1].get('command') != 'cleanup' or record['events'][-1].get('exit_code') != 0):
+            if record['state'] == 'RELEASED' and (record['active'] is not None or record['next_ordinal'] != len(record['stages']) or not record['events'] or record['events'][-1]['ordinal'] != len(record['stages'])-1 or record['events'][-1]['command'] != 'cleanup' or type(record['events'][-1]['exit_code']) is not int or record['events'][-1]['exit_code'] != 0 or record['events'][-1].get('disposition') is not None):
                 raise ValueError('Release tombstone lacks terminal cleanup')
             return record
         finally:
@@ -238,13 +260,20 @@ class Store:
                 raise ValueError('Exact active stage owner required')
             if type(exit_code) is not int or not isinstance(log_sha256, str) or not re.fullmatch('[0-9a-f]{64}', log_sha256):
                 raise ValueError('Actual terminal status and log digest required')
-            if quiescent() is not True:
-                raise ValueError('Complete actual stage quiescence required')
-            if active['command'] == 'verify-source' and exit_code == 0:
-                expected = record['session']
-                if not isinstance(binding, dict) or any(binding.get(key) != expected[key] for key in ('head', 'tree', 'bundle_sha256', 'attestation_sha256')):
-                    raise ValueError('Actual sealed source differs from reserved claim')
-                record['state'] = 'SOURCE_VERIFIED'
+            try:
+                if quiescent() is not True:
+                    raise ValueError('Complete actual stage quiescence required')
+                if active['command'] == 'verify-source' and exit_code == 0:
+                    expected = record['session']
+                    if not isinstance(binding, dict) or any(binding.get(key) != expected[key] for key in ('head', 'tree', 'bundle_sha256', 'attestation_sha256')):
+                        raise ValueError('Actual sealed source differs from reserved claim')
+                    record['state'] = 'SOURCE_VERIFIED'
+            except Exception as error:
+                record['state'] = 'HELD'
+                record['events'].append({**active, 'exit_code': None, 'log_sha256': log_sha256,
+                                         'disposition': 'FINISH_REFUSED', 'reason': str(error)[:200]})
+                self.write(record)
+                raise
             if exit_code != 0:
                 record['state'] = 'HELD'
             record['events'].append({**active, 'exit_code': exit_code, 'log_sha256': log_sha256})
@@ -253,9 +282,15 @@ class Store:
             self.write(record)
             return record
 
-    def release(self, identity, *, host, quiescent):
+    def release(self, identity, *, host, quiescent, project=None):
         with self.locked():
             record = self.read()
+            if (record is None or record['reservation_id'] != identity) and project is not None:
+                if not isinstance(project, str) or not re.fullmatch('qualification-[0-9a-f]{12}-[0-9a-f]{32}', project):
+                    raise ValueError('Exact archived run namespace required')
+                record = self.read('released-'+project+'.json')
+                if record is None or record['state'] != 'RELEASED' or record['session']['project'] != project:
+                    raise ValueError('Exact released tombstone unavailable')
             self.match(record, identity, host)
             if record['state'] == 'RELEASED':
                 return record  # durable lost-ack answer, no repeated effects
@@ -303,7 +338,7 @@ class Store:
             record = self.read()
             if record is None or record['state'] == 'RELEASED':
                 return
-            if record['host'] != list(host) or record['session']['project'] != project or record['active'] is None:
+            if record['host'] != list(host) or record['session']['project'] != project or record['active'] is None or (record['state'] == 'HELD' and record['active']['command'] != 'cleanup'):
                 raise ValueError('Host reserved; no matching active stage')
             if not actor_matches(record['active']['actor']):
                 raise ValueError('Host reserved for another actual stage process')

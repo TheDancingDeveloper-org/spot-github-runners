@@ -5,8 +5,9 @@ Source candidate only; no installed interface, live lease, payload or readiness.
 Implemented: bounded durable custody store, strict session/stage binding,
 detached signature verification through the existing source trust anchor,
 PID/start ancestry and metadata VM/boot observations, launcher/Docker/admission
-read-side gates, startup enrollment, retained uncertainty, interrupted-stage
-recovery and release tombstones. Sixteen focused synthetic controls pass.
+read-side gates, startup/runtime-update enrollment, retained uncertainty,
+interrupted-stage recovery and archived release tombstones. Twenty focused
+synthetic controls pass, including a real file-descriptor admission lock test.
 
 The production acquire/stage/reconcile/release control endpoint is not enabled.
 Trusted actual quiescence and full-source-binding producers must be connected;
