@@ -26,7 +26,7 @@ SCOPE_FIELDS={'schema','vm_id','boot','installation_nonce','project','reservatio
               'enrollment_sha256'}
 
 
-def root_bytes(path, maximum=1048576, *, mode=None):
+def root_bytes(path, maximum=1048576, *, mode=None, with_identity=False):
     """Bounded root-owned, nofollow read with stable inode and trusted ancestry."""
     path=Path(path)
     for parent in path.parents:
@@ -46,7 +46,7 @@ def root_bytes(path, maximum=1048576, *, mode=None):
         if (len(raw)!=before.st_size or any(getattr(before,key)!=getattr(after,key)
                 or getattr(before,key)!=getattr(current,key) for key in keys)):
             raise ValueError('Root state changed during observation')
-        return raw
+        return (raw,tuple(getattr(before,key) for key in keys)) if with_identity else raw
     finally:os.close(fd)
 
 
@@ -145,14 +145,18 @@ def proc_bytes(path,maximum):
 
 
 def snapshot(project,identity,nonce,*,record=None):
-    """A complete live join; caller holds global SH and optionally store lock."""
+    """A complete live join; caller holds global SH, not the store writer lock."""
     if custody.enrollment() is None:
         raise ValueError('Enrolled mounted reservation custody required')
     host=custody.host_identity()
     enrollment_sha256=runtime_binding(nonce,host)
     if record is None:
         store=custody.Store()
-        with store.locked():selected=store.read()
+        record_path=store.root/'record.json'
+        before,identity_before=root_bytes(record_path,custody.LIMIT,mode=0o600,with_identity=True)
+        selected=store.read()
+        if selected is None or custody.canonical(selected)!=before:
+            raise ValueError('Reservation changed during observation')
     else:selected=record
     # A caller retaining the store lock supplies its already validated record.
     # The dossier and descriptor are independently root-owned and nofollow.
@@ -167,6 +171,10 @@ def snapshot(project,identity,nonce,*,record=None):
             or selected['state'] not in ('SOURCE_VERIFIED','HELD') or selected['active'] is None):
         raise ValueError('No selected active owned stage')
     active=selected['active'];cgroup=unit_identity(project,identity,active)
+    if record is None:
+        after,identity_after=root_bytes(record_path,custody.LIMIT,mode=0o600,with_identity=True)
+        if after!=before or identity_after!=identity_before:
+            raise ValueError('Reservation changed during observation')
     return dict(schema=1,vm_id=host[0],boot=host[1],installation_nonce=nonce,
                 project=project,reservation=identity,actor_pid=active['actor']['pid'],
                 actor_start_ticks=active['actor']['start'],cgroup=cgroup,
@@ -227,6 +235,7 @@ def interrupt_owned(scope):
             # pidfd prevents PID reuse between this last kernel/service join and
             # the signal. Any failure leaves the durable hold and intent intact.
             unit_identity(project,identity,active)
+            validate_scope(scope,time.time())
             signal.pidfd_send_signal(pidfd,signal.SIGKILL,None,0)
         finally:os.close(pidfd)
     return dict(status='INTERRUPTION_REQUESTED_HELD',reservation=identity,
