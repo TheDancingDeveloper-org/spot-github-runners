@@ -96,7 +96,7 @@ class HeavyRunnerAdmissionTests(unittest.TestCase):
             self.assertTrue(pool.acquire_runner(OWNER,32))
 
 
-if __name__=='__main__':unittest.main()
+
 
 
 class StrictHeavyPoolTests(unittest.TestCase):
@@ -128,3 +128,6 @@ class StrictHeavyPoolTests(unittest.TestCase):
             self.assertTrue(pool.acquire_runner(first,32));self.assertTrue(pool.acquire_runner(second,32))
             self.assertFalse(pool.acquire_runner(third,32));pool.release_runner(first)
             self.assertTrue(pool.acquire_runner(third,32))
+
+if __name__ == "__main__":
+    unittest.main()

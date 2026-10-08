@@ -69,6 +69,7 @@ COPY entrypoint.py /usr/local/bin/oxidex-build-entrypoint
 RUN chmod 0755 /usr/local/bin/oxidex-build-entrypoint \
     && install -m 0444 /dev/null /run/oxidex-build-container
 USER runner
+ENV CARGO_HOME=/home/runner/.cargo
 ENV RUSTUP_HOME=/home/runner/.rustup
 ENV PATH=/home/runner/.cargo/bin:/opt/build-tools:/opt/uv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh \
