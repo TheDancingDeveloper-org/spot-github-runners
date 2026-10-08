@@ -736,3 +736,48 @@ vale README.md
 A clean Vale result covers the configured rules, not every editorial requirement
 in the Google guide. Check command examples against command-line help and source before
 submitting the documentation PR.
+
+## Strict CI runner pools
+
+Use `--heavy-runner-pool 2` or `--heavy-runner-pool 3` to provision fixed CI
+members. Each member has an 8-vCPU limit and a 32-GiB memory limit, including
+swap. The host must also provide 2 vCPUs and 16 GiB for host services. A
+32-vCPU, 128-GiB host meets these sizing requirements for either count.
+
+Choose a currently priced Spot zone and a GitHub runner group that selects only
+`swack-tools/oxidex` and permits public repositories. Preview the configuration
+before adding `--apply`:
+
+```bash
+python3 src/spot_runner_manager.py \
+  --project homelab-424523 --region '<region>' --zone '<zone>' \
+  --instance-type n4-standard-32 --cpu 32 --ram 128 \
+  --heavy-runner-pool 2 --runner-group-id '<group-id>' \
+  --max-cost 0.18 --max-total-daily-usd 4.50
+```
+
+The price limits are ceilings, not price quotes. The preview checks current
+compute and storage prices. The pool uses the `spot-heavy32` label and its exact
+registered member identities. It cannot share the host with remote builders or
+override an ordinary tier configuration.
+
+For an existing instance, the manager checks cached agent identities against
+the actual GitHub group and label targets. It starts a stopped retained host
+before reading its cached state. Turn off incoming work and let active jobs
+finish before applying an existing-host update; a successful source review is
+not a live drain or rollout proof.
+
+Runner images include Rust 1.99.0, rustfmt, clippy, and the configured cross-platform
+standard-library targets. Installed tools live under `/opt/runner-rust` in a
+shared read-only volume selected by immutable image ID. Cargo downloads and
+installed job tools use the writable `/work/.cargo` cache. CI setup must verify
+this preinstalled toolchain instead of trying to update the read-only tool home.
+
+### Run infrastructure tests remotely
+
+Set `OXIDEX_CONTROL_REPO` to a reviewed OxiDex checkout with the
+`test-infra-ci-remote` recipe, then run `just test`. The fixed CI-only profile
+runs the complete signed-source unittest suite on the admitted Spot builder.
+It verifies module coverage, discovered and executed test identities, actual
+test results, and artifact hashes. The older qualification profile retains its
+separate coverage requirements. No local full-suite fallback is provided.

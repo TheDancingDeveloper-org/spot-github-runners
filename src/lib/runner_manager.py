@@ -88,6 +88,7 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disk-type", default=None,
                         help="Data disk type; defaults to the machine family's compatible storage")
     parser.add_argument("--disk-device-name", default="runner-data")
+    parser.add_argument("--heavy-runner-pool", type=int, choices=(2,3), help="Strict CI-only pool: each runner 8 CPU/32 GiB, no extra swap")
     parser.add_argument("--runner-count", type=int, default=4)
     parser.add_argument("--runner-cpu", type=int, default=4)
     parser.add_argument("--runner-memory-gb", type=int, default=15)
@@ -111,11 +112,32 @@ def args_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def strict_pool_settings(args):
+    count=getattr(args,'heavy_runner_pool',None)
+    if count is None:return None
+    if type(count)is not int or count not in (2,3):raise RuntimeError('Strict pool must contain two or three runners')
+    if getattr(args,'remote_builder',False):raise RuntimeError('Strict CI pool cannot host remote builders')
+    if getattr(args,'tier',None):raise RuntimeError('Strict pool is an explicit fixed mode, not a tier override')
+    if args.cpu < count*8+2 or args.ram < count*32+16:raise RuntimeError('Strict pool needs 2 CPU and 16 GiB host headroom')
+    return count
+
+
 def select_sizing(args: argparse.Namespace) -> None:
     if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
         raise RuntimeError('Remote builders require a tier host with shared memory admission')
     configure_storage(args)
     configure_cpu_platform(args)
+    strict=strict_pool_settings(args)
+    if strict:
+        args.runner_count=strict
+        args.runner_cpu=8
+        args.runner_memory_gb=32
+        args.fixed_runner_sizing=True
+        args.admission_work_gib=32*strict
+        args.builder_memory_gib=28
+        args.runner_label='spot-heavy32'
+        if len(f'{args.runner_prefix}-{args.instance_name}-{strict}')>64:raise RuntimeError('GitHub runner name exceeds64 characters')
+        return
     if getattr(args,'tier',None):
         from .runner_tiers import TIERS
         from .host_admission import admission_budget
@@ -214,6 +236,10 @@ def verify_runner_group(args: argparse.Namespace) -> dict:
     repos = json.loads(run(["gh", "api", f"orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/repositories"], quiet=True))
     if not any(repo.get("full_name") == f"{ORG}/oxidex" for repo in repos.get("repositories", [])):
         raise RuntimeError(f"Runner group {args.runner_group_id} is not enabled for {ORG}/oxidex")
+    if getattr(args,'heavy_runner_pool',None) and group.get('allows_public_repositories') is not True:
+        raise RuntimeError('Strict runner group must permit the public OxiDex repository')
+    if getattr(args,'heavy_runner_pool',None) and [repo.get('full_name') for repo in repos.get('repositories',[])]!=[f'{ORG}/oxidex']:
+        raise RuntimeError('Strict runner group must select only OxiDex')
     return group
 
 
@@ -247,7 +273,9 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
     if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
         raise RuntimeError('Remote builders require a tier host with shared memory admission')
     source = STARTUP_SCRIPT
-    tiered = bool(getattr(args,'tier',None))
+    strict=strict_pool_settings(args)
+    if strict and (args.runner_count!=strict or args.runner_memory_gb!=32 or args.runner_cpu!=8 or args.admission_work_gib!=32*strict or args.runner_label!='spot-heavy32'):raise RuntimeError('Strict pool sizing has not been selected')
+    tiered = bool(getattr(args,'tier',None) or strict)
     admission_source = Path(__file__).with_name('host_admission.py').read_bytes()
     evidence_source = Path(__file__).with_name('host_evidence.py').read_bytes()
     replacements = {
@@ -279,6 +307,7 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "EVIDENCE_B64":base64.b64encode(evidence_source).decode(),
         "JOB_STARTED_B64":base64.b64encode((ROOT/'runner/job-started.sh').read_bytes()).decode(),
         "TIERED":'1' if tiered else '0',
+        "STRICT_HEAVY_POOL":'1' if strict else '0',
         "ADMISSION_WORK_GIB":str(getattr(args,'admission_work_gib',0)),
     }
     for key, value in replacements.items():
@@ -465,12 +494,78 @@ def online_runners(args: argparse.Namespace) -> list[str]:
     return online
 
 
+def verify_strict_runner_membership(args) -> dict[str, int] | None:
+    if not getattr(args,'heavy_runner_pool',None):return None
+    expected={f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1,args.runner_count+1)}
+    output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/runners','--jq','.runners[] | @json'],quiet=True)
+    rows=[json.loads(line) for line in output.splitlines() if line.strip()]
+    selected=[row for row in rows if row.get('name') in expected]
+    if (len(selected)!=len(expected) or {row.get('name') for row in selected}!=expected
+        or any(type(row.get('id'))is not int for row in selected)
+        or len({row['id'] for row in selected})!=len(expected)):
+        raise RuntimeError('Registered strict runners are not in the verified OxiDex group')
+    return {row['name']:row['id'] for row in selected}
+
+
+def start_retained_strict_host(args, zone):
+    if not (args.existing_instance and getattr(args,'heavy_runner_pool',None)):return
+    vm=args.deployment_vm
+    if not vm.instance_id or not vm.spot or vm.machine_type!=args.instance_type:
+        raise RuntimeError('Retained strict host identity/type/Spot policy differs')
+    if vm.running:return
+    if vm.status not in {'STOPPED','TERMINATED'}:raise RuntimeError('Retained strict host is transitioning')
+    if getattr(args,'min_cpu_platform',None):
+        gcloud(['compute','instances','update',args.instance_name,f'--zone={zone}',f'--min-cpu-platform={args.min_cpu_platform}','--quiet'])
+    gcloud(['compute','instances','start',args.instance_name,f'--zone={zone}','--quiet'])
+    deadline=time.monotonic()+min(120,args.registration_timeout_seconds)
+    while time.monotonic()<deadline:
+        actual=observed_deployment_vm(args,zone)
+        if actual.instance_id!=vm.instance_id or not actual.spot or actual.machine_type!=vm.machine_type:
+            raise RuntimeError('Retained strict host changed during start')
+        args.deployment_vm=actual
+        if actual.running:return
+        time.sleep(1)
+    raise RuntimeError('Retained strict host did not become running; no bootstrap applied')
+
+
+def read_cached_runner_ids(args):
+    expected=[f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1,args.runner_count+1)]
+    vm_id=getattr(getattr(args,'deployment_vm',None),'instance_id',None)
+    if not isinstance(vm_id,str)or not vm_id.isdigit():raise RuntimeError('Observed VM identity required for cached runner verification')
+    prefix="import urllib.request;actual=urllib.request.urlopen(urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/id',headers={'Metadata-Flavor':'Google'}),timeout=3).read().decode();assert actual=="+repr(vm_id)+"\n"
+    script=prefix+"import json,os,stat;from pathlib import Path;names="+repr(expected)+";rows={}\nfor name in names:\n p=Path('/mnt/runner-data/instances')/name/'.runner'\n if any(x.is_symlink() for x in [*p.parents,p]):raise ValueError('Symlinked cached runner')\n fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)\n with os.fdopen(fd,'rb')as f:\n  if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):raise ValueError('Nonregular cached runner')\n  raw=f.read(65537)\n if len(raw)>65536:raise ValueError('Oversized cached runner')\n row=json.loads(raw)\n if row.get('agentName')!=name or type(row.get('agentId'))is not int:raise ValueError('Cached identity invalid')\n rows[name]=row['agentId']\nprint(json.dumps(rows))"
+    output=gcloud(['compute','ssh',args.instance_name,f'--zone={args.zone or args.region+"-a"}',f'--project={args.project}','--quiet','--command='+shlex.join(['sudo','-n','python3','-I','-B','-c',script])],quiet=True)
+    return json.loads(output)
+
+
+def validate_strict_identity_join(group_ids,cached_ids,org_rows):
+    expected=set(group_ids)
+    selected=[row for row in org_rows if row.get('name')in expected]
+    if len(selected)!=len(expected) or any(type(row.get('id'))is not int for row in selected):raise RuntimeError('Ambiguous org runner identities')
+    targets={row['name']:row['id']for row in selected}
+    if set(targets)!=expected or cached_ids!=group_ids or targets!=group_ids:raise RuntimeError('Cached/group/label runner identities differ')
+
+
+def verify_strict_identities(args,org_rows=None):
+    if not getattr(args,'heavy_runner_pool',None):return
+    group_ids=verify_strict_runner_membership(args)
+    cached=read_cached_runner_ids(args)
+    if org_rows is None:
+        output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runners','--jq','.runners[] | @json'],quiet=True)
+        org_rows=[json.loads(line)for line in output.splitlines()if line.strip()]
+    validate_strict_identity_join(group_ids,cached,org_rows)
+
+
 def sync_runner_labels(args: argparse.Namespace) -> None:
     """Ensure every Spot VM runner has the common scheduling labels."""
+    if getattr(args,'heavy_runner_pool',None):
+        verify_runner_group(args)
+        verify_strict_runner_membership(args)
     expected_names = {f"{args.runner_prefix}-{args.instance_name}-{n}": n
                       for n in range(1, args.runner_count + 1)}
     output = run(["gh", "api", "--paginate", f"orgs/{ORG}/actions/runners",
                   "--jq", ".runners[] | @json"], quiet=True)
+    if getattr(args,'heavy_runner_pool',None):verify_strict_identities(args,[json.loads(line)for line in output.splitlines()if line.strip()])
     seen: set[str] = set()
     for line in output.splitlines():
         if not line.strip():
@@ -591,6 +686,9 @@ def main() -> int:
         return 0
 
     group = verify_runner_group(args)
+    if args.existing_instance:
+        start_retained_strict_host(args,zone)
+        verify_strict_identities(args)
     token = run(["gh", "api", "--method", "POST", f"orgs/{ORG}/actions/runners/registration-token", "--jq", ".token"], quiet=True)
     if not token:
         raise RuntimeError("GitHub returned an empty org runner registration token")

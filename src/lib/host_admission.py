@@ -522,6 +522,19 @@ def peer_owner(pid,uid,config):
 
 def heavy_runner_policy(config):
     """An absent policy preserves the ordinary 15-GiB deployment."""
+    if 'heavy_runners' in config:
+        names=config['heavy_runners']
+        if ('heavy_runner' in config or not isinstance(names,list) or not 2<=len(names)<=3
+            or any(not isinstance(name,str) or not name for name in names)
+            or len(set(names))!=len(names) or not isinstance(config.get('runner_names'),list)
+            or any(not isinstance(name,str) or not name for name in config['runner_names'])
+            or len(set(config['runner_names']))!=len(config['runner_names'])
+            or set(names)!=set(config['runner_names']) or config.get('role') not in (None,'runner')
+            or config.get('runner_gib')!=32 or type(config.get('runner_gib'))is bool
+            or type(config.get('work_gib'))not in (int,float)
+            or not math.isfinite(config['work_gib']) or config['work_gib']!=32*len(names)):
+            raise ValueError('Invalid strict heavy runner pool')
+        return dict(names=list(names),memory_gib=32,cpus=8)
     if 'heavy_runner' not in config:return None
     policy=config['heavy_runner']
     if (not isinstance(policy,dict) or set(policy)!={'name','memory_gib','cpus'}
@@ -550,7 +563,7 @@ def runner_reservation(owner,config):
     if row['Name'].lstrip('/') not in config['runner_names']:
         raise ValueError('Runner left this deployment')
     if not owner_alive(owner):raise OrphanRunnerHook('Runner Worker exited before grant')
-    if row['Name']=='/'+policy['name']:
+    if row['Name'].lstrip('/') in policy.get('names',[policy.get('name')]):
         amount=32
         caps=row['HostConfig']
         expected=int(amount*1024**3)
@@ -631,7 +644,7 @@ def serve():
                     limit=config['work_gib']
                     retain=_benchmark_module().ImageMaintenancePolicy(config) if config.get('role')=='benchmark-builder' else None
                     policy=heavy_runner_policy(config) if config.get('role') in (None,'runner') else None
-                    if 'heavy_runner' in config and config.get('role') not in (None,'runner'):
+                    if ('heavy_runner' in config or 'heavy_runners' in config) and config.get('role') not in (None,'runner'):
                         raise ValueError('Heavy runner policy on unsupported host role')
                     pool = LeasePool(ledger/'leases.json',config['work_gib'],alive=owner_alive,retain=retain,removal_fence=retain.finalize if retain is not None else None,heavy_builder_isolation=policy is not None)
                     if config.get('role')=='benchmark-builder':pool.refresh()

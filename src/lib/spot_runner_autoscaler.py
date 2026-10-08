@@ -683,8 +683,20 @@ sys.path.insert(0,'/opt/gha-runners')
 from host_admission import observed_envelope, request
 GIB=1024**3
 def heavy_runner_policy(config):
-    # The controller rolls out before the guest daemon. Keep this parser
-    # self-contained so the still-old host_admission module remains importable.
+    """An absent policy preserves the ordinary 15-GiB deployment."""
+    if 'heavy_runners' in config:
+        names=config['heavy_runners']
+        if ('heavy_runner' in config or not isinstance(names,list) or not 2<=len(names)<=3
+            or any(not isinstance(name,str) or not name for name in names)
+            or len(set(names))!=len(names) or not isinstance(config.get('runner_names'),list)
+            or any(not isinstance(name,str) or not name for name in config['runner_names'])
+            or len(set(config['runner_names']))!=len(config['runner_names'])
+            or set(names)!=set(config['runner_names']) or config.get('role') not in (None,'runner')
+            or config.get('runner_gib')!=32 or type(config.get('runner_gib'))is bool
+            or type(config.get('work_gib'))not in (int,float)
+            or not math.isfinite(config['work_gib']) or config['work_gib']!=32*len(names)):
+            raise ValueError('Invalid strict heavy runner pool')
+        return dict(names=list(names),memory_gib=32,cpus=8)
     if 'heavy_runner' not in config:return None
     policy=config['heavy_runner']
     if (not isinstance(policy,dict) or set(policy)!={'name','memory_gib','cpus'}
@@ -698,6 +710,8 @@ def heavy_runner_policy(config):
         or not math.isfinite(config['work_gib']) or config['work_gib']<32):
         raise ValueError('Invalid single heavy runner policy')
     return policy
+
+
 changed=[]
 pending_runner_ids=[]
 ledger_deadline=None
@@ -753,13 +767,13 @@ try:
             records={name:inspect(name,name) for name in names}
             if len({row['Id'] for row in records.values()})!=len(names):
                 raise ValueError('Runner identities are not unique')
-            if heavy:
-                cap=records[heavy['name']]['HostConfig']
+            heavy_names=heavy.get('names',[heavy.get('name')]) if heavy else []
+            for name in heavy_names:
+                cap=records[name]['HostConfig']
                 if (cap['Memory']!=32*GIB or cap['MemorySwap']!=32*GIB
                     or cap['NanoCpus']!=8_000_000_000):
                     raise ValueError('Heavy runner cap differs from policy')
-            ordinary={name:row for name,row in records.items()
-                      if heavy is None or name!=heavy['name']}
+            ordinary={name:row for name,row in records.items() if name not in heavy_names}
             if any(row['HostConfig']['Memory']>current*GIB for row in ordinary.values()):
                 raise ValueError('Runner limit exceeds its reservation')
             lagging=any(row['HostConfig']['Memory']<current*GIB for row in ordinary.values())
@@ -792,7 +806,7 @@ try:
                 changed.append('future-builder')
             else:
                 for name,before in records.items():
-                    if heavy is not None and name==heavy['name']:
+                    if heavy is not None and name in heavy_names:
                         continue  # Never rewrite the dedicated slot to ordinary caps.
                     identity=before['Id']
                     if any(owner.startswith(prefix+identity+':')

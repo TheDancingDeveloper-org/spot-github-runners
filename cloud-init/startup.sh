@@ -115,6 +115,7 @@ printf '%s' '{{ADMISSION_B64}}' | base64 -d >/opt/gha-runners/build/host_admissi
 printf '%s' '{{JOB_STARTED_B64}}' | base64 -d >/opt/gha-runners/build/job-started.sh
 printf '%s' '{{EVIDENCE_B64}}' | base64 -d >/opt/gha-runners/host_evidence.py
 TIERED={{TIERED}}
+STRICT_HEAVY_POOL={{STRICT_HEAVY_POOL}}
 if [[ "$TIERED" == 1 ]]; then
   install -d -m 0755 /run/gha-admission
   cp /opt/gha-runners/build/host_admission.py /opt/gha-runners/host_admission.py
@@ -123,8 +124,11 @@ if [[ "$TIERED" == 1 ]]; then
   python3 - <<'ADMISSION_CONFIG'
 import json, socket
 names = ['{{RUNNER_PREFIX}}-'+socket.gethostname().split('.')[0]+'-'+str(i) for i in range(1,{{RUNNER_COUNT}}+1)]
+config=dict(work_gib={{ADMISSION_WORK_GIB}},runner_gib={{RUNNER_MEMORY_GB}},builder_gib={{BUILDER_MEMORY_GIB}},runner_names=names)
+if {{STRICT_HEAVY_POOL}}:
+    config.update(role='runner',heavy_runners=names)
 with open('/etc/gha-admission.json','w') as target:
-    json.dump(dict(work_gib={{ADMISSION_WORK_GIB}},runner_gib={{RUNNER_MEMORY_GB}},builder_gib={{BUILDER_MEMORY_GIB}},runner_names=names),target)
+    json.dump(config,target)
 ADMISSION_CONFIG
   chmod 0644 /etc/gha-admission.json
   cat >/etc/systemd/system/gha-admission.service <<'ADMISSION_SERVICE'
@@ -163,6 +167,9 @@ ORG_URL=https://github.com/{{ORG}}
 RUNNER_LABELS='{{RUNNER_LABELS}}'
 RUNNER_GROUP='{{RUNNER_GROUP}}'
 RUNNER_PREFIX='{{RUNNER_PREFIX}}'
+RUNNER_IMAGE=$(docker image inspect oxidex-self-hosted-runner:{{RUNNER_VERSION}} | jq -er '.[0].Id')
+[[ "$RUNNER_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+RUST_VOLUME="gha-rust-${RUNNER_IMAGE#sha256:}"
 REGISTRATION_TOKEN={{REGISTRATION_TOKEN}}
 RUNNER_COUNT={{RUNNER_COUNT}}
 RUNNER_MEMORY_GB={{RUNNER_MEMORY_GB}}
@@ -186,7 +193,7 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     -e RUNNER_NAME="$name" -e RUNNER_LABELS="$runner_labels" \
     -e RUNNER_GROUP_NAME="$RUNNER_GROUP" -e GITHUB_RUNNER_URL="$ORG_URL" \
     -e RUNNER_STATE=/runner-state \
-    -v "$state:/runner-state" -v "$work:/work" oxidex-self-hosted-runner:{{RUNNER_VERSION}}
+    -v "$state:/runner-state" -v "$work:/work" "$RUNNER_IMAGE"
   rm -f "$env_file"
   docker rm -f "$name" >/dev/null 2>&1 || true
   # Equal CPU weights split cores only under contention; an idle host lets one
@@ -199,7 +206,9 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     docker_args+=(-e GHA_ADMISSION_REQUIRED=1 -v /run/gha-admission:/run/gha-admission:ro)
   fi
   [[ -z "$RUNNER_CPU_LIMIT" ]] || docker_args+=(--cpus="$RUNNER_CPU_LIMIT")
-  docker_args+=(oxidex-self-hosted-runner:{{RUNNER_VERSION}})
+  docker_args+=(--mount "type=volume,src=$RUST_VOLUME,dst=/opt/runner-rust,readonly")
+  [[ "$STRICT_HEAVY_POOL" != 1 ]] || docker_args+=(--memory-swap="32g")
+  docker_args+=("$RUNNER_IMAGE")
   docker run "${docker_args[@]}"
 done
 unset REGISTRATION_TOKEN

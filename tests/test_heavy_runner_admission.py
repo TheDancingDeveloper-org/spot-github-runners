@@ -96,4 +96,38 @@ class HeavyRunnerAdmissionTests(unittest.TestCase):
             self.assertTrue(pool.acquire_runner(OWNER,32))
 
 
-if __name__=='__main__':unittest.main()
+
+
+
+class StrictHeavyPoolTests(unittest.TestCase):
+    def pool_config(self):
+        return dict(role='runner',heavy_runners=[NAME,OTHER],runner_names=[NAME,OTHER],runner_gib=32,work_gib=64)
+
+    def test_both_members_require_exact_caps(self):
+        for name in (NAME,OTHER):
+            row={'Id':CID,'Name':'/'+name,'State':{'StartedAt':START,'Running':True},
+                 'HostConfig':{'Memory':32*GIB,'MemorySwap':32*GIB,'NanoCpus':8_000_000_000}}
+            with patch('lib.host_admission.docker_identity',return_value=(f'container:{CID}:{START}',row)),patch('lib.host_admission.owner_alive',return_value=True):
+                self.assertEqual(runner_reservation(OWNER,self.pool_config()),32)
+                for field,value in [('Memory',15*GIB),('MemorySwap',64*GIB),('NanoCpus',0)]:
+                    original=row['HostConfig'][field];row['HostConfig'][field]=value
+                    with self.assertRaises(ValueError):runner_reservation(OWNER,self.pool_config())
+                    row['HostConfig'][field]=original
+
+    def test_changed_owner_and_membership_refuse(self):
+        row={'Id':CID,'Name':'/'+NAME,'State':{'StartedAt':START},'HostConfig':{'Memory':32*GIB,'MemorySwap':32*GIB,'NanoCpus':8_000_000_000}}
+        with patch('lib.host_admission.docker_identity',return_value=(f'container:{CID}:{START}',row)),patch('lib.host_admission.owner_alive',return_value=False):
+            with self.assertRaisesRegex(ValueError,'Worker exited'):runner_reservation(OWNER,self.pool_config())
+        for change in [dict(runner_names=None),dict(runner_names=[NAME,OTHER,OTHER]),dict(runner_names=[NAME,{}]),dict(role='builder'),dict(work_gib=57),dict(heavy_runners=[NAME,NAME])]:
+            with self.assertRaises(ValueError):heavy_runner_policy(dict(self.pool_config(),**change))
+
+    def test_64_gib_budget_admits_two_and_refuses_third(self):
+        with tempfile.TemporaryDirectory() as folder:
+            pool=LeasePool(Path(folder)/'leases.json',64,alive=lambda _:True,heavy_builder_isolation=True)
+            first=OWNER;second=f'runner:{"b"*64}:{START}:124:457';third=f'runner:{"c"*64}:{START}:125:458'
+            self.assertTrue(pool.acquire_runner(first,32));self.assertTrue(pool.acquire_runner(second,32))
+            self.assertFalse(pool.acquire_runner(third,32));pool.release_runner(first)
+            self.assertTrue(pool.acquire_runner(third,32))
+
+if __name__ == "__main__":
+    unittest.main()
