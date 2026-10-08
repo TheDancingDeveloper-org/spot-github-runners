@@ -52,12 +52,18 @@ TRUSTED_BUILDER_ACCESS_SHA256 = frozenset({
 })
 
 
-def trusted_builder_access():
+def trusted_builder_access(*, selected_sha256=None):
     """Load the installed root-owned policy asset in standalone -I mode.
 
-    Package imports remain useful for source tests. The root CLI selects only
-    the fixed installed asset, never cwd, sys.path, or uploaded Python bytes.
+    Package imports remain useful for source tests. Before replacement, the
+    fixed historical digests are the only executable policy bytes. After the
+    helper is held, selected_sha256 binds the same root-owned path to the
+    reviewed asset and its exact target mode. Neither phase imports caller
+    paths or executes asset bytes directly.
     """
+    if selected_sha256 is not None and (not isinstance(selected_sha256, str)
+            or not re.fullmatch('[a-f0-9]{64}', selected_sha256)):
+        raise ValueError('Invalid selected builder access digest')
     if __package__:
         from . import builder_access
         return builder_access
@@ -65,10 +71,12 @@ def trusted_builder_access():
     with retained_ancestor_selection(path, authenticate=True) as verify_ancestors:
         state, raw = root_file_read(path)
         if (state is None or state.get('uid') != 0 or state.get('gid') != 0
-                or state.get('mode') not in (0o600, TARGETS[str(path)])
+                or state.get('mode') not in ((0o600, TARGETS[str(path)]) if selected_sha256 is None
+                                             else (TARGETS[str(path)],))
                 or not 0 < len(raw) <= 262144
                 or state.get('sha256') != hashlib.sha256(raw).hexdigest()
-                or state['sha256'] not in TRUSTED_BUILDER_ACCESS_SHA256):
+                or state['sha256'] not in (TRUSTED_BUILDER_ACCESS_SHA256 if selected_sha256 is None
+                                            else (selected_sha256,))):
             raise ValueError('Trusted installed builder access asset unavailable')
         with retained_file_selection(path, state, lambda: root_file_state(path)) as verify_file:
             code = compile(raw, str(path), 'exec')
@@ -119,10 +127,12 @@ def expected_uploader_policy(mapping):
     }
 
 
-def validate_policy_assets(assets):
+def validate_policy_assets(assets, *, installed=False):
     """Reject policy bytes not derived from the existing root-owned mapping."""
     import pwd
-    access = trusted_builder_access()
+    decoded = validate_assets(assets)
+    access = trusted_builder_access(selected_sha256=(hashlib.sha256(
+        decoded['/opt/gha-runners/builder_access.py']).hexdigest() if installed else None))
     state, raw = root_file_read('/etc/oxidex-builder-uploader.json')
     if state is None or state['mode'] & 0o077:
         raise ValueError('Root-approved uploader mapping unavailable')
@@ -134,7 +144,6 @@ def validate_policy_assets(assets):
     expected = expected_uploader_policy(mapping)
     if set(expected) != set(POLICY_TARGETS):
         raise ValueError('Fixed uploader policy target set differs')
-    decoded = validate_assets(assets)
     if any(decoded[path] != raw for path, raw in expected.items()):
         raise ValueError('Uploaded policy differs from fixed root-derived enrollment')
     return mapping
@@ -142,8 +151,9 @@ def validate_policy_assets(assets):
 
 def validate_installed_policy(assets, mapping):
     """Verify actual daemon policy while the update drain remains held."""
-    access = trusted_builder_access()
     decoded = validate_assets(assets)
+    access = trusted_builder_access(selected_sha256=hashlib.sha256(
+        decoded['/opt/gha-runners/builder_access.py']).hexdigest())
     for path, mode in POLICY_TARGETS.items():
         state = root_file_state(path)
         if (state is None or state['sha256'] != hashlib.sha256(decoded[path]).hexdigest()
@@ -905,8 +915,8 @@ def admission_ready(plan, pid, ticks, *, wait=True):
             time.sleep(min(.05, max(0, deadline-time.monotonic())))
 
 
-def observed_work_processes():
-    access = trusted_builder_access()
+def observed_work_processes(*, selected_helper_sha256=None):
+    access = trusted_builder_access(selected_sha256=selected_helper_sha256)
     _, mapping_raw = root_file_read('/etc/oxidex-builder-uploader.json')
     uploader_uid = access.approved_mapping(json.loads(mapping_raw))['uid']
     work_records = []
@@ -972,7 +982,7 @@ def validate_pending_marker(pending, current_boot, *, committed_original=None):
     return pending.get('nonce')
 
 
-def live_snapshot(plan, *, committed_original=None):
+def live_snapshot(plan, *, committed_original=None, selected_helper_sha256=None):
     """Read fixed host facts, never acquire leases or start containers."""
     config_path = Path('/etc/oxidex-remote-build.json')
     config_state, config_raw = root_file_read(config_path)
@@ -1006,7 +1016,7 @@ def live_snapshot(plan, *, committed_original=None):
     tools_ready = all(stat.S_ISREG(Path(p).stat().st_mode) and Path(p).stat().st_uid == 0
                       and not Path(p).stat().st_mode & 0o022
                       and os.access(p, os.X_OK) for p in executables)
-    uploads = observed_work_processes()
+    uploads = observed_work_processes(selected_helper_sha256=selected_helper_sha256)
     pending_state, pending_raw = root_file_read(PENDING_UPDATE)
     pending_nonce = None
     if pending_state is not None:
@@ -1118,13 +1128,13 @@ def trusted_directory(path, *, create=False):
 
 
 
-def mutation_idle_fence(plan):
+def mutation_idle_fence(plan, *, selected_helper_sha256=None):
     import time
     _, ledger = root_file_read('/var/lib/gha-admission/leases.json')
     _, token = root_file_read('/run/oxidex-build-draining')
     if (json.loads(ledger) != {} or token != plan['nonce'].encode()
             or checked_command(['/usr/bin/docker', 'ps', '-aq', '--no-trunc'])
-            or observed_work_processes()):
+            or observed_work_processes(selected_helper_sha256=selected_helper_sha256)):
         raise ValueError('Transfer, launcher, lease or container appeared before mutation')
     validate_plan(plan, time.time())
 
@@ -1241,10 +1251,11 @@ def transaction_lock_guard():
     return verify, bind
 
 
-def apply_replacement_fence(plan, target, expected_file, canonical_guard):
+def apply_replacement_fence(plan, target, expected_file, canonical_guard,
+                            *, selected_helper_sha256=None):
     """Finish all blocking checks, recheck selected target, then selected time."""
     import time
-    mutation_idle_fence(plan)
+    mutation_idle_fence(plan, selected_helper_sha256=selected_helper_sha256)
     file_mutation_fence(plan, target, expected_file=expected_file)
     selected = plan['before'][target] if expected_file is None else expected_file
     with retained_file_selection(target, selected, lambda:root_file_state(target)) as verify:
@@ -1259,6 +1270,11 @@ def apply_update(plan):
     lock_guard, bind_lock = transaction_lock_guard()
     assets = validate_plan(plan, time.time())
     uploader_mapping = validate_policy_assets(plan['assets'])
+    helper_target = '/opt/gha-runners/builder_access.py'
+    selected_helper_sha256 = hashlib.sha256(assets[helper_target]).hexdigest()
+    helper_installed = [False]
+    def held_helper():
+        return selected_helper_sha256 if helper_installed[0] else None
     journal_history = [None]
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
     trusted_directory(backup.parent)
@@ -1306,16 +1322,19 @@ def apply_update(plan):
             record('PERSISTENT_BOOT_HOLD_INSTALLED')
             for target in sorted(TARGETS):
                 validate_plan(plan, time.time())
-                mutation_idle_fence(plan)
+                mutation_idle_fence(plan, selected_helper_sha256=held_helper())
                 expected_file = held_launcher if target == LAUNCHER_TARGET else None
                 file_mutation_fence(plan, target, expected_file=expected_file)
                 trusted_directory(Path(target).parent, create=True)
-                mutation_idle_fence(plan)
+                mutation_idle_fence(plan, selected_helper_sha256=held_helper())
                 file_mutation_fence(plan, target, expected_file=expected_file)
                 def before_replace():
-                    apply_replacement_fence(plan, target, expected_file, lock_guard)
+                    apply_replacement_fence(plan, target, expected_file, lock_guard,
+                                            selected_helper_sha256=held_helper())
                 installed_mode = 0o644 if target == LAUNCHER_TARGET else TARGETS[target]
                 atomic_write(target, assets[target], installed_mode, before_replace=before_replace)
+                if target == helper_target:
+                    helper_installed[0] = True
                 record('FILE_REPLACED', target=target,
                        sha256=hashlib.sha256(assets[target]).hexdigest())
             validate_installed_policy(plan['assets'], uploader_mapping)
@@ -1326,19 +1345,19 @@ def apply_update(plan):
             record('UPLOADER_POLICY_ENROLLED', policy={target:root_file_state(target)
                    for target in POLICY_TARGETS})
             validate_plan(plan, time.time())
-            mutation_idle_fence(plan)
+            mutation_idle_fence(plan, selected_helper_sha256=selected_helper_sha256)
             trusted_directory('/mnt/runner-data/remote-build/qualification-sealed', create=True)
             validate_plan(plan, time.time())
-            mutation_idle_fence(plan)
+            mutation_idle_fence(plan, selected_helper_sha256=selected_helper_sha256)
             with selected_service_bindings(plan) as verify_bindings:
-                mutation_idle_fence(plan)
+                mutation_idle_fence(plan, selected_helper_sha256=selected_helper_sha256)
                 file_mutation_fence(plan)
                 lock_guard()
                 verify_bindings()
                 checked_command(['/usr/bin/systemctl', 'restart', 'gha-admission.service'])
             new_pid, new_ticks = service_identity(strict=False)
             admission_ready(plan, new_pid, new_ticks)
-            after = live_snapshot(plan)
+            after = live_snapshot(plan, selected_helper_sha256=selected_helper_sha256)
             if (after['service_pid'], after['service_startticks']) != (new_pid, new_ticks):
                 raise ValueError('Admission identity changed after readiness proof')
             expected = dict(plan, service_pid=after['service_pid'],
@@ -1367,7 +1386,7 @@ def apply_update(plan):
     def before_release(result):
         try:
             verify_boot_hold(plan)
-            snapshot = live_snapshot(plan)
+            snapshot = live_snapshot(plan, selected_helper_sha256=selected_helper_sha256)
             validate_plan(plan, time.time())
             expected = dict(plan, service_pid=result['service_pid'],
                             service_startticks=result['service_startticks'], before=snapshot['before'])
@@ -1403,7 +1422,7 @@ def installed_history(plan, client_pin, *, recovery=False, with_history=False):
     rows = [json.loads(line) for line in journal.splitlines()]
     import time
     verify_installed_history(plan, original, rows, client_pin, time.time(), recovery=recovery)
-    validate_installed_policy(plan['assets'], validate_policy_assets(plan['assets']))
+    validate_installed_policy(plan['assets'], validate_policy_assets(plan['assets'], installed=True))
     return (backup, (journal_state, journal)) if with_history else backup
 
 
@@ -1515,6 +1534,7 @@ def finish_update(plan, client_pin):
     lock_guard, bind_lock = transaction_lock_guard()
     validate_plan(plan, time.time())
     backup = installed_history(plan, client_pin)
+    selected_helper_sha256 = plan['assets']['/opt/gha-runners/builder_access.py']['sha256']
     journal_history = [None]
     expected = dict(plan, before=dict(plan['before']))
     pending_state = root_file_state(PENDING_UPDATE)
@@ -1536,9 +1556,9 @@ def finish_update(plan, client_pin):
             _, journal_history[0] = installed_history(plan, client_pin, with_history=True)
         if root_file_read(backup/'journal.jsonl') != journal_history[0]:
             raise ValueError('Previously authorized installation history changed')
-        snapshot = live_snapshot(expected)
+        snapshot = live_snapshot(expected, selected_helper_sha256=selected_helper_sha256)
         check_snapshot(expected, snapshot, owned_drain=True)
-        mutation_idle_fence(plan)
+        mutation_idle_fence(plan, selected_helper_sha256=selected_helper_sha256)
         admission_ready(plan, plan['service_pid'], plan['service_startticks'], wait=False)
         guard = root_file_state(BOOT_GUARD)
         if guard is None or guard['sha256'] != hashlib.sha256(BOOT_GUARD_BYTES).hexdigest():
@@ -1625,7 +1645,8 @@ def capture_committed_recovery(nonce, source_main, assets, client_pin, *, with_h
     journal = [json.loads(line) for line in raw.splitlines()]
     observed_at = time.time()
     verify_boot_guard()
-    snapshot = live_snapshot({}, committed_original=original)
+    snapshot = live_snapshot({}, committed_original=original,
+                             selected_helper_sha256=original['assets']['/opt/gha-runners/builder_access.py']['sha256'])
     if (snapshot['pending_nonce'] not in (None, nonce) or snapshot['drain_token'] not in (None, nonce)
             or snapshot['image_pin'] != snapshot['image_id'] or snapshot['admission_valid'] is not True
             or snapshot['cpu'] != 16 or snapshot['role'] != 'builder'
@@ -1692,7 +1713,8 @@ def complete_committed_recovery(plan, client_pin):
         if phase['active'] is not None:
             active = phase['active']
             validate_plan(active, time.time())
-            check_snapshot(active, live_snapshot(active, committed_original=original), owned_drain=True)
+            check_snapshot(active, live_snapshot(active, committed_original=original,
+                selected_helper_sha256=original['assets']['/opt/gha-runners/builder_access.py']['sha256']), owned_drain=True)
             admission_ready(active, active['service_pid'], active['service_startticks'], wait=False)
             return
         validate_runtime_observation(plan, time.time())
@@ -1765,7 +1787,8 @@ def complete_committed_recovery(plan, client_pin):
         active.update(schema=1, service_pid=pid, service_startticks=ticks, before=released_files)
         phase['active'] = active
         admission_ready(active, pid, ticks)
-        snapshot = live_snapshot(active, committed_original=original)
+        snapshot = live_snapshot(active, committed_original=original,
+            selected_helper_sha256=original['assets']['/opt/gha-runners/builder_access.py']['sha256'])
         check_snapshot(active, snapshot, owned_drain=True)
         return dict(status='REBOOT_RECOVERED_UNQUALIFIED', qualification_ready=False,
                     service_pid=pid, service_startticks=ticks, boot=plan['boot'])
@@ -1801,6 +1824,7 @@ def recover_finish_update(plan, client_pin):
     lock_guard, bind_lock = transaction_lock_guard()
     validate_plan(plan, time.time())
     backup = installed_history(plan, client_pin, recovery=True)
+    selected_helper_sha256 = plan['assets']['/opt/gha-runners/builder_access.py']['sha256']
     journal_history = [None]
     expected = dict(plan, before=dict(plan['before']))
     _, drain_raw = root_file_read('/run/oxidex-build-draining')
@@ -1824,9 +1848,9 @@ def recover_finish_update(plan, client_pin):
             _, journal_history[0] = installed_history(plan, client_pin, recovery=True, with_history=True)
         if root_file_read(backup/'journal.jsonl') != journal_history[0]:
             raise ValueError('Authorized recovery history changed')
-        snapshot = live_snapshot(expected)
+        snapshot = live_snapshot(expected, selected_helper_sha256=selected_helper_sha256)
         check_snapshot(expected, snapshot, owned_drain=owned)
-        if owned:mutation_idle_fence(plan)
+        if owned:mutation_idle_fence(plan, selected_helper_sha256=selected_helper_sha256)
         admission_ready(plan, plan['service_pid'], plan['service_startticks'], wait=False)
         if root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
             raise ValueError('Canonical recovery lock changed during checks')
@@ -1915,7 +1939,7 @@ def main():
             raise ValueError('Candidate assets differ from selected digest')
         assets = checked_json(raw, args.assets_sha256)
         validate_assets(assets)
-        validate_policy_assets(assets)
+        validate_policy_assets(assets, installed=bool(args.finish_nonce))
         if args.recover_committed:
             if not args.finish_nonce or not args.client_launcher_sha256:
                 parser.error('Committed recovery capture requires nonce and paired client pin')
@@ -1923,7 +1947,8 @@ def main():
             print(json.dumps(observation, sort_keys=True))
             return
         observed_at = time.time()
-        snapshot = live_snapshot({})
+        snapshot = live_snapshot({}, selected_helper_sha256=(
+            assets['/opt/gha-runners/builder_access.py']['sha256'] if args.finish_nonce else None))
         if args.recover_finish and not args.finish_nonce:
             parser.error('Recovery capture requires the installed finish nonce')
         if args.finish_nonce and (not re.fullmatch('[a-f0-9]{32}', args.finish_nonce) or not args.client_launcher_sha256):
@@ -1951,17 +1976,19 @@ def main():
         print(json.dumps(result, sort_keys=True))
         return
     validate_plan(plan, time.time())
-    snapshot = live_snapshot(plan)
-    validate_plan(plan, time.time())
-    if args.finish_nonce:
-        parser.error('finish-nonce is only valid with capture-assets')
     if args.apply and args.client_launcher_sha256:
         parser.error('A client pin selects finish checks and cannot be combined with apply')
     finishing = args.finish or args.recover_finish or bool(args.client_launcher_sha256)
-    check_snapshot(plan, snapshot, owned_drain=bool(snapshot['drain_token']) if args.recover_finish else finishing)
     if finishing:
         if not args.client_launcher_sha256:parser.error('Finish requires paired client launcher pin')
         installed_history(plan, args.client_launcher_sha256, recovery=args.recover_finish)
+    snapshot = live_snapshot(plan, selected_helper_sha256=(
+        plan['assets']['/opt/gha-runners/builder_access.py']['sha256'] if finishing else None))
+    validate_plan(plan, time.time())
+    if args.finish_nonce:
+        parser.error('finish-nonce is only valid with capture-assets')
+    check_snapshot(plan, snapshot, owned_drain=bool(snapshot['drain_token']) if args.recover_finish else finishing)
+    if finishing:
         if args.recover_finish:
             result = recover_finish_update(plan, args.client_launcher_sha256)
         else:

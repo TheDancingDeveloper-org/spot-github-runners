@@ -127,7 +127,7 @@ with tempfile.TemporaryDirectory() as poison:
                 assert globals_['validate_policy_assets'](assets)['uid']==2000
                 return {'status':'SELECTED'}
             replacements={'root_file_read':cli_read,'validate_plan':lambda *args:None,
-                          'live_snapshot':lambda plan:{'drain_token':None},
+                          'live_snapshot':lambda plan,**kw:{'drain_token':None},
                           'plan_from_snapshot':lambda *args,**kw:{'capture':True},
                           'check_snapshot':lambda *args,**kw:None,
                           'apply_update':selected_action,
@@ -146,9 +146,21 @@ with tempfile.TemporaryDirectory() as poison:
                     assert json.loads(output.getvalue())==expected
             # The held install replaces the helper only after these pre-update
             # decisions. Post-install daemon validation then uses the candidate.
-            selected_helper[0]=replacement.read_bytes()
+            replacement_raw=replacement.read_bytes()
+            replacement_sha=hashlib.sha256(replacement_raw).hexdigest()
+            assert replacement_sha not in globals_['TRUSTED_BUILDER_ACCESS_SHA256']
+            helper_target='/opt/gha-runners/builder_access.py'
+            assets[helper_target]={'data':base64.b64encode(replacement_raw).decode(),
+                                   'sha256':replacement_sha}
+            selected_helper[0]=replacement_raw
             selected_state['mode']=0o644
             globals_['validate_installed_policy'](assets,mapping)
+            assert globals_['validate_policy_assets'](assets,installed=True)['uid']==2000
+            assets[helper_target]['sha256']='0'*64
+            try:globals_['validate_installed_policy'](assets,mapping)
+            except ValueError as error:assert 'Runtime asset differs from reviewed bytes' in str(error)
+            else:raise AssertionError('Wrong selected asset hash accepted')
+            assets[helper_target]['sha256']=replacement_sha
     finally:sys.path.remove(poison)
 # Every accepted pre-update mode is exact; post-install state stays 0644.
 files={path:{'sha256':row['sha256'],'mode':globals_['TARGETS'][path]}
@@ -162,25 +174,39 @@ except ValueError as error:assert 'Installed runtime bytes or held mode differ' 
 else:raise AssertionError('Post-install 0600 helper accepted')
 
 def refused(label):
-    try:globals_['trusted_builder_access']()
+    try:globals_['trusted_builder_access'](selected_sha256=replacement_sha)
     except ValueError as error:
         assert 'Trusted installed builder access asset unavailable' in str(error),label
     else:raise AssertionError('Untrusted helper accepted: '+label)
 for field,value in (('uid',1001),('gid',1001),('mode',0o666),('mode',0o640),
-                    ('mode',0o700),('mode',0o777)):
+                    ('mode',0o700),('mode',0o777),('mode',0o600)):
     previous=selected_state[field];selected_state[field]=value
     try:refused(field+'='+oct(value))
     finally:selected_state[field]=previous
 selected_helper[0]=b'raise RuntimeError("unknown root code executed")\n'
 try:refused('unknown bytes')
-finally:selected_helper[0]=replacement.read_bytes()
+finally:selected_helper[0]=replacement_raw
+try:globals_['trusted_builder_access'](selected_sha256='0'*64)
+except ValueError as error:assert 'Trusted installed builder access asset unavailable' in str(error)
+else:raise AssertionError('Wrong selected digest accepted')
+try:globals_['trusted_builder_access']()
+except ValueError as error:assert 'Trusted installed builder access asset unavailable' in str(error)
+else:raise AssertionError('Unknown replacement accepted before selected phase')
 @contextmanager
 def red_ancestor(path,*,authenticate=False):
     assert authenticate
     raise ValueError('Untrusted selected ancestor')
     yield
 with patch.dict(globals_,{'retained_ancestor_selection':red_ancestor}):
-    try:globals_['trusted_builder_access']()
+    try:globals_['trusted_builder_access'](selected_sha256=replacement_sha)
     except ValueError as error:assert 'Untrusted selected ancestor' in str(error)
     else:raise AssertionError('Writable or symlinked parent accepted')
+@contextmanager
+def red_file(path,state,read_state):
+    raise ValueError('Selected file custody changed')
+    yield
+with patch.dict(globals_,{'retained_file_selection':red_file}):
+    try:globals_['trusted_builder_access'](selected_sha256=replacement_sha)
+    except ValueError as error:assert 'Selected file custody changed' in str(error)
+    else:raise AssertionError('Changed selected file accepted')
 print('isolated standalone policy capture/update/recovery, process and installed checks: PASS')

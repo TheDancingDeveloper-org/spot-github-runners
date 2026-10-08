@@ -218,7 +218,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             plan['before']={k:dict(v) for k,v in plan['before'].items()};plan['before'][runtime.LAUNCHER_TARGET]=state(launcher)
             if expire_at=='selected-gid-changed':plan['before'][runtime.LAUNCHER_TARGET]['gid']+=1
             guard=root/'guard';guard.write_bytes(runtime.BOOT_GUARD_BYTES);guard.chmod(0o644)
-            def snapshot(expected):return dict(expected,image_pin=expected['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())
+            def snapshot(expected, **kwargs):return dict(expected,image_pin=expected['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())
             def record(path,row,**kwargs):
                 if expire_at=='authority-stage-expiry' and row['stage']=='FINISH_RELEASE_COMMITTED':clock[0]=plan['observed_at']+121
                 if kwargs.get('before_publish') is not None:kwargs['before_publish']()
@@ -253,7 +253,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                     publishing[0]=True;permit_seen[0]=False
                 return write(path,*args,**kwargs)
             with ExitStack() as stack:
-                replacements=dict(validate_plan=checked_validation,atomic_write=selected_write,PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:(root,(None,b'')) if kwargs.get('with_history') else root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
+                replacements=dict(validate_plan=checked_validation,atomic_write=selected_write,PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:(root,(None,b'')) if kwargs.get('with_history') else root,live_snapshot=snapshot,mutation_idle_fence=lambda plan,**kwargs:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]));stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
                 if expire_at=='require-commit':
@@ -361,7 +361,7 @@ class CommittedFlowTests(unittest.TestCase):
                 executed=True
                 self.assertTrue(running);self.assertEqual((pid,ticks),(50,60));events.append('ready')
                 if failure=='readiness':raise ConnectionRefusedError('not ready')
-            def snapshot(active, *, committed_original=None):
+            def snapshot(active, *, committed_original=None, selected_helper_sha256=None):
                 nonlocal snapshots
                 self.assertEqual(committed_original,original, 'Recovery snapshot lost original marker authority')
                 snapshots+=1

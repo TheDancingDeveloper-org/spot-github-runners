@@ -39,12 +39,16 @@ class ProofRepairControls(unittest.TestCase):
         probe=ROOT/'tests/isolated_builder_runtime_probe.py'
         with tempfile.TemporaryDirectory() as directory:
             Path(directory,'builder_access.py').write_text('raise RuntimeError("cwd poison")\n')
+            reviewed=Path(directory,'reviewed_builder_access.py')
+            reviewed.write_bytes(helpers[1].read_bytes()+b'\n# Distinct reviewed replacement fixture.\n')
+            self.assertNotIn(hashlib.sha256(reviewed.read_bytes()).hexdigest(),
+                             update.TRUSTED_BUILDER_ACCESS_SHA256)
             environment=dict(os.environ,PYTHONPATH=directory)
             for helper in helpers:
                 for mode in (0o600,0o644):
                     with self.subTest(helper=helper.name,mode=oct(mode)):
                         process=subprocess.run([sys.executable,'-I','-B',str(probe),str(updater),
-                                                str(helper),str(helpers[1]),oct(mode)],
+                                                str(helper),str(reviewed),oct(mode)],
                                                cwd=directory,env=environment,capture_output=True,text=True)
                         self.assertEqual(process.returncode,0,str(helper)+' '+oct(mode)+'\n'+process.stdout+process.stderr)
                         self.assertIn('checks: PASS',process.stdout)
