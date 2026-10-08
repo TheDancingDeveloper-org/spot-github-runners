@@ -25,4 +25,4 @@ infra-python-tests:
       echo 'infra-python-tests requires the admitted non-root Linux builder container.' >&2
       exit 2
     fi
-    PYTHONPATH=src python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+    PYTHONPATH=src python3 -B tools/infra_python_test_proof.py
