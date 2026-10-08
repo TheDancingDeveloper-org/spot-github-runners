@@ -20,18 +20,19 @@ def reconcile_log(path):
     try:
         fd=os.open(path,flags)
     except FileNotFoundError:
-        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
-        with os.fdopen(fd,'wb') as output:
-            output.write(RECONCILE_LOG);output.flush();os.fsync(output.fileno())
-        parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-        try:os.fsync(parent)
-        finally:os.close(parent)
-        fd=os.open(path,flags)
+        fd=os.open(path,flags|os.O_CREAT|os.O_EXCL,0o600)
+        try:
+            if os.write(fd,RECONCILE_LOG)!=len(RECONCILE_LOG):
+                raise ValueError('Reconciliation log creation incomplete')
+        except BaseException:
+            os.close(fd)
+            raise
     try:
         before=os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid!=0 or before.st_nlink!=1
                 or before.st_mode&0o022 or before.st_size>len(RECONCILE_LOG)):
             raise ValueError('Retained reconciliation log differs')
+        os.lseek(fd,0,os.SEEK_SET)
         existing=os.read(fd,len(RECONCILE_LOG)+1)
         if len(existing)!=before.st_size or not RECONCILE_LOG.startswith(existing):
             raise ValueError('Retained reconciliation log differs')
@@ -42,11 +43,22 @@ def reconcile_log(path):
             remainder=RECONCILE_LOG[len(existing):]
             if os.write(fd,remainder)!=len(remainder):
                 raise ValueError('Reconciliation log completion failed')
-            os.fsync(fd)
         os.lseek(fd,0,os.SEEK_SET)
         if (os.fstat(fd).st_size!=len(RECONCILE_LOG)
                 or os.read(fd,len(RECONCILE_LOG)+1)!=RECONCILE_LOG):
             raise ValueError('Reconciliation log completion differs')
+        # Complete bytes alone do not prove a prior failed file or directory
+        # sync was durable. Every accepted retry syncs both again.
+        stable=os.fstat(fd)
+        os.fsync(fd)
+        parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(parent)
+        finally:os.close(parent)
+        current=os.fstat(fd)
+        named=os.lstat(path)
+        identity=lambda info:(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+        if identity(stable)!=identity(current) or identity(current)!=identity(named):
+            raise ValueError('Reconciliation log changed after durability proof')
         return hashlib.sha256(RECONCILE_LOG).hexdigest()
     finally:os.close(fd)
 

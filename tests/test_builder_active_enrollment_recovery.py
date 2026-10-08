@@ -4,9 +4,11 @@ import hashlib
 import os
 from pathlib import Path
 import pwd
+import stat
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -19,6 +21,71 @@ control=importlib.util.module_from_spec(spec);spec.loader.exec_module(control)
 
 
 class ActiveControlTests(unittest.TestCase):
+    def test_reconcile_log_reproves_file_and_directory_durability_on_retry(self):
+        home=Path(pwd.getpwuid(os.getuid()).pw_dir)
+        actual_fstat=os.fstat;actual_fsync=os.fsync
+        def root_info(fd):
+            info=actual_fstat(fd)
+            return SimpleNamespace(st_mode=info.st_mode,st_uid=0,st_nlink=info.st_nlink,
+                st_size=info.st_size,st_dev=info.st_dev,st_ino=info.st_ino,
+                st_mtime_ns=info.st_mtime_ns,st_ctime_ns=info.st_ctime_ns)
+        with tempfile.TemporaryDirectory(dir=home) as directory:
+            for failed_sync in (1,2):
+                with self.subTest(failed_sync=failed_sync):
+                    path=Path(directory)/('failed-'+str(failed_sync))
+                    attempted=[]
+                    def fail_at(fd):
+                        attempted.append('directory' if stat.S_ISDIR(actual_fstat(fd).st_mode) else 'file')
+                        if len(attempted)==failed_sync:raise OSError('injected fsync failure')
+                        return actual_fsync(fd)
+                    with patch.object(control.os,'fstat',side_effect=root_info),\
+                         patch.object(control.os,'fsync',side_effect=fail_at):
+                        with self.assertRaisesRegex(OSError,'injected fsync'):
+                            control.reconcile_log(path)
+                    self.assertEqual(path.read_bytes(),control.RECONCILE_LOG)
+                    proved=[]
+                    def sync(fd):
+                        proved.append('directory' if stat.S_ISDIR(actual_fstat(fd).st_mode) else 'file')
+                        return actual_fsync(fd)
+                    with patch.object(control.os,'fstat',side_effect=root_info),\
+                         patch.object(control.os,'fsync',side_effect=sync):
+                        self.assertEqual(control.reconcile_log(path),hashlib.sha256(control.RECONCILE_LOG).hexdigest())
+                    self.assertEqual(proved,['file','directory'])
+            partial=Path(directory)/'partial'
+            partial.write_bytes(control.RECONCILE_LOG[:17])
+            proved=[]
+            def sync(fd):
+                proved.append('directory' if stat.S_ISDIR(actual_fstat(fd).st_mode) else 'file')
+                return actual_fsync(fd)
+            with patch.object(control.os,'fstat',side_effect=root_info),\
+                 patch.object(control.os,'fsync',side_effect=sync):
+                control.reconcile_log(partial)
+            self.assertEqual(proved,['file','directory'])
+            self.assertEqual(partial.read_bytes(),control.RECONCILE_LOG)
+
+    def test_reconcile_log_rejects_named_file_swap_after_sync(self):
+        home=Path(pwd.getpwuid(os.getuid()).pw_dir)
+        actual_fstat=os.fstat;actual_fsync=os.fsync
+        with tempfile.TemporaryDirectory(dir=home) as directory:
+            path=Path(directory)/'reconcile-cleanup.log'
+            path.write_bytes(control.RECONCILE_LOG)
+            replacement=Path(directory)/'replacement'
+            replacement.write_bytes(control.RECONCILE_LOG)
+            def root_info(fd):
+                info=actual_fstat(fd)
+                return SimpleNamespace(st_mode=info.st_mode,st_uid=0,st_nlink=info.st_nlink,
+                    st_size=info.st_size,st_dev=info.st_dev,st_ino=info.st_ino,
+                    st_mtime_ns=info.st_mtime_ns,st_ctime_ns=info.st_ctime_ns)
+            def swap_at_directory_sync(fd):
+                actual_fsync(fd)
+                if stat.S_ISDIR(actual_fstat(fd).st_mode):
+                    path.rename(Path(directory)/'old')
+                    replacement.rename(path)
+            with patch.object(control.os,'fstat',side_effect=root_info),\
+                 patch.object(control.os,'fsync',side_effect=swap_at_directory_sync):
+                with self.assertRaisesRegex(ValueError,'changed after durability proof'):
+                    control.reconcile_log(path)
+
     def test_stage_and_export_reobserve_enrollment_after_shared_fence(self):
         for operation in ('stage','export'):
             with self.subTest(operation=operation):
@@ -61,8 +128,10 @@ class ActiveControlTests(unittest.TestCase):
             path=Path(directory)/'reconcile-cleanup.log'
             actual=os.fstat
             def root_info(fd):
-                info=actual(fd);values=list(info);values[4]=0
-                return os.stat_result(values)
+                info=actual(fd)
+                return SimpleNamespace(st_mode=info.st_mode,st_uid=0,st_nlink=info.st_nlink,
+                    st_size=info.st_size,st_dev=info.st_dev,st_ino=info.st_ino,
+                    st_mtime_ns=info.st_mtime_ns,st_ctime_ns=info.st_ctime_ns)
             with patch.object(control.os,'fstat',side_effect=root_info):
                 self.assertEqual(control.reconcile_log(path),hashlib.sha256(control.RECONCILE_LOG).hexdigest())
                 self.assertEqual(path.read_bytes(),control.RECONCILE_LOG)
