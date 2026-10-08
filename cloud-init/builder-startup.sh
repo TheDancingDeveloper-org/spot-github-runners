@@ -129,6 +129,7 @@ with path.open('w') as output:
 RESERVATION_ENROLLMENT
 chmod 0755 /usr/local/bin/oxidex-remote-build /usr/local/bin/docker
 chmod 0700 /usr/local/sbin/oxidex-reservation-control
+chmod 0755 /usr/local/sbin/oxidex-uploader-session
 python3 - <<'HOST_HEADROOM'
 import os,runpy
 from pathlib import Path
@@ -176,5 +177,19 @@ printf '%%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build\n
 chmod 0440 /etc/sudoers.d/oxidex-build
 visudo -cf /etc/sudoers.d/oxidex-build
 python3 -B /opt/gha-runners/builder_access.py /etc/oxidex-builder-uploader.json '{{UPLOADER_SHA}}' >/var/lib/oxidex-builder/uploader-observed.json
+python3 -B - <<'UPLOAD_FENCE'
+import json
+from pathlib import Path
+mapping=json.loads(Path('/etc/oxidex-builder-uploader.json').read_text())
+username=mapping['username']
+Path('/etc/ssh/sshd_config.d/40-oxidex-uploader-fence.conf').write_text(
+    'Match User '+username+'\n    ForceCommand /usr/local/sbin/oxidex-uploader-session\n    DisableForwarding yes\n    PermitTTY no\nMatch all\n')
+Path('/etc/sudoers.d/oxidex-uploader-session').write_text(
+    username+' ALL=(root) NOPASSWD: /usr/local/sbin/oxidex-uploader-session\n')
+Path('/etc/sudoers.d/oxidex-uploader-session').chmod(0o440)
+UPLOAD_FENCE
+/usr/sbin/sshd -t
+/usr/sbin/visudo -cf /etc/sudoers.d/oxidex-uploader-session
+systemctl reload ssh
 printf '%s\n' '{{DEPLOYMENT_ID}}' >/var/lib/oxidex-builder-bootstrap.complete
 chmod 0444 /var/lib/oxidex-builder-bootstrap.complete

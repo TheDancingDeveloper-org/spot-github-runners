@@ -27,10 +27,11 @@ def inspection_fence():
 def main():
     if os.geteuid()!=0:raise RuntimeError('Root-authenticated control transport required')
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation',choices=['inspect','reserve','stage','submit-stage','export','reconcile','release'])
+    parser.add_argument('operation',choices=['inspect','reserve','stage','submit-stage','export','reconcile','reconcile-reboot','release'])
     parser.add_argument('--project')
     parser.add_argument('--reservation')
     parser.add_argument('--ordinal',type=int)
+    parser.add_argument('--expected-old-boot')
     args=parser.parse_args()
     sys.path.insert(0,'/opt/oxidex-builder')
     from qualification_trust.reservation import ROOT,Store,enrollment,host_identity
@@ -68,6 +69,10 @@ def main():
             raw=sys.stdin.buffer.read(65537)
             if len(raw)>65536:raise ValueError('Bounded root control request required')
             result=engine.reserve(json.loads(raw,object_pairs_hook=pairs))
+            print(json.dumps(result,sort_keys=True));return 0
+        if args.operation=='reconcile-reboot':
+            if args.project is None or args.reservation is None or args.expected_old_boot is None:parser.error('Exact original reboot identity required')
+            result=engine.reconcile_reboot(args.project,args.reservation,args.expected_old_boot)
             print(json.dumps(result,sort_keys=True));return 0
         if args.operation in ('reconcile','release'):
             if args.project is None or args.reservation is None:parser.error('Owned reservation identity required')

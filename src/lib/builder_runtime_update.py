@@ -26,6 +26,7 @@ TARGETS = {
     '/usr/local/bin/oxidex-remote-build': 0o755,
     '/usr/local/bin/docker': 0o755,
     '/usr/local/sbin/oxidex-reservation-control': 0o700,
+    '/usr/local/sbin/oxidex-uploader-session': 0o755,
     '/opt/gha-runners/host_admission.py': 0o600,
     '/opt/gha-runners/builder_access.py': 0o644,
     '/etc/oxidex-remote-build/qualification.gitconfig': 0o444,

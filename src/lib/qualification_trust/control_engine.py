@@ -14,9 +14,10 @@ from .task20_receiver import receive,MEMBERS,MAX_ARCHIVE
 BUILD=Path('/mnt/runner-data/remote-build')
 
 
-def write(path,value):
+def write(path,value,*,mode=0o400):
     raw=custody.canonical(value)
-    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode)
+    os.fchmod(fd,mode)  # exact RO reader policy, independent of root's 077 umask
     with os.fdopen(fd,'wb') as output:output.write(raw);output.flush();os.fsync(output.fileno())
     directory=os.open(Path(path).parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     try:os.fsync(directory)
@@ -76,12 +77,27 @@ def reserve(request):
     session,document,signature=validate_request(request)
     # Caller owns global EX and the root-authenticated descriptor channel.
     path=dossier(session['project'])
-    if path.exists() or path.is_symlink():raise ValueError('Prior dossier retained; inspect only')
     actual=custody.authenticate_claim(document,signature,session)
+    store=custody.Store()
+    with store.locked():previous=store.read()
+    if previous is not None and previous['state']!='RELEASED':
+        store.match(previous,previous['reservation_id'],custody.host_identity())
+        if previous['session']!=session or previous['descriptor_sha256']!=custody.digest(request):
+            raise ValueError('Foreign retained custody; descriptor recovery refused')
+        # Lost publication acknowledgement: restore only the exact root-bound
+        # dossier; never acquire a second reservation or replay a stage.
+        path.mkdir(mode=0o700,exist_ok=True)
+        if not (path/'descriptor.json').exists():write(path/'descriptor.json',request)
+        elif root_json(path/'descriptor.json')!=request:raise ValueError('Retained descriptor differs')
+        return previous
+    if path.exists() or path.is_symlink():raise ValueError('Prior dossier retained; inspect only')
     record=custody.Store().acquire(session,request['stages'],host=custody.host_identity(),
         owner=custody.current_actor(),authenticate=lambda claim:actual,
         quiescent=lambda:idle(session['project']),descriptor_sha256=custody.digest(request))
     path.mkdir(mode=0o700)
+    parent=os.open(custody.ROOT,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(parent)
+    finally:os.close(parent)
     write(path/'descriptor.json',request)
     return record
 
@@ -98,6 +114,11 @@ def selected(project,identity):
 
 
 def stage(project,identity,ordinal,stream,*,protective_fds=()):
+    with activity(project,'operation'):
+        return stage_locked(project,identity,ordinal,stream,protective_fds=protective_fds)
+
+
+def stage_locked(project,identity,ordinal,stream,*,protective_fds=()):
     path,request,record=selected(project,identity)
     if type(ordinal) is not int or not 0<=ordinal<8:raise ValueError('Fixed ordinal required')
     argv=request['argv'][ordinal];actor=custody.current_actor();host=custody.host_identity();store=custody.Store()
@@ -151,7 +172,7 @@ def stage(project,identity,ordinal,stream,*,protective_fds=()):
                 write(artifact,proof)
                 # Prior stage proof remains immutable. No container survives this
                 # boundary, so the canonical next bind may be replaced atomically.
-                temporary=path/('.proof-'+str(ordinal));write(temporary,proof)
+                temporary=path/('.proof-'+str(ordinal));write(temporary,proof,mode=0o444)
                 os.replace(temporary,path/'host-proof.json')
                 result=subprocess.run(['/usr/local/bin/oxidex-remote-build',project,*argv],
                                       stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,
@@ -173,7 +194,7 @@ def stage(project,identity,ordinal,stream,*,protective_fds=()):
 
 class activity:
     def __init__(self,project,kind):
-        if kind not in ('upload','export'):raise ValueError('Fixed activity lock kind')
+        if kind not in ('upload','export','operation'):raise ValueError('Fixed activity lock kind')
         self.path='/run/oxidex-'+kind+'-'+project+'.lock'
     def __enter__(self):
         self.fd=os.open(self.path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
@@ -212,6 +233,7 @@ def publish_container(project,created):
     store=custody.Store()
     with store.locked():record=store.read()
     if record is None or record['session'].get('profile')!='task20-v1':return
+    if record['state']=='RELEASED':return
     if record['active'] is None or record['session']['project']!=project or not custody.ancestor_matches(record['active']['actor'],os.getpid()):
         raise ValueError('Created container has no actual Task20 owner')
     path=dossier(project)/'host-proof.json'
@@ -241,6 +263,11 @@ def publish_container(project,created):
 
 
 def export(project,identity,output):
+    with activity(project,'operation'):
+        return export_locked(project,identity,output)
+
+
+def export_locked(project,identity,output):
     path,request,record=selected(project,identity)
     if record['state']!='SOURCE_VERIFIED' or record['active'] is not None or record['next_ordinal'] not in (6,7):
         raise ValueError('Actual pack terminal required before result export')
@@ -288,3 +315,39 @@ def capture_pack(project,path):
         write(path/'pack-observed.json',{'schema':1,'project':project,
                                        'archive_sha256':value.hexdigest(),'archive_bytes':count})
     finally:os.close(fd)
+
+
+def reconcile_reboot(project,identity,expected_old_boot):
+    """Explicit same-VM reboot cleanup; never continue old stage tokens.
+
+    Spot replacement is intentionally not inferred from guest metadata: a new
+    VM requires separately authenticated provider-absence/disk-ownership proof.
+    """
+    store=custody.Store();host=custody.host_identity();custody.enrollment()
+    idle(project)
+    with store.locked():
+        record=store.read()
+        if record is None or record['reservation_id']!=identity or record['session']['project']!=project:
+            raise ValueError('Exact retained reboot custody required')
+        if record['host'][0]!=host[0] or record['host'][1]!=expected_old_boot or host[1]==expected_old_boot:
+            raise ValueError('Same provider VM and distinct actual reboot required')
+        if record['state']=='RELEASED':return record
+        path=dossier(project);actor=custody.current_actor()
+        evidence={'schema':1,'reservation_id':identity,'historical_host':record['host'],
+                  'observed_host':list(host),'record_sha256':custody.digest(record),
+                  'actor':actor,'quiescent':True,'outcome':'INTERRUPTED_REBOOT_CUSTODY_ONLY'}
+        write(path/'reboot-reconciliation.json',evidence)
+        log=path/'reboot-cleanup.log'
+        with log.open('xb') as output:
+            output.write(custody.canonical(evidence)+b'\n');output.flush();os.fsync(output.fileno())
+        if record['active'] is not None:
+            record['events'].append({**record['active'],'exit_code':None,'log_sha256':None,
+                                     'disposition':'INTERRUPTED'})
+        ordinal=len(record['stages'])-1
+        record['events'].append({'ordinal':ordinal,'command':'cleanup','actor':actor,
+                                 'exit_code':0,'log_sha256':file_digest(log)})
+        record.update(state='RELEASED',active=None,next_ordinal=len(record['stages']))
+        # Preserve original host and signed claim; separate evidence records the
+        # new boot. No old stage is replayed or promoted to a successful build.
+        store.write(record)
+        return record

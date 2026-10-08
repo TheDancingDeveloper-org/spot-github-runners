@@ -63,6 +63,18 @@ def quiescent(project, *, own_unit=None):
         raise ValueError('Malformed owned namespace')
     config=root_json('/etc/oxidex-remote-build.json')
     if config.get('role')!='builder':raise ValueError('Dedicated zero-runner host required')
+    uploader=root_json('/etc/oxidex-builder-uploader.json')
+    username=uploader.get('username')
+    if not isinstance(username,str) or not re.fullmatch('[a-z_][a-z0-9_-]{0,31}',username):
+        raise ValueError('Root uploader enrollment missing')
+    effective=command(['/usr/sbin/sshd','-T','-C','user='+username+',host=localhost,addr=127.0.0.1'])
+    rows=dict(line.split(' ',1) for line in effective.splitlines() if ' ' in line)
+    if rows.get('forcecommand')!='/usr/local/sbin/oxidex-uploader-session' or rows.get('disableforwarding')!='yes':
+        raise ValueError('Legacy transfer lifetime fence not effectively enrolled')
+    for hold in ('/run/oxidex-build-draining','/var/lib/oxidex-builder/runtime-update-pending.json',
+                 '/etc/systemd/system/gha-admission.service.d/20-runtime-update-hold.conf'):
+        path=Path(hold)
+        if path.exists() or path.is_symlink():raise ValueError('Foreign maintenance hold; preserve ownership')
     ids=command(['/usr/bin/docker','ps','-aq','--no-trunc']).split()
     if ids:raise ValueError('Actual container transaction remains; custody retained')
     if root_json('/var/lib/gha-admission/leases.json')!={}:
