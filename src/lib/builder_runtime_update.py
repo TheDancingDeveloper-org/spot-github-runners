@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import types
 from contextlib import contextmanager, ExitStack
 
 PENDING_UPDATE = Path('/var/lib/oxidex-builder/runtime-update-pending.json')
@@ -44,6 +45,34 @@ TARGETS = {
 }
 
 
+def trusted_builder_access():
+    """Load the installed root-owned policy asset in standalone -I mode.
+
+    Package imports remain useful for source tests. The root CLI selects only
+    the fixed installed asset, never cwd, sys.path, or uploaded Python bytes.
+    """
+    if __package__:
+        from . import builder_access
+        return builder_access
+    path = Path('/opt/gha-runners/builder_access.py')
+    with retained_ancestor_selection(path, authenticate=True) as verify_ancestors:
+        state, raw = root_file_read(path)
+        if (state is None or state.get('uid') != 0 or state.get('mode') != TARGETS[str(path)]
+                or not 0 < len(raw) <= 262144
+                or state['sha256'] != hashlib.sha256(raw).hexdigest()):
+            raise ValueError('Trusted installed builder access asset unavailable')
+        with retained_file_selection(path, state, lambda: root_file_state(path)) as verify_file:
+            code = compile(raw, str(path), 'exec')
+            verify_ancestors()
+            verify_file()
+            module = types.ModuleType('_oxidex_trusted_builder_access')
+            module.__file__ = str(path)
+            exec(code, module.__dict__)
+            verify_ancestors()
+            verify_file()
+            return module
+
+
 def validate_assets(assets):
     if not isinstance(assets, dict) or set(assets) != set(TARGETS):
         raise ValueError('Exactly the reviewed runtime target set is required')
@@ -67,16 +96,16 @@ def validate_assets(assets):
 def validate_policy_assets(assets):
     """Reject policy bytes not derived from the existing root-owned mapping."""
     import pwd
-    from .builder_access import approved_mapping, uploader_policy_bytes, restricted_group_guard
+    access = trusted_builder_access()
     state, raw = root_file_read('/etc/oxidex-builder-uploader.json')
     if state is None or state['mode'] & 0o077:
         raise ValueError('Root-approved uploader mapping unavailable')
-    mapping = approved_mapping(json.loads(raw))
+    mapping = access.approved_mapping(json.loads(raw))
     account = pwd.getpwnam(mapping['username'])
     if account.pw_uid != mapping['uid']:
         raise ValueError('Enrolled uploader account changed')
-    restricted_group_guard(mapping)
-    expected = uploader_policy_bytes(mapping)
+    access.restricted_group_guard(mapping)
+    expected = access.uploader_policy_bytes(mapping)
     decoded = validate_assets(assets)
     if any(decoded[path] != raw for path, raw in expected.items()):
         raise ValueError('Uploaded policy differs from fixed root-derived enrollment')
@@ -85,7 +114,7 @@ def validate_policy_assets(assets):
 
 def validate_installed_policy(assets, mapping):
     """Verify actual daemon policy while the update drain remains held."""
-    from .builder_access import effective_sudo_guard
+    access = trusted_builder_access()
     decoded = validate_assets(assets)
     for path, mode in POLICY_TARGETS.items():
         state = root_file_state(path)
@@ -101,7 +130,7 @@ def validate_installed_policy(assets, mapping):
     if (rows.get('forcecommand') != '/usr/local/sbin/oxidex-uploader-session'
             or rows.get('disableforwarding') != 'yes' or rows.get('permittty') != 'no'):
         raise ValueError('Effective uploader SSH policy differs')
-    effective_sudo_guard(username, require_uploader_session=True)
+    access.effective_sudo_guard(username, require_uploader_session=True)
 
 
 
@@ -849,9 +878,9 @@ def admission_ready(plan, pid, ticks, *, wait=True):
 
 
 def observed_work_processes():
-    from .builder_access import approved_mapping
+    access = trusted_builder_access()
     _, mapping_raw = root_file_read('/etc/oxidex-builder-uploader.json')
-    uploader_uid = approved_mapping(json.loads(mapping_raw))['uid']
+    uploader_uid = access.approved_mapping(json.loads(mapping_raw))['uid']
     work_records = []
     for proc_path in Path('/proc').iterdir():
         if not proc_path.name.isdecimal():

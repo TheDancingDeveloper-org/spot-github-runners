@@ -32,6 +32,22 @@ PROJECT='qualification-'+'a'*12+'-'+'b'*32
 
 
 class ProofRepairControls(unittest.TestCase):
+    def test_runtime_updater_isolated_standalone_entry_and_policy_paths(self):
+        updater=ROOT/'src/lib/builder_runtime_update.py'
+        helper=ROOT/'src/lib/builder_access.py'
+        probe=ROOT/'tests/isolated_builder_runtime_probe.py'
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory,'builder_access.py').write_text('raise RuntimeError("cwd poison")\n')
+            environment=dict(os.environ,PYTHONPATH=directory)
+            process=subprocess.run([sys.executable,'-I','-B',str(probe),str(updater),str(helper)],
+                                   cwd=directory,env=environment,capture_output=True,text=True)
+            self.assertEqual(process.returncode,0,process.stdout+process.stderr)
+            self.assertIn('checks: PASS',process.stdout)
+            entry=subprocess.run([sys.executable,'-I','-B',str(updater),'--help'],
+                                 cwd=directory,env=environment,capture_output=True,text=True)
+            self.assertEqual(entry.returncode,0,entry.stdout+entry.stderr)
+            self.assertIn('--recover-policy',entry.stdout)
+
     def test_permanent_guard_requires_exact_bytes_when_present(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'guard.conf'
@@ -307,4 +323,47 @@ class ProofRepairControls(unittest.TestCase):
                 (path/'reboot-cleanup.log').chmod(0o600)
                 (path/'reboot-cleanup.log').write_bytes(b'foreign\n')
                 with self.assertRaisesRegex(ValueError,'cleanup log differs'):
+                    engine.reconcile_reboot(PROJECT,'r','old-boot')
+
+    def test_reboot_reconcile_interrupted_cleanup_lost_ack_and_duplicate_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)
+            actor={'pid':1,'start':1}
+            record={'reservation_id':'r','session':{'project':PROJECT},
+                    'host':['123','old-boot'],'state':'HELD',
+                    'active':{'ordinal':0,'command':'cleanup','actor':actor},
+                    'events':[{'ordinal':0,'command':'cleanup','actor':actor,
+                               'exit_code':None,'log_sha256':None,'disposition':'FINISH_REFUSED'}],
+                    'stages':[{'command':'cleanup'}],'next_ordinal':0}
+            class Store:
+                def locked(self):
+                    from contextlib import nullcontext
+                    return nullcontext()
+                def read(self):return record
+                def write(self,value):record.update(value)
+            original_fstat=os.fstat
+            def root_fstat(fd):
+                info=original_fstat(fd);values=list(info);values[4]=0
+                return os.stat_result(values)
+            with patch.object(engine,'idle',return_value=True),patch.object(engine,'dossier',return_value=path),\
+                 patch.object(custody,'Store',return_value=Store()),\
+                 patch.object(custody,'host_identity',return_value=('123','new-boot')),\
+                 patch.object(custody,'enrollment',return_value={}),\
+                 patch.object(custody,'current_actor',return_value=actor),\
+                 patch.object(engine,'root_json',side_effect=lambda file:json.loads(Path(file).read_text())),\
+                 patch.object(engine.os,'fstat',side_effect=root_fstat):
+                self.assertEqual(engine.reconcile_reboot(PROJECT,'r','old-boot')['state'],'RELEASED')
+                self.assertEqual([row.get('disposition') for row in record['events']],
+                                 ['FINISH_REFUSED','INTERRUPTED',None])
+                evidence=(path/'reboot-reconciliation.json').read_bytes()
+                log=(path/'reboot-cleanup.log').read_bytes()
+                self.assertEqual(engine.reconcile_reboot(PROJECT,'r','old-boot')['state'],'RELEASED')
+                self.assertEqual((path/'reboot-reconciliation.json').read_bytes(),evidence)
+                self.assertEqual((path/'reboot-cleanup.log').read_bytes(),log)
+                record['events'][-1]['actor']={'pid':2,'start':2}
+                with self.assertRaisesRegex(ValueError,'cleanup differs'):
+                    engine.reconcile_reboot(PROJECT,'r','old-boot')
+                record['events'][-1]['actor']=actor
+                record['events'].append(copy.deepcopy(record['events'][-1]))
+                with self.assertRaisesRegex(ValueError,'cleanup differs'):
                     engine.reconcile_reboot(PROJECT,'r','old-boot')

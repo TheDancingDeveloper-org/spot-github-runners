@@ -374,9 +374,16 @@ def reconcile_reboot(project,identity,expected_old_boot):
             try:os.fsync(directory)
             finally:os.close(directory)
         if released:
-            cleanup=[event for event in record['events'] if event.get('command')=='cleanup'
-                     and event.get('ordinal')==len(record['stages'])-1]
-            if (len(cleanup)!=1 or cleanup[0].get('log_sha256')!=file_digest(log)):
+            ordinal=len(record['stages'])-1
+            terminal={'ordinal':ordinal,'command':'cleanup','actor':evidence['actor'],
+                      'exit_code':0,'log_sha256':file_digest(log)}
+            events=record['events']
+            # Earlier interrupted/refused cleanup attempts are durable history.
+            # Only the final, unique successful event reconciles this evidence.
+            if (not events or events[-1]!=terminal
+                    or any(event.get('command')=='cleanup' and event.get('ordinal')==ordinal
+                           and event.get('disposition') not in ('INTERRUPTED','FINISH_REFUSED')
+                           for event in events[:-1])):
                 raise ValueError('Released reboot cleanup differs from published evidence')
             return record
         if record['active'] is not None:
