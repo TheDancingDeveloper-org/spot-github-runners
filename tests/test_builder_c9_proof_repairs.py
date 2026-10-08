@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import stat
 from pathlib import Path
 import pwd
 import subprocess
@@ -329,6 +330,45 @@ class ProofRepairControls(unittest.TestCase):
             self.assertEqual(record['state'],'HELD')
             self.assertEqual(record['active'],{'ordinal':3,'actor':actor})
             self.assertEqual((path/'stage-3.log').read_bytes(),b'bounded partial\n')
+
+    def test_new_stage_log_directory_sync_precedes_terminal_record(self):
+        actor={'pid':11,'start':22};host=('123','new-boot')
+        record={'state':'SOURCE_VERIFIED','reservation_id':'r',
+                'active':{'ordinal':7,'actor':actor,'command':'cleanup'}}
+        class Store:
+            def locked(self):
+                from contextlib import nullcontext
+                return nullcontext()
+            def begin(self,*args,**kwargs):pass
+            def read(self):return record
+            def match(self,selected,identity,observed):
+                assert selected is record and identity=='r' and observed==host
+            def write(self,value):record.update(value)
+            def finish(self,*args,**kwargs):raise AssertionError('terminal record preceded directory sync')
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)
+            session={'project':PROJECT,'head':'a'*40,'bundle_sha256':'b'*64}
+            selected={**record,'session':session,'stages':[{'command':'cleanup'}]*8}
+            request={'session':session,'argv':[[]]*8}
+            actual_fsync=os.fsync;actual_fstat=os.fstat;order=[]
+            def fail_directory_sync(fd):
+                kind='directory' if stat.S_ISDIR(actual_fstat(fd).st_mode) else 'file'
+                order.append(kind)
+                if kind=='directory':raise OSError('injected dossier directory fsync failure')
+                return actual_fsync(fd)
+            with patch.object(engine,'selected',return_value=(path,request,selected)),\
+                 patch.object(engine,'idle',return_value=True),\
+                 patch.object(custody,'Store',return_value=Store()),\
+                 patch.object(custody,'host_identity',return_value=host),\
+                 patch.object(custody,'current_actor',return_value=actor),\
+                 patch.object(engine.os,'fsync',side_effect=fail_directory_sync):
+                with self.assertRaisesRegex(OSError,'dossier directory fsync failure'):
+                    engine.stage_locked(PROJECT,'r',7,None)
+            self.assertEqual(order,['file','directory','file'])
+            self.assertEqual(record['state'],'HELD')
+            self.assertEqual(record['active']['ordinal'],7)
+            self.assertEqual((path/'stage-7.log').read_bytes(),
+                             b'Actual custody cleanup only; source/cache/evidence retained.\n')
 
     def test_runtime_updater_isolated_standalone_entry_and_policy_paths(self):
         updater=ROOT/'src/lib/builder_runtime_update.py'

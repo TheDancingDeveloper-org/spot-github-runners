@@ -78,6 +78,10 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
     && rustup component add rustfmt clippy --toolchain 1.97.1 \
     && rustup target add --toolchain 1.97.1 x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
     && rustup target add --toolchain 1.97.1 aarch64-apple-darwin x86_64-apple-darwin \
+    && rustup toolchain install 1.99.0 --profile minimal \
+    && rustup component add rustfmt clippy --toolchain 1.99.0 \
+    && rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+    && rustup target add --toolchain 1.99.0 aarch64-apple-darwin x86_64-apple-darwin \
     && cargo install --locked -j4 just \
     && cargo install --locked -j4 cargo-nextest \
     && cargo install --locked -j4 --version 0.29.2 cbindgen \

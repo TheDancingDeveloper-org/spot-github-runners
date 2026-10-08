@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Root-only observation endpoint; Task20 mutation remains deliberately disabled."""
+"""Root-authenticated reservation control with enabled fixed-scope mutations."""
 import argparse
 import fcntl
 import json

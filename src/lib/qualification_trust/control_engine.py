@@ -280,6 +280,10 @@ def stage_locked(project,identity,ordinal,stream,*,protective_fds=()):
                 if ordinal==5 and status==0:
                     capture_pack(project,path)
             output.flush();os.fsync(output.fileno())
+        # The terminal record must never outlive the new stage-log name.
+        directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(directory)
+        finally:os.close(directory)
         sha=file_digest(log)
         return store.finish(identity,ordinal,host=host,actor=actor,exit_code=status,
                             log_sha256=sha,quiescent=lambda:idle(project),binding=binding)

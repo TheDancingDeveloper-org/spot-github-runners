@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -81,6 +82,15 @@ class BuilderCrossCompileTests(unittest.TestCase):
         self.assertEqual(builder_assets.BUILDER_DOCKERFILE, (ROOT / 'builder/Dockerfile').read_text())
         self.assertEqual(builder_assets.BUILDER_ENTRYPOINT, (ROOT / 'builder/entrypoint.py').read_text())
         self.assertEqual(builder_assets.HOST_LAUNCHER, (ROOT / 'builder/host-launcher.py').read_text())
+
+    def test_dedicated_builder_installs_selected_source_pin(self):
+        from lib import builder_assets
+        pin=tomllib.loads((ROOT/'rust-toolchain.toml').read_text())['toolchain']['channel']
+        for dockerfile in ((ROOT/'builder/Dockerfile').read_text(),
+                           builder_assets.BUILDER_DOCKERFILE):
+            with self.subTest(pin=pin):
+                self.assertIn('rustup toolchain install '+pin+' --profile minimal',dockerfile)
+                self.assertIn('rustup component add rustfmt clippy --toolchain '+pin,dockerfile)
 
 
 if __name__ == '__main__':

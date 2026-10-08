@@ -1,6 +1,8 @@
 """Focused source controls; no host mutation or live reservation."""
 import importlib.util
+import contextlib
 import hashlib
+import io
 import os
 from pathlib import Path
 import pwd
@@ -21,6 +23,16 @@ control=importlib.util.module_from_spec(spec);spec.loader.exec_module(control)
 
 
 class ActiveControlTests(unittest.TestCase):
+    def test_root_control_help_states_mutations_are_enabled(self):
+        output=io.StringIO()
+        with patch.object(control.os,'geteuid',return_value=0),\
+             patch.object(sys,'argv',['reservation-control','--help']),\
+             contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit) as result:control.main()
+        self.assertEqual(result.exception.code,0)
+        self.assertIn('enabled fixed-scope mutations',output.getvalue())
+        self.assertNotIn('mutation remains deliberately disabled',output.getvalue())
+
     def test_reconcile_log_reproves_file_and_directory_durability_on_retry(self):
         home=Path(pwd.getpwuid(os.getuid()).pw_dir)
         actual_fstat=os.fstat;actual_fsync=os.fsync
@@ -149,6 +161,42 @@ class ActiveControlTests(unittest.TestCase):
 
 
 class RecoveryStoreTests(unittest.TestCase):
+    def test_ordinary_cleanup_dead_actor_recovers_without_reboot(self):
+        from test_whole_run_reservation import ReservationTests, reservation as isolated_custody
+        for refused_finish in (False,True):
+            with self.subTest(refused_finish=refused_finish):
+                fixture=ReservationTests();fixture.setUp()
+                try:
+                    record=fixture.claim();identity=record['reservation_id']
+                    for ordinal in range(7):fixture.step(record,ordinal)
+                    old=fixture.actor;new={'pid':300,'start':400}
+                    fixture.store.begin(identity,7,host=fixture.host,actor=old,argv=fixture.argv[7])
+                    if refused_finish:
+                        with self.assertRaisesRegex(ValueError,'quiescence'):
+                            fixture.store.finish(identity,7,host=fixture.host,actor=old,
+                                exit_code=0,log_sha256='f'*64,quiescent=lambda:False)
+                    self.assertEqual(fixture.store.read()['state'],
+                                     'HELD' if refused_finish else 'SOURCE_VERIFIED')
+                    with patch.object(isolated_custody,'process',return_value=(old,1)):
+                        with self.assertRaisesRegex(ValueError,'Prior cleanup actor remains'):
+                            fixture.store.cleanup_after_failure(identity,host=fixture.host,
+                                actor=new,argv=fixture.argv[7],quiescent=lambda:True)
+                    with patch.object(isolated_custody,'process',side_effect=FileNotFoundError):
+                        with self.assertRaisesRegex(ValueError,'quiescence'):
+                            fixture.store.cleanup_after_failure(identity,host=fixture.host,
+                                actor=new,argv=fixture.argv[7],quiescent=lambda:False)
+                        recovered=fixture.store.cleanup_after_failure(identity,host=fixture.host,
+                            actor=new,argv=fixture.argv[7],quiescent=lambda:True)
+                    self.assertEqual(recovered['state'],'RECOVERING')
+                    self.assertEqual(recovered['active']['actor'],new)
+                    self.assertEqual(recovered['events'][-1]['disposition'],'INTERRUPTED')
+                    self.assertEqual(recovered['events'][-1]['actor'],old)
+                    fixture.store.finish(identity,7,host=fixture.host,actor=new,exit_code=0,
+                                         log_sha256='f'*64,quiescent=lambda:True)
+                    self.assertEqual(fixture.store.release(identity,host=fixture.host,
+                        quiescent=lambda:True)['state'],'RELEASED')
+                finally:fixture.tearDown()
+
     def test_dead_cleanup_actor_rebinds_only_after_quiescence_and_retains_interruption(self):
         from test_whole_run_reservation import ReservationTests, reservation as isolated_custody
         fixture=ReservationTests();fixture.setUp()

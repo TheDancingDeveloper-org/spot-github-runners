@@ -315,7 +315,13 @@ class Store:
                 raise ValueError('Exact active stage owner required')
             refused = any(event.get('disposition') == 'FINISH_REFUSED' and event['ordinal'] == ordinal
                           for event in record['events'])
-            if refused or record['state'] == 'HELD':
+            # A prior refusal is terminal for that actor. Only an explicit
+            # dead-actor cleanup transition may finish under a new actor.
+            recovered = (record['state'] == 'RECOVERING' and record['events']
+                         and record['events'][-1].get('disposition') == 'INTERRUPTED'
+                         and record['events'][-1]['ordinal'] == ordinal
+                         and record['events'][-1]['actor'] != actor)
+            if (refused and not recovered) or record['state'] == 'HELD':
                 raise ValueError('Refused stage requires explicit recovery, not finalization retry')
             if type(exit_code) is not int or not isinstance(log_sha256, str) or not re.fullmatch('[0-9a-f]{64}', log_sha256):
                 raise ValueError('Actual terminal status and log digest required')
@@ -378,8 +384,9 @@ class Store:
             if record['next_ordinal'] >= len(record['stages']) or digest(argv) != stage['argv_sha256']:
                 raise ValueError('Owned cleanup already finished or command differs')
             if record['active'] is not None and record['active']['command'] == 'cleanup':
-                if record['state'] != 'RECOVERING':
-                    raise ValueError('Uncertain cleanup cannot be repeated')
+                if (record['state'] not in ('SOURCE_VERIFIED', 'HELD', 'RECOVERING')
+                        or record['active']['ordinal'] != ordinal or record['next_ordinal'] != ordinal):
+                    raise ValueError('Uncertain cleanup state or ordinal differs')
                 previous = record['active']['actor']
                 if previous == actor or not actor_exited(previous):
                     raise ValueError('Prior cleanup actor remains or cannot be excluded')
@@ -387,6 +394,7 @@ class Store:
                     raise ValueError('Recovery event budget exhausted')
                 record['events'].append({**record['active'], 'exit_code': None,
                                          'log_sha256': None, 'disposition': 'INTERRUPTED'})
+                record['state'] = 'RECOVERING'
                 record['active'] = dict(ordinal=ordinal, actor=actor, command='cleanup')
                 self.write(record)
                 return record
