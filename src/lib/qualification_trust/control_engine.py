@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
 import stat
 import subprocess
@@ -15,6 +16,9 @@ from .task20_receiver import receive,MEMBERS,MAX_ARCHIVE
 
 BUILD=Path('/mnt/runner-data/remote-build')
 LOG_LIMIT=128*1024*1024
+CAPTURE_POLL_SECONDS=.05
+POST_EOF_EXIT_OBSERVATION_SECONDS=5
+POST_EXIT_PIPE_DRAIN_SECONDS=5
 
 
 def write(path,value,*,mode=0o400):
@@ -87,36 +91,63 @@ def stop_stage_children(process):
         if time.monotonic()>=deadline:
             raise ValueError('Stage descendants remain after output limit; retain custody')
         time.sleep(.02)
-    process.wait()
+    process.wait(timeout=5)
 
 
 def capture_stage(argv,output,*,limit=LOG_LIMIT,scope_processes=stage_unit_processes):
-    """Stream one combined pipe in bounded blocks; the caller retains all locks."""
+    """Observe output and launcher independently while the caller retains all locks.
+
+    A live launcher may run without output. Once its pipe reaches EOF, allow a
+    bounded status observation, then stop and hold if it remains alive. Time
+    alone never establishes successful completion or releases custody.
+    """
     if type(limit) is not int or not 0<limit<=LOG_LIMIT:
         raise ValueError('Invalid stage log bound')
     process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,close_fds=True,start_new_session=True,
         env={'PATH':'/usr/local/bin:/usr/bin:/bin','LANG':'C'})
-    count=0
+    count=0;pipe_eof=False;exit_deadline=None;drain_deadline=None
     try:
-        with process.stdout:
+        with process.stdout, selectors.DefaultSelector() as selector:
+            fd=process.stdout.fileno()
+            os.set_blocking(fd,False)
+            selector.register(fd,selectors.EVENT_READ)
             while True:
-                block=process.stdout.read(65536)
-                if not block:break
-                remaining=limit-count
-                if remaining:
-                    output.write(block[:remaining]);count+=min(len(block),remaining)
-                if len(block)>remaining:
-                    stop_stage_children(process)
-                    raise ValueError('Bounded control log exceeded during capture; custody held')
-        status=process.wait()
-        if scope_processes()!={os.getpid()}:
-            raise ValueError('Actual stage descendants remain; custody held')
-        return status
+                ready=selector.select(CAPTURE_POLL_SECONDS) if not pipe_eof else ()
+                if ready:
+                    try:block=os.read(fd,65536)
+                    except BlockingIOError:block=None
+                    if block==b'':
+                        selector.unregister(fd);pipe_eof=True
+                    elif block:
+                        remaining=limit-count
+                        if remaining:
+                            kept=block[:remaining]
+                            output.write(kept);count+=len(kept)
+                        if len(block)>remaining:
+                            raise ValueError('Bounded control log exceeded during capture; custody held')
+                status=process.poll()
+                if status is not None:
+                    if scope_processes()!={os.getpid()}:
+                        raise ValueError('Actual stage descendants remain; custody held')
+                    if pipe_eof:return status
+                    if drain_deadline is None:
+                        drain_deadline=time.monotonic()+POST_EXIT_PIPE_DRAIN_SECONDS
+                    if time.monotonic()>=drain_deadline:
+                        raise ValueError('Stage pipe remains open after launcher exit; custody held')
+                    if not ready:
+                        raise ValueError('Stage pipe remains open after launcher exit; custody held')
+                    # Drain bytes already ready before deciding whether EOF is present.
+                    continue
+                if pipe_eof:
+                    if exit_deadline is None:
+                        exit_deadline=time.monotonic()+POST_EOF_EXIT_OBSERVATION_SECONDS
+                    if time.monotonic()>=exit_deadline:
+                        raise ValueError('Launcher remains alive after stage pipe EOF; custody held')
+                    time.sleep(CAPTURE_POLL_SECONDS)
     except BaseException:
-        if process.poll() is None:
-            try:stop_stage_children(process)
-            except Exception:pass  # Unknown descendants are retained as HELD.
+        try:stop_stage_children(process)
+        except Exception:pass  # Unknown descendants are retained as HELD.
         raise
 
 

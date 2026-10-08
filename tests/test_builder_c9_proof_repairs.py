@@ -147,13 +147,69 @@ class ProofRepairControls(unittest.TestCase):
                                          scope_processes=lambda:{os.getpid(),999999})
             lock=os.open(Path(directory)/'parent.lock',os.O_CREAT|os.O_RDWR,0o600)
             try:
+                fcntl.flock(lock,fcntl.LOCK_EX)
                 os.set_inheritable(lock,True)
                 with output.open('wb') as stream:
                     script='import os,sys\ntry: os.fstat('+str(lock)+'); sys.stdout.write("leaked")\nexcept OSError: sys.stdout.write("closed")\n'
                     self.assertEqual(engine.capture_stage([sys.executable,'-c',script],stream,
                         limit=1024,scope_processes=lambda:{os.getpid()}),0)
                 self.assertEqual(output.read_bytes(),b'closed')
+                challenger=os.open(Path(directory)/'parent.lock',os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(challenger,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                finally:os.close(challenger)
             finally:os.close(lock)
+
+    def test_capture_observes_real_process_lifetimes_and_stops_local_group(self):
+        # ps is a local stand-in for the installed root cgroup observer. It
+        # reads actual processes; stop_stage_children still performs the kill.
+        def live_group(path):
+            group=int(path.read_text())
+            rows=subprocess.check_output(['ps','-axo','pid=,pgid=,stat='],text=True)
+            return {int(fields[0]) for row in rows.splitlines()
+                    if len(fields:=row.split())>=3 and int(fields[1])==group
+                    and not fields[2].startswith('Z')}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)
+            for name,script,expected,retained in (
+                ('pipe-owner',
+                 'import os,time\nopen({marker!r},"w").write(str(os.getpgrp()))\n'
+                 'if os.fork()==0: time.sleep(1);os._exit(0)\n'
+                 'os.write(1,b"parent-exit\\n");os._exit(0)\n',
+                 'descendants remain',b'parent-exit\n'),
+                ('overflow',
+                 'import os,time\nopen({marker!r},"w").write(str(os.getpgrp()))\n'
+                 'os.write(1,b"x"*1025);time.sleep(1)\n',
+                 'during capture',b'x'*1024),
+                ('eof-live',
+                 'import os,time\nopen({marker!r},"w").write(str(os.getpgrp()))\n'
+                 'os.close(1);os.close(2);time.sleep(1)\n',
+                 'after stage pipe EOF',b''),
+            ):
+                with self.subTest(name=name):
+                    marker=path/(name+'.group');log=path/(name+'.log')
+                    command=[sys.executable,'-c',script.format(marker=str(marker))]
+                    def observed():return {os.getpid()}|live_group(marker)
+                    started=time.monotonic()
+                    with patch.object(engine,'stage_unit_processes',side_effect=observed),\
+                         patch.object(engine,'POST_EOF_EXIT_OBSERVATION_SECONDS',.12),\
+                         log.open('wb') as output:
+                        with self.assertRaisesRegex(ValueError,expected):
+                            engine.capture_stage(command,output,limit=1024,
+                                                 scope_processes=observed)
+                    self.assertLess(time.monotonic()-started,.7)
+                    self.assertEqual(log.read_bytes(),retained)
+                    self.assertEqual(live_group(marker),set())
+
+            with (path/'normal.log').open('wb') as output:
+                command=[sys.executable,'-c',
+                    'import os,time\nos.write(1,b"first");time.sleep(.05);'
+                    'os.write(2,b"-stderr");time.sleep(.05);os.write(1,b"-last")']
+                self.assertEqual(engine.capture_stage(command,output,limit=1024,
+                    scope_processes=lambda:{os.getpid()}),0)
+            self.assertEqual((path/'normal.log').read_bytes(),b'first-stderr-last')
 
     def test_all_four_container_ordinals_use_bounded_capture_and_forward_failure(self):
         actor={'pid':11,'start':22};host=('123','new-boot')
