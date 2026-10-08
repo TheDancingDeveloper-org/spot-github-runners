@@ -331,15 +331,54 @@ def reconcile_reboot(project,identity,expected_old_boot):
             raise ValueError('Exact retained reboot custody required')
         if record['host'][0]!=host[0] or record['host'][1]!=expected_old_boot or host[1]==expected_old_boot:
             raise ValueError('Same provider VM and distinct actual reboot required')
-        if record['state']=='RELEASED':return record
         path=dossier(project);actor=custody.current_actor()
-        evidence={'schema':1,'reservation_id':identity,'historical_host':record['host'],
-                  'observed_host':list(host),'record_sha256':custody.digest(record),
-                  'actor':actor,'quiescent':True,'outcome':'INTERRUPTED_REBOOT_CUSTODY_ONLY'}
-        write(path/'reboot-reconciliation.json',evidence)
-        log=path/'reboot-cleanup.log'
-        with log.open('xb') as output:
-            output.write(custody.canonical(evidence)+b'\n');output.flush();os.fsync(output.fileno())
+        evidence_path=path/'reboot-reconciliation.json';log=path/'reboot-cleanup.log'
+        released=record['state']=='RELEASED'
+        if evidence_path.exists() or evidence_path.is_symlink():
+            evidence=root_json(evidence_path)
+            if (set(evidence)!={'schema','reservation_id','historical_host','observed_host',
+                                'record_sha256','actor','quiescent','outcome'}
+                    or evidence['schema']!=1 or evidence['reservation_id']!=identity
+                    or evidence['historical_host']!=record['host'] or evidence['observed_host']!=list(host)
+                    or (not released and evidence['record_sha256']!=custody.digest(record))
+                    or not isinstance(evidence['record_sha256'],str)
+                    or not custody.re.fullmatch('[0-9a-f]{64}',evidence['record_sha256'])
+                    or evidence['quiescent'] is not True
+                    or evidence['outcome']!='INTERRUPTED_REBOOT_CUSTODY_ONLY'):
+                raise ValueError('Published reboot evidence differs from retained custody')
+            custody.validate_actor(evidence['actor'])
+        else:
+            if released:raise ValueError('Released reboot custody lacks published evidence')
+            if log.exists() or log.is_symlink():
+                raise ValueError('Unbound reboot cleanup log retained')
+            evidence={'schema':1,'reservation_id':identity,'historical_host':record['host'],
+                      'observed_host':list(host),'record_sha256':custody.digest(record),
+                      'actor':actor,'quiescent':True,'outcome':'INTERRUPTED_REBOOT_CUSTODY_ONLY'}
+            write(evidence_path,evidence)
+        raw=custody.canonical(evidence)+b'\n'
+        if released and not log.exists():
+            raise ValueError('Released reboot custody lacks published cleanup log')
+        if log.exists() or log.is_symlink():
+            fd=os.open(log,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            try:
+                info=os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1
+                        or info.st_mode&0o022 or info.st_size!=len(raw) or os.read(fd,len(raw)+1)!=raw):
+                    raise ValueError('Published reboot cleanup log differs')
+            finally:os.close(fd)
+        else:
+            fd=os.open(log,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+            with os.fdopen(fd,'wb') as output:
+                output.write(raw);output.flush();os.fsync(output.fileno())
+            directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            try:os.fsync(directory)
+            finally:os.close(directory)
+        if released:
+            cleanup=[event for event in record['events'] if event.get('command')=='cleanup'
+                     and event.get('ordinal')==len(record['stages'])-1]
+            if (len(cleanup)!=1 or cleanup[0].get('log_sha256')!=file_digest(log)):
+                raise ValueError('Released reboot cleanup differs from published evidence')
+            return record
         if record['active'] is not None:
             record['events'].append({**record['active'],'exit_code':None,'log_sha256':None,
                                      'disposition':'INTERRUPTED'})

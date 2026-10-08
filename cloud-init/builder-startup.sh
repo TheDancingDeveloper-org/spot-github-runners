@@ -180,16 +180,19 @@ python3 -B /opt/gha-runners/builder_access.py /etc/oxidex-builder-uploader.json 
 python3 -B - <<'UPLOAD_FENCE'
 import json
 from pathlib import Path
+import runpy
 mapping=json.loads(Path('/etc/oxidex-builder-uploader.json').read_text())
-username=mapping['username']
-Path('/etc/ssh/sshd_config.d/40-oxidex-uploader-fence.conf').write_text(
-    'Match User '+username+'\n    ForceCommand /usr/local/sbin/oxidex-uploader-session\n    DisableForwarding yes\n    PermitTTY no\nMatch all\n')
-Path('/etc/sudoers.d/oxidex-uploader-session').write_text(
-    username+' ALL=(root) NOPASSWD: /usr/local/sbin/oxidex-uploader-session\n')
+policy=runpy.run_path('/opt/gha-runners/builder_access.py')['uploader_policy_bytes'](mapping)
+for name,raw in policy.items():Path(name).write_bytes(raw)
 Path('/etc/sudoers.d/oxidex-uploader-session').chmod(0o440)
 UPLOAD_FENCE
 /usr/sbin/sshd -t
 /usr/sbin/visudo -cf /etc/sudoers.d/oxidex-uploader-session
+python3 -B - <<'UPLOAD_POLICY_CHECK'
+import runpy
+policy=runpy.run_path('/opt/gha-runners/builder_access.py')
+policy['effective_sudo_guard']('{{UPLOADER_USERNAME}}',require_uploader_session=True)
+UPLOAD_POLICY_CHECK
 systemctl reload ssh
 printf '%s\n' '{{DEPLOYMENT_ID}}' >/var/lib/oxidex-builder-bootstrap.complete
 chmod 0444 /var/lib/oxidex-builder-bootstrap.complete

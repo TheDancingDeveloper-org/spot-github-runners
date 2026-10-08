@@ -8,6 +8,24 @@ import stat
 import subprocess
 from contextlib import ExitStack
 
+BOOT_GUARD='/etc/systemd/system/gha-admission.service.d/20-runtime-update-hold.conf'
+BOOT_GUARD_BYTES=(b'[Unit]\n'
+    b'ConditionPathExists=|!/var/lib/oxidex-builder/runtime-update-pending.json\n'
+    b'ConditionPathExists=|/run/oxidex-runtime-update-allow\n')
+
+
+def verify_permanent_boot_guard():
+    """The installed guard is healthy only with exact managed bytes."""
+    try:fd=os.open(BOOT_GUARD,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    except FileNotFoundError:return
+    try:
+        info=os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1
+                or stat.S_IMODE(info.st_mode)!=0o644 or info.st_size!=len(BOOT_GUARD_BYTES)
+                or os.read(fd,len(BOOT_GUARD_BYTES)+1)!=BOOT_GUARD_BYTES):
+            raise ValueError('Permanent admission boot guard differs')
+    finally:os.close(fd)
+
 
 def command(argv):
     result=subprocess.run(argv,check=True,capture_output=True,text=True,timeout=10)
@@ -71,8 +89,9 @@ def quiescent(project, *, own_unit=None):
     rows=dict(line.split(' ',1) for line in effective.splitlines() if ' ' in line)
     if rows.get('forcecommand')!='/usr/local/sbin/oxidex-uploader-session' or rows.get('disableforwarding')!='yes':
         raise ValueError('Legacy transfer lifetime fence not effectively enrolled')
+    verify_permanent_boot_guard()
     for hold in ('/run/oxidex-build-draining','/var/lib/oxidex-builder/runtime-update-pending.json',
-                 '/etc/systemd/system/gha-admission.service.d/20-runtime-update-hold.conf'):
+                 '/run/oxidex-runtime-update-allow'):
         path=Path(hold)
         if path.exists() or path.is_symlink():raise ValueError('Foreign maintenance hold; preserve ownership')
     ids=command(['/usr/bin/docker','ps','-aq','--no-trunc']).split()
@@ -98,16 +117,22 @@ def quiescent(project, *, own_unit=None):
             if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1 or info.st_mode&0o022:
                 raise ValueError('Untrusted canonical activity lock')
             fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        # Independent legacy transports cannot be treated as stage children.
+        # Every process carrying the enrolled UID is a possible uploader,
+        # regardless of executable name, fork ancestry, or open descriptors.
+        uid=uploader.get('uid')
+        if type(uid) is not int or uid<1000 or uid==1001:
+            raise ValueError('Root uploader UID enrollment invalid')
         for process in Path('/proc').iterdir():
             if not process.name.isdecimal():continue
             try:
-                raw=(process/'cmdline').read_bytes().split(b'\0')
-                exe=raw[0].rsplit(b'/',1)[-1] if raw else b''
-                if exe in (b'rsync',b'scp',b'sftp-server',b'tar',b'gzip'):
-                    raise ValueError('Actual transfer/export process remains')
+                lines=(process/'status').read_text().splitlines()
+                fields=[line.split(':',1)[1].split() for line in lines if line.startswith('Uid:')]
+                if len(fields)!=1 or len(fields[0])!=4:
+                    raise ValueError('Complete uploader UID observation unavailable')
+                if any(int(value)==uid for value in fields[0]):
+                    raise ValueError('Actual uploader UID process remains')
             except (FileNotFoundError,ProcessLookupError):
                 continue  # Process vanished; no named effect is inferred complete.
-            except PermissionError:
+            except (PermissionError,UnicodeError):
                 raise ValueError('Complete process observation unavailable')
         return True

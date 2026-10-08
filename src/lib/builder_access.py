@@ -43,6 +43,18 @@ def approved_mapping(record):
     return record
 
 
+def uploader_policy_bytes(record):
+    """Fixed host policy derived only from the root-approved mapping."""
+    username=approved_mapping(record)['username']
+    return {
+        '/etc/ssh/sshd_config.d/40-oxidex-uploader-fence.conf':
+            ('Match User '+username+'\n    ForceCommand /usr/local/sbin/oxidex-uploader-session\n'
+             '    DisableForwarding yes\n    PermitTTY no\nMatch all\n').encode(),
+        '/etc/sudoers.d/oxidex-uploader-session':
+            (username+' ALL=(root) NOPASSWD: /usr/local/sbin/oxidex-uploader-session\n').encode(),
+    }
+
+
 def uploader_enrollment_plan(record,account,group):
     approved_mapping(record)
     if group!={'name':'oxidex-build','gid':1001}:raise ValueError('Restricted build group collision')
@@ -104,10 +116,11 @@ def nofollow_root_json(path,expected_sha=None):
     finally:os.close(fd)
 
 
-def effective_sudo_guard(username):
+def effective_sudo_guard(username, *, require_uploader_session=False):
     """Read effective policy, including per-user/google-sudoers grants.
 
-    Sudo's verbose C-locale format must describe only the fixed root launcher.
+    Sudo's verbose C-locale format may grant only the fixed launcher and
+    uploader supervisor.
     Unknown output/options/RunAs identities fail closed; no command is executed.
     """
     result=subprocess.run(['/usr/bin/sudo','-n','-ll','-U',username],capture_output=True,text=True,
@@ -116,24 +129,34 @@ def effective_sudo_guard(username):
     if result.returncode==1:
         if not re.fullmatch(r'User '+re.escape(username)+r' is not allowed to run sudo on [A-Za-z0-9_.-]+\.\s*',result.stdout):
             raise ValueError('Unknown sudo denial output')
+        if require_uploader_session:raise ValueError('Uploader sudo grant is absent')
         return
     entries=result.stdout.split('Sudoers entry:')[1:]
     if not entries:raise ValueError('Unknown effective sudo policy format')
+    observed=set()
     for entry in entries:
         if entry.count('Commands:')!=1:raise ValueError('Unknown sudo command scope')
         metadata,commands=entry.split('Commands:')
         lines=[line.strip() for line in metadata.splitlines() if line.strip()]
         # Debian13 sudo prefixes the entry with its exact source filename.
-        if lines and lines[0]=='/etc/sudoers.d/oxidex-build':lines.pop(0)
+        if lines and lines[0] in ('/etc/sudoers.d/oxidex-build',
+                                  '/etc/sudoers.d/oxidex-uploader-session'):lines.pop(0)
         pairs=[line.split(':',1) for line in lines]
         if any(len(pair)!=2 for pair in pairs) or len({pair[0] for pair in pairs})!=len(pairs):
             raise ValueError('Unknown or duplicate effective sudo fields')
         fields=dict(pairs)
+        commands_seen=[line.strip() for line in commands.splitlines() if line.strip()]
         if (set(fields)-{'RunAsUsers','RunAsGroups','Options'} or fields.get('RunAsUsers','').strip()!='root'
             or fields.get('RunAsGroups','root').strip()!='root'
             or fields.get('Options','!authenticate').strip() not in ('!authenticate','authenticate')
-            or [line.strip() for line in commands.splitlines() if line.strip()]!=['/usr/local/bin/oxidex-remote-build']):
+            or commands_seen not in
+               (['/usr/local/bin/oxidex-remote-build'],
+                ['/usr/local/sbin/oxidex-uploader-session'])):
             raise ValueError('Uploader has broader effective sudo privileges')
+        if commands_seen[0] in observed:raise ValueError('Duplicate effective sudo grant')
+        observed.add(commands_seen[0])
+    if require_uploader_session and '/usr/local/sbin/oxidex-uploader-session' not in observed:
+        raise ValueError('Uploader sudo grant is absent')
 
 
 def enroll(record,expected_sha):

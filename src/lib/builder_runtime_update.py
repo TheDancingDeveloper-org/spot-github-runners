@@ -22,6 +22,10 @@ BOOT_GUARD_BYTES = (b'[Unit]\n'
 LAUNCHER_TARGET = '/usr/local/bin/oxidex-remote-build'
 
 QUALIFICATION = '/opt/oxidex-builder/qualification_trust/'
+POLICY_TARGETS = {
+    '/etc/ssh/sshd_config.d/40-oxidex-uploader-fence.conf': 0o644,
+    '/etc/sudoers.d/oxidex-uploader-session': 0o440,
+}
 TARGETS = {
     '/usr/local/bin/oxidex-remote-build': 0o755,
     '/usr/local/bin/docker': 0o755,
@@ -36,6 +40,7 @@ TARGETS = {
         'launcher_contract', 'mounts', 'qualification_source', 'runtime', 'reservation',
         'task20_receiver', 'control_observation', 'control_engine', 'task20_runtime')},
     QUALIFICATION + 'runtime_git.py': 0o555,
+    **POLICY_TARGETS,
 }
 
 
@@ -57,6 +62,46 @@ def validate_assets(assets):
             raise ValueError('Runtime asset differs from reviewed bytes')
         result[target] = raw
     return result
+
+
+def validate_policy_assets(assets):
+    """Reject policy bytes not derived from the existing root-owned mapping."""
+    import pwd
+    from .builder_access import approved_mapping, uploader_policy_bytes, restricted_group_guard
+    state, raw = root_file_read('/etc/oxidex-builder-uploader.json')
+    if state is None or state['mode'] & 0o077:
+        raise ValueError('Root-approved uploader mapping unavailable')
+    mapping = approved_mapping(json.loads(raw))
+    account = pwd.getpwnam(mapping['username'])
+    if account.pw_uid != mapping['uid']:
+        raise ValueError('Enrolled uploader account changed')
+    restricted_group_guard(mapping)
+    expected = uploader_policy_bytes(mapping)
+    decoded = validate_assets(assets)
+    if any(decoded[path] != raw for path, raw in expected.items()):
+        raise ValueError('Uploaded policy differs from fixed root-derived enrollment')
+    return mapping
+
+
+def validate_installed_policy(assets, mapping):
+    """Verify actual daemon policy while the update drain remains held."""
+    from .builder_access import effective_sudo_guard
+    decoded = validate_assets(assets)
+    for path, mode in POLICY_TARGETS.items():
+        state = root_file_state(path)
+        if (state is None or state['sha256'] != hashlib.sha256(decoded[path]).hexdigest()
+                or state['mode'] != mode):
+            raise ValueError('Installed uploader policy differs: ' + path)
+    checked_command(['/usr/sbin/sshd', '-t'])
+    checked_command(['/usr/sbin/visudo', '-cf', '/etc/sudoers.d/oxidex-uploader-session'])
+    checked_command(['/usr/sbin/visudo', '-c'])
+    username = mapping['username']
+    rows = dict(line.split(' ', 1) for line in checked_command(['/usr/sbin/sshd', '-T',
+        '-C', 'user='+username+',host=localhost,addr=127.0.0.1']).splitlines() if ' ' in line)
+    if (rows.get('forcecommand') != '/usr/local/sbin/oxidex-uploader-session'
+            or rows.get('disableforwarding') != 'yes' or rows.get('permittty') != 'no'):
+        raise ValueError('Effective uploader SSH policy differs')
+    effective_sudo_guard(username, require_uploader_session=True)
 
 
 
@@ -804,6 +849,9 @@ def admission_ready(plan, pid, ticks, *, wait=True):
 
 
 def observed_work_processes():
+    from .builder_access import approved_mapping
+    _, mapping_raw = root_file_read('/etc/oxidex-builder-uploader.json')
+    uploader_uid = approved_mapping(json.loads(mapping_raw))['uid']
     work_records = []
     for proc_path in Path('/proc').iterdir():
         if not proc_path.name.isdecimal():
@@ -811,10 +859,18 @@ def observed_work_processes():
         try:
             comm = (proc_path / 'comm').read_text().strip()
             argv = (proc_path / 'cmdline').read_bytes()
+            status = (proc_path / 'status').read_text().splitlines()
+            uid_rows = [row.split(':',1)[1].split() for row in status if row.startswith('Uid:')]
+            if len(uid_rows)!=1 or len(uid_rows[0])!=4:
+                raise ValueError('Incomplete uploader UID observation')
+            if any(int(uid)==uploader_uid for uid in uid_rows[0]):
+                work_records.append(dict(pid=int(proc_path.name),comm='uploader-uid',argv=[]))
         except (FileNotFoundError, ProcessLookupError):
             continue
+        except PermissionError as error:
+            raise ValueError('Complete work process observation unavailable') from error
         work_records.append(dict(pid=int(proc_path.name),comm=comm,argv=argv.split(b'\0')))
-    return active_work_processes(work_records)
+    return [row['pid'] for row in work_records if row['comm']=='uploader-uid']+active_work_processes(work_records)
 
 
 def parse_recovery_service_state(raw):
@@ -888,7 +944,8 @@ def live_snapshot(plan, *, committed_original=None):
         service_state = None
         service_pid, service_ticks = service_identity()
     executables = ('/usr/bin/git', '/usr/bin/ssh-keygen', '/usr/bin/python3',
-                   '/usr/bin/docker', '/usr/bin/systemctl')
+                   '/usr/bin/docker', '/usr/bin/systemctl', '/usr/bin/systemd-run',
+                   '/usr/bin/sudo', '/usr/sbin/sshd', '/usr/sbin/visudo')
     tools_ready = all(stat.S_ISREG(Path(p).stat().st_mode) and Path(p).stat().st_uid == 0
                       and not Path(p).stat().st_mode & 0o022
                       and os.access(p, os.X_OK) for p in executables)
@@ -1144,6 +1201,7 @@ def apply_update(plan):
     import time
     lock_guard, bind_lock = transaction_lock_guard()
     assets = validate_plan(plan, time.time())
+    uploader_mapping = validate_policy_assets(plan['assets'])
     journal_history = [None]
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
     trusted_directory(backup.parent)
@@ -1203,6 +1261,13 @@ def apply_update(plan):
                 atomic_write(target, assets[target], installed_mode, before_replace=before_replace)
                 record('FILE_REPLACED', target=target,
                        sha256=hashlib.sha256(assets[target]).hexdigest())
+            validate_installed_policy(plan['assets'], uploader_mapping)
+            # Reload only after both policy files and their effective grants
+            # are checked. A failure retains the drain and backup for recovery.
+            checked_command(['/usr/bin/systemctl', 'reload', 'ssh'])
+            validate_installed_policy(plan['assets'], uploader_mapping)
+            record('UPLOADER_POLICY_ENROLLED', policy={target:root_file_state(target)
+                   for target in POLICY_TARGETS})
             validate_plan(plan, time.time())
             mutation_idle_fence(plan)
             trusted_directory('/mnt/runner-data/remote-build/qualification-sealed', create=True)
@@ -1281,7 +1346,110 @@ def installed_history(plan, client_pin, *, recovery=False, with_history=False):
     rows = [json.loads(line) for line in journal.splitlines()]
     import time
     verify_installed_history(plan, original, rows, client_pin, time.time(), recovery=recovery)
+    validate_installed_policy(plan['assets'], validate_policy_assets(plan['assets']))
     return (backup, (journal_state, journal)) if with_history else backup
+
+
+def recover_policy_update(plan):
+    """Explicitly restore backed-up uploader policies under the retained drain.
+
+    This only repairs a partial apply. It never reopens admission, restores a
+    launcher, deletes the drain, or adopts a file with unknown bytes.
+    """
+    import time
+    validate_plan(plan, plan['observed_at'])
+    validate_policy_assets(plan['assets'])
+    backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
+    _, saved = root_file_read(backup/'plan.json')
+    if json.loads(saved) != plan:
+        raise ValueError('Recovery plan differs from root-saved update')
+    journal_state, journal_raw = root_file_read(backup/'journal.jsonl')
+    journal_selection = [(journal_state, journal_raw)]
+    stages = [json.loads(row).get('stage') for row in journal_raw.splitlines()]
+    if ('BACKUPS_COMPLETE' not in stages or any(stage in stages for stage in
+            ('FILES_AND_SERVICE_VERIFIED','FINISH_RELEASE_COMMITTED'))):
+        raise ValueError('Policy rollback requires an incomplete held apply')
+    already_rolled_back = stages[-1] == 'POLICY_ROLLED_BACK_HELD'
+    pending, pending_raw = root_file_read(PENDING_UPDATE)
+    if pending is None or json.loads(pending_raw) != dict(nonce=plan['nonce'],
+            boot=plan['boot'],source_main=plan['source_main']):
+        raise ValueError('Retained policy rollback hold differs')
+    verify_boot_guard()
+    lock_guard, bind_lock = transaction_lock_guard()
+    decoded = validate_assets(plan['assets'])
+    mapping_sha = root_file_state('/etc/oxidex-builder-uploader.json')['sha256']
+
+    def check():
+        lock_guard()
+        if root_file_read('/run/oxidex-build-draining')[1] != plan['nonce'].encode():
+            raise ValueError('Owned policy rollback drain changed')
+        if (checked_command(['/usr/bin/curl','-q','--fail','--silent','--show-error',
+             '--max-time','2','-H','Metadata-Flavor:Google',
+             'http://metadata.google.internal/computeMetadata/v1/instance/id']) != plan['vm_id']
+                or root_file_state('/etc/oxidex-remote-build.json')['sha256'] != plan['config_sha256']
+                or root_file_state('/etc/oxidex-builder-uploader.json')['sha256'] != mapping_sha
+                or json.loads(root_file_read(PENDING_UPDATE)[1]) !=
+                   dict(nonce=plan['nonce'],boot=plan['boot'],source_main=plan['source_main'])):
+            raise ValueError('Policy rollback host or hold changed')
+        if (json.loads(root_file_read('/var/lib/gha-admission/leases.json')[1]) != {}
+                or checked_command(['/usr/bin/docker','ps','-aq','--no-trunc'])
+                or observed_work_processes()):
+            raise ValueError('Policy rollback requires actual idle host')
+        if root_file_read(backup/'journal.jsonl') != journal_selection[0]:
+            raise ValueError('Policy rollback journal changed')
+
+    def restore():
+        check()
+        for target in POLICY_TARGETS:
+            index=sorted(TARGETS).index(target)
+            original=plan['before'][target]
+            backup_path=backup/(str(index)+'.before')
+            if original is None:
+                if root_file_state(backup_path) is not None:
+                    raise ValueError('Unexpected backup for absent policy')
+                old_raw=None
+            else:
+                saved_state, old_raw=root_file_read(backup_path)
+                if saved_state is None or hashlib.sha256(old_raw).hexdigest()!=original['sha256']:
+                    raise ValueError('Selected policy backup differs')
+            current=root_file_state(target)
+            def same_content(state, sha, mode):
+                return (state is not None and state['sha256']==sha and state['mode']==mode
+                        and state['uid']==0 and state['gid']==0)
+            if current is None and original is None:continue
+            if original is not None and same_content(current,original['sha256'],original['mode']):
+                continue
+            if not same_content(current,hashlib.sha256(decoded[target]).hexdigest(),POLICY_TARGETS[target]):
+                raise ValueError('Foreign policy state retained; rollback refused')
+            with retained_file_selection(target,current,lambda target=target:root_file_state(target)) as verify:
+                check();verify()
+                if old_raw is None:
+                    os.unlink(target)
+                    directory=os.open(Path(target).parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                    try:os.fsync(directory)
+                    finally:os.close(directory)
+                else:
+                    atomic_write(target,old_raw,original['mode'],before_replace=lambda:(check(),verify()))
+        checked_command(['/usr/sbin/sshd','-t'])
+        checked_command(['/usr/sbin/visudo','-c'])
+        checked_command(['/usr/bin/systemctl','reload','ssh'])
+        check()
+        for target in POLICY_TARGETS:
+            original=plan['before'][target]
+            current=root_file_state(target)
+            if (current is not None if original is None else
+                    current is None or current['sha256']!=original['sha256'] or
+                    current['mode']!=original['mode']):
+                raise ValueError('Restored policy differs from backup')
+        if not already_rolled_back:
+            journal_selection[0] = append_journal_record(backup/'journal.jsonl',dict(stage='POLICY_ROLLED_BACK_HELD',
+                observed_at=time.time(),policy={target:root_file_state(target) for target in POLICY_TARGETS}),
+                before_publish=lock_guard,selected_history=journal_selection[0])
+        return dict(status='POLICY_ROLLED_BACK_HELD',qualification_ready=False,
+                    nonce=plan['nonce'])
+
+    return finish_owned_drain('/run/oxidex-build.lock','/run/oxidex-build-draining',
+        plan['nonce'],check,restore,release=False,lock_bound=bind_lock,root_custody=True)
 
 
 def finish_update(plan, client_pin):
@@ -1675,6 +1843,7 @@ def main():
     actions.add_argument('--finish', action='store_true', help='Reopen an installed route; not qualification readiness')
     actions.add_argument('--recover-committed', action='store_true', help='Explicitly recover a committed release after reboot')
     actions.add_argument('--recover-finish', action='store_true', help='Restore a checked interrupted finish to held state')
+    actions.add_argument('--recover-policy', action='store_true', help='Restore backed-up uploader policy under the owned drain')
     parser.add_argument('--finish-nonce', help='Capture fresh observations for this installed update nonce')
     parser.add_argument('--client-launcher-sha256', help='Explicit paired client launcher pin')
     args = parser.parse_args()
@@ -1689,6 +1858,7 @@ def main():
             raise ValueError('Candidate assets differ from selected digest')
         assets = checked_json(raw, args.assets_sha256)
         validate_assets(assets)
+        validate_policy_assets(assets)
         if args.recover_committed:
             if not args.finish_nonce or not args.client_launcher_sha256:
                 parser.error('Committed recovery capture requires nonce and paired client pin')
@@ -1713,6 +1883,10 @@ def main():
     if state is None or state['sha256'] != args.plan_sha256:
         raise ValueError('Plan differs from the explicitly selected reviewed digest')
     plan = checked_json(raw, args.plan_sha256)
+    if args.recover_policy:
+        result = recover_policy_update(plan)
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.recover_committed:
         if not args.client_launcher_sha256:
             parser.error('Committed recovery requires paired client pin')

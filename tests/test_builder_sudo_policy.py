@@ -16,4 +16,11 @@ class SudoSourceHeaderTests(unittest.TestCase):
  def test_wider_commands_options_or_runas_refuse(self):
   for text in (ACTUAL.replace('/usr/local/bin/oxidex-remote-build','ALL'),ACTUAL.replace('RunAsUsers: root','RunAsUsers: ALL'),ACTUAL.replace('Options: !authenticate','Options: !authenticate, !use_pty')):
    with self.assertRaises(ValueError):self.assess(text)
+ def test_enrolled_wrapper_requires_exact_effective_grant(self):
+  wrapper='Sudoers entry: /etc/sudoers.d/oxidex-uploader-session\n    RunAsUsers: root\n    Options: !authenticate\n    Commands:\n\t/usr/local/sbin/oxidex-uploader-session\n'
+  with patch.object(access.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=ACTUAL+'\n'+wrapper,stderr='')):
+   access.effective_sudo_guard('oxidex-uploader',require_uploader_session=True)
+  with patch.object(access.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=ACTUAL,stderr='')):
+   with self.assertRaisesRegex(ValueError,'grant is absent'):
+    access.effective_sudo_guard('oxidex-uploader',require_uploader_session=True)
 if __name__=='__main__':unittest.main()

@@ -49,6 +49,7 @@ def render_builder_startup(args,deployment_id):
     replacements['DEPLOYMENT_ID']=deployment_id
     replacements['UPLOADER_CONFIG']=json.dumps(uploader,separators=(',',':'),sort_keys=True)
     replacements['UPLOADER_SHA']=uploader_sha
+    replacements['UPLOADER_USERNAME']=uploader['username']
     config=dict(role='builder',cpus=16,memory_gib=28,image=IMAGE,approved_image_id=None,
                 reservation_enrollment=dict(schema=1,enabled=False,uuid=None,device=None))
     admission=dict(role='builder',host_cpus=16,builder_cpus=16,work_gib=28,runner_gib=0,builder_gib=28,runner_names=[])
@@ -74,7 +75,8 @@ def readiness_source(deployment_id,hashes,disk_device_name='builder-cache'):
 from pathlib import Path
 import runpy
 module=runpy.run_path('/opt/gha-runners/host_admission.py',run_name='builder_readiness')
-for executable in ('/usr/bin/git','/usr/bin/ssh-keygen','/usr/bin/python3'):
+for executable in ('/usr/bin/git','/usr/bin/ssh-keygen','/usr/bin/python3',
+                   '/usr/bin/systemd-run','/usr/bin/sudo','/usr/sbin/sshd','/usr/sbin/visudo'):
     if not os.access(executable,os.X_OK):raise SystemExit('Host verifier dependency unavailable')
 subprocess.run(['/usr/bin/git','--version'],check=True,timeout=10,stdout=subprocess.DEVNULL)
 expected_hashes='''+repr(hashes)+'''
