@@ -6,7 +6,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
       perl cpanminus libarchive-zip-perl zlib1g-dev libzstd-dev libarchive-dev ca-certificates unzip zip xz-utils \
       zstd \
     && rm -rf /var/lib/apt/lists/* \
-    && install -d -o runner -g runner /runner-state /work \
+    && install -d -o runner -g runner /runner-state /work /opt/runner-rust/cargo /opt/runner-rust/rustup \
     && install -m 0444 /dev/null /run/oxidex-spot-runner
 COPY entrypoint.sh /usr/local/bin/gha-runner-entrypoint
 COPY job-completed.sh /usr/local/bin/gha-runner-job-completed.sh
@@ -15,9 +15,9 @@ COPY host_admission.py /usr/local/bin/gha-host-admission.py
 COPY clean_target.py /usr/local/bin/gha-runner-clean-target.py
 RUN chmod 0755 /usr/local/bin/gha-runner-job-started.sh /usr/local/bin/gha-runner-entrypoint /usr/local/bin/gha-runner-job-completed.sh
 USER runner
-ENV CARGO_HOME=/home/runner/.cargo
-ENV RUSTUP_HOME=/home/runner/.rustup
-ENV PATH=/home/runner/.cargo/bin:${PATH}
+ENV CARGO_HOME=/opt/runner-rust/cargo
+ENV RUSTUP_HOME=/opt/runner-rust/rustup
+ENV PATH=/opt/runner-rust/cargo/bin:${PATH}
 RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh \
     && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 \
     && rm /tmp/rustup-init.sh \
