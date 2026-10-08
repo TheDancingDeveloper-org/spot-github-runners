@@ -18,6 +18,7 @@ from unittest.mock import patch
 updater=Path(sys.argv[1])
 helper=Path(sys.argv[2])
 replacement=Path(sys.argv[3])
+initial_mode=int(sys.argv[4],8)
 scope=runpy.run_path(str(updater),run_name='isolated_standalone_updater')
 globals_=scope['validate_policy_assets'].__globals__
 assert globals_['__package__'] in (None,'')
@@ -38,17 +39,19 @@ assets={path:{'data':base64.b64encode(policy.get(path,uploaded)).decode(),
         for path in globals_['TARGETS']}
 helper_raw=helper.read_bytes()
 selected_helper=[helper_raw]
+selected_state={'mode':initial_mode,'uid':0,'gid':0}
 legacy=hashlib.sha256(helper_raw).hexdigest()==('463b7887505c9593d400ed8534b7a792038129690b7a4ad08bc5649533022e36')
 if helper.name=='builder_access_15asset.py':
     assert legacy, 'Retained installed helper bytes changed'
 if legacy:
     assert b'def uploader_policy_bytes' not in helper_raw
 assert len(globals_['TARGETS'])==24
+assert hashlib.sha256(helper_raw).hexdigest() in globals_['TRUSTED_BUILDER_ACCESS_SHA256']
 def root_read(path):
     if str(path)=='/opt/gha-runners/builder_access.py':
         raw=selected_helper[0]
-        return ({'sha256':hashlib.sha256(raw).hexdigest(),'mode':0o644,
-                 'uid':0,'gid':0,'device':1,'inode':1},raw)
+        return ({'sha256':hashlib.sha256(raw).hexdigest(),
+                 **selected_state,'device':1,'inode':1},raw)
     if str(path)=='/etc/oxidex-builder-uploader.json':
         raw=json.dumps(mapping).encode()
         return {'mode':0o600,'sha256':hashlib.sha256(raw).hexdigest()},raw
@@ -144,15 +147,40 @@ with tempfile.TemporaryDirectory() as poison:
             # The held install replaces the helper only after these pre-update
             # decisions. Post-install daemon validation then uses the candidate.
             selected_helper[0]=replacement.read_bytes()
+            selected_state['mode']=0o644
             globals_['validate_installed_policy'](assets,mapping)
     finally:sys.path.remove(poison)
-# A root-owned fixed-path identity is mandatory before any helper bytes run.
-saved=root_read
-globals_['root_file_read']=lambda path:({**saved(path)[0],'mode':0o666},saved(path)[1])
-try:
-    globals_['trusted_builder_access']()
-except ValueError as error:
-    assert 'Trusted installed builder access asset unavailable' in str(error)
-else:
-    raise AssertionError('Untrusted helper mode accepted')
+# Every accepted pre-update mode is exact; post-install state stays 0644.
+files={path:{'sha256':row['sha256'],'mode':globals_['TARGETS'][path]}
+       for path,row in assets.items()}
+files[globals_['LAUNCHER_TARGET']]['mode']=0o644
+pin=assets[globals_['LAUNCHER_TARGET']]['sha256']
+globals_['verify_installed_runtime'](assets,files,client_launcher_sha256=pin)
+files['/opt/gha-runners/builder_access.py']['mode']=0o600
+try:globals_['verify_installed_runtime'](assets,files,client_launcher_sha256=pin)
+except ValueError as error:assert 'Installed runtime bytes or held mode differ' in str(error)
+else:raise AssertionError('Post-install 0600 helper accepted')
+
+def refused(label):
+    try:globals_['trusted_builder_access']()
+    except ValueError as error:
+        assert 'Trusted installed builder access asset unavailable' in str(error),label
+    else:raise AssertionError('Untrusted helper accepted: '+label)
+for field,value in (('uid',1001),('gid',1001),('mode',0o666),('mode',0o640),
+                    ('mode',0o700),('mode',0o777)):
+    previous=selected_state[field];selected_state[field]=value
+    try:refused(field+'='+oct(value))
+    finally:selected_state[field]=previous
+selected_helper[0]=b'raise RuntimeError("unknown root code executed")\n'
+try:refused('unknown bytes')
+finally:selected_helper[0]=replacement.read_bytes()
+@contextmanager
+def red_ancestor(path,*,authenticate=False):
+    assert authenticate
+    raise ValueError('Untrusted selected ancestor')
+    yield
+with patch.dict(globals_,{'retained_ancestor_selection':red_ancestor}):
+    try:globals_['trusted_builder_access']()
+    except ValueError as error:assert 'Untrusted selected ancestor' in str(error)
+    else:raise AssertionError('Writable or symlinked parent accepted')
 print('isolated standalone policy capture/update/recovery, process and installed checks: PASS')

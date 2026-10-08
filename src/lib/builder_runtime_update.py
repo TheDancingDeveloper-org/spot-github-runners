@@ -44,6 +44,13 @@ TARGETS = {
     **POLICY_TARGETS,
 }
 
+# The installed 15-target helper and this release's 24-target helper are the
+# only reviewed policy code that may run before the replacement is held.
+TRUSTED_BUILDER_ACCESS_SHA256 = frozenset({
+    '463b7887505c9593d400ed8534b7a792038129690b7a4ad08bc5649533022e36',
+    'e24503f6f3de00f9360a77ef5706b5693b0bdf4dd1ed3afcbefc4ee4b574f64e',
+})
+
 
 def trusted_builder_access():
     """Load the installed root-owned policy asset in standalone -I mode.
@@ -57,9 +64,11 @@ def trusted_builder_access():
     path = Path('/opt/gha-runners/builder_access.py')
     with retained_ancestor_selection(path, authenticate=True) as verify_ancestors:
         state, raw = root_file_read(path)
-        if (state is None or state.get('uid') != 0 or state.get('mode') != TARGETS[str(path)]
+        if (state is None or state.get('uid') != 0 or state.get('gid') != 0
+                or state.get('mode') not in (0o600, TARGETS[str(path)])
                 or not 0 < len(raw) <= 262144
-                or state['sha256'] != hashlib.sha256(raw).hexdigest()):
+                or state.get('sha256') != hashlib.sha256(raw).hexdigest()
+                or state['sha256'] not in TRUSTED_BUILDER_ACCESS_SHA256):
             raise ValueError('Trusted installed builder access asset unavailable')
         with retained_file_selection(path, state, lambda: root_file_state(path)) as verify_file:
             code = compile(raw, str(path), 'exec')

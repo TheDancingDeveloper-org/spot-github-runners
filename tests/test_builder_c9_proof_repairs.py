@@ -41,10 +41,13 @@ class ProofRepairControls(unittest.TestCase):
             Path(directory,'builder_access.py').write_text('raise RuntimeError("cwd poison")\n')
             environment=dict(os.environ,PYTHONPATH=directory)
             for helper in helpers:
-                process=subprocess.run([sys.executable,'-I','-B',str(probe),str(updater),str(helper),str(helpers[1])],
-                                       cwd=directory,env=environment,capture_output=True,text=True)
-                self.assertEqual(process.returncode,0,str(helper)+'\n'+process.stdout+process.stderr)
-                self.assertIn('checks: PASS',process.stdout)
+                for mode in (0o600,0o644):
+                    with self.subTest(helper=helper.name,mode=oct(mode)):
+                        process=subprocess.run([sys.executable,'-I','-B',str(probe),str(updater),
+                                                str(helper),str(helpers[1]),oct(mode)],
+                                               cwd=directory,env=environment,capture_output=True,text=True)
+                        self.assertEqual(process.returncode,0,str(helper)+' '+oct(mode)+'\n'+process.stdout+process.stderr)
+                        self.assertIn('checks: PASS',process.stdout)
             entry=subprocess.run([sys.executable,'-I','-B',str(updater),'--help'],
                                  cwd=directory,env=environment,capture_output=True,text=True)
             self.assertEqual(entry.returncode,0,entry.stdout+entry.stderr)
