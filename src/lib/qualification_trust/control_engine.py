@@ -5,13 +5,16 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
+import time
 from . import reservation as custody
 from .control_observation import root_json,sealed_binding,quiescent
 from .task20_receiver import receive,MEMBERS,MAX_ARCHIVE
 
 BUILD=Path('/mnt/runner-data/remote-build')
+LOG_LIMIT=128*1024*1024
 
 
 def write(path,value,*,mode=0o400):
@@ -29,7 +32,7 @@ def file_digest(path):
     with Path(path).open('rb') as stream:
         for block in iter(lambda:stream.read(1024*1024),b''):
             total+=len(block)
-            if total>128*1024*1024:raise ValueError('Bounded control log exceeded; preserve bytes and hold')
+            if total>LOG_LIMIT:raise ValueError('Bounded control log exceeded; preserve bytes and hold')
             value.update(block)
     return value.hexdigest()
 
@@ -47,6 +50,74 @@ def own_unit():
 
 
 def idle(project):return quiescent(project,own_unit=own_unit())
+
+
+def stage_unit_processes():
+    """Read every process in the actual root-owned stage service cgroup."""
+    unit=own_unit()
+    rows=Path('/proc/self/cgroup').read_text().splitlines()
+    if unit is None or len(rows)!=1 or not rows[0].startswith('0::') or rows[0][3:].rsplit('/',1)[-1]!=unit:
+        raise ValueError('Actual stage scope unavailable; retain custody')
+    root=Path('/sys/fs/cgroup')/rows[0][3:].lstrip('/')
+    pending=[root];members=set()
+    while pending:
+        current=pending.pop();info=current.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:
+            raise ValueError('Untrusted stage cgroup; retain custody')
+        for row in (current/'cgroup.procs').read_text().splitlines():
+            if not row.isdecimal():raise ValueError('Unknown stage cgroup process')
+            members.add(int(row))
+        with os.scandir(current) as entries:
+            pending.extend(Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False))
+    if os.getpid() not in members:raise ValueError('Stage owner absent from actual cgroup')
+    return members
+
+
+def stop_stage_children(process):
+    """On excess output, stop the process group and every remaining unit child."""
+    try:os.killpg(process.pid,signal.SIGKILL)
+    except ProcessLookupError:pass
+    deadline=time.monotonic()+5
+    while True:
+        others=stage_unit_processes()-{os.getpid()}
+        if not others:break
+        for pid in others:
+            try:os.kill(pid,signal.SIGKILL)
+            except ProcessLookupError:pass
+        if time.monotonic()>=deadline:
+            raise ValueError('Stage descendants remain after output limit; retain custody')
+        time.sleep(.02)
+    process.wait()
+
+
+def capture_stage(argv,output,*,limit=LOG_LIMIT,scope_processes=stage_unit_processes):
+    """Stream one combined pipe in bounded blocks; the caller retains all locks."""
+    if type(limit) is not int or not 0<limit<=LOG_LIMIT:
+        raise ValueError('Invalid stage log bound')
+    process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,close_fds=True,start_new_session=True,
+        env={'PATH':'/usr/local/bin:/usr/bin:/bin','LANG':'C'})
+    count=0
+    try:
+        with process.stdout:
+            while True:
+                block=process.stdout.read(65536)
+                if not block:break
+                remaining=limit-count
+                if remaining:
+                    output.write(block[:remaining]);count+=min(len(block),remaining)
+                if len(block)>remaining:
+                    stop_stage_children(process)
+                    raise ValueError('Bounded control log exceeded during capture; custody held')
+        status=process.wait()
+        if scope_processes()!={os.getpid()}:
+            raise ValueError('Actual stage descendants remain; custody held')
+        return status
+    except BaseException:
+        if process.poll() is None:
+            try:stop_stage_children(process)
+            except Exception:pass  # Unknown descendants are retained as HELD.
+        raise
 
 
 def dossier(project):
@@ -174,10 +245,7 @@ def stage_locked(project,identity,ordinal,stream,*,protective_fds=()):
                 # boundary, so the canonical next bind may be replaced atomically.
                 temporary=path/('.proof-'+str(ordinal));write(temporary,proof,mode=0o444)
                 os.replace(temporary,path/'host-proof.json')
-                result=subprocess.run(['/usr/local/bin/oxidex-remote-build',project,*argv],
-                                      stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,
-                                      env={'PATH':'/usr/local/bin:/usr/bin:/bin','LANG':'C'})
-                status=result.returncode
+                status=capture_stage(['/usr/local/bin/oxidex-remote-build',project,*argv],output)
                 if ordinal==5 and status==0:
                     capture_pack(project,path)
             output.flush();os.fsync(output.fileno())
@@ -189,7 +257,62 @@ def stage_locked(project,identity,ordinal,stream,*,protective_fds=()):
         # never a retry or inferred terminal success, resolves partial effects.
         with store.locked():
             held=store.read();store.match(held,identity,host);held['state']='HELD';store.write(held)
+        if log.exists():
+            retained=os.open(log,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            try:
+                if os.fstat(retained).st_size>LOG_LIMIT:
+                    raise ValueError('Retained stage log exceeded fixed production bound')
+                os.fsync(retained)
+            finally:os.close(retained)
         raise
+
+
+def reconcile_old_boot_leases(project,record,host):
+    """Refresh only a proven dead dedicated host owner under caller's global EX."""
+    import importlib
+    admission=importlib.import_module('lib.host_admission' if __package__.startswith('lib.') else 'host_admission')
+    if record['host'][0]!=host[0] or record['host'][1]==host[1]:
+        raise ValueError('Same-VM distinct reboot proof required before lease refresh')
+    active=record['active']
+    if (active is None or active['command'] not in
+            ('task20-bootstrap','task20-execute','task20-pack','task20-replay')):
+        raise ValueError('No selected old container stage owns admission; custody held')
+    rows=root_json('/var/lib/gha-admission/leases.json')
+    if not isinstance(rows,dict) or len(rows)!=1:
+        raise ValueError('Unknown or foreign admission owner; custody held')
+    owner,amount=next(iter(rows.items()))
+    match=custody.re.fullmatch(r'host:([1-9][0-9]*):([1-9][0-9]*)',owner) if isinstance(owner,str) else None
+    if match is None or type(amount) not in (int,float) or amount!=28:
+        raise ValueError('Foreign admission owner; custody held')
+    config=root_json('/etc/gha-admission.json')
+    admission.builder_capacity_record(config)
+    # Same-VM new boot was validated by the caller. A current PID, even with
+    # different start ticks, may be a new foreign process and must hold.
+    pid=int(match[1])
+    def dead(selected):
+        if selected!=owner:raise ValueError('Admission ledger changed; custody held')
+        try:actual=admission.process_identity(pid)
+        except FileNotFoundError:return False
+        except (OSError,ValueError,IndexError) as error:
+            raise ValueError('Admission PID/start observation uncertain; custody held') from error
+        raise ValueError('Admission PID remains or was reused; custody held: '+actual)
+    # Observe all other fences before the canonical pool can alter its ledger.
+    # No unit/container/cgroup/transfer uncertainty is accepted as dead work.
+    if quiescent(project,own_unit=own_unit(),admission_leases=False) is not True:
+        raise ValueError('Complete quiescence unavailable; custody held')
+    unit='oxidex-reservation-'+record['reservation_id']+'-'+str(active['ordinal'])+'.service'
+    from .control_observation import command
+    state=command(['/usr/bin/systemctl','show',unit,
+                   '--property=ActiveState,MainPID,ControlGroup','--no-pager'])
+    fields=dict(row.split('=',1) for row in state.splitlines() if '=' in row)
+    if fields!={'ActiveState':'inactive','MainPID':'0','ControlGroup':''}:
+        raise ValueError('Old stage unit/cgroup presence uncertain; custody held')
+    # Recheck actual absence immediately before LeasePool's locked refresh.
+    dead(owner)
+    pool=admission.LeasePool('/var/lib/gha-admission/leases.json',28,alive=dead)
+    pool.refresh()
+    if root_json('/var/lib/gha-admission/leases.json')!={}:
+        raise ValueError('Admission refresh left a retained lease; custody held')
 
 
 class activity:
@@ -324,13 +447,17 @@ def reconcile_reboot(project,identity,expected_old_boot):
     VM requires separately authenticated provider-absence/disk-ownership proof.
     """
     store=custody.Store();host=custody.host_identity();custody.enrollment()
-    idle(project)
     with store.locked():
         record=store.read()
         if record is None or record['reservation_id']!=identity or record['session']['project']!=project:
             raise ValueError('Exact retained reboot custody required')
         if record['host'][0]!=host[0] or record['host'][1]!=expected_old_boot or host[1]==expected_old_boot:
             raise ValueError('Same provider VM and distinct actual reboot required')
+        try:idle(project)
+        except ValueError as error:
+            if str(error)!='Actual admission leases remain; never clear them':raise
+            reconcile_old_boot_leases(project,record,host)
+            idle(project)
         path=dossier(project);actor=custody.current_actor()
         custody.validate_actor(actor)
         evidence_path=path/'reboot-reconciliation.json';log=path/'reboot-cleanup.log'
@@ -374,11 +501,37 @@ def reconcile_reboot(project,identity,expected_old_boot):
             directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
             try:os.fsync(directory)
             finally:os.close(directory)
+        ordinal=len(record['stages'])-1
+        completed=(not released and record['active'] is None and record['next_ordinal']==len(record['stages'])
+                   and record['events'] and record['events'][-1].get('ordinal')==ordinal
+                   and record['events'][-1].get('command')=='cleanup'
+                   and record['events'][-1].get('exit_code')==0
+                   and record['events'][-1].get('disposition') is None)
+        terminal=(record['events'][-1] if completed else
+                  {'ordinal':ordinal,'command':'cleanup','actor':evidence['actor'],
+                   'exit_code':0,'log_sha256':file_digest(log)})
+        if completed:
+            # The ordinal-7 log and actor belong to the already completed
+            # stage. Reboot evidence has its own log and publication actor.
+            stage_log=dossier(project)/('stage-'+str(ordinal)+'.log')
+            if (set(terminal)!={'ordinal','command','actor','exit_code','log_sha256'}
+                    or terminal.get('log_sha256')!=file_digest(stage_log)):
+                raise ValueError('Completed cleanup differs from retained stage log')
         if released:
-            ordinal=len(record['stages'])-1
-            terminal={'ordinal':ordinal,'command':'cleanup','actor':evidence['actor'],
-                      'exit_code':0,'log_sha256':file_digest(log)}
             events=record['events']
+            stage_terminal=events[-1] if events else None
+            if stage_terminal!=terminal:
+                stage_log=path/('stage-'+str(ordinal)+'.log')
+                if (not stage_terminal or stage_terminal.get('ordinal')!=ordinal
+                        or stage_terminal.get('command')!='cleanup' or stage_terminal.get('exit_code')!=0
+                        or stage_terminal.get('disposition') is not None
+                        or set(stage_terminal)!={'ordinal','command','actor','exit_code','log_sha256'}
+                        or not stage_log.exists()
+                        or stage_terminal.get('log_sha256')!=file_digest(stage_log)
+                        or not any(custody.digest({**record,'state':state})==evidence['record_sha256']
+                                   for state in ('SOURCE_VERIFIED','RECOVERING'))):
+                    raise ValueError('Released cleanup differs from retained stage log')
+                terminal=stage_terminal
             # Earlier interrupted/refused cleanup attempts are durable history.
             # Only the final, unique successful event reconciles this evidence.
             if (not events or events[-1]!=terminal
@@ -390,12 +543,10 @@ def reconcile_reboot(project,identity,expected_old_boot):
         if record['active'] is not None:
             record['events'].append({**record['active'],'exit_code':None,'log_sha256':None,
                                      'disposition':'INTERRUPTED'})
-        ordinal=len(record['stages'])-1
         # The evidence and log may have been published by an earlier caller.
         # Keep that authenticated publication identity in the terminal receipt;
         # the current caller was observed independently above.
-        record['events'].append({'ordinal':ordinal,'command':'cleanup','actor':evidence['actor'],
-                                 'exit_code':0,'log_sha256':file_digest(log)})
+        if not completed:record['events'].append(terminal)
         record.update(state='RELEASED',active=None,next_ordinal=len(record['stages']))
         # Preserve original host and signed claim; separate evidence records the
         # new boot. No old stage is replayed or promoted to a successful build.

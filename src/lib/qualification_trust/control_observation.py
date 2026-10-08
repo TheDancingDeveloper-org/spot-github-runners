@@ -71,7 +71,7 @@ def sealed_binding(root, session):
     return actual
 
 
-def quiescent(project, *, own_unit=None):
+def quiescent(project, *, own_unit=None, admission_leases=True):
     """Observe complete host state under caller's global EX/SH fence.
 
     own_unit must be independently derived from the actual control process,
@@ -96,7 +96,7 @@ def quiescent(project, *, own_unit=None):
         if path.exists() or path.is_symlink():raise ValueError('Foreign maintenance hold; preserve ownership')
     ids=command(['/usr/bin/docker','ps','-aq','--no-trunc']).split()
     if ids:raise ValueError('Actual container transaction remains; custody retained')
-    if root_json('/var/lib/gha-admission/leases.json')!={}:
+    if admission_leases and root_json('/var/lib/gha-admission/leases.json')!={}:
         raise ValueError('Actual admission leases remain; never clear them')
     units=command(['/usr/bin/systemctl','list-units','--type=service',
                    '--state=active,activating,deactivating','--no-legend','--plain','--no-pager'])

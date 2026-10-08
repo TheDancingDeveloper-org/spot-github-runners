@@ -21,6 +21,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
 from lib import builder_runtime_update as update
 from lib import builder_access
+from lib import host_admission
 from lib.builder_access import uploader_policy_bytes
 from lib.qualification_trust import control_observation as observation
 from lib.qualification_trust import control_engine as engine
@@ -32,6 +33,196 @@ PROJECT='qualification-'+'a'*12+'-'+'b'*32
 
 
 class ProofRepairControls(unittest.TestCase):
+    def test_reboot_refreshes_only_proven_dead_old_stage_lease_with_canonical_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger=Path(directory)/'leases.json'
+            owner='host:987654:12345'
+            record={'reservation_id':'a'*32,'active':{'ordinal':3,'command':'task20-bootstrap'},
+                    'host':['123','old-boot']}
+            original_pool=host_admission.LeasePool
+            def selected_pool(path,*args,**kwargs):
+                self.assertEqual(str(path),'/var/lib/gha-admission/leases.json')
+                return original_pool(ledger,*args,**kwargs)
+            def selected_json(path):
+                if str(path).endswith('/leases.json'):return json.loads(ledger.read_text())
+                if str(path)=='/etc/gha-admission.json':return {'role':'builder','runner_names':[],
+                    'host_cpus':16,'builder_cpus':16,'work_gib':28,'builder_gib':28,'runner_gib':0}
+                raise AssertionError(path)
+            def absent(pid):raise FileNotFoundError(pid)
+            inactive='ActiveState=inactive\nMainPID=0\nControlGroup=\n'
+            with patch.object(engine,'root_json',side_effect=selected_json),\
+                 patch.object(engine,'quiescent',return_value=True),\
+                 patch.object(engine,'own_unit',return_value=None),\
+                 patch.object(observation,'command',return_value=inactive),\
+                 patch.object(host_admission,'LeasePool',side_effect=selected_pool),\
+                 patch.object(host_admission,'process_identity',side_effect=absent) as identity:
+                ledger.write_text(json.dumps({owner:28}))
+                engine.reconcile_old_boot_leases(PROJECT,record,('123','new-boot'))
+                self.assertEqual(json.loads(ledger.read_text()),{})
+                self.assertGreaterEqual(identity.call_count,2)
+                for observed in (owner,'host:987654:99999'):
+                    ledger.write_text(json.dumps({owner:28}))
+                    with patch.object(host_admission,'process_identity',return_value=observed):
+                        with self.assertRaisesRegex(ValueError,'PID remains or was reused'):
+                            engine.reconcile_old_boot_leases(PROJECT,record,('123','new-boot'))
+                    self.assertEqual(json.loads(ledger.read_text()),{owner:28})
+                ledger.write_text(json.dumps({owner:28}))
+                with patch.object(host_admission,'process_identity',side_effect=PermissionError('unknown')):
+                    with self.assertRaisesRegex(ValueError,'observation uncertain'):
+                        engine.reconcile_old_boot_leases(PROJECT,record,('123','new-boot'))
+                self.assertEqual(json.loads(ledger.read_text()),{owner:28})
+                ledger.write_text(json.dumps({'runner:foreign':28}))
+                with self.assertRaisesRegex(ValueError,'Foreign admission owner'):
+                    engine.reconcile_old_boot_leases(PROJECT,record,('123','new-boot'))
+                self.assertEqual(json.loads(ledger.read_text()),{'runner:foreign':28})
+                ledger.write_text(json.dumps({owner:28}))
+                with patch.object(observation,'command',return_value='ActiveState=active\nMainPID=3\nControlGroup=/live\n'):
+                    with self.assertRaisesRegex(ValueError,'unit/cgroup'):
+                        engine.reconcile_old_boot_leases(PROJECT,record,('123','new-boot'))
+                self.assertEqual(json.loads(ledger.read_text()),{owner:28})
+                with self.assertRaisesRegex(ValueError,'No selected old container stage'):
+                    engine.reconcile_old_boot_leases(PROJECT,{**record,'active':None},('123','new-boot'))
+
+    def test_completed_cleanup_is_reused_with_its_original_actor_and_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory);original={'pid':11,'start':22};new={'pid':33,'start':44}
+            stage_log=path/'stage-7.log';stage_log.write_bytes(b'actual completed cleanup\n')
+            stages=[{'command':name} for name in ('prepare','upload-receive','verify-source',
+                'task20-bootstrap','task20-execute','task20-pack','task20-replay','cleanup')]
+            event={'ordinal':7,'command':'cleanup','actor':original,'exit_code':0,
+                   'log_sha256':hashlib.sha256(stage_log.read_bytes()).hexdigest()}
+            record={'reservation_id':'r','session':{'project':PROJECT},'host':['123','old-boot'],
+                    'state':'SOURCE_VERIFIED','active':None,'events':[event],'stages':stages,'next_ordinal':8}
+            class Store:
+                def locked(self):
+                    from contextlib import nullcontext
+                    return nullcontext()
+                def read(self):return record
+                def write(self,value):record.update(value)
+            original_fstat=os.fstat
+            def root_fstat(fd):
+                info=original_fstat(fd);values=list(info);values[4]=0
+                return os.stat_result(values)
+            actor=[new]
+            with patch.object(engine,'idle',return_value=True),patch.object(engine,'dossier',return_value=path),\
+                 patch.object(custody,'Store',return_value=Store()),\
+                 patch.object(custody,'host_identity',return_value=('123','new-boot')),\
+                 patch.object(custody,'enrollment',return_value={}),\
+                 patch.object(custody,'current_actor',side_effect=lambda:actor[0]),\
+                 patch.object(engine,'root_json',side_effect=lambda file:json.loads(Path(file).read_text())),\
+                 patch.object(engine.os,'fstat',side_effect=root_fstat):
+                self.assertEqual(engine.reconcile_reboot(PROJECT,'r','old-boot')['state'],'RELEASED')
+                self.assertEqual(record['events'],[event])
+                evidence=json.loads((path/'reboot-reconciliation.json').read_text())
+                self.assertEqual(evidence['actor'],new)
+                self.assertNotEqual(event['log_sha256'],hashlib.sha256((path/'reboot-cleanup.log').read_bytes()).hexdigest())
+                actor[0]={'pid':55,'start':66}
+                self.assertEqual(engine.reconcile_reboot(PROJECT,'r','old-boot')['events'],[event])
+                stage_log.write_bytes(b'tampered')
+                with self.assertRaisesRegex(ValueError,'retained stage log'):
+                    engine.reconcile_reboot(PROJECT,'r','old-boot')
+
+    def test_stage_capture_bounds_pipe_before_file_growth_and_holds_descendants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output=Path(directory)/'stage.log'
+            # Test-only bound; stage_locked always uses the fixed production default.
+            with output.open('wb') as stream:
+                command=[sys.executable,'-c','import sys;sys.stdout.buffer.write(b"x"*8192)']
+                def stop(process):
+                    process.wait()
+                with patch.object(engine,'stop_stage_children',side_effect=stop) as stopped:
+                    with self.assertRaisesRegex(ValueError,'during capture'):
+                        engine.capture_stage(command,stream,limit=1024,
+                                             scope_processes=lambda:{os.getpid()})
+                    self.assertEqual(stopped.call_count,1)
+            self.assertEqual(output.stat().st_size,1024)
+            with output.open('wb') as stream:
+                self.assertEqual(engine.capture_stage([sys.executable,'-c',
+                    'import sys;sys.stdout.write("ok");sys.stderr.write("err")'],stream,
+                    limit=1024,scope_processes=lambda:{os.getpid()}),0)
+            self.assertIn(output.read_bytes(),(b'okerr',b'errok'))
+            with output.open('wb') as stream:
+                with self.assertRaisesRegex(ValueError,'descendants remain'):
+                    engine.capture_stage([sys.executable,'-c','pass'],stream,limit=1024,
+                                         scope_processes=lambda:{os.getpid(),999999})
+            lock=os.open(Path(directory)/'parent.lock',os.O_CREAT|os.O_RDWR,0o600)
+            try:
+                os.set_inheritable(lock,True)
+                with output.open('wb') as stream:
+                    script='import os,sys\ntry: os.fstat('+str(lock)+'); sys.stdout.write("leaked")\nexcept OSError: sys.stdout.write("closed")\n'
+                    self.assertEqual(engine.capture_stage([sys.executable,'-c',script],stream,
+                        limit=1024,scope_processes=lambda:{os.getpid()}),0)
+                self.assertEqual(output.read_bytes(),b'closed')
+            finally:os.close(lock)
+
+    def test_all_four_container_ordinals_use_bounded_capture_and_forward_failure(self):
+        actor={'pid':11,'start':22};host=('123','new-boot')
+        session={'project':PROJECT,'head':'a'*40,'bundle_sha256':'b'*64}
+        names=['prepare','upload-receive','verify-source','task20-bootstrap',
+               'task20-execute','task20-pack','task20-replay','cleanup']
+        record={'session':session,'stages':[{'command':name,'argv_sha256':'c'*64}
+                  for name in names]}
+        request={'session':session,'argv':[['fixed-'+str(index)] for index in range(8)]}
+        class Store:
+            def begin(self,*args,**kwargs):pass
+            def finish(self,identity,ordinal,**kwargs):
+                return {'ordinal':ordinal,'exit_code':kwargs['exit_code']}
+        for ordinal in (3,4,5,6):
+            with self.subTest(ordinal=ordinal),tempfile.TemporaryDirectory() as directory:
+                path=Path(directory)
+                def capture(argv,output):
+                    self.assertEqual(argv,['/usr/local/bin/oxidex-remote-build',PROJECT,'fixed-'+str(ordinal)])
+                    output.write(b'bounded output\n')
+                    return 17 if ordinal==6 else 0
+                with patch.object(engine,'selected',return_value=(path,request,record)),\
+                     patch.object(engine,'idle',return_value=True),\
+                     patch.object(engine,'capture_stage',side_effect=capture) as captured,\
+                     patch.object(engine,'capture_pack'),\
+                     patch.object(engine,'file_digest',return_value='d'*64),\
+                     patch.object(custody,'Store',return_value=Store()),\
+                     patch.object(custody,'host_identity',return_value=host),\
+                     patch.object(custody,'current_actor',return_value=actor):
+                    result=engine.stage_locked(PROJECT,'r',ordinal,None)
+                self.assertEqual(captured.call_count,1)
+                self.assertEqual(result['exit_code'],17 if ordinal==6 else 0)
+                self.assertEqual((path/('stage-'+str(ordinal)+'.log')).read_bytes(),b'bounded output\n')
+
+    def test_stage_capture_failure_retains_partial_log_and_held_owner(self):
+        actor={'pid':11,'start':22};host=('123','new-boot')
+        record={'state':'SOURCE_VERIFIED','reservation_id':'r','active':{'ordinal':3,'actor':actor}}
+        class Store:
+            def locked(self):
+                from contextlib import nullcontext
+                return nullcontext()
+            def begin(self,*args,**kwargs):pass
+            def read(self):return record
+            def match(self,selected,identity,observed):
+                assert selected is record and identity=='r' and observed==host
+            def write(self,value):record.update(value)
+            def finish(self,*args,**kwargs):raise AssertionError('uncertain stage must not finish')
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)
+            session={'project':PROJECT,'head':'a'*40,'bundle_sha256':'b'*64}
+            selected_record={**record,'session':session,'stages':[
+                {'command':name,'argv_sha256':'c'*64} for name in
+                ('prepare','upload-receive','verify-source','task20-bootstrap')]}
+            request={'session':session,'argv':[[],[],[],['fixed']]}
+            def overflow(argv,output):
+                output.write(b'bounded partial\n')
+                raise ValueError('Bounded control log exceeded during capture; custody held')
+            with patch.object(engine,'selected',return_value=(path,request,selected_record)),\
+                 patch.object(engine,'idle',return_value=True),\
+                 patch.object(engine,'capture_stage',side_effect=overflow),\
+                 patch.object(engine,'file_digest',return_value='d'*64),\
+                 patch.object(custody,'Store',return_value=Store()),\
+                 patch.object(custody,'host_identity',return_value=host),\
+                 patch.object(custody,'current_actor',return_value=actor):
+                with self.assertRaisesRegex(ValueError,'during capture'):
+                    engine.stage_locked(PROJECT,'r',3,None)
+            self.assertEqual(record['state'],'HELD')
+            self.assertEqual(record['active'],{'ordinal':3,'actor':actor})
+            self.assertEqual((path/'stage-3.log').read_bytes(),b'bounded partial\n')
+
     def test_runtime_updater_isolated_standalone_entry_and_policy_paths(self):
         updater=ROOT/'src/lib/builder_runtime_update.py'
         helpers=(ROOT/'tests/fixtures/builder_access_15asset.py',
