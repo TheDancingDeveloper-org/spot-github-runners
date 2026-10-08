@@ -115,6 +115,18 @@ printf '%s\n' '{{ADMISSION_CONFIG}}' >/etc/gha-admission.json
 printf '%s\n' '{{UPLOADER_CONFIG}}' >/etc/oxidex-builder-uploader.json
 chmod 0600 /etc/oxidex-builder-uploader.json
 chmod 0644 /etc/oxidex-remote-build.json /etc/gha-admission.json
+python3 -B - <<'RESERVATION_ENROLLMENT'
+import json,os,sys
+from pathlib import Path
+sys.path.insert(0,'/opt/oxidex-builder')
+from qualification_trust.reservation import subprocess_storage
+uuid,device=subprocess_storage()
+path=Path('/etc/oxidex-remote-build.json')
+config=json.loads(path.read_text())
+config['reservation_enrollment']={'schema':1,'enabled':True,'uuid':uuid,'device':device}
+with path.open('w') as output:
+    json.dump(config,output,sort_keys=True);output.flush();os.fsync(output.fileno())
+RESERVATION_ENROLLMENT
 chmod 0755 /usr/local/bin/oxidex-remote-build /usr/local/bin/docker
 python3 - <<'HOST_HEADROOM'
 import os,runpy

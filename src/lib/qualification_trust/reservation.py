@@ -17,6 +17,7 @@ import uuid
 import urllib.request
 
 ROOT = Path('/mnt/runner-data/remote-build/qualification-reservations')
+CONFIG = Path('/etc/oxidex-remote-build.json')
 LIMIT = 65536
 COMMANDS = frozenset({'prepare', 'upload', 'verify-source', 'bootstrap',
                       'execute', 'pack', 'replay', 'cleanup'})
@@ -45,6 +46,30 @@ def digest(value):
 def validate_actor(actor):
     if not isinstance(actor, dict) or set(actor) != {'pid', 'start'} or any(type(actor[key]) is not int or actor[key] <= 0 for key in actor):
         raise ValueError('Actual PID and start tick identity required')
+
+
+def command_arguments(command, argv, session):
+    """Current fixed host allowlist; Task20 IDs require authenticated additions."""
+    if not isinstance(argv, list) or any(not isinstance(arg, str) for arg in argv):
+        raise ValueError('Fixed stage argument list required')
+    head = session['head']; project = session['project']; bundle = session['bundle_sha256']
+    output = '/target/ops/evidence/remote-qualification/'+project
+    base = ['python3', '/target/checkout/tools/remote-build/qualification.py']
+    fixed = {
+        'prepare': ['prepare'], 'upload': ['upload'], 'cleanup': ['cleanup'],
+        'verify-source': ['verify-source', '--head', head, '--bundle-sha256', bundle, '--run-id', project],
+        'execute': base+['--remote-run', '--output', output, '--expected-head', head],
+        'pack': base+['--pack-results', '--output', output, '--expected-head', head, '--result-file', '/target/pack-result.json'],
+        'replay': base+['--verify-results-tar', '/target/results.tar.gz', '--output', output, '--expected-head', head, '--result-file', '/target/replay-result.json'],
+    }
+    if command == 'bootstrap':
+        prefix = ['python3', '/src/qualification_bootstrap.py', '--head', head, '--output', output,
+                  '--bundle-sha256', bundle, '--signers-sha256']
+        if len(argv) == 10 and argv[:9] == prefix and re.fullmatch('[0-9a-f]{64}', argv[9]):
+            return
+    elif command in fixed and argv == fixed[command]:
+        return
+    raise ValueError('Command ID differs from fixed host arguments; unsupported Task20 command')
 
 
 def record_name(filename):
@@ -208,6 +233,8 @@ class Store:
     def acquire(self, session, stages, *, host, owner, authenticate, quiescent):
         validate_session(session, stages)
         validate_actor(owner)
+        if self.root == ROOT and enrollment() is None:
+            raise ValueError('Production reservation requires explicit mounted-storage enrollment')
         if host != (session['expected_vm_id'], session['expected_boot']):
             raise ValueError('Actual host differs from reservation claim')
         # authenticate verifies actual detached bytes/signature, never a boolean
@@ -245,6 +272,7 @@ class Store:
             if type(ordinal) is not int or not 0 <= ordinal < len(record['stages']) or record['state'] in ('HELD', 'RELEASED') or record['active'] is not None or ordinal != record['next_ordinal']:
                 raise ValueError('Stage replay, gap or uncertain prior stage')
             stage = record['stages'][ordinal]
+            command_arguments(stage['command'], argv, record['session'])
             if digest(argv) != stage['argv_sha256']:
                 raise ValueError('Stage argv differs from reviewed command')
             if stage['command'] not in ('prepare', 'upload', 'verify-source', 'cleanup') and record['state'] != 'SOURCE_VERIFIED':
@@ -380,24 +408,80 @@ def current_actor():
 
 def ancestor_matches(actor, pid):
     validate_actor(actor)
+    chain = []
     for _ in range(64):
         if pid <= 0:
             return False
         observed, parent = process(pid)
+        if chain and observed['start'] > chain[-1][0]['start']:
+            raise ValueError('Parent started after child; PID reuse or invalid ancestry')
+        chain.append((observed, parent))
         if observed == actor:
             status = Path('/proc/'+str(pid)+'/status').read_text()
             uid = next(line for line in status.splitlines() if line.startswith('Uid:')).split()[1:]
-            return uid == ['0', '0', '0', '0'] and process(pid)[0] == actor
+            if uid != ['0', '0', '0', '0']:
+                return False
+            # Recheck complete adjacent links after reaching the authorized root.
+            for index, (selected, selected_parent) in enumerate(chain):
+                if process(selected['pid']) != (selected, selected_parent):
+                    raise ValueError('Ancestry changed before grant')
+                if index+1 < len(chain) and selected_parent != chain[index+1][0]['pid']:
+                    raise ValueError('Ancestry link differs')
+            return True
         if process(pid) != (observed, parent):
             raise ValueError('Stage ancestry changed during observation')
         pid = parent
     raise ValueError('Stage ancestry bound exceeded')
 
 
+def enrollment():
+    """Read trusted boot configuration; absent enrolled cache is not idleness."""
+    fd = os.open(CONFIG, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > 16384:
+            raise ValueError('Untrusted builder enrollment configuration')
+        config = json.loads(os.read(fd, 16385), object_pairs_hook=pairs)
+    finally:
+        os.close(fd)
+    legacy = {'role', 'cpus', 'memory_gib', 'image', 'approved_image_id'}
+    if (isinstance(config, dict) and set(config) == legacy and config.get('role') == 'builder'
+            and type(config.get('cpus')) is int and config['cpus'] == 16
+            and type(config.get('memory_gib')) is int and config['memory_gib'] == 28
+            and config.get('image') == 'oxidex-remote-builder:1.99.0'
+            and (config.get('approved_image_id') is None or isinstance(config['approved_image_id'], str)
+                 and re.fullmatch('sha256:[0-9a-f]{64}', config['approved_image_id']))):
+        return None  # Explicitly recognized historical configuration schema.
+    policy = config.get('reservation_enrollment') if isinstance(config, dict) else None
+    if not isinstance(policy, dict) or set(policy) != {'schema', 'enabled', 'uuid', 'device'} or type(policy['schema']) is not int or policy['schema'] != 1 or type(policy['enabled']) is not bool:
+        raise ValueError('Unknown reservation enrollment')
+    if not policy['enabled']:
+        if policy['uuid'] is not None or policy['device'] is not None:
+            raise ValueError('Unenrolled policy has unexpected storage identity')
+        return None
+    if not isinstance(policy['uuid'], str) or not re.fullmatch('[0-9a-f-]{36}', policy['uuid']) or type(policy['device']) is not int or policy['device'] <= 0:
+        raise ValueError('Enrolled storage identity missing')
+    mounted = subprocess_storage()
+    if mounted != (policy['uuid'], policy['device']):
+        raise ValueError('Enrolled cache mount unavailable or replaced; custody held')
+    return policy
+
+
+def subprocess_storage():
+    import subprocess
+    result = subprocess.run(['/usr/bin/findmnt', '-n', '-o', 'TARGET,UUID,FSTYPE', '--mountpoint', '/mnt/runner-data'],
+                            check=True, capture_output=True, text=True, timeout=5)
+    fields = result.stdout.split()
+    if result.stderr or len(fields) != 3 or fields[0] != '/mnt/runner-data' or fields[2] != 'ext4':
+        raise ValueError('Complete expected cache mount required')
+    return fields[1], Path('/mnt/runner-data').stat().st_dev
+
+
 def host_identity():
-    request = urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/id',
+    request = urllib.request.Request('http://169.254.169.254/computeMetadata/v1/instance/id',
                                      headers={'Metadata-Flavor': 'Google'})
-    with urllib.request.urlopen(request, timeout=3) as response:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=3) as response:
         if response.headers.get('Metadata-Flavor') != 'Google':
             raise ValueError('Unknown metadata identity response')
         identity = response.read(32).decode().strip()
@@ -409,8 +493,11 @@ def host_identity():
 
 def route_guard(project=None, *, pid=None, argv=None):
     """Read-side enrollment; caller retains global SH around all guarded work."""
+    policy = enrollment()
     if not ROOT.exists() and not ROOT.is_symlink():
-        return  # Historical installation, no reservation feature provisioned.
+        if policy is not None:
+            raise ValueError('Enrolled persistent custody directory unavailable')
+        return  # Trusted explicit historical/unenrolled configuration only.
     store = Store()
     with store.locked():
         record = store.read()
@@ -425,5 +512,7 @@ def route_guard(project=None, *, pid=None, argv=None):
             raise ValueError('Host reserved for another actual stage process')
         if argv is not None and digest(argv) != record['stages'][record['active']['ordinal']]['argv_sha256']:
             raise ValueError('Stage command differs from root-reviewed descriptor')
+        if argv is not None:
+            command_arguments(record['active']['command'], argv, record['session'])
         if argv == ['cleanup']:
             raise ValueError('Reservation cleanup is custody-only; preserve source and evidence')

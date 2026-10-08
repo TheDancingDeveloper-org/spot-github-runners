@@ -24,8 +24,18 @@ class ReservationTests(unittest.TestCase):
         self.head = 'a'*40
         self.project = 'qualification-'+self.head[:12]+'-'+'b'*32
         self.host = ('438', '0b99c4d2-ca5f-4471-bf84-ff4ab8dbefd3')
-        self.argv = [['prepare'], ['upload'], ['verify-source'], ['bootstrap'], ['execute'], ['pack'], ['replay'], ['cleanup']]
-        self.stages = [dict(ordinal=i, command=argv[0], argv_sha256=reservation.digest(argv)) for i, argv in enumerate(self.argv)]
+        self.commands = ['prepare', 'upload', 'verify-source', 'bootstrap', 'execute', 'pack', 'replay', 'cleanup']
+        output = '/target/ops/evidence/remote-qualification/'+self.project
+        base = ['python3', '/target/checkout/tools/remote-build/qualification.py']
+        self.argv = [['prepare'], ['upload'],
+            ['verify-source', '--head', self.head, '--bundle-sha256', 'd'*64, '--run-id', self.project],
+            ['python3', '/src/qualification_bootstrap.py', '--head', self.head, '--output', output,
+             '--bundle-sha256', 'd'*64, '--signers-sha256', 'f'*64],
+            base+['--remote-run', '--output', output, '--expected-head', self.head],
+            base+['--pack-results', '--output', output, '--expected-head', self.head, '--result-file', '/target/pack-result.json'],
+            base+['--verify-results-tar', '/target/results.tar.gz', '--output', output,
+                  '--expected-head', self.head, '--result-file', '/target/replay-result.json'], ['cleanup']]
+        self.stages = [dict(ordinal=i, command=self.commands[i], argv_sha256=reservation.digest(argv)) for i, argv in enumerate(self.argv)]
         self.session = dict(schema=1, project=self.project, attempt='final-r1',
                             expected_vm_id=self.host[0], expected_boot=self.host[1],
                             head=self.head, tree='c'*40, bundle_sha256='d'*64,
@@ -171,6 +181,7 @@ class ReservationTests(unittest.TestCase):
         record = self.claim()
         self.store.begin(record['reservation_id'], 0, host=self.host, actor=self.actor, argv=self.argv[0])
         with patch.object(reservation, 'ROOT', Path(self.folder.name)), \
+             patch.object(reservation, 'enrollment', return_value={'enabled': True}), \
              patch.object(reservation, 'Store', return_value=self.store), \
              patch.object(reservation, 'host_identity', return_value=self.host), \
              patch.object(reservation, 'ancestor_matches', return_value=True):
@@ -180,6 +191,7 @@ class ReservationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 reservation.route_guard(self.project, argv=['different'])
         with patch.object(reservation, 'ROOT', Path(self.folder.name)), \
+             patch.object(reservation, 'enrollment', return_value={'enabled': True}), \
              patch.object(reservation, 'Store', return_value=self.store), \
              patch.object(reservation, 'host_identity', return_value=self.host), \
              patch.object(reservation, 'ancestor_matches', return_value=False):
@@ -189,6 +201,7 @@ class ReservationTests(unittest.TestCase):
     def test_retained_record_never_calls_process_reclamation(self):
         self.claim()
         with patch.object(reservation, 'ROOT', Path(self.folder.name)), \
+             patch.object(reservation, 'enrollment', return_value={'enabled': True}), \
              patch.object(reservation, 'Store', return_value=self.store), \
              patch.object(reservation, 'host_identity', return_value=self.host), \
              patch.object(reservation, 'ancestor_matches') as ancestors:
@@ -219,6 +232,7 @@ class ReservationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.step(record, 2, binding={**self.session, 'tree': '0'*40})
         with patch.object(reservation, 'ROOT', Path(self.folder.name)), \
+             patch.object(reservation, 'enrollment', return_value={'enabled': True}), \
              patch.object(reservation, 'Store', return_value=self.store), \
              patch.object(reservation, 'host_identity', return_value=self.host), \
              patch.object(reservation, 'ancestor_matches', return_value=True):
@@ -293,3 +307,41 @@ class ReservationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.write(record)
         self.assertEqual(self.store.read(), before)
+
+    def test_enrolled_missing_storage_is_not_legacy_idleness(self):
+        missing = Path(self.folder.name)/'unmounted-cache'
+        with patch.object(reservation, 'ROOT', missing), \
+             patch.object(reservation, 'enrollment', return_value={'enabled': True}):
+            with self.assertRaises(ValueError):
+                reservation.route_guard(self.project)
+        with patch.object(reservation, 'ROOT', missing), \
+             patch.object(reservation, 'enrollment', return_value=None):
+            reservation.route_guard('ordinary-unenrolled')
+
+    def test_prepare_label_cannot_authorize_execute_arguments(self):
+        self.stages[0]['argv_sha256'] = reservation.digest(self.argv[4])
+        self.session['stages_sha256'] = reservation.digest(self.stages)
+        record = self.claim()
+        with self.assertRaises(ValueError):
+            self.store.begin(record['reservation_id'], 0, host=self.host,
+                             actor=self.actor, argv=self.argv[4])
+        self.assertIsNone(self.store.read()['active'])
+
+    def test_impossible_or_changed_ancestry_is_rejected(self):
+        actor = dict(pid=100, start=100)
+        rows = {300:(dict(pid=300,start=200),200),
+                200:(dict(pid=200,start=300),100), 100:(actor,1)}
+        with patch.object(reservation, 'process', side_effect=lambda pid: rows[pid]):
+            with self.assertRaises(ValueError):
+                reservation.ancestor_matches(actor, 300)
+        calls = {300:0,200:0,100:0}
+        rows[200] = (dict(pid=200,start=150),100)
+        def changed(pid):
+            calls[pid] += 1
+            if pid == 200 and calls[pid] >= 3:
+                return dict(pid=200,start=201),100
+            return rows[pid]
+        with patch.object(reservation, 'process', side_effect=changed), \
+             patch.object(reservation.Path, 'read_text', return_value='Uid:\t0\t0\t0\t0\n'):
+            with self.assertRaises(ValueError):
+                reservation.ancestor_matches(actor, 300)

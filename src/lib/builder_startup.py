@@ -49,7 +49,8 @@ def render_builder_startup(args,deployment_id):
     replacements['DEPLOYMENT_ID']=deployment_id
     replacements['UPLOADER_CONFIG']=json.dumps(uploader,separators=(',',':'),sort_keys=True)
     replacements['UPLOADER_SHA']=uploader_sha
-    config=dict(role='builder',cpus=16,memory_gib=28,image=IMAGE,approved_image_id=None)
+    config=dict(role='builder',cpus=16,memory_gib=28,image=IMAGE,approved_image_id=None,
+                reservation_enrollment=dict(schema=1,enabled=False,uuid=None,device=None))
     admission=dict(role='builder',host_cpus=16,builder_cpus=16,work_gib=28,runner_gib=0,builder_gib=28,runner_names=[])
     replacements['BUILD_CONFIG']=json.dumps(config,separators=(',',':'),sort_keys=True)
     replacements['ADMISSION_CONFIG']=json.dumps(admission,separators=(',',':'),sort_keys=True)
