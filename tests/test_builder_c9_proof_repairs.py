@@ -211,6 +211,57 @@ class ProofRepairControls(unittest.TestCase):
                     scope_processes=lambda:{os.getpid()}),0)
             self.assertEqual((path/'normal.log').read_bytes(),b'first-stderr-last')
 
+    def test_capture_drains_eof_when_launcher_exits_after_empty_poll(self):
+        # The selector can time out just before the launcher exits. Wait for
+        # the real subprocess at that seam so the timing is deterministic.
+        actual_popen=subprocess.Popen
+        def launch(*args,**kwargs):
+            process=actual_popen(*args,**kwargs)
+            actual_poll=process.poll
+            def poll_after_exit():
+                process.wait(timeout=1)
+                return actual_poll()
+            process.poll=poll_after_exit
+            return process
+
+        with tempfile.TemporaryDirectory() as directory:
+            log=Path(directory)/'stage.log'
+            observations=[]
+            def observed():
+                observations.append(True)
+                return {os.getpid()}
+            command=[sys.executable,'-c',
+                     'import os,time;time.sleep(.08);os.write(1,b"complete\\n")']
+            with patch.object(engine.subprocess,'Popen',side_effect=launch),\
+                 patch.object(engine,'CAPTURE_POLL_SECONDS',.01),\
+                 log.open('wb') as output:
+                self.assertEqual(engine.capture_stage(command,output,limit=1024,
+                    scope_processes=observed),0)
+            self.assertEqual(log.read_bytes(),b'complete\n')
+            self.assertTrue(observations)
+
+    def test_capture_holds_if_pipe_never_reaches_eof_after_exit(self):
+        # Simulate a pipe owner outside the observed stage scope. Even an
+        # otherwise empty scope cannot make the drain deadline a success.
+        def stop(process):
+            os.killpg(process.pid,9)
+            process.wait(timeout=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            log=Path(directory)/'stage.log'
+            command=[sys.executable,'-c',
+                     'import os,time\nif os.fork()==0: time.sleep(1);os._exit(0)\nos._exit(0)']
+            started=time.monotonic()
+            with patch.object(engine,'POST_EXIT_PIPE_DRAIN_SECONDS',.12),\
+                 patch.object(engine,'stop_stage_children',side_effect=stop) as stopped,\
+                 log.open('wb') as output:
+                with self.assertRaisesRegex(ValueError,'pipe remains open after launcher exit'):
+                    engine.capture_stage(command,output,limit=1024,
+                        scope_processes=lambda:{os.getpid()})
+            self.assertEqual(stopped.call_count,1)
+            self.assertGreaterEqual(time.monotonic()-started,.12)
+            self.assertEqual(log.read_bytes(),b'')
+
     def test_all_four_container_ordinals_use_bounded_capture_and_forward_failure(self):
         actor={'pid':11,'start':22};host=('123','new-boot')
         session={'project':PROJECT,'head':'a'*40,'bundle_sha256':'b'*64}

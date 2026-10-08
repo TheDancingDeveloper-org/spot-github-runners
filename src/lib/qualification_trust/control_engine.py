@@ -99,7 +99,8 @@ def capture_stage(argv,output,*,limit=LOG_LIMIT,scope_processes=stage_unit_proce
 
     A live launcher may run without output. Once its pipe reaches EOF, allow a
     bounded status observation, then stop and hold if it remains alive. Time
-    alone never establishes successful completion or releases custody.
+    alone never establishes successful completion or releases custody. After
+    launcher exit, wait for actual pipe EOF within the bounded drain period.
     """
     if type(limit) is not int or not 0<limit<=LOG_LIMIT:
         raise ValueError('Invalid stage log bound')
@@ -135,9 +136,8 @@ def capture_stage(argv,output,*,limit=LOG_LIMIT,scope_processes=stage_unit_proce
                         drain_deadline=time.monotonic()+POST_EXIT_PIPE_DRAIN_SECONDS
                     if time.monotonic()>=drain_deadline:
                         raise ValueError('Stage pipe remains open after launcher exit; custody held')
-                    if not ready:
-                        raise ValueError('Stage pipe remains open after launcher exit; custody held')
-                    # Drain bytes already ready before deciding whether EOF is present.
+                    # A timeout's empty ready set predates this status check;
+                    # the pipe may become readable or reach EOF just after it.
                     continue
                 if pipe_eof:
                     if exit_deadline is None:
