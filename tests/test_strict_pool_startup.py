@@ -60,7 +60,7 @@ class StrictPoolStartup(unittest.TestCase):
         for status in ('STOPPED','TERMINATED'):
             vm=manager.GceVm(args.instance_name,'test-a',status,args.instance_type,True,instance_id='123')
             args.deployment_vm=vm
-            with patch.object(manager,'gcloud')as cloud,patch.object(manager,'observed_deployment_vm',side_effect=[replace(vm,status='STAGING'),replace(vm,status='RUNNING')]),patch.object(manager.time,'sleep'):
+            with patch.object(manager,'gcloud')as cloud,patch.object(manager,'observed_deployment_vm',side_effect=[replace(vm,status='STAGING'),replace(vm,status='RUNNING')]),patch.object(manager.time,'sleep'),patch.object(manager,'wait_for_retained_ssh'):
                 manager.start_retained_strict_host(args,'test-a')
             self.assertEqual(cloud.call_count,1)
             self.assertEqual(cloud.call_args.args[0][:3],['compute','instances','start'])
@@ -68,6 +68,41 @@ class StrictPoolStartup(unittest.TestCase):
         with patch.object(manager,'gcloud')as cloud:
             manager.start_retained_strict_host(args,'test-a')
             cloud.assert_not_called()
+    def test_ssh_readiness_retries_connection_refusal_then_checks_id(self):
+        import subprocess
+        args=self.args();args.deployment_vm=manager.GceVm(args.instance_name,'test-a','RUNNING',args.instance_type,True,instance_id='123')
+        replies=[subprocess.CompletedProcess([],255,'','ssh: connect to host 192.0.2.1 port 22: Connection refused\n'),
+                 subprocess.CompletedProcess([],0,'123\n','')]
+        with patch.object(manager.subprocess,'run',side_effect=replies) as call,patch.object(manager.time,'monotonic',return_value=0),patch.object(manager.time,'sleep'):
+            manager.wait_for_retained_ssh(args,'test-a',30)
+        self.assertEqual(call.call_count,2)
+        self.assertTrue(all(c.kwargs['timeout']<=20 for c in call.call_args_list))
+
+    def test_ssh_readiness_rejects_identity_and_auth_failures_without_retry(self):
+        import subprocess
+        args=self.args();args.deployment_vm=manager.GceVm(args.instance_name,'test-a','RUNNING',args.instance_type,True,instance_id='123')
+        for code,out,err in [(0,'999\n',''),(255,'','Permission denied (publickey).'),(255,'','Host key verification failed.')]:
+            with self.subTest(err=err),patch.object(manager.subprocess,'run',return_value=subprocess.CompletedProcess([],code,out,err)) as call,patch.object(manager.time,'monotonic',return_value=0):
+                with self.assertRaises(RuntimeError):manager.wait_for_retained_ssh(args,'test-a',30)
+                call.assert_called_once()
+
+    def test_ssh_readiness_deadline_clips_timeout_and_never_extends(self):
+        import subprocess
+        args=self.args();args.deployment_vm=manager.GceVm(args.instance_name,'test-a','RUNNING',args.instance_type,True,instance_id='123')
+        with patch.object(manager.subprocess,'run',side_effect=subprocess.TimeoutExpired('gcloud',2)) as call,patch.object(manager.time,'monotonic',side_effect=[28,30,30]),patch.object(manager.time,'sleep'):
+            with self.assertRaises(TimeoutError):manager.wait_for_retained_ssh(args,'test-a',30)
+        self.assertEqual(call.call_args.kwargs['timeout'],2)
+        call.assert_called_once()
+
+    def test_retained_start_waits_for_ssh_not_just_running(self):
+        from dataclasses import replace
+        args=self.args();args.existing_instance=True
+        vm=manager.GceVm(args.instance_name,'test-a','STOPPED',args.instance_type,True,instance_id='123')
+        args.deployment_vm=vm
+        with patch.object(manager,'gcloud'),patch.object(manager,'observed_deployment_vm',return_value=replace(vm,status='RUNNING')),patch.object(manager,'wait_for_retained_ssh',create=True) as ready:
+            manager.start_retained_strict_host(args,'test-a')
+        ready.assert_called_once()
+
     def test_retained_start_rejects_changed_identity(self):
         from dataclasses import replace
         args=self.args();args.existing_instance=True

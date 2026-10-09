@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -507,6 +508,34 @@ def verify_strict_runner_membership(args) -> dict[str, int] | None:
     return {row['name']:row['id'] for row in selected}
 
 
+def wait_for_retained_ssh(args, zone, deadline):
+    """Wait within the start deadline for SSH and the exact guest metadata ID."""
+    expected=args.deployment_vm.instance_id
+    script="import urllib.request;print(urllib.request.urlopen(urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/id',headers={'Metadata-Flavor':'Google'}),timeout=3).read().decode())"
+    command=['gcloud','compute','ssh',args.instance_name,f'--zone={zone}',
+             f'--project={args.project}','--quiet','--ssh-flag=-oConnectTimeout=5',
+             '--ssh-flag=-oConnectionAttempts=1',
+             '--command='+shlex.join(['python3','-I','-B','-c',script])]
+    while True:
+        remaining=deadline-time.monotonic()
+        if remaining<=0:raise TimeoutError('Retained host SSH readiness deadline expired; no bootstrap applied')
+        try:
+            result=subprocess.run(command,text=True,capture_output=True,timeout=min(20,remaining))
+        except subprocess.TimeoutExpired:
+            result=None
+        if result is not None:
+            if result.returncode==0:
+                if result.stdout.strip()!=expected:
+                    raise RuntimeError('Retained SSH guest identity differs; no bootstrap applied')
+                return
+            transient=(result.returncode in (1,255) and not result.stdout and
+                       re.search(r'^ssh: connect to host \S+ port 22: (?:Connection refused|Connection timed out)\r?$',
+                                 result.stderr,re.MULTILINE))
+            if not transient:
+                raise RuntimeError('Retained host SSH failed: '+error_detail(result.stderr or result.stdout))
+        time.sleep(min(1,max(0,deadline-time.monotonic())))
+
+
 def start_retained_strict_host(args, zone):
     if not (args.existing_instance and getattr(args,'heavy_runner_pool',None)):return
     vm=args.deployment_vm
@@ -523,7 +552,9 @@ def start_retained_strict_host(args, zone):
         if actual.instance_id!=vm.instance_id or not actual.spot or actual.machine_type!=vm.machine_type:
             raise RuntimeError('Retained strict host changed during start')
         args.deployment_vm=actual
-        if actual.running:return
+        if actual.running:
+            wait_for_retained_ssh(args,zone,deadline)
+            return
         time.sleep(1)
     raise RuntimeError('Retained strict host did not become running; no bootstrap applied')
 
