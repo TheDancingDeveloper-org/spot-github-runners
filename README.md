@@ -27,7 +27,8 @@ For the simplification target and remaining work, see
 
 | Goal | Entry point | Creates or changes resources? |
 | --- | --- | --- |
-| Find candidate Spot offers | `src/spot_finder.py` | No |
+| List Spot compute prices by minimum CPU, RAM, and daily cap | `tools/spot_prices.py` | No |
+| Find candidate Spot offers with deployment constraints | `src/spot_finder.py` | No |
 | Inspect runners and VMs | `src/runner_fleet.py` | No |
 | Preview or provision runner hosts | `src/spot_runner_manager.py` | Only with `--apply` |
 | Plan or manage runner capacity | `src/spot_runner_autoscaler.py` | Yes, except a tiered `--dry-run` |
@@ -39,6 +40,31 @@ Keep the distinction between registered listeners and active jobs. Twenty
 registered runners do not mean that twenty jobs can each use 32 GiB at once.
 Admission reserves memory before starting work; the physical host also needs
 space for its operating system, services, and idle listeners.
+
+## Find compute prices
+
+Use the active `gcloud` account and project to list machine types that meet your
+minimum CPU and RAM requirements and cost at most the daily cap:
+
+```bash
+python3 tools/spot_prices.py --min-cpu 4 --min-ram 8 \
+  --price-per-day 5 --list cheapest --results all
+```
+
+`--min-ram` uses GiB. Prices use USD for 24 hours of Spot **compute only**;
+disks, GPUs, network traffic, and taxes are excluded. The command reads the
+current official Billing Catalog and machine-type inventory. It prints CSV to
+standard output and progress to standard error. It does not create a VM or
+reserve capacity.
+
+Use `--results 20` to limit the output, `--project PROJECT_ID` to override the
+active project, or `--csv offers.csv` to save the displayed results. Machine types
+without supported catalog prices, including shared-core shapes, are omitted and
+counted in the diagnostics.
+Conflicting catalog prices are omitted and reported as unsupported.
+Authentication failures and incomplete inventories fail the command.
+M2 prices apply to an evaluation period; check the machine series requirements
+before launching it.
 
 ## Prerequisites
 
