@@ -25,6 +25,14 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
     && rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin \
     && rustc --version | grep '^rustc 1.99.0 ' \
     && cargo --version | grep '^cargo 1.99.0 '
+USER root
+RUN chown -R root:root /opt/runner-rust \
+    && chmod -R a-w /opt/runner-rust
+USER runner
+ENV CARGO_HOME=/work/.cargo
+ENV PATH=/opt/runner-rust/cargo/bin:/work/.cargo/bin:${PATH}
+RUN test ! -w /opt/runner-rust/cargo/bin/rustup \
+    && test ! -w /opt/runner-rust/rustup
 WORKDIR /work
 ENV RUNNER_STATE=/runner-state
 ENV OXIDEX_CLEAN_TARGET=1

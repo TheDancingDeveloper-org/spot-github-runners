@@ -26,3 +26,13 @@ infra-python-tests:
       exit 2
     fi
     PYTHONPATH=src python3 -B tools/infra_python_test_proof.py
+
+# Complete the signed CI-only source suite inside the admitted builder.
+infra-python-complete-tests:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(uname -s)" != Linux || ! -f /run/oxidex-build-container || "$(id -u)" == 0 ]]; then
+      echo 'infra-python-complete-tests requires the admitted non-root Linux builder container.' >&2
+      exit 2
+    fi
+    PYTHONPATH=src python3 -B tools/infra_python_complete_proof.py

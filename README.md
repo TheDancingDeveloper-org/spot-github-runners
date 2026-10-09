@@ -27,7 +27,8 @@ For the simplification target and remaining work, see
 
 | Goal | Entry point | Creates or changes resources? |
 | --- | --- | --- |
-| Find candidate Spot offers | `src/spot_finder.py` | No |
+| List Spot compute prices by minimum CPU, RAM, and daily cap | `tools/spot_prices.py` | No |
+| Find candidate Spot offers with deployment constraints | `src/spot_finder.py` | No |
 | Inspect runners and VMs | `src/runner_fleet.py` | No |
 | Preview or provision runner hosts | `src/spot_runner_manager.py` | Only with `--apply` |
 | Plan or manage runner capacity | `src/spot_runner_autoscaler.py` | Yes, except a tiered `--dry-run` |
@@ -39,6 +40,31 @@ Keep the distinction between registered listeners and active jobs. Twenty
 registered runners do not mean that twenty jobs can each use 32 GiB at once.
 Admission reserves memory before starting work; the physical host also needs
 space for its operating system, services, and idle listeners.
+
+## Find compute prices
+
+Use the active `gcloud` account and project to list machine types that meet your
+minimum CPU and RAM requirements and cost at most the daily cap:
+
+```bash
+python3 tools/spot_prices.py --min-cpu 4 --min-ram 8 \
+  --price-per-day 5 --list cheapest --results all
+```
+
+`--min-ram` uses GiB. Prices use USD for 24 hours of Spot **compute only**;
+disks, GPUs, network traffic, and taxes are excluded. The command reads the
+current official Billing Catalog and machine-type inventory. It prints CSV to
+standard output and progress to standard error. It does not create a VM or
+reserve capacity.
+
+Use `--results 20` to limit the output, `--project PROJECT_ID` to override the
+active project, or `--csv offers.csv` to save the displayed results. Machine types
+without supported catalog prices, including shared-core shapes, are omitted and
+counted in the diagnostics.
+Conflicting catalog prices are omitted and reported as unsupported.
+Authentication failures and incomplete inventories fail the command.
+M2 prices apply to an evaluation period; check the machine series requirements
+before launching it.
 
 ## Prerequisites
 
@@ -751,3 +777,48 @@ vale README.md
 A clean Vale result covers the configured rules, not every editorial requirement
 in the Google guide. Check command examples against command-line help and source before
 submitting the documentation PR.
+
+## Strict CI runner pools
+
+Use `--heavy-runner-pool 2` or `--heavy-runner-pool 3` to provision fixed CI
+members. Each member has an 8-vCPU limit and a 32-GiB memory limit, including
+swap. The host must also provide 2 vCPUs and 16 GiB for host services. A
+32-vCPU, 128-GiB host meets these sizing requirements for either count.
+
+Choose a currently priced Spot zone and a GitHub runner group that selects only
+`swack-tools/oxidex` and permits public repositories. Preview the configuration
+before adding `--apply`:
+
+```bash
+python3 src/spot_runner_manager.py \
+  --project homelab-424523 --region '<region>' --zone '<zone>' \
+  --instance-type n4-standard-32 --cpu 32 --ram 128 \
+  --heavy-runner-pool 2 --runner-group-id '<group-id>' \
+  --max-cost 0.18 --max-total-daily-usd 4.50
+```
+
+The price limits are ceilings, not price quotes. The preview checks current
+compute and storage prices. The pool uses the `spot-heavy32` label and its exact
+registered member identities. It cannot share the host with remote builders or
+override an ordinary tier configuration.
+
+For an existing instance, the manager checks cached agent identities against
+the actual GitHub group and label targets. It starts a stopped retained host
+before reading its cached state. Turn off incoming work and let active jobs
+finish before applying an existing-host update; a successful source review is
+not a live drain or rollout proof.
+
+Runner images include Rust 1.99.0, rustfmt, clippy, and the configured cross-platform
+standard-library targets. Installed tools live under `/opt/runner-rust` in a
+shared read-only volume selected by immutable image ID. Cargo downloads and
+installed job tools use the writable `/work/.cargo` cache. CI setup must verify
+this preinstalled toolchain instead of trying to update the read-only tool home.
+
+### Run infrastructure tests remotely
+
+Set `OXIDEX_CONTROL_REPO` to a reviewed OxiDex checkout with the
+`test-infra-ci-remote` recipe, then run `just test`. The fixed CI-only profile
+runs the complete signed-source unittest suite on the admitted Spot builder.
+It verifies module coverage, discovered and executed test identities, actual
+test results, and artifact hashes. The older qualification profile retains its
+separate coverage requirements. No local full-suite fallback is provided.
