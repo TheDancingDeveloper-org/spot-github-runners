@@ -30,7 +30,7 @@ SCOPE_FIELDS={'schema','vm_id','boot','installation_nonce','project','reservatio
               'enrollment_sha256'}
 
 
-def root_bytes(path, maximum=1048576, *, mode=None, with_identity=False):
+def root_bytes(path, maximum=1048576, *, mode=None, with_identity=False, durable=False):
     """Bounded root-owned, nofollow read with stable inode and trusted ancestry."""
     path=Path(path)
     for parent in path.parents:
@@ -45,6 +45,13 @@ def root_bytes(path, maximum=1048576, *, mode=None, with_identity=False):
                 or (mode is not None and stat.S_IMODE(before.st_mode)!=mode)):
             raise ValueError('Untrusted root state file')
         raw=os.read(fd,maximum+1)
+        if durable:
+            # A prior process may have published complete bytes but died before
+            # syncing the file or its directory entry. Re-establish both here.
+            os.fsync(fd)
+            parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            try:os.fsync(parent)
+            finally:os.close(parent)
         after=os.fstat(fd);current=path.lstat()
         keys=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
         if (len(raw)!=before.st_size or any(getattr(before,key)!=getattr(after,key)
@@ -225,7 +232,7 @@ def interrupt_owned(scope):
         intent=engine.dossier(project)/'interrupt-owned-4.json'
         retained=intent.exists() or intent.is_symlink()
         if retained:
-            previous=json.loads(root_bytes(intent,custody.LIMIT,mode=0o400),object_pairs_hook=custody.pairs)
+            previous=json.loads(root_bytes(intent,custody.LIMIT,mode=0o400,durable=True),object_pairs_hook=custody.pairs)
             original=previous.get('scope') if isinstance(previous,dict) else None
             if not isinstance(original,dict) or set(original)!=SCOPE_FIELDS:
                 raise ValueError('Retained interruption intent differs')
@@ -247,9 +254,9 @@ def interrupt_owned(scope):
                 engine.write(intent,dict(schema=1,scope=scope,scope_sha256=custody.digest(scope),
                                          actor=active['actor'],host=record['host'],
                                          reservation_id=identity,ordinal=4,action='PIDFD_SIGKILL'))
-            if record['state']!='HELD':
-                record['state']='HELD'
-                store.write(record)
+            # A visible HELD record can likewise precede its directory fsync.
+            record['state']='HELD'
+            store.write(record)
             # pidfd prevents PID reuse between this last kernel/service join and
             # the signal. Any failure leaves the durable hold and intent intact.
             unit_identity(project,identity,active)

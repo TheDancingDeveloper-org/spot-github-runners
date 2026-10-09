@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
+from types import SimpleNamespace
 import sys
 import tempfile
 import time
@@ -58,6 +60,61 @@ class OwnedFaultTests(unittest.TestCase):
                 self.assertEqual(result['status'],'INTERRUPTION_REQUESTED_HELD')
                 self.assertEqual((path/'interrupt-owned-4.json').read_bytes(),intent)
                 self.assertEqual(record['state'],'HELD')
+
+    def test_durable_root_read_syncs_file_and_parent_and_propagates_failure(self):
+        raw=b'{}';path=Path('/trusted/intent')
+        info=SimpleNamespace(st_mode=stat.S_IFREG|0o400,st_uid=0,st_nlink=1,
+            st_size=len(raw),st_dev=1,st_ino=2,st_mtime_ns=3,st_ctime_ns=4)
+        directory=SimpleNamespace(st_mode=stat.S_IFDIR|0o700,st_uid=0)
+        for failed_fd in (None,11,12):
+            with self.subTest(failed_fd=failed_fd):
+                synced=[]
+                def sync(fd):
+                    synced.append(fd)
+                    if fd==failed_fd:raise OSError('sync failed')
+                with patch.object(Path,'lstat',lambda p:info if p==path else directory), \
+                     patch.object(fault.os,'open',side_effect=[11,12]), \
+                     patch.object(fault.os,'fstat',return_value=info), \
+                     patch.object(fault.os,'read',return_value=raw), \
+                     patch.object(fault.os,'fsync',side_effect=sync), \
+                     patch.object(fault.os,'close') as close:
+                    if failed_fd is None:
+                        self.assertEqual(fault.root_bytes(path,mode=0o400,durable=True),raw)
+                    else:
+                        with self.assertRaisesRegex(OSError,'sync failed'):
+                            fault.root_bytes(path,mode=0o400,durable=True)
+                self.assertEqual(synced,[11] if failed_fd==11 else [11,12])
+                self.assertEqual([c.args[0] for c in close.call_args_list],
+                                 [11] if failed_fd==11 else [12,11])
+
+    def test_retained_retry_syncs_intent_and_republishes_hold_before_signal(self):
+        for state in ('SOURCE_VERIFIED','HELD'):
+            with self.subTest(state=state),tempfile.TemporaryDirectory() as folder:
+                scope=self.scope();path=Path(folder);events=[]
+                record={'reservation_id':IDENTITY,'host':list(HOST),'state':state,
+                        'active':{'ordinal':4,'command':'task20-execute','actor':ACTOR}}
+                intent=dict(schema=1,scope=scope,scope_sha256=fault.custody.digest(scope),
+                            actor=ACTOR,host=list(HOST),reservation_id=IDENTITY,
+                            ordinal=4,action='PIDFD_SIGKILL')
+                raw=fault.custody.canonical(intent)
+                (path/'interrupt-owned-4.json').write_bytes(raw)
+                store=Mock();store.locked.return_value=nullcontext();store.read.return_value=record
+                store.write.side_effect=lambda r:events.append('hold-durable')
+                def read(*args,**kwargs):
+                    if kwargs.get('durable'):events.append('intent-durable')
+                    return raw
+                def signal_after_barriers(*args):
+                    self.assertEqual(events,['intent-durable','hold-durable'])
+                with patch.object(fault.custody,'Store',return_value=store), \
+                     patch.object(fault.custody,'host_identity',return_value=HOST), \
+                     patch.object(fault,'snapshot',return_value=(BASE,'digest')), \
+                     patch.object(fault.engine,'dossier',return_value=path), \
+                     patch.object(fault,'root_bytes',side_effect=read), \
+                     patch.object(fault,'unit_identity',return_value=BASE['cgroup']), \
+                     patch.object(fault.os,'pidfd_open',side_effect=lambda *a:os.open('/dev/null',os.O_RDONLY),create=True), \
+                     patch.object(fault.signal,'pidfd_send_signal',side_effect=signal_after_barriers,create=True):
+                    fault.interrupt_owned(scope)
+                self.assertEqual((path/'interrupt-owned-4.json').read_bytes(),raw)
 
     def test_held_resume_requires_matching_durable_intent_before_pidfd(self):
         record={'reservation_id':IDENTITY,'host':list(HOST),'state':'HELD',
