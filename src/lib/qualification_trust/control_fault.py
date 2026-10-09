@@ -216,26 +216,40 @@ def interrupt_owned(scope):
     with store.locked():
         record=store.read();custody.Store.match(record,identity,custody.host_identity())
         active=record['active']
-        if (record['state']!='SOURCE_VERIFIED' or active is None or active['ordinal']!=4
+        if (record['state'] not in ('SOURCE_VERIFIED','HELD') or active is None or active['ordinal']!=4
                 or active['command']!='task20-execute'):
             raise ValueError('Only active reviewed execute supervisor may be interrupted')
         current,_=snapshot(project,identity,nonce,record=record)
         if any(scope[key]!=value for key,value in current.items()):
             raise ValueError('Fault scope differs from current owned actor')
+        intent=engine.dossier(project)/'interrupt-owned-4.json'
+        retained=intent.exists() or intent.is_symlink()
+        if retained:
+            previous=json.loads(root_bytes(intent,custody.LIMIT,mode=0o400),object_pairs_hook=custody.pairs)
+            original=previous.get('scope') if isinstance(previous,dict) else None
+            if not isinstance(original,dict) or set(original)!=SCOPE_FIELDS:
+                raise ValueError('Retained interruption intent differs')
+            validate_scope(original,original['observed_at'])
+            expected=dict(schema=1,scope=original,scope_sha256=custody.digest(original),
+                          actor=active['actor'],host=record['host'],
+                          reservation_id=identity,ordinal=4,action='PIDFD_SIGKILL')
+            if (custody.canonical(previous)!=custody.canonical(expected)
+                    or any(original[key]!=value for key,value in current.items())):
+                raise ValueError('Retained interruption intent differs')
+        elif record['state']=='HELD':
+            raise ValueError('Held stage lacks an authenticated interruption intent')
         pidfd=os.pidfd_open(current['actor_pid'],0)
         try:
             again,_=snapshot(project,identity,nonce,record=record)
             if again!=current or time.time()>=scope['deadline']:
                 raise ValueError('Selected actor changed before interruption')
-            path=engine.dossier(project)
-            intent=path/'interrupt-owned-4.json'
-            if intent.exists() or intent.is_symlink():
-                raise ValueError('Prior interruption intent retained')
-            engine.write(intent,dict(schema=1,scope_sha256=custody.digest(scope),
-                                     actor=active['actor'],host=record['host'],
-                                     reservation_id=identity,ordinal=4,action='PIDFD_SIGKILL'))
-            record['state']='HELD'
-            store.write(record)
+            if not retained:
+                engine.write(intent,dict(schema=1,scope=scope,scope_sha256=custody.digest(scope),
+                                         actor=active['actor'],host=record['host'],
+                                         reservation_id=identity,ordinal=4,action='PIDFD_SIGKILL'))
+            if record['state']!='HELD':
+                record['state']='HELD'
+                store.write(record)
             # pidfd prevents PID reuse between this last kernel/service join and
             # the signal. Any failure leaves the durable hold and intent intact.
             unit_identity(project,identity,active)

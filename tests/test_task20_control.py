@@ -2,6 +2,8 @@
 import hashlib
 import io
 import json
+import os
+import stat
 from contextlib import nullcontext
 from pathlib import Path
 import sys
@@ -14,6 +16,40 @@ from lib.qualification_trust import host_gate
 
 
 class ControlTests(unittest.TestCase):
+    def test_uploaded_names_are_durable_before_success_is_published(self):
+        from lib.qualification_trust import control_engine as engine
+        project=self.claim()['project']; identity='1'*32
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder); dossier=root/'dossier'; dossier.mkdir()
+            source=root/'sources'/project; source.mkdir(parents=True)
+            incoming=dossier/'receive'/'incoming'; incoming.mkdir(parents=True)
+            (incoming/'packet').write_bytes(b'verified packet')
+            directories={p.stat().st_ino:p for p in (source,incoming)}
+            synced=set(); real_fsync=os.fsync
+            def fsync(fd):
+                info=os.fstat(fd)
+                if stat.S_ISDIR(info.st_mode) and info.st_ino in directories:
+                    synced.add(directories[info.st_ino])
+                real_fsync(fd)
+            def finish(*args,**kwargs):
+                self.assertEqual(synced,{source,incoming},'Renamed entries must be durable before terminal success')
+                self.assertEqual((source/'packet').read_bytes(),b'verified packet')
+                self.assertEqual(list(incoming.iterdir()),[])
+                return {'status':'finished'}
+            store=Mock(); store.locked.return_value=nullcontext();store.read.return_value={}
+            store.finish.side_effect=finish
+            request={'argv':[[],['upload-receive']], 'archive':dict(sha256='a'*64,bytes=1,members={})}
+            with patch.object(engine,'BUILD',root), \
+                 patch.object(engine,'selected',return_value=(dossier,request,{})), \
+                 patch.object(engine,'idle',return_value=True), \
+                 patch.object(engine,'activity',return_value=nullcontext()), \
+                 patch.object(engine,'receive',return_value={'verified':True}), \
+                 patch.object(engine.custody,'Store',return_value=store), \
+                 patch.object(engine.custody,'current_actor',return_value={'pid':1,'start':2}), \
+                 patch.object(engine.custody,'host_identity',return_value=('438','boot')), \
+                 patch.object(engine.os,'fsync',side_effect=fsync):
+                self.assertEqual(engine.stage_locked(project,identity,1,io.BytesIO()),{'status':'finished'})
+
     def claim(self):
         return dict(schema=2,profile='task20-v1',project='qualification-'+'a'*12+'-'+'b'*32,
             attempt='final-r1',expected_vm_id='438',expected_boot='0b99c4d2-ca5f-4471-bf84-ff4ab8dbefd3',

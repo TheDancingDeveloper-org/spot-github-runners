@@ -244,7 +244,14 @@ def stage_locked(project,identity,ordinal,stream,*,protective_fds=()):
                     # Existing source is root-owned and empty; move only verified intake.
                     source=BUILD/'sources'/project
                     if any(source.iterdir()):raise ValueError('Prepared source unexpectedly populated')
-                    for member in (path/'receive/incoming').iterdir():member.rename(source/member.name)
+                    incoming=path/'receive/incoming'
+                    for member in incoming.iterdir():member.rename(source/member.name)
+                    # Receive synced the file bytes. Persist both changed name
+                    # spaces before Store.finish can advance past this upload.
+                    for parent in (source,incoming):
+                        directory=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                        try:os.fsync(directory)
+                        finally:os.close(directory)
                     output.write(custody.canonical(result)+b'\n')
             elif ordinal==2:
                 from .launcher_contract import create_binding

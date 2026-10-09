@@ -29,6 +29,63 @@ BASE=dict(schema=1,vm_id=HOST[0],boot=HOST[1],installation_nonce=NONCE,
 
 
 class OwnedFaultTests(unittest.TestCase):
+    def test_interrupted_signal_resumes_same_actor_with_fresh_scope(self):
+        record={'reservation_id':IDENTITY,'host':list(HOST),'state':'SOURCE_VERIFIED',
+                'active':{'ordinal':4,'command':'task20-execute','actor':ACTOR}}
+        store=Mock();store.locked.return_value=nullcontext();store.read.return_value=record
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)
+            with patch.object(fault.custody,'Store',return_value=store), \
+                 patch.object(fault.custody,'host_identity',return_value=HOST), \
+                 patch.object(fault,'snapshot',return_value=(BASE,'digest')), \
+                 patch.object(fault.engine,'dossier',return_value=path), \
+                 patch.object(fault,'root_bytes',side_effect=lambda p,*a,**k:Path(p).read_bytes()), \
+                 patch.object(fault,'unit_identity',return_value=BASE['cgroup']), \
+                 patch.object(fault.os,'pidfd_open',side_effect=lambda *a:os.open('/dev/null',os.O_RDONLY),create=True), \
+                 patch.object(fault.signal,'pidfd_send_signal',side_effect=[OSError('interrupted before signal'),None],create=True):
+                with self.assertRaisesRegex(OSError,'interrupted before signal'):
+                    fault.interrupt_owned(self.scope())
+                self.assertEqual(record['state'],'HELD')
+                intent=(path/'interrupt-owned-4.json').read_bytes()
+                original=json.loads(intent)['scope']
+                later=original['observed_at']+121
+                fresh=dict(BASE,observed_at=later,deadline=later+120)
+                failure=None;result=None
+                with patch.object(fault.time,'time',return_value=later):
+                    try:result=fault.interrupt_owned(fresh)
+                    except ValueError as error:failure=error
+                self.assertIsNone(failure,'Durable interruption must be resumable for the same verified actor')
+                self.assertEqual(result['status'],'INTERRUPTION_REQUESTED_HELD')
+                self.assertEqual((path/'interrupt-owned-4.json').read_bytes(),intent)
+                self.assertEqual(record['state'],'HELD')
+
+    def test_held_resume_requires_matching_durable_intent_before_pidfd(self):
+        record={'reservation_id':IDENTITY,'host':list(HOST),'state':'HELD',
+                'active':{'ordinal':4,'command':'task20-execute','actor':ACTOR}}
+        scope=self.scope()
+        valid=dict(schema=1,scope=scope,scope_sha256=fault.custody.digest(scope),
+                   actor=ACTOR,host=list(HOST),reservation_id=IDENTITY,ordinal=4,action='PIDFD_SIGKILL')
+        changed=copy.deepcopy(valid)
+        changed['scope']['installation_nonce']='f'*32
+        changed['scope_sha256']=fault.custody.digest(changed['scope'])
+        cases=[None,{},dict(valid,actor={'pid':12345,'start':67891}),
+               dict(valid,reservation_id='f'*32),dict(valid,action='OTHER'),changed]
+        for previous in cases:
+            with self.subTest(previous=previous),tempfile.TemporaryDirectory() as folder:
+                path=Path(folder)
+                if previous is not None:fault.engine.write(path/'interrupt-owned-4.json',previous)
+                store=Mock();store.locked.return_value=nullcontext();store.read.return_value=record
+                with patch.object(fault.custody,'Store',return_value=store), \
+                     patch.object(fault.custody,'host_identity',return_value=HOST), \
+                     patch.object(fault,'snapshot',return_value=(BASE,'digest')), \
+                     patch.object(fault.engine,'dossier',return_value=path), \
+                     patch.object(fault,'root_bytes',side_effect=lambda p,*a,**k:Path(p).read_bytes()), \
+                     patch.object(fault.os,'pidfd_open',create=True) as opened, \
+                     patch.object(fault.signal,'pidfd_send_signal',create=True) as send:
+                    with self.assertRaisesRegex(ValueError,'intent'):
+                        fault.interrupt_owned(scope)
+                opened.assert_not_called();send.assert_not_called();store.write.assert_not_called()
+
     def scope(self):
         now=time.time()
         return dict(BASE,observed_at=now,deadline=now+120)
