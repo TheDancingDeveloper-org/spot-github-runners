@@ -3,27 +3,11 @@
 
 locals {
   name = "gha-spot-1"
-  apis = [
-    "compute.googleapis.com",
-    "billingbudgets.googleapis.com",
-    "pubsub.googleapis.com",
-    "cloudfunctions.googleapis.com",
-    "cloudbuild.googleapis.com",
-    "run.googleapis.com",
-    "eventarc.googleapis.com",
-    "artifactregistry.googleapis.com",
-    "storage.googleapis.com",
-    "iam.googleapis.com",
-  ]
 }
 
+# APIs (compute, billingbudgets, pubsub) are enabled out of band: the deployer
+# service account deliberately cannot enable services or edit project IAM.
 data "google_project" "this" {}
-
-resource "google_project_service" "apis" {
-  for_each           = toset(local.apis)
-  service            = each.value
-  disable_on_destroy = false
-}
 
 # ---------------------------------------------------------------- network
 # Dedicated VPC with no inbound rules: the runner only dials out (GitHub,
@@ -31,7 +15,6 @@ resource "google_project_service" "apis" {
 resource "google_compute_network" "ci" {
   name                    = "gha-spot"
   auto_create_subnetworks = false
-  depends_on              = [google_project_service.apis]
 }
 
 resource "google_compute_subnetwork" "ci" {
@@ -112,29 +95,13 @@ resource "google_compute_instance" "runner" {
   }
 }
 
-# ---------------------------------------------------------------- poller identity
-# Runs on Node B (estate). It may only read, start, stop and set metadata on
-# instances in this project. Create its key out of band (README) so the private
-# key never lands in Terraform state.
-resource "google_project_iam_custom_role" "poller" {
-  role_id = "ghaSpotPoller"
-  title   = "GHA Spot runner poller"
-  permissions = [
-    "compute.instances.get",
-    "compute.instances.start",
-    "compute.instances.stop",
-    "compute.instances.setMetadata",
-    "compute.zoneOperations.get",
-  ]
-}
-
-resource "google_service_account" "poller" {
-  account_id   = "gha-spot-poller"
-  display_name = "GHA Spot runner poller (Node B)"
-}
-
-resource "google_project_iam_member" "poller" {
-  project = var.project_id
-  role    = google_project_iam_custom_role.poller.id
-  member  = "serviceAccount:${google_service_account.poller.email}"
+# ---------------------------------------------------------------- poller access
+# The poller service account (var.poller_sa_email) is created out of band. It
+# gets instance-level rights only on this VM: get, start, stop, set metadata and
+# labels. No project-wide grant is needed.
+resource "google_compute_instance_iam_member" "poller" {
+  zone          = var.zone
+  instance_name = google_compute_instance.runner.name
+  role          = "roles/compute.instanceAdmin.v1"
+  member        = "serviceAccount:${var.poller_sa_email}"
 }

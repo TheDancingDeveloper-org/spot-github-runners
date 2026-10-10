@@ -13,7 +13,8 @@ Environment:
   GH_ORG              default TheDancingDeveloper-org
   REPOS               comma list, default vogt,codex,rustnzb,msp-klaudia
   RUNNER_LABEL        default gcp-spot
-  MAX_HOURS_PER_MONTH default 250 (belt and braces under the $30 budget)
+  MAX_HOURS_PER_MONTH default 250 (belt and braces under the budget)
+  GCP_BUDGET_SUBSCRIPTION default gha-spot-budget-poller (budget Pub/Sub; >=100% stops and locks the VM)
   STATE_FILE          default ~/.local/state/gha-spot-poller.json
   --once              one poll then exit (for a systemd timer); default loops every 30 s
 """
@@ -36,6 +37,7 @@ INSTANCE = os.environ.get("GCP_INSTANCE", "gha-spot-1")
 MAX_HOURS = float(os.environ.get("MAX_HOURS_PER_MONTH", "250"))
 STATE_FILE = os.path.expanduser(os.environ.get("STATE_FILE", "~/.local/state/gha-spot-poller.json"))
 INTERVAL = 30
+BUDGET_SUB = os.environ.get("GCP_BUDGET_SUBSCRIPTION", "gha-spot-budget-poller")
 
 
 def log(msg):
@@ -68,7 +70,7 @@ def gcp_token():
     header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
     claims = b64url(json.dumps({
         "iss": key["client_email"], "aud": key["token_uri"], "iat": now, "exp": now + 3600,
-        "scope": "https://www.googleapis.com/auth/compute"}).encode())
+        "scope": "https://www.googleapis.com/auth/cloud-platform"}).encode())
     signing_input = f"{header}.{claims}".encode()
     keyfd_r, keyfd_w = os.pipe()
     os.write(keyfd_w, key["private_key"].encode())
@@ -89,6 +91,29 @@ def gcp_token():
 def compute(method, suffix="", body=None):
     url = f"https://compute.googleapis.com/compute/v1/projects/{PROJECT}/zones/{ZONE}/instances/{INSTANCE}{suffix}"
     return http(method, url, gcp_token(), body)
+
+
+def budget_exhausted():
+    """Drain budget notifications; True if any reports actual spend >= budget."""
+    url = f"https://pubsub.googleapis.com/v1/projects/{PROJECT}/subscriptions/{BUDGET_SUB}"
+    resp = http("POST", url + ":pull", gcp_token(), {"maxMessages": 50})
+    msgs = resp.get("receivedMessages", [])
+    hit = False
+    for m in msgs:
+        data = json.loads(base64.b64decode(m["message"].get("data", "")) or b"{}")
+        if float(data.get("costAmount", 0)) >= float(data.get("budgetAmount", float("inf"))):
+            hit = True
+    if msgs:
+        http("POST", url + ":acknowledge", gcp_token(), {"ackIds": [m["ackId"] for m in msgs]})
+    return hit
+
+
+def lock_and_stop(inst):
+    labels = dict(inst.get("labels", {}), **{"gha-budget-locked": "true"})
+    compute("POST", "/setLabels", {"labels": labels, "labelFingerprint": inst["labelFingerprint"]})
+    if inst["status"] in ("RUNNING", "PROVISIONING", "STAGING"):
+        compute("POST", "/stop")
+    log(f"budget reached: {INSTANCE} stopped and labelled gha-budget-locked=true")
 
 
 # ---------------------------------------------------------------- GitHub
@@ -140,6 +165,10 @@ def poll(state):
         state["running_seconds"] += min(now - state["last_poll"], 10 * INTERVAL)
     state["last_poll"] = now
     hours = state["running_seconds"] / 3600
+
+    if labels.get("gha-budget-locked") != "true" and budget_exhausted():
+        lock_and_stop(inst)
+        return
 
     if status == "RUNNING" and hours >= MAX_HOURS:
         log(f"monthly cap {MAX_HOURS}h reached ({hours:.1f}h); stopping {INSTANCE}")
