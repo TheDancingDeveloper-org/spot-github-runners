@@ -1,0 +1,13 @@
+# The repo root ignores everything not allow-listed; allow this module's sources.
+!*.tf
+!*.tpl
+!terraform.tfvars.example
+!requirements.txt
+!.terraform.lock.hcl
+
+.terraform/
+.build/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.json
