@@ -91,7 +91,7 @@ resource "google_compute_instance" "runner" {
   lifecycle {
     # The poller and budget guard own power state, the one-hour registration
     # token and the budget lock label.
-    ignore_changes = [desired_status, metadata["gha-reg-token"], labels["gha-budget-locked"]]
+    ignore_changes = [desired_status, metadata["gha-reg-token"], metadata["tailscale-auth-key"], labels["gha-budget-locked"]]
   }
 }
 
