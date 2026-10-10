@@ -2,14 +2,14 @@
 project_id         = "email-rs-493900" # business org project; billing already enabled
 billing_account_id = "01D74B-095DA7-FAE7D2"
 budget_currency    = "AUD" # billing account currency
-budget_amount      = 45    # about US$30; covers the whole email-rs project
+budget_amount      = 60    # about US$39 (raised from A$45 with the 160 GB disk, 2026-10-10)
 
 # Recommended: scale-to-zero 16 vCPU in Sydney.
 mode         = "scale_to_zero"
 region       = "australia-southeast1"
 zone         = "australia-southeast1-c"
 machine_type = "c3d-highcpu-16"
-boot_disk_gb = 100
+boot_disk_gb = 160 # resized in place 2026-10-10; Terraform ignores size drift (see main.tf)
 
 # Fallback if c3d Spot capacity is short in -c:
 # zone = "australia-southeast1-a"; machine_type = "c2d-highcpu-16"

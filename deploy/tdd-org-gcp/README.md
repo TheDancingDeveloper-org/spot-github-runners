@@ -98,3 +98,13 @@ keep "Require approval for all outside collaborators" on for fork workflows.
 
 At $30, the budget buys about 210 VM-hours a month, or about 290 with a 60 GB
 disk.
+
+## Disk size and drift (2026-10-10)
+
+The boot disk was resized in place from 100 GB to 160 GB with
+`gcloud compute disks resize gha-spot-1 --size=160GB`, because changing
+`boot_disk.initialize_params.size` in Terraform forces a VM replacement.
+`main.tf` ignores that attribute, so Terraform state still records the
+creation-time size (100) while the live disk is 160 GB. Ubuntu's cloud-init
+grew the root filesystem automatically on the next boot (154 GB usable). The
+budget was raised from A$45 to A$60 through Terraform to match.
