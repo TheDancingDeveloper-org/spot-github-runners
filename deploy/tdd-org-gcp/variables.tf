@@ -20,6 +20,11 @@ variable "budget_currency" {
   default     = "AUD"
 }
 
+variable "poller_sa_email" {
+  description = "Service account the Node B poller uses (created out of band, e.g. gha-spot-poller@PROJECT.iam.gserviceaccount.com)."
+  type        = string
+}
+
 variable "region" {
   type    = string
   default = "australia-southeast1"

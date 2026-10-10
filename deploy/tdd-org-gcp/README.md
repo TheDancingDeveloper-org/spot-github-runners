@@ -20,38 +20,38 @@ Vogt WI-1155 for the full evaluation.
   the runner serves. When it finds one, it writes a fresh one-hour registration
   token to the VM metadata and starts the VM. It also stops the VM when
   `MAX_HOURS_PER_MONTH` (default 250) is reached.
-- `budget.tf`: a $30 monthly budget with alerts at 50%, 90%, 100% and forecast
-  100%. Its Pub/Sub topic triggers `budget-guard`, which stops every
-  `gha-spot=true` VM when actual spend reaches 100% and labels it
-  `gha-budget-locked=true`. The poller will not start a locked VM; remove the
-  label by hand to unlock it. Billing data lags by hours, so the poller's hour
-  cap is the first line of defence.
+- `budget.tf`: an A$45 (about US$30) monthly budget with alerts at 50%, 90%
+  and 100%. It publishes to a Pub/Sub topic. The poller pulls the
+  subscription; at 100% of actual spend it stops the VM and labels it
+  `gha-budget-locked=true`, and it won't start a locked VM. Remove the label by
+  hand to unlock it. Billing data lags by hours, so the poller's hour cap is
+  the first line of defence.
 
 ## Prerequisites (operator)
 
-1. A GCP project with billing linked. Record the project ID and the billing
-   account ID.
-2. A deployer identity for `terraform apply`. Compute Admin alone is not
-   enough. It needs:
-   - `roles/compute.admin` (VM, VPC, firewall)
-   - `roles/iam.serviceAccountAdmin`, `roles/iam.roleAdmin`,
-     `roles/resourcemanager.projectIamAdmin` (poller and guard service
-     accounts, custom role, bindings)
-   - `roles/iam.serviceAccountUser` (attach the guard service account to the
-     function)
-   - `roles/serviceusage.serviceUsageAdmin` (enable APIs)
-   - `roles/cloudfunctions.admin`, `roles/run.admin`, `roles/pubsub.admin`,
-     `roles/storage.admin` (budget guard)
-   - On the **billing account**: `roles/billing.costsManager` (create the
-     budget)
+Target: project `email-rs-493900` (business organization), billing account
+`01D74B-095DA7-FAE7D2` (AUD). The deployer is deliberately not Owner, because
+the project also hosts the email-rs services.
 
-   Project Owner plus Billing Account Costs Manager covers all of these.
-3. A GitHub credential for `TheDancingDeveloper-org` with org "Self-hosted
-   runners: read and write" and "Actions: read" on the four repos. A
-   fine-grained PAT or a GitHub App both work. The current `gh` token
-   (thedancingdeveloper) gets 403 on the org runner APIs.
-4. Optional: a Tailscale auth key, tagged `tag:ci-gcp` and pre-authorised.
-   Also an ACL that allows `tag:ci-gcp` to reach only
+1. Enabled APIs: compute, billingbudgets, iam, cloudresourcemanager,
+   cloudbilling, plus **pubsub**.
+2. Deployer `gha-spot-deployer@email-rs-493900.iam.gserviceaccount.com`, key in
+   Infisical `infrastructure`/prod `GCP_GHA_SPOT_DEPLOYER_KEY`, with these
+   roles:
+   - `roles/compute.admin`, `roles/iam.serviceAccountUser`,
+     `roles/serviceusage.serviceUsageConsumer` on the project;
+   - `roles/billing.costsManager` on the billing account;
+   - **`roles/pubsub.admin`** on the project. Terraform creates the budget
+     topic and subscription, and sets IAM on them: linking a budget needs
+     `pubsub.topics.setIamPolicy`, and granting the poller subscriber needs
+     `pubsub.subscriptions.setIamPolicy`.
+3. Poller service account `gha-spot-poller@email-rs-493900.iam.gserviceaccount.com`
+   with **no project roles**. Terraform grants it access to the VM and the
+   subscription only. Store its key in Infisical `infrastructure`/prod
+   `GCP_GHA_SPOT_POLLER_KEY`.
+4. A GitHub credential for `TheDancingDeveloper-org` with org "Self-hosted
+   runners: read and write" and "Actions: read" on the repos.
+5. Optional: a Tailscale auth key tagged `tag:ci-gcp`, with an ACL limited to
    `100.92.54.45:6380`.
 
 ## Apply (only after approval)
@@ -85,7 +85,7 @@ runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.he
 Fork PRs stay on GitHub-hosted runners. All four repos are public, so also
 keep "Require approval for all outside collaborators" on for fork workflows.
 
-## Costs (Sydney, prices from 2026-10-04)
+## Costs (Sydney, live catalog 2026-10-10: c3d-highcpu-30 $0.1265/h, c3d-highcpu-16 $0.0677/h)
 
 | Item | Rate | Month |
 | --- | --- | --- |
