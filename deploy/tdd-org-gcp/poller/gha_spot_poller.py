@@ -169,6 +169,7 @@ def poll(state):
         state.update(month=month, running_seconds=0)
     inst = compute("GET")
     status = inst["status"]
+    heartbeat(state, status)
     labels = inst.get("labels", {})
     now = time.time()
     if status == "RUNNING" and state.get("last_poll"):
@@ -202,6 +203,17 @@ def poll(state):
     compute("POST", "/setMetadata", {"fingerprint": inst["metadata"]["fingerprint"], "items": items})
     compute("POST", "/start")
     log(f"started {INSTANCE} for {', '.join(jobs[:5])} ({hours:.1f}h used this month)")
+
+
+_last_heartbeat = [0.0]
+
+
+def heartbeat(state, status):
+    """Log the first successful poll, then once an hour, so the journal proves liveness."""
+    now = time.time()
+    if now - _last_heartbeat[0] >= 3600:
+        _last_heartbeat[0] = now
+        log(f"poll ok: {INSTANCE} {status}, {state.get('running_seconds', 0) / 3600:.1f}h running this month")
 
 
 def main():
