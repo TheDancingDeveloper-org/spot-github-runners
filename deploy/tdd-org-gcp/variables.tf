@@ -59,9 +59,9 @@ variable "idle_minutes" {
 }
 
 variable "boot_disk_gb" {
-  description = "Persistent pd-balanced boot disk; holds Docker images, cargo registry and the sccache dir."
+  description = "Persistent pd-balanced boot disk; holds Docker images, cargo registry and the sccache dir. 160 GB since 2026-10-10: a combined codex fork-ci job peaks above 74 GB."
   type        = number
-  default     = 100
+  default     = 160
 }
 
 variable "github_org" {
