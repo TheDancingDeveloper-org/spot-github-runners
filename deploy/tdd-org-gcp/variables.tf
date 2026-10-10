@@ -76,9 +76,9 @@ variable "runner_group" {
 }
 
 variable "runner_labels" {
-  description = "Extra labels; GitHub adds self-hosted,linux,x64. Workflows opt in with runs-on: [self-hosted, gcp-spot]."
+  description = "Extra labels; GitHub adds self-hosted,linux,x64. Workflows opt in with runs-on: [self-hosted, rust-heavy]."
   type        = string
-  default     = "gcp-spot,gcp-spot-16"
+  default     = "rust-heavy"
 }
 
 variable "runner_version" {
