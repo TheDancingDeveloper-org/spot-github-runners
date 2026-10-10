@@ -1,4 +1,4 @@
-# $30 budget. Billing budgets only notify, so a function subscribed to the
+# A$45 (about US$30) budget. Billing budgets only notify, so a function subscribed to the
 # budget topic makes it a hard stop: at >= 100% of actual spend it stops every
 # gha-spot VM and labels it gha-budget-locked=true, which the poller honours.
 # Billing data lags by several hours, so set the poller's hour cap as well.

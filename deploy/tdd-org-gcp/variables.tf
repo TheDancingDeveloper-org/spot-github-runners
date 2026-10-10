@@ -9,15 +9,15 @@ variable "billing_account_id" {
 }
 
 variable "budget_amount" {
-  description = "Monthly budget. At 100% of actual spend the budget guard stops and locks the runner VM."
+  description = "Monthly budget in budget_currency (A$45 is about US$30). At 100% of actual spend the budget guard stops and locks the runner VM."
   type        = number
-  default     = 30
+  default     = 45
 }
 
 variable "budget_currency" {
   description = "Must equal the billing account's currency (USD, AUD, NZD...), or the budget is rejected."
   type        = string
-  default     = "USD"
+  default     = "AUD"
 }
 
 variable "region" {

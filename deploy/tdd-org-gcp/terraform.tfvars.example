@@ -1,8 +1,8 @@
 # Copy to terraform.tfvars (git-ignored) once the operator supplies these.
-project_id         = "REPLACE-gcp-project-id"
-billing_account_id = "REPLACE-XXXXXX-XXXXXX-XXXXXX"
-budget_currency    = "USD" # must match the billing account currency
-budget_amount      = 30
+project_id         = "email-rs-493900" # business org project; billing already enabled
+billing_account_id = "01D74B-095DA7-FAE7D2"
+budget_currency    = "AUD" # billing account currency
+budget_amount      = 45    # about US$30; covers the whole email-rs project
 
 # Recommended: scale-to-zero 16 vCPU in Sydney.
 mode         = "scale_to_zero"
