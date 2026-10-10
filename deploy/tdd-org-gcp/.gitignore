@@ -4,6 +4,7 @@
 !terraform.tfvars.example
 !requirements.txt
 !.terraform.lock.hcl
+!*.md
 
 .terraform/
 .build/
