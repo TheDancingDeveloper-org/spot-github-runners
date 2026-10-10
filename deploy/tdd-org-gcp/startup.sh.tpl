@@ -69,6 +69,8 @@ if [[ ! -f /var/lib/gha-provisioned ]]; then
     build-essential cmake pkg-config libssl-dev python3
   # Optional extras from universe; on the GCE image universe has not resolved (follow-up).
   $APT install -y --no-install-recommends clang protobuf-compiler python3-pip || echo "gha-startup: optional universe packages unavailable"
+  # codex fork-ci (rust-heavy): linux-sandbox links libcap via pkg-config; its tests run bubblewrap.
+  $APT install -y --no-install-recommends libcap-dev libasound2-dev bubblewrap || echo "gha-startup: codex CI packages unavailable"
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo "$VERSION_CODENAME") stable" \
@@ -88,6 +90,16 @@ if [[ ! -f /var/lib/gha-provisioned ]]; then
   ./bin/installdependencies.sh
   touch /var/lib/gha-provisioned
 fi
+
+# --- unprivileged user namespaces (every boot) --------------------------------
+# bubblewrap sandbox tests need them; Ubuntu 24.04+ AppArmor restricts them by default.
+cat >/etc/sysctl.d/60-gha-userns.conf <<'EOF'
+kernel.unprivileged_userns_clone = 1
+EOF
+if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+  echo 'kernel.apparmor_restrict_unprivileged_userns = 0' >>/etc/sysctl.d/60-gha-userns.conf
+fi
+sysctl -p /etc/sysctl.d/60-gha-userns.conf || echo "gha-startup: userns sysctl failed"
 
 # --- Tailscale: join as tag:ci-gcp (ACL: Redis 6380 + Loki 3101 out, Netdata in)
 # The auth key is single-use and pre-authorised; once joined, node state on the
