@@ -1,0 +1,21 @@
+# Copy to terraform.tfvars (git-ignored) once the operator supplies these.
+project_id         = "REPLACE-gcp-project-id"
+billing_account_id = "REPLACE-XXXXXX-XXXXXX-XXXXXX"
+budget_currency    = "USD" # must match the billing account currency
+budget_amount      = 30
+
+# Recommended: scale-to-zero 16 vCPU in Sydney.
+mode         = "scale_to_zero"
+region       = "australia-southeast1"
+zone         = "australia-southeast1-c"
+machine_type = "c3d-highcpu-16"
+boot_disk_gb = 100
+
+# Fallback if c3d Spot capacity is short in -c:
+# zone = "australia-southeast1-a"; machine_type = "c2d-highcpu-16"
+
+# Always-on alternative (~$32-35/month all-in):
+# mode = "always_on"; machine_type = "c3d-highcpu-8"; boot_disk_gb = 50
+
+# Optional estate sccache over the tailnet (pass the key via TF_VAR_tailscale_auth_key, not this file):
+# sccache_redis_url = "redis://100.92.54.45:6380"
