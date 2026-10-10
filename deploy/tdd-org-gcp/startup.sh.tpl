@@ -91,6 +91,19 @@ if [[ ! -f /var/lib/gha-provisioned ]]; then
   touch /var/lib/gha-provisioned
 fi
 
+# --- catch-up: packages added after a disk was first provisioned -----------------
+# The first-boot block above is skipped on an already-provisioned disk, so
+# install any later additions here, only when missing.
+missing=()
+for pkg in libcap-dev libasound2-dev bubblewrap; do
+  dpkg-query -W -f='$${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed || missing+=("$pkg")
+done
+if (( $${#missing[@]} > 0 )); then
+  apt-get -o DPkg::Lock::Timeout=900 update
+  apt-get -o DPkg::Lock::Timeout=900 install -y --no-install-recommends "$${missing[@]}" \
+    || echo "gha-startup: catch-up install failed: $${missing[*]}"
+fi
+
 # --- unprivileged user namespaces (every boot) --------------------------------
 # bubblewrap sandbox tests need them; Ubuntu 24.04+ AppArmor restricts them by default.
 cat >/etc/sysctl.d/60-gha-userns.conf <<'EOF'
