@@ -29,8 +29,8 @@ import urllib.error
 import urllib.request
 
 ORG = os.environ.get("GH_ORG", "TheDancingDeveloper-org")
-REPOS = os.environ.get("REPOS", "vogt,codex,rustnzb,msp-klaudia").split(",")
-LABEL = os.environ.get("RUNNER_LABEL", "gcp-spot")
+REPOS = os.environ.get("REPOS", "vogt,codex,rustnzb").split(",")
+LABEL = os.environ.get("RUNNER_LABEL", "rust-heavy")
 PROJECT = os.environ.get("GCP_PROJECT", "")
 ZONE = os.environ.get("GCP_ZONE", "australia-southeast1-c")
 INSTANCE = os.environ.get("GCP_INSTANCE", "gha-spot-1")
@@ -65,7 +65,9 @@ def b64url(raw):
 def gcp_token():
     if _gcp["token"] and time.time() < _gcp["exp"] - 120:
         return _gcp["token"]
-    key = json.load(open(os.environ["GCP_SA_KEY_FILE"]))
+    d = os.environ.get("CREDENTIALS_DIRECTORY")
+    path = os.path.join(d, "gcp_sa_key") if d and os.path.exists(os.path.join(d, "gcp_sa_key")) else os.environ["GCP_SA_KEY_FILE"]
+    key = json.load(open(path))
     now = int(time.time())
     header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
     claims = b64url(json.dumps({
@@ -117,13 +119,21 @@ def lock_and_stop(inst):
 
 
 # ---------------------------------------------------------------- GitHub
+def cred(env_name, cred_name):
+    """Secret from $CREDENTIALS_DIRECTORY (systemd LoadCredentialEncrypted) or the environment."""
+    d = os.environ.get("CREDENTIALS_DIRECTORY")
+    if d and os.path.exists(os.path.join(d, cred_name)):
+        return open(os.path.join(d, cred_name)).read().strip()
+    return os.environ[env_name]
+
+
 def gh(method, path, body=None):
-    return http(method, f"https://api.github.com/{path}", os.environ["GH_TOKEN"], body)
+    return http(method, f"https://api.github.com/{path}", cred("GH_TOKEN", "gh_token"), body)
 
 
 def queued_jobs():
     """Queued jobs whose runs-on labels are all served by the gcp-spot runner."""
-    served = {"self-hosted", "linux", "x64", LABEL, f"{LABEL}-16"}
+    served = {"self-hosted", "linux", "x64", LABEL}
     found = []
     for repo in REPOS:
         for status in ("queued", "in_progress"):

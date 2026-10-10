@@ -2,7 +2,10 @@
 # GCE startup script (runs on every boot). Idempotent: installs once, then
 # just (re)starts the runner. Rendered by Terraform templatefile().
 set -Eeuo pipefail
-exec > >(logger -t gha-startup) 2>&1
+# google_metadata_script_runner copies stdout/stderr to the journal and the serial
+# console ("startup-script:" lines), readable without SSH. Never echo secrets.
+exec 2>&1
+trap 'echo "gha-startup: failed at line $LINENO (exit $?)"' ERR
 
 ORG="${github_org}"
 GROUP="${runner_group}"
@@ -16,18 +19,62 @@ md() { curl -fsS -H 'Metadata-Flavor: Google' "$MD/$1" 2>/dev/null || true; }
 RUNNER_HOME=/opt/actions-runner
 CACHE=/var/cache/ci
 
+# --- self power-off when idle (scale_to_zero) ----------------------------------
+# Installed first so the VM always stops itself, even if a later step fails.
+if (( IDLE_MINUTES > 0 )); then
+  cat >/usr/local/bin/gha-idle-check <<IDLE
+#!/usr/bin/env bash
+# Counts consecutive idle minutes; a running Runner.Worker means a job is active.
+f=/run/gha-idle-minutes
+if pgrep -f Runner.Worker >/dev/null; then echo 0 >"\$f"; exit 0; fi
+n=\$(( \$(cat "\$f" 2>/dev/null || echo 0) + 1 )); echo "\$n" >"\$f"
+if (( n >= $IDLE_MINUTES )); then logger -t gha-idle "idle \$n min, powering off"; systemctl poweroff; fi
+IDLE
+  chmod 0755 /usr/local/bin/gha-idle-check
+  cat >/etc/systemd/system/gha-idle.service <<'UNIT'
+[Unit]
+Description=Power off the runner VM when idle
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gha-idle-check
+UNIT
+  cat >/etc/systemd/system/gha-idle.timer <<'UNIT'
+[Unit]
+Description=Check runner idleness every minute
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1min
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now gha-idle.timer
+fi
+
+
 # --- packages, Docker, runner user (first boot only) ---------------------------
 if [[ ! -f /var/lib/gha-provisioned ]]; then
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl git jq unzip zip xz-utils zstd \
-    build-essential clang cmake pkg-config libssl-dev protobuf-compiler python3 python3-pip
+  # A previous boot may have been stopped mid-install, and unattended-upgrades
+  # holds the dpkg lock on a fresh image: repair, then wait for locks.
+  APT="apt-get -o DPkg::Lock::Timeout=900"
+  dpkg --configure -a || true
+  # An interrupted earlier "apt-get update" leaves InRelease files without their
+  # package lists, so later updates "Hit" and never fetch them: start clean.
+  rm -rf /var/lib/apt/lists/*
+  # GCE Ubuntu images ship with only "main"; clang, protobuf-compiler and pip are in universe.
+  add-apt-repository -y -n universe || sed -i 's/^Components: main restricted$/Components: main restricted universe/' /etc/apt/sources.list.d/ubuntu.sources
+  $APT update
+  $APT install -y --no-install-recommends ca-certificates curl git jq unzip zip xz-utils zstd \
+    build-essential cmake pkg-config libssl-dev python3
+  # Optional extras from universe; on the GCE image universe has not resolved (follow-up).
+  $APT install -y --no-install-recommends clang protobuf-compiler python3-pip || echo "gha-startup: optional universe packages unavailable"
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo "$VERSION_CODENAME") stable" \
     >/etc/apt/sources.list.d/docker.list
-  apt-get update
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  $APT update
+  $APT install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
   usermod -aG docker runner # Docker for jobs: runner runs on the host, not in a container
   install -d -o runner -g runner "$CACHE" "$CACHE/sccache" "$CACHE/cargo" "$RUNNER_HOME"
@@ -87,34 +134,3 @@ if [[ ! -f "$RUNNER_HOME/.runner" ]]; then
   (cd "$RUNNER_HOME" && ./svc.sh install runner)
 fi
 (cd "$RUNNER_HOME" && ./svc.sh start) || true
-
-# --- self power-off when idle (scale_to_zero) ----------------------------------
-if (( IDLE_MINUTES > 0 )); then
-  cat >/usr/local/bin/gha-idle-check <<IDLE
-#!/usr/bin/env bash
-# Counts consecutive idle minutes; a running Runner.Worker means a job is active.
-f=/run/gha-idle-minutes
-if pgrep -f Runner.Worker >/dev/null; then echo 0 >"\$f"; exit 0; fi
-n=\$(( \$(cat "\$f" 2>/dev/null || echo 0) + 1 )); echo "\$n" >"\$f"
-if (( n >= $IDLE_MINUTES )); then logger -t gha-idle "idle \$n min, powering off"; systemctl poweroff; fi
-IDLE
-  chmod 0755 /usr/local/bin/gha-idle-check
-  cat >/etc/systemd/system/gha-idle.service <<'UNIT'
-[Unit]
-Description=Power off the runner VM when idle
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/gha-idle-check
-UNIT
-  cat >/etc/systemd/system/gha-idle.timer <<'UNIT'
-[Unit]
-Description=Check runner idleness every minute
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=1min
-[Install]
-WantedBy=timers.target
-UNIT
-  systemctl daemon-reload
-  systemctl enable --now gha-idle.timer
-fi
