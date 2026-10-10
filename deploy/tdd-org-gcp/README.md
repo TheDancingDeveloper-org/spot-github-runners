@@ -63,7 +63,7 @@ gh api -X POST orgs/TheDancingDeveloper-org/actions/runner-groups \
   -F 'selected_repository_ids[]=<vogt id>' ...   # ids via gh api repos/ORG/REPO --jq .id
 
 cp terraform.tfvars.example terraform.tfvars   # fill project/billing IDs
-terraform init && terraform plan -out plan.bin  # review: 1 VM, budget, function
+terraform init && terraform plan -out plan.bin  # review: 8 to add (VPC, VM, budget, Pub/Sub, IAM)
 terraform apply plan.bin
 
 # Poller key, kept out of Terraform state; store it in Infisical, not on disk in Git:
@@ -93,7 +93,7 @@ keep "Require approval for all outside collaborators" on for fork workflows.
 | Ephemeral IPv4 | $0.005/h running | 80 h = $0.40 |
 | 100 GB pd-balanced | $0.135/GB-month, charged while stopped | $13.50 |
 | Internet egress (artifacts, sccache writes) | $0.19/GB | 5 GB = $0.95 |
-| Budget guard function, Pub/Sub, bucket | free tier | ~$0.10 |
+| Pub/Sub budget topic and subscription | free tier | ~$0 |
 | **Total at 80 VM-hours** | | **~$20** |
 
 At $30, the budget buys about 210 VM-hours a month, or about 290 with a 60 GB
