@@ -19,6 +19,10 @@ md() { curl -fsS -H 'Metadata-Flavor: Google' "$MD/$1" 2>/dev/null || true; }
 RUNNER_HOME=/opt/actions-runner
 CACHE=/var/cache/ci
 
+# Keep the runner offline until this script has finished setting up the host
+# (packages, tailnet, .env, hooks); it is started again at the end.
+systemctl stop 'actions.runner.*' 2>/dev/null || true
+
 # --- self power-off when idle (scale_to_zero) ----------------------------------
 # Installed first so the VM always stops itself, even if a later step fails.
 if (( IDLE_MINUTES > 0 )); then
@@ -177,7 +181,7 @@ fi
   echo "SCCACHE_DIR=$CACHE/sccache"
   echo "SCCACHE_CACHE_SIZE=40G"
   echo "CARGO_INCREMENTAL=0"
-  echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-job-completed"
+  echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-job-completed.sh"
   if [[ -n "$SCCACHE_REDIS" && "$TS_UP" == 1 ]]; then echo "SCCACHE_REDIS_ENDPOINT=$SCCACHE_REDIS"; fi
 } >"$RUNNER_HOME/.env"
 chown runner:runner "$RUNNER_HOME/.env"
@@ -185,7 +189,7 @@ chown runner:runner "$RUNNER_HOME/.env"
 [[ -x "$CACHE/cargo/bin/cargo" ]] || sudo -u runner cp -a /home/runner/.cargo/. "$CACHE/cargo/"
 echo "PATH=$CACHE/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" >>"$RUNNER_HOME/.env"
 
-cat >/usr/local/bin/gha-job-completed <<'HOOK'
+cat >/usr/local/bin/gha-job-completed.sh <<'HOOK'
 #!/usr/bin/env bash
 # Remove job containers/networks/volumes; keep images and build cache warm.
 docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
@@ -196,7 +200,7 @@ avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
 if (( avail < 20 )); then docker system prune -af --filter until=72h >/dev/null 2>&1 || true; fi
 exit 0
 HOOK
-chmod 0755 /usr/local/bin/gha-job-completed
+chmod 0755 /usr/local/bin/gha-job-completed.sh
 
 # --- register once (persistent runner; caches survive between jobs) -------------
 if [[ ! -f "$RUNNER_HOME/.runner" ]]; then
