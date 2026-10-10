@@ -89,11 +89,60 @@ if [[ ! -f /var/lib/gha-provisioned ]]; then
   touch /var/lib/gha-provisioned
 fi
 
-# --- Tailscale (optional; needed only to reach the estate sccache Redis) -------
-TS_KEY=$(md tailscale-auth-key)
-if [[ -n "$TS_KEY" ]]; then
-  command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
-  tailscale status >/dev/null 2>&1 || tailscale up --authkey="$TS_KEY" --hostname="$NAME" --advertise-tags=tag:ci-gcp --ssh=false
+# --- Tailscale: join as tag:ci-gcp (ACL: Redis 6380 + Loki 3101 out, Netdata in)
+# The auth key is single-use and pre-authorised; once joined, node state on the
+# persistent disk keeps the identity and the key in metadata is spent.
+command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+systemctl enable --now tailscaled
+if ! tailscale status >/dev/null 2>&1; then
+  TS_KEY=$(md tailscale-auth-key)
+  if [[ -n "$TS_KEY" ]]; then
+    tailscale up --authkey="$TS_KEY" --hostname="$NAME" --advertise-tags=tag:ci-gcp --ssh=false --accept-dns=false \
+      || echo "gha-startup: tailscale up failed"
+  fi
+  unset TS_KEY
+fi
+TS_UP=0; tailscale status >/dev/null 2>&1 && TS_UP=1
+
+# --- Netdata: scraped by Node B Prometheus over the tailnet --------------------
+# Bound to all interfaces: the VPC has no inbound firewall rules, so only
+# tailnet peers allowed by the ACL (Node B -> :19999) can reach it.
+if [[ ! -x /usr/sbin/netdata ]]; then
+  curl -fsSL https://get.netdata.cloud/kickstart.sh -o /tmp/netdata-kickstart.sh \
+    && sh /tmp/netdata-kickstart.sh --stable-channel --disable-telemetry --dont-wait --non-interactive \
+    || echo "gha-startup: netdata install failed"
+fi
+
+# --- Grafana Alloy: ship the journal to Loki on Node B ------------------------
+if [[ ! -x /usr/bin/alloy ]]; then
+  curl -fsSL https://apt.grafana.com/gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/grafana.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" >/etc/apt/sources.list.d/grafana.list
+  apt-get -o DPkg::Lock::Timeout=900 update && apt-get -o DPkg::Lock::Timeout=900 install -y alloy \
+    || echo "gha-startup: alloy install failed"
+fi
+if [[ -x /usr/bin/alloy ]]; then
+  cat >/etc/alloy/config.alloy <<'ALLOY'
+loki.relabel "journal" {
+  forward_to = []
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+}
+loki.source.journal "journal" {
+  forward_to    = [loki.write.nodeb.receiver]
+  relabel_rules = loki.relabel.journal.rules
+  labels        = { job = "gha-spot", host = "gha-spot-1" }
+}
+loki.write "nodeb" {
+  endpoint {
+    url = "http://100.92.54.45:3101/loki/api/v1/push"
+  }
+}
+ALLOY
+  usermod -aG systemd-journal alloy 2>/dev/null || true
+  systemctl enable alloy >/dev/null 2>&1 || true
+  systemctl restart alloy || echo "gha-startup: alloy restart failed"
 fi
 
 # --- job environment + per-job cleanup hook ------------------------------------
@@ -104,7 +153,7 @@ fi
   echo "SCCACHE_CACHE_SIZE=40G"
   echo "CARGO_INCREMENTAL=0"
   echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-job-completed"
-  if [[ -n "$SCCACHE_REDIS" && -n "$TS_KEY" ]]; then echo "SCCACHE_REDIS_ENDPOINT=$SCCACHE_REDIS"; fi
+  if [[ -n "$SCCACHE_REDIS" && "$TS_UP" == 1 ]]; then echo "SCCACHE_REDIS_ENDPOINT=$SCCACHE_REDIS"; fi
 } >"$RUNNER_HOME/.env"
 chown runner:runner "$RUNNER_HOME/.env"
 # Cargo binaries: seed the shared CARGO_HOME from the rustup install once.
