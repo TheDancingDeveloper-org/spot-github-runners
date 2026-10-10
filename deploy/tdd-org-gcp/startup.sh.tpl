@@ -19,9 +19,19 @@ md() { curl -fsS -H 'Metadata-Flavor: Google' "$MD/$1" 2>/dev/null || true; }
 RUNNER_HOME=/opt/actions-runner
 CACHE=/var/cache/ci
 
-# Keep the runner offline until this script has finished setting up the host
-# (packages, tailnet, .env, hooks); it is started again at the end.
-systemctl stop 'actions.runner.*' 2>/dev/null || true
+# The runner service is not enabled at boot: only this script starts it, once
+# the host is set up (packages, tailnet, .env, hooks). An enabled unit raced this
+# script on 2026-10-10: it took a job at boot and the stop below killed it.
+RUNNER_UNIT="actions.runner.$ORG.$NAME.service"
+systemctl disable "$RUNNER_UNIT" >/dev/null 2>&1 || true
+if pgrep -f Runner.Worker >/dev/null; then
+  # A job is already running (unit was still enabled on this boot): leave it.
+  echo "gha-startup: job already running; not stopping the runner"
+  RUNNER_BUSY_AT_BOOT=1
+else
+  systemctl stop "$RUNNER_UNIT" 2>/dev/null || true
+  RUNNER_BUSY_AT_BOOT=0
+fi
 
 # --- disk report and boot-time reclaim (runner is offline until the end) -------
 # Logged to the serial console and Loki, so disk use is visible without SSH.
@@ -37,7 +47,7 @@ journalctl --vacuum-size=500M >/dev/null 2>&1 || true
 root_pct=$(df --output=pcent / | tail -1 | tr -dc 0-9)
 # Operators can force a reclaim on the next boot with metadata gha-force-reclaim=1.
 force=$(md gha-force-reclaim)
-if (( root_pct >= 70 )) || [[ "$force" == 1 ]]; then
+if (( RUNNER_BUSY_AT_BOOT == 0 )) && { (( root_pct >= 70 )) || [[ "$force" == 1 ]]; }; then  # never under a running job
   echo "gha-disk: root at $root_pct% (force=$force), reclaiming"
   find /opt/actions-runner/_work -mindepth 3 -maxdepth 4 -type d -name target -prune -exec rm -rf -- {} + 2>/dev/null || true
   rm -rf -- /var/cache/ci/cargo/registry/src
@@ -259,5 +269,6 @@ if [[ ! -f "$RUNNER_HOME/.runner" ]]; then
     --url "https://github.com/$ORG" --token "$TOKEN" --name "$NAME" \
     --runnergroup "$GROUP" --labels "$LABELS" --work /opt/actions-runner/_work
   (cd "$RUNNER_HOME" && ./svc.sh install runner)
+  systemctl disable "$RUNNER_UNIT" >/dev/null 2>&1 || true  # started below, never at boot
 fi
 (cd "$RUNNER_HOME" && ./svc.sh start) || true
