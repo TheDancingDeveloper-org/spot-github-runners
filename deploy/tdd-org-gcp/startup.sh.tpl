@@ -23,6 +23,34 @@ CACHE=/var/cache/ci
 # (packages, tailnet, .env, hooks); it is started again at the end.
 systemctl stop 'actions.runner.*' 2>/dev/null || true
 
+# --- disk report and boot-time reclaim (runner is offline until the end) -------
+# Logged to the serial console and Loki, so disk use is visible without SSH.
+disk_report() {
+  echo "gha-disk: $1: $(df -h --output=size,used,avail,pcent / | tail -1)"
+  for d in /opt/actions-runner/_work /var/cache/ci/sccache /var/cache/ci/cargo/registry \
+           /var/lib/docker /var/lib/containerd /var/log /opt/actions-runner/_diag /home/runner /tmp; do
+    [[ -e "$d" ]] && echo "gha-disk: $1: $(du -sh "$d" 2>/dev/null | cut -f1) $d"
+  done
+}
+disk_report before
+journalctl --vacuum-size=500M >/dev/null 2>&1 || true
+root_pct=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+# Operators can force a reclaim on the next boot with metadata gha-force-reclaim=1.
+force=$(md gha-force-reclaim)
+if (( root_pct >= 70 )) || [[ "$force" == 1 ]]; then
+  echo "gha-disk: root at $root_pct% (force=$force), reclaiming"
+  find /opt/actions-runner/_work -mindepth 3 -maxdepth 4 -type d -name target -prune -exec rm -rf -- {} + 2>/dev/null || true
+  rm -rf -- /var/cache/ci/cargo/registry/src
+  command -v docker >/dev/null && docker system prune -af >/dev/null 2>&1 || true
+  # sccache is capped at 20G from now on; a cache larger than that predates the cap.
+  if (( $(du -sk /var/cache/ci/sccache 2>/dev/null | cut -f1) > 25 * 1024 * 1024 )); then
+    find /var/cache/ci/sccache -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  fi
+  find /opt/actions-runner/_diag -type f -mtime +1 -delete 2>/dev/null || true
+  disk_report after
+fi
+
+
 # --- self power-off when idle (scale_to_zero) ----------------------------------
 # Installed first so the VM always stops itself, even if a later step fails.
 if (( IDLE_MINUTES > 0 )); then
@@ -179,7 +207,7 @@ fi
   echo "CARGO_HOME=$CACHE/cargo"
   echo "RUSTC_WRAPPER=/usr/local/bin/sccache"
   echo "SCCACHE_DIR=$CACHE/sccache"
-  echo "SCCACHE_CACHE_SIZE=40G"
+  echo "SCCACHE_CACHE_SIZE=20G"
   echo "CARGO_INCREMENTAL=0"
   echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-job-completed.sh"
   if [[ -n "$SCCACHE_REDIS" && "$TS_UP" == 1 ]]; then echo "SCCACHE_REDIS_ENDPOINT=$SCCACHE_REDIS"; fi
@@ -191,13 +219,34 @@ echo "PATH=$CACHE/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 
 cat >/usr/local/bin/gha-job-completed.sh <<'HOOK'
 #!/usr/bin/env bash
+# Runs as the runner user after every job. Best effort; never fails the job.
 # Remove job containers/networks/volumes; keep images and build cache warm.
 docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
 docker network prune -f >/dev/null 2>&1 || true
 docker volume prune -f >/dev/null 2>&1 || true
-# Keep the disk from filling: trim images when free space < 20 GiB.
-avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
-if (( avail < 20 )); then docker system prune -af --filter until=72h >/dev/null 2>&1 || true; fi
+pct() { df --output=pcent / | tail -1 | tr -dc 0-9; }
+echo "job-completed: root at $(pct)% before cleanup" >&2
+# Cargo target dirs: actions/checkout's git clean removes them on the next
+# checkout anyway, so a large one only wastes disk until then. Drop any over
+# 15 GiB, or all of them once the disk is 80% full. sccache keeps compiles warm.
+limit_kb=$((15 * 1024 * 1024))
+find /opt/actions-runner/_work -mindepth 3 -maxdepth 4 -type d -name target -prune 2>/dev/null | while read -r t; do
+  kb=$(du -sk "$t" 2>/dev/null | cut -f1)
+  if (( kb > limit_kb )) || (( $(pct) >= 80 )); then
+    echo "job-completed: removing $t ($((kb / 1024 / 1024)) GiB)" >&2
+    rm -rf -- "$t"
+  fi
+done
+# Runner diagnostics older than three days.
+find /opt/actions-runner/_diag -type f -mtime +3 -delete 2>/dev/null || true
+if (( $(pct) >= 80 )); then
+  # Extracted crate sources are re-extracted from registry/cache on demand.
+  rm -rf -- /var/cache/ci/cargo/registry/src
+  docker system prune -af --filter until=72h >/dev/null 2>&1 || true
+fi
+# Restart sccache so SCCACHE_CACHE_SIZE (LRU cap) is re-read and enforced.
+/usr/local/bin/sccache --stop-server >/dev/null 2>&1 || true
+echo "job-completed: root at $(pct)% after cleanup" >&2
 exit 0
 HOOK
 chmod 0755 /usr/local/bin/gha-job-completed.sh
