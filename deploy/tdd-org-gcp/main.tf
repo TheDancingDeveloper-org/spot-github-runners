@@ -91,7 +91,11 @@ resource "google_compute_instance" "runner" {
   lifecycle {
     # The poller and budget guard own power state, the one-hour registration
     # token and the budget lock label.
-    ignore_changes = [desired_status, metadata["gha-reg-token"], metadata["tailscale-auth-key"], metadata["gha-force-reclaim"], labels["gha-budget-locked"]]
+    ignore_changes = [desired_status, metadata["gha-reg-token"], metadata["tailscale-auth-key"], metadata["gha-force-reclaim"], labels["gha-budget-locked"],
+      # boot_disk size is set at creation only; resizes are done in place with
+      # `gcloud compute disks resize` (2026-10-10: 100 -> 160 GB) because changing
+      # initialize_params.size forces a VM replacement.
+    boot_disk[0].initialize_params[0].size]
   }
 }
 
