@@ -140,9 +140,15 @@ missing=()
 for pkg in libcap-dev libasound2-dev bubblewrap; do
   dpkg-query -W -f='$${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed || missing+=("$pkg")
 done
+# dpkg's record alone is not proof: also require the bwrap binary itself.
+if ! [[ -x /usr/bin/bwrap ]] && [[ " $${missing[*]} " != *" bubblewrap "* ]]; then
+  missing+=(bubblewrap)
+  apt_reinstall=--reinstall
+fi
 if (( $${#missing[@]} > 0 )); then
+  echo "gha-startup: catch-up installing: $${missing[*]}"
   apt-get -o DPkg::Lock::Timeout=900 update
-  apt-get -o DPkg::Lock::Timeout=900 install -y --no-install-recommends "$${missing[@]}" \
+  apt-get -o DPkg::Lock::Timeout=900 install -y --no-install-recommends $${apt_reinstall:-} "$${missing[@]}" \
     || echo "gha-startup: catch-up install failed: $${missing[*]}"
 fi
 
@@ -271,4 +277,23 @@ if [[ ! -f "$RUNNER_HOME/.runner" ]]; then
   (cd "$RUNNER_HOME" && ./svc.sh install runner)
   systemctl disable "$RUNNER_UNIT" >/dev/null 2>&1 || true  # started below, never at boot
 fi
-(cd "$RUNNER_HOME" && ./svc.sh start) || true
+# --- prerequisite gate: jobs here skip their own sudo installs, so the runner
+# must not come online without them. Logged every boot (serial console + Loki).
+prereq_ok=1
+bwrap_path=$(command -v bwrap || true)
+echo "gha-prereq: bwrap=$${bwrap_path:-MISSING} $(dpkg-query -W -f='bubblewrap=$${Version} $${db:Status-Status}' bubblewrap 2>/dev/null || echo bubblewrap=not-installed)"
+for pkg in libcap-dev libasound2-dev; do
+  dpkg-query -W -f='$${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed || { echo "gha-prereq: $pkg MISSING"; prereq_ok=0; }
+done
+[[ -n "$bwrap_path" ]] || prereq_ok=0
+userns=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo n/a)
+aa=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)
+echo "gha-prereq: unprivileged_userns_clone=$userns apparmor_restrict_unprivileged_userns=$aa"
+[[ "$userns" == 1 && ( "$aa" == 0 || "$aa" == n/a ) ]] || prereq_ok=0
+if (( prereq_ok == 1 )); then
+  echo "gha-prereq: ok"
+  (cd "$RUNNER_HOME" && ./svc.sh start) || true
+else
+  # Fail closed: leave the runner offline; the idle timer powers the VM off.
+  echo "gha-prereq: FAILED - runner left offline"
+fi
