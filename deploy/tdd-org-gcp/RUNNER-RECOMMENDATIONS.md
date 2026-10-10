@@ -135,3 +135,35 @@ usage of about 200 h a month.
   which is why heavy builds go to GCP.
 - **Prices:** Spot prices can change up to once every 30 days. Re-check with
   `tools/spot_prices.py` once a GCP project exists.
+
+## Provider comparison (about 30–32 vCPU, 2026-10-10)
+
+Prices are compute only, in USD per hour. Disk, IP and egress come on top.
+
+- **GCP:** gcloud-compute.com catalog snapshot dated 2026-10-04.
+- **AWS:** public Spot feed `spot.js`, which tends to lag the live market.
+- **Azure:** Retail Prices API.
+- **Oracle (OCI):** public price list. OCI charges the same price in every
+  region, and its preemptible VMs are 50% off.
+- **Hetzner:** list prices quoted from memory, not fetched. Treat them as
+  approximate.
+
+| Provider | Shape | Region | $/h | Hours $30 buys | Notes |
+|---|---|---|---|---|---|
+| **GCP Spot** | c3d-highcpu-30 (30 vCPU, 59 GB) | Sydney | **0.127** | **~118** (after the $13.50 disk) | Cheapest per hour. Preemptible. |
+| Azure Spot | F32s_v2 (32 vCPU, 64 GB) | australiaeast | 0.328 | ~90 | Older Intel shape. Arm D32pls_v6 is 0.229. |
+| OCI preemptible | E5 Flex, 16 OCPU = 32 vCPU, 64 GB | Sydney | ~0.30 | ~100 | Arm A1 with 32 OCPU is about 0.21. |
+| AWS Spot | c6a.8xlarge (32 vCPU, 64 GB) | ap-southeast-2 | 0.725 | ~40 | us-west-2 is 0.58 (c7g Arm: 0.35). |
+| Hetzner Cloud | CCX53 (32 dedicated vCPU) | EU, US, Singapore | ~0.40 | ~75 | Billed while stopped; must be deleted and recreated. No Australia region. |
+| Hetzner dedicated | Auction Ryzen 16 cores / 32 threads, 64–128 GB | EU | flat ~€40–70/month | Unlimited | Always on, no preemption. EU latency is irrelevant to CI with a local cache. |
+| OCI Always Free | A1 Arm, 4 OCPU / 24 GB | Any | 0 | Unlimited | Arm only; free capacity is hard to obtain. |
+
+**Takeaways:**
+- **On demand:** GCP Spot in Sydney is the cheapest hourly option by a factor of
+  2–5. Keep it as the recommendation.
+- **Always on:** if you'd rather pay a flat fee with no preemption, cold start
+  or budget cap, a Hetzner auction server (16 cores / 32 threads, about
+  €40–70/month) gives unlimited heavy-Rust hours. It costs roughly twice the
+  budget, and the estate already has a Hetzner account.
+- **Free extra:** OCI's Always Free Arm instance could host a free small runner
+  for Arm-compatible jobs, if capacity can be obtained.
