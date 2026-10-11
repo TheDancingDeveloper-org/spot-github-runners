@@ -27,12 +27,22 @@ bwrap_path=$(command -v bwrap || true)
 echo "gha-prereq: bwrap=$${bwrap_path:-MISSING} userns=$(sysctl -n kernel.unprivileged_userns_clone) apparmor_restrict=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
 if [[ -z "$bwrap_path" ]]; then echo "gha-prereq: FAILED"; systemctl poweroff; exit 1; fi
 
-# --- optional tailnet (ephemeral node) + Loki log shipping ----------------------
-TS_KEY=$(md tailscale-auth-key)
-if [[ -n "$TS_KEY" ]]; then
+# --- tailnet (ephemeral node via Tailscale federated identity) + Loki logs ------
+# No stored key: the VM's service-account identity token (issuer accounts.google.com,
+# subject = gha-runner-vm's unique ID) is exchanged for a one-time tag:ci-gcp login.
+TS_CLIENT_ID="${ts_client_id}"
+TS_AUDIENCE="${ts_audience}"
+if [[ -n "$TS_CLIENT_ID" ]]; then
   systemctl enable --now tailscaled >/dev/null 2>&1 || true
-  tailscale up --authkey="$TS_KEY" --hostname="$NAME" --advertise-tags=tag:ci-gcp \
-    --ssh=false --accept-dns=false --timeout=60s || echo "gha-vm: tailscale up failed"
+  id_token=$(curl -fsS -H 'Metadata-Flavor: Google' \
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=$TS_AUDIENCE&format=full" || true)
+  if [[ -n "$id_token" ]] && tailscale up --client-id="$TS_CLIENT_ID?ephemeral=true&preauthorized=true" --id-token="$id_token" \
+       --hostname="$NAME" --advertise-tags=tag:ci-gcp --ssh=false --accept-dns=false --timeout=60s; then
+    echo "gha-vm: tailnet up as $(tailscale ip -4 2>/dev/null)"
+  else
+    echo "gha-vm: tailscale login failed; continuing without the tailnet"
+  fi
+  unset id_token
   cat >/etc/alloy/config.alloy <<ALLOY
 loki.relabel "journal" {
   forward_to = []
@@ -55,7 +65,6 @@ ALLOY
   usermod -aG systemd-journal alloy 2>/dev/null || true
   systemctl restart alloy || echo "gha-vm: alloy failed"
 fi
-unset TS_KEY
 
 # --- job environment ---------------------------------------------------------------
 RUNNER_HOME=/opt/actions-runner

@@ -23,6 +23,17 @@ variable "sccache_bucket" {
   default     = ""
 }
 
+variable "ts_client_id" {
+  description = "Tailscale federated identity client ID (not secret). Empty = no tailnet on throwaway VMs."
+  type        = string
+  default     = ""
+}
+
+variable "ts_audience" {
+  type    = string
+  default = ""
+}
+
 variable "ephemeral_machine_type" {
   type    = string
   default = "c3d-highcpu-30"
@@ -70,7 +81,7 @@ resource "google_compute_instance_template" "rust_heavy" {
 
   service_account {
     email  = var.runner_vm_sa_email
-    scopes = ["https://www.googleapis.com/auth/devstorage.read_write"]
+    scopes = ["https://www.googleapis.com/auth/devstorage.read_write"] # identity tokens need no scope
   }
 
   shielded_instance_config {
@@ -82,6 +93,8 @@ resource "google_compute_instance_template" "rust_heavy" {
     block-project-ssh-keys = "TRUE"
     startup-script = templatefile("${path.module}/image/runtime.sh.tpl", {
       sccache_bucket       = var.sccache_bucket
+      ts_client_id         = var.ts_client_id
+      ts_audience          = var.ts_audience
       idle_limit_minutes   = 20
       max_lifetime_minutes = 360
     })
