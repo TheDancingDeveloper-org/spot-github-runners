@@ -31,12 +31,16 @@ gcloud compute instances create "$BUILDER" "${Z[@]}" \
   --metadata=image-version="$VERSION",enable-oslogin=TRUE,block-project-ssh-keys=TRUE >/dev/null
 
 echo "bake: waiting for the builder to finish and power off"
+# Serial output is only readable while the VM runs, so collect it on every poll.
+log=""
 for _ in $(seq 1 90); do
   sleep 20
+  out=$(gcloud compute instances get-serial-port-output "$BUILDER" "${Z[@]}" 2>/dev/null || true)
+  [[ -n "$out" ]] && log=$(grep -a 'gha-bake:' <<<"$out" | sed 's/.*startup-script: //' | awk '!s[$0]++' || true)
   status=$(gcloud compute instances describe "$BUILDER" "${Z[@]}" --format='value(status)')
   [[ "$status" == TERMINATED ]] && break
+  grep -q 'gha-bake: FAILED' <<<"$log" && break
 done
-log=$(gcloud compute instances get-serial-port-output "$BUILDER" "${Z[@]}" 2>/dev/null | grep -a 'gha-bake:' | sed 's/.*startup-script: //' | awk '!s[$0]++')
 echo "$log"
 [[ "$status" == TERMINATED ]] || { echo "bake: builder did not finish" >&2; exit 1; }
 grep -q "gha-bake: done $VERSION" <<<"$log" || { echo "bake: provisioning failed; image not created" >&2; exit 1; }
