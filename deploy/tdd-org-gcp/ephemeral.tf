@@ -8,7 +8,7 @@
 variable "enable_ephemeral" {
   description = "Create the instance template for throwaway runner VMs."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "runner_vm_sa_email" {

@@ -8,7 +8,7 @@ locals {
 variable "enable_persistent" {
   description = "The original long-lived runner VM (gha-spot-1). Replaced by throwaway VMs (ephemeral.tf) on 2026-10-12."
   type        = bool
-  default     = true
+  default     = false
 }
 
 # APIs (compute, billingbudgets, pubsub) are enabled out of band: the deployer
