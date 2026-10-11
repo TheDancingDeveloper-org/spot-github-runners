@@ -16,6 +16,8 @@ Environment:
   MAX_HOURS_PER_MONTH default 250 (belt and braces under the budget)
   GCP_BUDGET_SUBSCRIPTION default gha-spot-budget-poller (budget Pub/Sub; >=100% stops and locks the VM)
   STATE_FILE          default ~/.local/state/gha-spot-poller.json
+  MODE                persistent (start/stop GCP_INSTANCE) or ephemeral (one throwaway VM per job)
+  GCP_TEMPLATE, MAX_VMS, RUNNER_GROUP_ID, MAX_VM_AGE_MIN   ephemeral mode settings
   --once              one poll then exit (for a systemd timer); default loops every 30 s
 """
 import base64
@@ -38,6 +40,14 @@ MAX_HOURS = float(os.environ.get("MAX_HOURS_PER_MONTH", "250"))
 STATE_FILE = os.path.expanduser(os.environ.get("STATE_FILE", "~/.local/state/gha-spot-poller.json"))
 INTERVAL = 30
 BUDGET_SUB = os.environ.get("GCP_BUDGET_SUBSCRIPTION", "gha-spot-budget-poller")
+# MODE=persistent (default): start/stop the long-lived GCP_INSTANCE.
+# MODE=ephemeral: create one throwaway VM per queued job from GCP_TEMPLATE with a
+# just-in-time runner registration, and delete it once it has powered off.
+MODE = os.environ.get("MODE", "persistent")
+TEMPLATE = os.environ.get("GCP_TEMPLATE", "")          # instance template self link or name
+MAX_VMS = int(os.environ.get("MAX_VMS", "1"))
+RUNNER_GROUP_ID = int(os.environ.get("RUNNER_GROUP_ID", "6"))
+MAX_VM_AGE_S = int(os.environ.get("MAX_VM_AGE_MIN", "420")) * 60  # backstop over the VM's own 6 h limit
 
 
 def log(msg):
@@ -205,6 +215,85 @@ def poll(state):
     log(f"started {INSTANCE} for {', '.join(jobs[:5])} ({hours:.1f}h used this month)")
 
 
+# ---------------------------------------------------------------- ephemeral mode
+def zone_api(method, suffix="", body=None):
+    url = f"https://compute.googleapis.com/compute/v1/projects/{PROJECT}/zones/{ZONE}{suffix}"
+    return http(method, url, gcp_token(), body)
+
+
+def ephemeral_vms():
+    resp = zone_api("GET", "/instances?filter=labels.gha-ephemeral%3Dtrue&maxResults=50")
+    return resp.get("items", [])
+
+
+def template_metadata_items():
+    name = TEMPLATE.rsplit("/", 1)[-1]
+    tpl = http("GET", f"https://compute.googleapis.com/compute/v1/projects/{PROJECT}/global/instanceTemplates/{name}",
+               gcp_token())
+    return tpl["properties"].get("metadata", {}).get("items", []), name
+
+
+def create_vm(job_ref):
+    name = "gha-rh-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    jit = gh("POST", f"orgs/{ORG}/actions/runners/generate-jitconfig", {
+        "name": name, "runner_group_id": RUNNER_GROUP_ID,
+        "labels": ["self-hosted", "Linux", "X64", LABEL], "work_folder": "_work"})["encoded_jit_config"]
+    items, tpl_name = template_metadata_items()
+    # An instance body's metadata replaces the template's, so carry its items over.
+    items = [i for i in items if i["key"] != "gha-jitconfig"] + [{"key": "gha-jitconfig", "value": jit}]
+    zone_api("POST", f"/instances?sourceInstanceTemplate=projects/{PROJECT}/global/instanceTemplates/{tpl_name}",
+             {"name": name, "metadata": {"items": items}})
+    log(f"created {name} for {job_ref}")
+
+
+def delete_vm(name, why):
+    zone_api("DELETE", f"/instances/{name}")
+    log(f"deleting {name} ({why})")
+
+
+def poll_ephemeral(state):
+    month = dt.date.today().strftime("%Y-%m")
+    if state.get("month") != month:
+        state.update(month=month, running_seconds=0)
+    now = time.time()
+    vms = ephemeral_vms()
+    live = [v for v in vms if v["status"] not in ("TERMINATED", "STOPPING", "STOPPED", "SUSPENDED")]
+    if state.get("last_poll"):
+        state["running_seconds"] += len([v for v in live if v["status"] == "RUNNING"]) * min(now - state["last_poll"], 10 * INTERVAL)
+    state["last_poll"] = now
+    hours = state["running_seconds"] / 3600
+    heartbeat(state, f"{len(live)} live / {len(vms)} total throwaway VMs")
+
+    for v in vms:  # finished (powered off) or overdue VMs go, with their disks
+        created = dt.datetime.fromisoformat(v["creationTimestamp"]).timestamp()
+        if v["status"] == "TERMINATED":
+            delete_vm(v["name"], "finished")
+        elif now - created > MAX_VM_AGE_S:
+            delete_vm(v["name"], f"older than {MAX_VM_AGE_S // 60} min")
+
+    if not state.get("budget_locked") and budget_exhausted():
+        state["budget_locked"] = True
+        for v in live:
+            delete_vm(v["name"], "budget reached")
+        log("budget reached: throwaway VMs deleted; set budget_locked=false in the state file to unlock")
+        return
+    if hours >= MAX_HOURS:
+        for v in live:
+            delete_vm(v["name"], f"monthly cap {MAX_HOURS}h reached")
+        return
+
+    jobs = queued_jobs()
+    # A VM that has not yet picked up its job still counts against the queue.
+    want = min(len(jobs), MAX_VMS) - len(live)
+    if want <= 0:
+        return
+    if state.get("budget_locked"):
+        log(f"{len(jobs)} queued but budget-locked; not creating VMs")
+        return
+    for job in jobs[:want]:
+        create_vm(job)
+
+
 _last_heartbeat = [0.0]
 
 
@@ -219,11 +308,13 @@ def heartbeat(state, status):
 def main():
     if not PROJECT:
         sys.exit("GCP_PROJECT is required")
+    if MODE == "ephemeral" and not TEMPLATE:
+        sys.exit("GCP_TEMPLATE is required in ephemeral mode")
     once = "--once" in sys.argv
     while True:
         state = load_state()
         try:
-            poll(state)
+            (poll_ephemeral if MODE == "ephemeral" else poll)(state)
         except (urllib.error.URLError, subprocess.CalledProcessError, KeyError) as error:
             log(f"poll failed: {error}")
         save_state(state)
