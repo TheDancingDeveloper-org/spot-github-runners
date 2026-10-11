@@ -5,6 +5,12 @@ locals {
   name = "gha-spot-1"
 }
 
+variable "enable_persistent" {
+  description = "The original long-lived runner VM (gha-spot-1). Replaced by throwaway VMs (ephemeral.tf) on 2026-10-12."
+  type        = bool
+  default     = true
+}
+
 # APIs (compute, billingbudgets, pubsub) are enabled out of band: the deployer
 # service account deliberately cannot enable services or edit project IAM.
 data "google_project" "this" {}
@@ -38,6 +44,7 @@ resource "google_compute_firewall" "iap_ssh" {
 
 # ---------------------------------------------------------------- runner VM
 resource "google_compute_instance" "runner" {
+  count        = var.enable_persistent ? 1 : 0
   name         = local.name
   machine_type = var.machine_type
   zone         = var.zone
@@ -104,8 +111,19 @@ resource "google_compute_instance" "runner" {
 # gets instance-level rights only on this VM: get, start, stop, set metadata and
 # labels. No project-wide grant is needed.
 resource "google_compute_instance_iam_member" "poller" {
+  count         = var.enable_persistent ? 1 : 0
   zone          = var.zone
-  instance_name = google_compute_instance.runner.name
+  instance_name = google_compute_instance.runner[0].name
   role          = "roles/compute.instanceAdmin.v1"
   member        = "serviceAccount:${var.poller_sa_email}"
+}
+
+# count was added on 2026-10-12; keep the existing objects at their new addresses.
+moved {
+  from = google_compute_instance.runner
+  to   = google_compute_instance.runner[0]
+}
+moved {
+  from = google_compute_instance_iam_member.poller
+  to   = google_compute_instance_iam_member.poller[0]
 }
