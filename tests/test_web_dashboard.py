@@ -11,12 +11,10 @@ import urllib.request
 
 from lib.dashboard_models import (
     DEFAULT_RUNNER_CLOUD_INIT,
-    calculate_spot_pricing,
     compute_cpu_benchmark_score,
     disk_category,
     filter_regions,
     format_gcloud_ssh_command,
-    normalize_budget,
     parse_cloud_init,
     qualify_instances,
 )
@@ -26,7 +24,7 @@ from lib.dashboard_scaling import (
     evaluate_scaling_decision,
     parse_github_oom_deep_link,
 )
-from lib.dashboard_server import DashboardStore, create_dashboard_server, main as dashboard_main
+from lib.dashboard_server import create_dashboard_server, main as dashboard_main
 from lib.rust_build_telemetry import (
     classify_ip_and_network,
     compute_cpu_points,

@@ -4,7 +4,7 @@ Rust Remote Builder Web UI Dashboard.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -23,7 +23,6 @@ from .dashboard_models import (
     calculate_spot_pricing,
     compute_cpu_benchmark_score,
     disk_category,
-    filter_regions,
     format_gcloud_ssh_command,
     measure_region_latencies,
     normalize_budget,
@@ -38,7 +37,6 @@ from .dashboard_scaling import (
 )
 from .rust_build_telemetry import (
     classify_ip_and_network,
-    compute_cpu_points,
     enrich_rust_build_record,
 )
 
@@ -1678,7 +1676,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        # Operator requested graceful shutdown via Ctrl-C; close the listening socket in finally.
+        return 0
     finally:
         server.server_close()
     return 0

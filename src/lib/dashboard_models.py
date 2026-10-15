@@ -4,15 +4,13 @@ VM templates, and Cloud-Init parser/visualizer for the Web UI Dashboard.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import re
 import socket
 import time
 from typing import Any
 
-from .machine_profiles import C4_GRANITE_MIN_CPU_ZONES, MACHINE_PROFILES, machine_profile
+from .machine_profiles import MACHINE_PROFILES
 
 
 HOURS_PER_DAY = Decimal("24")

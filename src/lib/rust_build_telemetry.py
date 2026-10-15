@@ -5,7 +5,7 @@ analytics for the Web UI Dashboard.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 import ipaddress
 from typing import Any
 
