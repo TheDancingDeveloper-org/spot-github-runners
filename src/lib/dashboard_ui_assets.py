@@ -2335,7 +2335,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById("sim-builds-active").value = st.active_builds ?? 1;
       document.getElementById("sim-builds-queued").value = st.queued_builds ?? 0;
 
-      const bev = APP_STATE.builder_scaling_evaluation;
+      const bev = (APP_STATE.scaling_evaluations && APP_STATE.scaling_evaluations.rust_builder) || APP_STATE.builder_scaling_evaluation;
       if (bev) {
         const breasons = [...(bev.scale_up_reasons || []), ...(bev.scale_down_reasons || [])];
         document.getElementById("builder-scaling-decision-box").innerHTML = `

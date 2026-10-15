@@ -16,6 +16,7 @@ import json
 import math
 import os
 from pathlib import Path
+import ssl
 import threading
 import time
 from typing import Any
@@ -163,6 +164,20 @@ def _build_instance_record(
         "runners_count": runners_count,
         "runner_vcpu": runner_vcpu,
         "runner_ram_gib": runner_ram_gib,
+        "runner_labels": (
+            [
+                "self-hosted",
+                "Linux",
+                "X64",
+                "spot-runner",
+                "rust",
+                "docker",
+                f"gcp-{region}",
+                family,
+            ]
+            if role == "cicd_runner"
+            else []
+        ),
         "workload_summary": (
             f"Currently running {runners_count} GitHub runners, each with {runner_vcpu} vCPU and {runner_ram_gib:g} GB of RAM"
             if role == "cicd_runner"
@@ -1010,8 +1025,33 @@ class DashboardStore:
             return units
         return 1
 
+    def _running_role_hourly_rates(self, role: str) -> list[float]:
+        """Return per-instance hourly USD rates for all currently RUNNING instances of the given role."""
+        prof = self.state.get("profiles", {}).get(role, {})
+        pol = self.state.get("scaling", {}).get(role, {})
+        budget = prof.get("budget", {})
+        include_disk = bool(
+            pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
+        )
+        include_tax = bool(budget.get("include_taxes", False))
+        running = [
+            inst
+            for inst in self.state.get("instances", [])
+            if isinstance(inst, dict)
+            and inst.get("status") == "RUNNING"
+            and inst.get("role") == role
+        ]
+        return [
+            self._instance_hourly_for_budget(
+                inst.get("pricing", {}),
+                include_disk=include_disk,
+                include_tax=include_tax,
+            )
+            for inst in running
+        ]
+
     def _sync_fleet_telemetry(self) -> None:
-        """Synchronize scaling telemetry counters and CPU percentages with active fleet instances."""
+        """Synchronize scaling telemetry counters, CPU percentages, and active fleet hourly rates with running instances."""
         running_runners = [
             inst
             for inst in self.state.get("instances", [])
@@ -1028,10 +1068,12 @@ class DashboardStore:
         telem["instance_cpu_percentages"] = [
             float(inst.get("cpu_utilization_percent", 0.0)) for inst in running_runners
         ]
+        telem["running_instance_hourly_rates"] = self._running_role_hourly_rates("cicd_runner")
         telem["current_builder_instances"] = len(running_builders)
         telem["builder_cpu_percentages"] = [
             float(inst.get("cpu_utilization_percent", 0.0)) for inst in running_builders
         ]
+        telem["builder_instance_hourly_rates"] = self._running_role_hourly_rates("rust_builder")
         raw_journal_ooms = telem.get("journal_oom_events", [])
         if isinstance(raw_journal_ooms, list):
             telem["builder_journal_oom_events"] = [
@@ -1294,6 +1336,12 @@ class DashboardStore:
     ) -> dict[str, Any]:
         with self._lock:
             self._refresh_instances_pricing()
+            running_runner_rates = self._running_role_hourly_rates("cicd_runner")
+            running_builder_rates = self._running_role_hourly_rates("rust_builder")
+            if self.state["scaling_telemetry"].get("current_instances") == len(running_runner_rates):
+                self.state["scaling_telemetry"]["running_instance_hourly_rates"] = running_runner_rates
+            if self.state["scaling_telemetry"].get("current_builder_instances") == len(running_builder_rates):
+                self.state["scaling_telemetry"]["builder_instance_hourly_rates"] = running_builder_rates
             latencies = self.state.get("region_latencies_ms")
             cicd_qual = qualify_instances(
                 self.state["profiles"]["cicd_runner"],
@@ -1380,6 +1428,7 @@ class DashboardStore:
                 "scaling": self.state["scaling"],
                 "scaling_telemetry": self.state["scaling_telemetry"],
                 "scaling_evaluation": scaling_eval,
+                "builder_scaling_evaluation": builder_scaling_eval,
                 "scaling_evaluations": {
                     "cicd_runner": scaling_eval,
                     "rust_builder": builder_scaling_eval,
@@ -1721,6 +1770,50 @@ class DashboardStore:
                 raise
             return {"status": "ok", "profile": candidate, "qualification": qual}
 
+    def _consume_active_oom_events(
+        self,
+        *,
+        role: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        """Mark active/unhandled OOM events as handled/acknowledged so a single OOM does not repeatedly trigger scale-ups."""
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        telem = self.state.setdefault("scaling_telemetry", {})
+        if role in (None, "cicd_runner"):
+            for run in telem.get("github_oom_runs", []):
+                if not isinstance(run, dict):
+                    continue
+                if event_id and str(run.get("id", "")) != event_id and str(run.get("run_id", "")) != event_id:
+                    continue
+                run["handled"] = True
+                run["acknowledged"] = True
+                run.setdefault("handled_at", now_iso)
+        for evt in telem.get("journal_oom_events", []):
+            if not isinstance(evt, dict):
+                continue
+            if event_id and str(evt.get("id", "")) != event_id:
+                continue
+            is_builder = (
+                str(evt.get("role", "")).strip().lower() == "rust_builder"
+                or str(evt.get("instance_name", "")).strip().lower().startswith("builder-")
+            )
+            if role == "cicd_runner" and is_builder:
+                continue
+            if role == "rust_builder" and not is_builder:
+                continue
+            evt["handled"] = True
+            evt["acknowledged"] = True
+            evt.setdefault("handled_at", now_iso)
+        if role in (None, "rust_builder"):
+            for evt in telem.get("builder_journal_oom_events", []):
+                if not isinstance(evt, dict):
+                    continue
+                if event_id and str(evt.get("id", "")) != event_id:
+                    continue
+                evt["handled"] = True
+                evt["acknowledged"] = True
+                evt.setdefault("handled_at", now_iso)
+
     def update_scaling(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Update scaling rules, triggers, hourly thresholds, CPU scope, and telemetry."""
         with self._lock:
@@ -1773,17 +1866,28 @@ class DashboardStore:
                         self.state["profiles"]["rust_builder"]["runner_ram_gib"] = float(
                             pol.get("container_ram_gib", pol.get("builder_ram_gib", 28))
                         )
-                if "telemetry" in payload and isinstance(payload["telemetry"], dict):
-                    if "current_runners" in payload["telemetry"] and "current_instances" not in payload["telemetry"]:
+                telem_payload = payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {}
+                if telem_payload:
+                    if "current_runners" in telem_payload and "current_instances" not in telem_payload:
                         self.state["scaling_telemetry"].pop("current_instances", None)
-                    self.state["scaling_telemetry"].update(payload["telemetry"])
-                    if "github_oom_runs" in payload["telemetry"] and isinstance(
+                    if (
+                        ("current_runners" in telem_payload or "current_instances" in telem_payload)
+                        and "running_instance_hourly_rates" not in telem_payload
+                    ):
+                        self.state["scaling_telemetry"].pop("running_instance_hourly_rates", None)
+                    if (
+                        "current_builder_instances" in telem_payload
+                        and "builder_instance_hourly_rates" not in telem_payload
+                    ):
+                        self.state["scaling_telemetry"].pop("builder_instance_hourly_rates", None)
+                    self.state["scaling_telemetry"].update(telem_payload)
+                    if "github_oom_runs" in telem_payload and isinstance(
                         self.state["scaling_telemetry"].get("github_oom_runs"), list
                     ):
                         self._normalize_github_ci_runs()
                     if (
-                        "journal_oom_events" in payload["telemetry"]
-                        and "builder_journal_oom_events" not in payload["telemetry"]
+                        "journal_oom_events" in telem_payload
+                        and "builder_journal_oom_events" not in telem_payload
                     ):
                         raw_journal_ooms = self.state["scaling_telemetry"].get("journal_oom_events", [])
                         if isinstance(raw_journal_ooms, list):
@@ -1796,6 +1900,12 @@ class DashboardStore:
                                     or str(evt.get("instance_name", "")).startswith("builder-")
                                 )
                             ]
+                if payload.get("acknowledge_all_ooms"):
+                    self._consume_active_oom_events(role=role if "role" in payload else None)
+                if payload.get("acknowledge_oom_id"):
+                    self._consume_active_oom_events(
+                        role=None, event_id=str(payload["acknowledge_oom_id"]).strip()
+                    )
                 if "add_github_oom_run" in payload and isinstance(payload["add_github_oom_run"], dict):
                     item = dict(payload["add_github_oom_run"])
                     if "deep_link" in item and not item.get("run_id"):
@@ -1839,7 +1949,24 @@ class DashboardStore:
                     item["badge_text"] = cls_info["badge_text"]
                     item.setdefault("id", f"gh-ci-{uuid.uuid4().hex[:8]}")
                     item.setdefault("failed_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                    item.setdefault(
+                        "baseline_runners",
+                        int(self.state["scaling_telemetry"].get("current_runners", 0)),
+                    )
                     self.state["scaling_telemetry"]["github_oom_runs"].insert(0, item)
+
+                running_runner_rates = self._running_role_hourly_rates("cicd_runner")
+                running_builder_rates = self._running_role_hourly_rates("rust_builder")
+                if (
+                    "running_instance_hourly_rates" not in telem_payload
+                    and self.state["scaling_telemetry"].get("current_instances") == len(running_runner_rates)
+                ):
+                    self.state["scaling_telemetry"]["running_instance_hourly_rates"] = running_runner_rates
+                if (
+                    "builder_instance_hourly_rates" not in telem_payload
+                    and self.state["scaling_telemetry"].get("current_builder_instances") == len(running_builder_rates)
+                ):
+                    self.state["scaling_telemetry"]["builder_instance_hourly_rates"] = running_builder_rates
 
                 cicd_eval = evaluate_scaling_decision(
                     self.state["scaling"]["cicd_runner"],
@@ -2395,15 +2522,9 @@ class DashboardStore:
                         ),
                         4,
                     )
-                    evaluator_unit_hourly = max(
-                        0.0001, float(self._resolve_scaling_unit_hourly_usd(role))
-                    )
-                    max_affordable_instances = max(
-                        0, int(math.floor(effective_hourly_cap / evaluator_unit_hourly))
-                    )
                     if (
-                        projected_fleet_hourly > effective_hourly_cap
-                        or projected_total > max_affordable_instances
+                        effective_hourly_cap <= 0.0
+                        or projected_fleet_hourly > effective_hourly_cap + 1e-9
                     ):
                         raise ValueError(
                             f"Scaling up in {region} to {target_count} instance(s) (total fleet: {projected_total}, "
@@ -2412,6 +2533,7 @@ class DashboardStore:
                         )
                     for created in new_records:
                         self.state["instances"].insert(0, created)
+                    self._consume_active_oom_events(role=role)
 
                 self._sync_fleet_telemetry()
                 self._persist()
@@ -2789,6 +2911,7 @@ def make_handler(
     store: DashboardStore,
     *,
     auth_token: str | None = None,
+    require_secure_cookie: bool = False,
 ) -> type[BaseHTTPRequestHandler]:
     """Create the HTTP handler bound to a DashboardStore instance."""
     from .dashboard_ui_assets import render_dashboard_html
@@ -2807,6 +2930,16 @@ def make_handler(
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
+
+        def _format_session_cookie(self) -> str:
+            forwarded_proto = (self.headers.get("X-Forwarded-Proto") or "").strip().lower()
+            is_secure = (
+                require_secure_cookie
+                or isinstance(getattr(self, "connection", None), ssl.SSLSocket)
+                or forwarded_proto == "https"
+            )
+            secure_attr = "; Secure" if is_secure else ""
+            return f"dashboard_session={expected_session_cookie}; HttpOnly; SameSite=Strict; Path=/{secure_attr}"
 
         def _send_json(
             self,
@@ -2993,7 +3126,7 @@ def make_handler(
                     )
                     if supplied and hmac.compare_digest(supplied, expected_token):
                         extra_hdrs = {
-                            "Set-Cookie": f"dashboard_session={expected_session_cookie}; HttpOnly; SameSite=Strict; Path=/"
+                            "Set-Cookie": self._format_session_cookie()
                         }
                 self._send_html(
                     render_dashboard_html(project=store.project, org=store.org),
@@ -3080,7 +3213,7 @@ def make_handler(
                     self._send_json(
                         {"status": "ok", "authenticated": True},
                         extra_headers={
-                            "Set-Cookie": f"dashboard_session={expected_session_cookie}; HttpOnly; SameSite=Strict; Path=/"
+                            "Set-Cookie": self._format_session_cookie()
                         },
                     )
                     return
@@ -3165,6 +3298,9 @@ def create_dashboard_server(
     project: str = "homelab-424523",
     org: str = "swack-tools",
     auth_token: str | None = None,
+    tls_certfile: str | Path | None = None,
+    tls_keyfile: str | Path | None = None,
+    allow_insecure_non_loopback: bool | None = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
     """Instantiate the ThreadingHTTPServer and DashboardStore."""
     resolved_token = (
@@ -3173,14 +3309,62 @@ def create_dashboard_server(
         else os.environ.get("DASHBOARD_AUTH_TOKEN")
     )
     cleaned_token = str(resolved_token).strip() if resolved_token else ""
-    if not _is_loopback_host(host) and not cleaned_token:
+    resolved_cert = (
+        tls_certfile
+        if tls_certfile is not None
+        else os.environ.get("DASHBOARD_TLS_CERTFILE")
+    )
+    resolved_key = (
+        tls_keyfile
+        if tls_keyfile is not None
+        else os.environ.get("DASHBOARD_TLS_KEYFILE")
+    )
+    cleaned_cert = str(resolved_cert).strip() if resolved_cert else ""
+    cleaned_key = str(resolved_key).strip() if resolved_key else ""
+    if bool(cleaned_cert) != bool(cleaned_key):
         raise ValueError(
-            f"Refusing to bind Web UI Dashboard to non-loopback address '{host}' without authentication. "
-            "Provide --auth-token or set DASHBOARD_AUTH_TOKEN, or bind to 127.0.0.1 / ::1 / localhost."
+            "Both --tls-certfile and --tls-keyfile (or DASHBOARD_TLS_CERTFILE and DASHBOARD_TLS_KEYFILE) must be provided together."
         )
+    has_tls = bool(cleaned_cert and cleaned_key)
+    resolved_allow_insecure = (
+        bool(allow_insecure_non_loopback)
+        if allow_insecure_non_loopback is not None
+        else (
+            str(os.environ.get("DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK", ""))
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+    )
+    if not _is_loopback_host(host):
+        if not cleaned_token:
+            raise ValueError(
+                f"Refusing to bind Web UI Dashboard to non-loopback address '{host}' without authentication. "
+                "Provide --auth-token or set DASHBOARD_AUTH_TOKEN, or bind to 127.0.0.1 / ::1 / localhost."
+            )
+        if not has_tls and not resolved_allow_insecure:
+            raise ValueError(
+                f"Refusing to bind Web UI Dashboard to non-loopback address '{host}' over plaintext HTTP without TLS. "
+                "Provide --tls-certfile and --tls-keyfile (or DASHBOARD_TLS_CERTFILE / DASHBOARD_TLS_KEYFILE), "
+                "bind to a loopback address (127.0.0.1 / ::1 / localhost) behind a TLS proxy, or pass "
+                "--allow-insecure-non-loopback (DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1) if a trusted network proxy terminates TLS."
+            )
     store = DashboardStore(state_path=state_path, project=project, org=org)
-    handler = make_handler(store, auth_token=cleaned_token or None)
+    handler = make_handler(
+        store,
+        auth_token=cleaned_token or None,
+        require_secure_cookie=has_tls or not _is_loopback_host(host),
+    )
     server = ThreadingHTTPServer((host, port), handler)
+    if has_tls:
+        try:
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ssl_ctx.load_cert_chain(certfile=cleaned_cert, keyfile=cleaned_key)
+            server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+        except Exception:
+            server.server_close()
+            raise
     return server, store
 
 
@@ -3198,6 +3382,22 @@ def args_parser():
         "--auth-token",
         default=None,
         help="Bearer token required for HTTP requests (mandatory for non-loopback --host; or set DASHBOARD_AUTH_TOKEN)",
+    )
+    parser.add_argument(
+        "--tls-certfile",
+        default=None,
+        help="Path to PEM TLS certificate file for HTTPS (mandatory for non-loopback --host unless --allow-insecure-non-loopback is set; or set DASHBOARD_TLS_CERTFILE)",
+    )
+    parser.add_argument(
+        "--tls-keyfile",
+        default=None,
+        help="Path to PEM TLS private key file for HTTPS (or set DASHBOARD_TLS_KEYFILE)",
+    )
+    parser.add_argument(
+        "--allow-insecure-non-loopback",
+        action="store_true",
+        default=None,
+        help="Explicitly allow plaintext HTTP on a non-loopback --host when behind a trusted TLS-terminating proxy (or set DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1)",
     )
     parser.add_argument(
         "--state-file",
@@ -3227,9 +3427,13 @@ def main(argv: list[str] | None = None) -> int:
         project=args.project,
         org=args.org,
         auth_token=args.auth_token,
+        tls_certfile=args.tls_certfile,
+        tls_keyfile=args.tls_keyfile,
+        allow_insecure_non_loopback=args.allow_insecure_non_loopback,
     )
     actual_host, actual_port = server.server_address[:2]
-    print(f"Spot Fleet & Rust Builder Web UI Dashboard listening on http://{actual_host}:{actual_port}")
+    scheme = "https" if isinstance(server.socket, ssl.SSLSocket) else "http"
+    print(f"Spot Fleet & Rust Builder Web UI Dashboard listening on {scheme}://{actual_host}:{actual_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

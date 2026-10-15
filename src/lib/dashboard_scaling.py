@@ -301,6 +301,7 @@ def evaluate_scaling_decision(
     per_instance_hourly_usd: float = 0.14,
     now_epoch: float | None = None,
     max_instances: int | None = None,
+    running_instance_hourly_rates: list[float] | None = None,
 ) -> dict[str, Any]:
     """Evaluate live telemetry against scaling triggers and max scale-up budgets.
 
@@ -364,6 +365,12 @@ def evaluate_scaling_decision(
         for run in github_oom_runs:
             if not _is_recent_unhandled_oom(run, now_ts, lookback_seconds):
                 continue
+            if (
+                run.get("baseline_runners") is not None
+                and current_runners > _finite_int_val(run["baseline_runners"], "baseline_runners")
+            ):
+                run["handled"] = True
+                continue
             if "error_excerpt" in run and run.get("error_excerpt") is not None:
                 excerpt = str(run.get("error_excerpt"))
             elif (
@@ -379,6 +386,7 @@ def evaluate_scaling_decision(
             classification = classify_github_ci_failure(excerpt, runner_name=runner_name)
             if not classification["is_self_hosted_runner"] or not classification["is_oom"]:
                 continue
+            run.setdefault("baseline_runners", current_runners)
             any_confirmed_oom = True
             link = run.get("deep_link") or build_github_oom_deep_link(
                 run.get("repository", "swack-tools/oxidex"),
@@ -408,14 +416,25 @@ def evaluate_scaling_decision(
 
     # 2. VM Journal OOM Trigger (only recent unhandled CI runner events; exclude Rust builder OOMs)
     if cfg.get("enable_journal_oom_trigger", True) and journal_oom_events:
-        active_journal_ooms = [
-            evt
-            for evt in journal_oom_events
-            if isinstance(evt, dict)
-            and str(evt.get("role", "")).strip().lower() != "rust_builder"
-            and not str(evt.get("instance_name", "")).strip().lower().startswith("builder-")
-            and _is_recent_unhandled_oom(evt, now_ts, lookback_seconds)
-        ]
+        active_journal_ooms: list[dict[str, Any]] = []
+        for evt in journal_oom_events:
+            if not isinstance(evt, dict):
+                continue
+            if (
+                str(evt.get("role", "")).strip().lower() == "rust_builder"
+                or str(evt.get("instance_name", "")).strip().lower().startswith("builder-")
+            ):
+                continue
+            if not _is_recent_unhandled_oom(evt, now_ts, lookback_seconds):
+                continue
+            if (
+                evt.get("baseline_runners") is not None
+                and current_runners > _finite_int_val(evt["baseline_runners"], "baseline_runners")
+            ):
+                evt["handled"] = True
+                continue
+            evt.setdefault("baseline_runners", current_runners)
+            active_journal_ooms.append(evt)
         for evt in active_journal_ooms:
             scale_up_reasons.append(
                 {
@@ -578,7 +597,29 @@ def evaluate_scaling_decision(
         max_daily_cap / 24.0,
         max_monthly_cap / (24.0 * 365.0 / 12.0),
     )
-    max_affordable_instances = max(0, int(math.floor(effective_hourly_cap / unit_hourly)))
+    raw_fleet_rates = (
+        running_instance_hourly_rates
+        if running_instance_hourly_rates is not None
+        else telemetry.get("running_instance_hourly_rates")
+    )
+    existing_rates: list[float] | None = None
+    if isinstance(raw_fleet_rates, (list, tuple)) and len(raw_fleet_rates) == current_instances_count:
+        existing_rates = [
+            max(0.0, _finite_float_val(r, "running_instance_hourly_rates")) for r in raw_fleet_rates
+        ]
+
+    if existing_rates is not None:
+        existing_fleet_hourly = sum(existing_rates)
+        remaining_hourly = effective_hourly_cap - existing_fleet_hourly
+        if remaining_hourly < -1e-9:
+            max_affordable_instances = 0
+        else:
+            max_affordable_instances = current_instances_count + int(
+                math.floor(max(0.0, remaining_hourly + 1e-9) / unit_hourly)
+            )
+    else:
+        max_affordable_instances = max(0, int(math.floor(effective_hourly_cap / unit_hourly)))
+
     budget_capped = False
     budget_cap_note = ""
 
@@ -597,7 +638,15 @@ def evaluate_scaling_decision(
             f"${max_monthly_cap:.2f}/mo incl. disks)"
         )
 
-    projected_hourly = round(desired_instances * unit_hourly, 4)
+    if existing_rates is not None:
+        if desired_instances >= current_instances_count:
+            projected_hourly = round(
+                sum(existing_rates) + (desired_instances - current_instances_count) * unit_hourly, 4
+            )
+        else:
+            projected_hourly = round(sum(sorted(existing_rates)[:desired_instances]), 4)
+    else:
+        projected_hourly = round(desired_instances * unit_hourly, 4)
     projected_daily = round(projected_hourly * 24.0, 2)
     projected_monthly = round(projected_daily * (365.0 / 12.0), 2)
 
@@ -636,6 +685,7 @@ def evaluate_builder_scaling_decision(
     telemetry: dict[str, Any],
     per_instance_hourly_usd: float = 0.25,
     now_epoch: float | None = None,
+    running_instance_hourly_rates: list[float] | None = None,
 ) -> dict[str, Any]:
     """Evaluate dedicated Rust builder telemetry against builder scaling triggers and budgets."""
     _assert_finite_json_tree(policy, "policy")
@@ -697,9 +747,20 @@ def evaluate_builder_scaling_decision(
     desired_instances = current_instances
 
     if cfg.get("enable_journal_oom_trigger", True) and journal_oom_events:
-        active_ooms = [
-            evt for evt in journal_oom_events if _is_recent_unhandled_oom(evt, now_ts, lookback_seconds)
-        ]
+        active_ooms: list[dict[str, Any]] = []
+        for evt in journal_oom_events:
+            if not isinstance(evt, dict):
+                continue
+            if not _is_recent_unhandled_oom(evt, now_ts, lookback_seconds):
+                continue
+            if (
+                evt.get("baseline_instances") is not None
+                and current_instances > _finite_int_val(evt["baseline_instances"], "baseline_instances")
+            ):
+                evt["handled"] = True
+                continue
+            evt.setdefault("baseline_instances", current_instances)
+            active_ooms.append(evt)
         for evt in active_ooms:
             scale_up_reasons.append(
                 {
@@ -780,7 +841,29 @@ def evaluate_builder_scaling_decision(
         max_daily_cap / 24.0,
         max_monthly_cap / (24.0 * 365.0 / 12.0),
     )
-    max_affordable_instances = max(0, int(math.floor(effective_hourly_cap / unit_hourly)))
+    raw_builder_rates = (
+        running_instance_hourly_rates
+        if running_instance_hourly_rates is not None
+        else telemetry.get("builder_instance_hourly_rates")
+    )
+    existing_builder_rates: list[float] | None = None
+    if isinstance(raw_builder_rates, (list, tuple)) and len(raw_builder_rates) == current_instances:
+        existing_builder_rates = [
+            max(0.0, _finite_float_val(r, "builder_instance_hourly_rates")) for r in raw_builder_rates
+        ]
+
+    if existing_builder_rates is not None:
+        existing_fleet_hourly = sum(existing_builder_rates)
+        remaining_hourly = effective_hourly_cap - existing_fleet_hourly
+        if remaining_hourly < -1e-9:
+            max_affordable_instances = 0
+        else:
+            max_affordable_instances = current_instances + int(
+                math.floor(max(0.0, remaining_hourly + 1e-9) / unit_hourly)
+            )
+    else:
+        max_affordable_instances = max(0, int(math.floor(effective_hourly_cap / unit_hourly)))
+
     budget_capped = False
     budget_cap_note = ""
 
@@ -795,7 +878,15 @@ def evaluate_builder_scaling_decision(
             f"${max_monthly_cap:.2f}/mo incl. disks)"
         )
 
-    projected_hourly = round(desired_instances * unit_hourly, 4)
+    if existing_builder_rates is not None:
+        if desired_instances >= current_instances:
+            projected_hourly = round(
+                sum(existing_builder_rates) + (desired_instances - current_instances) * unit_hourly, 4
+            )
+        else:
+            projected_hourly = round(sum(sorted(existing_builder_rates)[:desired_instances]), 4)
+    else:
+        projected_hourly = round(desired_instances * unit_hourly, 4)
     projected_daily = round(projected_hourly * 24.0, 2)
     projected_monthly = round(projected_daily * (365.0 / 12.0), 2)
 

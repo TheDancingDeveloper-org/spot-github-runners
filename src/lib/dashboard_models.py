@@ -95,7 +95,7 @@ write_files:
       GITHUB_ORG_URL="https://github.com/YOUR_ORG_NAME"
       GITHUB_RUNNER_TOKEN="YOUR_REGISTRATION_TOKEN"
       RUNNER_GROUP="Default"
-      RUNNER_LABELS="self-hosted,Linux,X64,gcp-dallas,n2,rust,docker"
+      RUNNER_LABELS="self-hosted,Linux,X64,spot-runner,rust,docker"
       RUNNERS_COUNT="4"
 
 runcmd:
@@ -106,9 +106,9 @@ runcmd:
   - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now docker
-  # 2. Download, Configure & Start Persistent GitHub Actions Runner Slots
+  # 2. Download, Configure & Start Persistent GitHub Actions Runner Slots with live GCE region & machine-family labels
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${dir}"; chown -R runner:runner "${dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${dir}"; chown -R runner:runner "${dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -151,19 +151,22 @@ write_files:
       RUNNER_GROUP="oxidex-strict"
       RUNNER_LABELS="self-hosted,Linux,X64,spot-heavy32,rust-1.99"
       RUNNERS_COUNT="4"
+      RUNNER_CPU_LIMIT="8"
+      RUNNER_MEMORY_GB="32"
       DISK_DEVICE="/dev/disk/by-id/google-runner-data"
       DISK_MOUNT="/mnt/runner-data"
 
 runcmd:
-  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && dev="${DISK_DEVICE:-/dev/disk/by-id/google-runner-data}" && mp="${DISK_MOUNT:-/mnt/runner-data}" && if [[ ! -b "$dev" ]]; then echo "Missing persistent runner disk $dev" >&2; exit 1; fi && (blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -F "$dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp") && mkdir -p "$mp/docker" "$mp/containerd" "$mp/instances" "$mp/work"'''
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && dev="${DISK_DEVICE:-/dev/disk/by-id/google-runner-data}" && mp="${DISK_MOUNT:-/mnt/runner-data}" && if [[ ! -b "$dev" ]]; then echo "Missing persistent runner disk $dev" >&2; exit 1; fi && (blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -F "$dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp") && mountpoint -q "$mp" && mkdir -p "$mp/docker" "$mp/containerd" "$mp/instances" "$mp/work"'''
   - install -m 0755 -d /etc/apt/keyrings
   - 'curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}")/gpg" -o /etc/apt/keyrings/docker.asc'
   - chmod a+r /etc/apt/keyrings/docker.asc
   - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker"'''
+  - 'bash -lc ''set -euo pipefail && install -d -m 0755 -o runner -g runner /opt/runner-rust/cargo /opt/runner-rust/rustup && curl --proto "=https" --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup runuser -u runner -- sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup component add rustfmt clippy --toolchain 1.99.0 && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && ln -sfn /opt/runner-rust/cargo/bin/* /usr/local/bin/ && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "'''
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --work "${work_dir}" && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --work "${work_dir}" && ./svc.sh install runner && unit_name="$(basename "$(cat .service)")" && install -d -m 0755 "/etc/systemd/system/${unit_name}.d" && printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nEnvironment=RUSTUP_HOME=/opt/runner-rust/rustup\\nEnvironment=PATH=/opt/runner-rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/${unit_name}.d/heavy32-limits.conf" && systemctl daemon-reload && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -178,7 +181,7 @@ users:
   - default
   - name: oxidex-uploader
     gecos: Dedicated Rust 1.99 Remote Builder Uploader
-    sudo: ["ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build"]
+    sudo: ["ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/bin/flock --shared /run/oxidex-build.lock *"]
     groups: oxidex-build
     shell: /bin/bash
     lock_passwd: true
@@ -201,6 +204,11 @@ packages:
   - zstd
 
 write_files:
+  - path: /etc/sudoers.d/oxidex-build
+    permissions: '0440'
+    owner: root:root
+    content: |
+      %oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/bin/flock --shared /run/oxidex-build.lock *
   - path: /etc/oxidex-remote-build.json
     permissions: '0644'
     owner: root:root
@@ -231,7 +239,7 @@ write_files:
           compiler = subprocess.check_output(['rustup', 'which', '--toolchain', pin, 'rustc'], text=True).strip()
           cargo = subprocess.check_output(['rustup', 'which', '--toolchain', pin, 'cargo'], text=True).strip()
           env = dict(os.environ, RUSTC=compiler, RUSTDOC=str(Path(compiler).with_name('rustdoc')), RUSTUP_TOOLCHAIN=pin)
-          env['PATH'] = f"{Path(compiler).parent}:{env.get('PATH', '')}"
+          env['PATH'] = f"{Path(compiler).parent}:/usr/local/cargo/bin:{env.get('PATH', '')}"
           env['CARGO_HOME'] = '/cargo'
           env['CARGO_TARGET_DIR'] = '/target'
           command = sys.argv[1:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']
@@ -247,10 +255,17 @@ write_files:
     content: |
       FROM rust:1.99.0-bookworm
       RUN apt-get update && apt-get install -y --no-install-recommends clang lld cmake pkg-config libssl-dev zstd git ca-certificates time python3 rsync && rm -rf /var/lib/apt/lists/*
+      RUN rustup component add rustfmt clippy --toolchain 1.99.0 \\
+          && rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin \\
+          && cargo install --locked -j4 just \\
+          && cargo install --locked -j4 cargo-nextest \\
+          && cargo install --locked -j4 --version 0.29.2 cbindgen \\
+          && rustc -vV && cargo -V && just --version && cbindgen --version && cargo nextest --version
       RUN groupadd -g 1001 runner && useradd -m -u 1001 -g 1001 -s /bin/bash runner && install -d -o 1001 -g 1001 /src /target /cargo
       COPY entrypoint.py /usr/local/bin/oxidex-build-entrypoint
       RUN chmod 0755 /usr/local/bin/oxidex-build-entrypoint
       USER 1001:1001
+      ENV PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       ENV CARGO_HOME=/cargo
       ENV CARGO_TARGET_DIR=/target
       WORKDIR /src
@@ -279,6 +294,9 @@ write_files:
               raise RuntimeError('Invoke this root-owned launcher with sudo')
           config = json.loads(Path('/etc/oxidex-remote-build.json').read_text())
           root = Path(config.get('cache_mount', '/mnt/runner-data/remote-build'))
+          mount_root = root.parent if root.name == 'remote-build' else root
+          if not os.path.ismount(mount_root):
+              raise RuntimeError(f'Builder cache mount point is not mounted: {mount_root}')
           image = config.get('image', 'oxidex-remote-builder:1.99.0')
           cpus = int(config.get('cpus', 16))
           memory_gib = int(config.get('memory_gib', 28))
@@ -330,8 +348,8 @@ write_files:
           main()
 
 runcmd:
-  # 1. Mount persistent NVMe Hyperdisk cache and configure unprivileged build container
-  - 'bash -lc ''set -euo pipefail && mp="/mnt/runner-data" && for dev in /dev/disk/by-id/google-builder-cache /dev/disk/by-id/google-runner-data; do if [[ -b "$dev" ]]; then (blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -F "$dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp"); break; fi; done && mkdir -p "$mp/docker" "$mp/containerd" "$mp/remote-build/cargo" "$mp/remote-build/sources" "$mp/remote-build/targets" "$mp/remote-build/exports"'''
+  # 1. Mount persistent NVMe Hyperdisk cache (fail if unmounted) and configure unprivileged build container
+  - 'bash -lc ''set -euo pipefail && mp="/mnt/runner-data" && found_dev="" && for dev in /dev/disk/by-id/google-builder-cache /dev/disk/by-id/google-runner-data; do if [[ -b "$dev" ]]; then found_dev="$dev"; break; fi; done && if [[ -z "$found_dev" ]]; then echo "Missing persistent builder cache disk (/dev/disk/by-id/google-builder-cache or google-runner-data)" >&2; exit 1; fi && (blkid "$found_dev" >/dev/null 2>&1 || mkfs.ext4 -F "$found_dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$found_dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp") && mountpoint -q "$mp" && mkdir -p "$mp/docker" "$mp/containerd" "$mp/remote-build/cargo" "$mp/remote-build/sources" "$mp/remote-build/targets" "$mp/remote-build/exports"'''
   - install -m 0755 -d /etc/apt/keyrings
   - 'curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}")/gpg" -o /etc/apt/keyrings/docker.asc'
   - chmod a+r /etc/apt/keyrings/docker.asc
@@ -1445,7 +1463,13 @@ def _split_yaml_flow_top_level(text: str, sep: str) -> list[str]:
     return parts
 
 
-def _validate_yaml_flow_value(expr: str, line_no: int, *, in_flow: bool = False) -> list[str]:
+def _validate_yaml_flow_value(
+    expr: str,
+    line_no: int,
+    *,
+    in_flow: bool = False,
+    defined_anchors: set[str] | None = None,
+) -> list[str]:
     """Validate YAML flow sequences ([...]), flow mappings ({...}), and scalar values."""
     val = expr.strip()
     if not val:
@@ -1501,8 +1525,16 @@ def _validate_yaml_flow_value(expr: str, line_no: int, *, in_flow: bool = False)
                         f"YAML syntax error on line {line_no}: invalid flow mapping entry '{item}' in '{val}'."
                     )
                     return errors
-                errors.extend(_validate_yaml_flow_value(kv_parts[0].strip(), line_no, in_flow=True))
-                errors.extend(_validate_yaml_flow_value(kv_parts[1].strip(), line_no, in_flow=True))
+                errors.extend(
+                    _validate_yaml_flow_value(
+                        kv_parts[0].strip(), line_no, in_flow=True, defined_anchors=defined_anchors
+                    )
+                )
+                errors.extend(
+                    _validate_yaml_flow_value(
+                        kv_parts[1].strip(), line_no, in_flow=True, defined_anchors=defined_anchors
+                    )
+                )
             else:
                 kv_parts = _split_yaml_flow_top_level(item, ":")
                 if len(kv_parts) > 2:
@@ -1516,26 +1548,79 @@ def _validate_yaml_flow_value(expr: str, line_no: int, *, in_flow: bool = False)
                             f"YAML syntax error on line {line_no}: incomplete mapping entry '{item}' in flow sequence."
                         )
                         return errors
-                    errors.extend(_validate_yaml_flow_value(kv_parts[1].strip(), line_no, in_flow=True))
+                    errors.extend(
+                        _validate_yaml_flow_value(
+                            kv_parts[1].strip(), line_no, in_flow=True, defined_anchors=defined_anchors
+                        )
+                    )
                 else:
-                    errors.extend(_validate_yaml_flow_value(item, line_no, in_flow=True))
+                    errors.extend(
+                        _validate_yaml_flow_value(
+                            item, line_no, in_flow=True, defined_anchors=defined_anchors
+                        )
+                    )
+        return errors
+
+    if val.startswith("&"):
+        m_anchor = re.match(r"^&([A-Za-z0-9_-]+)(?:\s+(.*))?$", val)
+        if not m_anchor:
+            errors.append(
+                f"YAML syntax error on line {line_no}: invalid anchor syntax '{val}'."
+            )
+            return errors
+        if defined_anchors is not None:
+            defined_anchors.add(m_anchor.group(1))
+        rest = (m_anchor.group(2) or "").strip()
+        if not rest:
+            return errors
+        return _validate_yaml_flow_value(
+            rest, line_no, in_flow=in_flow, defined_anchors=defined_anchors
+        )
+
+    if val.startswith("*"):
+        m_alias = re.match(r"^\*([A-Za-z0-9_-]+)$", val)
+        if not m_alias:
+            errors.append(
+                f"YAML syntax error on line {line_no}: invalid alias syntax '{val}'."
+            )
+            return errors
+        alias_name = m_alias.group(1)
+        if defined_anchors is None or alias_name not in defined_anchors:
+            errors.append(
+                f"YAML syntax error on line {line_no}: undefined alias '*{alias_name}'."
+            )
+        return errors
+
+    if val[0] in ("@", "`"):
+        errors.append(
+            f"YAML syntax error on line {line_no}: reserved indicator '{val[0]}' cannot start a plain scalar."
+        )
         return errors
 
     if val[0] in ("'", '"'):
         quote_ch = val[0]
-        escape = False
         closed_at = -1
         i = 1
+        valid_single_escapes = set('0abtnvfre "/\\N_LP\t')
         while i < len(val):
             ch = val[i]
-            if escape:
-                escape = False
-                i += 1
-                continue
             if ch == "\\" and quote_ch == '"':
-                escape = True
-                i += 1
-                continue
+                if i + 1 >= len(val):
+                    break
+                nxt = val[i + 1]
+                if nxt in valid_single_escapes:
+                    i += 2
+                    continue
+                if nxt in ("x", "u", "U"):
+                    hex_len = 2 if nxt == "x" else (4 if nxt == "u" else 8)
+                    hex_part = val[i + 2 : i + 2 + hex_len]
+                    if len(hex_part) == hex_len and all(c in "0123456789abcdefABCDEF" for c in hex_part):
+                        i += 2 + hex_len
+                        continue
+                errors.append(
+                    f"YAML syntax error on line {line_no}: invalid escape sequence '\\{nxt}' in double-quoted scalar."
+                )
+                return errors
             if ch == "'" and quote_ch == "'" and i + 1 < len(val) and val[i + 1] == "'":
                 i += 2
                 continue
@@ -1548,6 +1633,28 @@ def _validate_yaml_flow_value(expr: str, line_no: int, *, in_flow: bool = False)
                 f"YAML syntax error on line {line_no}: unexpected trailing content after quoted scalar '{val}'."
             )
         return errors
+
+    # Plain unquoted scalar: check for unquoted ': ' (nested mapping value on same line)
+    in_s = False
+    in_d = False
+    esc = False
+    for idx_c, ch in enumerate(val):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_d:
+            esc = True
+            continue
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        elif not in_s and not in_d and ch == ":":
+            if idx_c == len(val) - 1 or val[idx_c + 1] in (" ", "\t"):
+                errors.append(
+                    f"YAML syntax error on line {line_no}: mapping values are not allowed in plain scalar '{val}'."
+                )
+                return errors
 
     if in_flow and any(ch in val for ch in ("[", "]", "{", "}")):
         errors.append(
@@ -1563,12 +1670,14 @@ def _validate_cloud_init_syntax(
     is_shell_script: bool,
 ) -> list[str]:
     """Perform syntax and structural validation on cloud-config YAML or shell startup scripts."""
+    import shutil
     import subprocess
 
     errors: list[str] = []
     if is_cloud_config:
         block_scalar_indent: int | None = None
         scopes: list[dict[str, Any]] = []
+        defined_anchors: set[str] = set()
         for idx, raw in enumerate(lines[1:], start=2):
             if not raw.strip() or raw.lstrip().startswith("#"):
                 continue
@@ -1688,7 +1797,9 @@ def _validate_cloud_init_syntax(
                             {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": True}
                         )
                     else:
-                        errors.extend(_validate_yaml_flow_value(v_str, idx))
+                        errors.extend(
+                            _validate_yaml_flow_value(v_str, idx, defined_anchors=defined_anchors)
+                        )
                         scopes.append(
                             {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": False}
                         )
@@ -1696,7 +1807,9 @@ def _validate_cloud_init_syntax(
                     if re.search(r"^[|>][-+]?\s*$", after_dash):
                         block_scalar_indent = indent
                     else:
-                        errors.extend(_validate_yaml_flow_value(after_dash, idx))
+                        errors.extend(
+                            _validate_yaml_flow_value(after_dash, idx, defined_anchors=defined_anchors)
+                        )
                     scopes.append(
                         {"indent": indent, "kind": "list", "child_indent": None, "allow_children": False}
                     )
@@ -1713,10 +1826,52 @@ def _validate_cloud_init_syntax(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": True}
                     )
                 else:
-                    errors.extend(_validate_yaml_flow_value(v_str, idx))
+                    m_block_anchor = re.match(r"^&([A-Za-z0-9_-]+)\s+[|>][-+]?\s*$", v_str)
+                    if m_block_anchor:
+                        defined_anchors.add(m_block_anchor.group(1))
+                        block_scalar_indent = indent
+                        scopes.append(
+                            {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
+                        )
+                        continue
+                    m_map_anchor = re.match(r"^&([A-Za-z0-9_-]+)$", v_str)
+                    if m_map_anchor:
+                        defined_anchors.add(m_map_anchor.group(1))
+                        scopes.append(
+                            {"indent": indent, "kind": "map", "child_indent": None, "allow_children": True}
+                        )
+                        continue
+                    errors.extend(
+                        _validate_yaml_flow_value(v_str, idx, defined_anchors=defined_anchors)
+                    )
                     scopes.append(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
                     )
+
+        if not errors:
+            yaml_doc = "\n".join(lines) + "\n"
+            ruby_bin = shutil.which("ruby") or ("/usr/bin/ruby" if os.path.exists("/usr/bin/ruby") else None)
+            if ruby_bin:
+                try:
+                    proc = _ORIG_SUBPROCESS_RUN(
+                        [
+                            ruby_bin,
+                            "-ryaml",
+                            "-e",
+                            'doc = YAML.safe_load(STDIN.read, [], [], true); abort("YAML syntax error: top-level cloud-config document must be a mapping") unless doc.is_a?(Hash)',
+                        ],
+                        input=yaml_doc,
+                        text=True,
+                        capture_output=True,
+                        timeout=2,
+                        check=False,
+                    )
+                    if proc.returncode != 0:
+                        err_line = (proc.stderr or "invalid YAML syntax").strip().splitlines()[0]
+                        errors.append(f"YAML syntax error: {err_line}")
+                except (OSError, subprocess.SubprocessError):
+                    # If the external Ruby Psych YAML parser cannot be executed, rely on the structural YAML validator above.
+                    pass
     elif is_shell_script:
         import shutil
 

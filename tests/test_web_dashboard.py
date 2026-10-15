@@ -1363,7 +1363,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             self.assertIn("/etc/apt/sources.list.d/docker.list", tpl_str)
             self.assertIn("actions-runner-linux-x64", tpl_str)
             self.assertIn("./config.sh --unattended", tpl_str)
-            self.assertIn("./svc.sh install runner && ./svc.sh start", tpl_str)
+            self.assertIn("./svc.sh install runner", tpl_str)
+            self.assertIn("./svc.sh start", tpl_str)
 
         # 8. Saving an existing cloud-init template with an updated role persists the new role and assigns to that role
         created_ci = self._post(
@@ -1804,7 +1805,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             for inst in self.store.state["instances"]
             if inst.get("status") != "RUNNING"
         ]
-        self.assertTrue(len(deleted_before) > 0)
+        self.assertGreater(len(deleted_before), 0)
         try:
             set_live_spot_pricing_override(
                 {
@@ -1874,6 +1875,160 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(ctx_bad_status.exception.code, 400)
         ctx_bad_status.exception.close()
+
+    def test_round10_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_CLOUD_INIT,
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        from lib.dashboard_ui_assets import render_dashboard_html
+
+        # 1. DEFAULT_RUST_BUILDER_CLOUD_INIT allows canonical outer builder transaction flock + oxidex-remote-build in sudoers
+        self.assertIn(
+            'sudo: ["ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/bin/flock --shared /run/oxidex-build.lock *"]',
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        self.assertIn(
+            "%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/bin/flock --shared /run/oxidex-build.lock *",
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+
+        # 2. DEFAULT_RUST_BUILDER_CLOUD_INIT fails when data disk is missing/unmounted and installs canonical release build tools (just, cbindgen, cargo-nextest, rustfmt, clippy)
+        self.assertIn('mountpoint -q "$mp"', DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("if not os.path.ismount(mount_root):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("cargo-nextest", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("cbindgen", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("just --version && cbindgen --version && cargo nextest --version", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn(":/usr/local/cargo/bin:", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        # 3. DEFAULT_RUNNER_STRICT_CLOUD_INIT installs Rust 1.99.0 and enforces 8-vCPU / 32-GiB systemd drop-in limits before advertising rust-1.99 / heavy32 labels
+        self.assertIn("sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('rustc --version | grep "^rustc 1.99.0 "', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("heavy32-limits.conf", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('mem_max="${RUNNER_MEMORY_GB:-32}G"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 4. DEFAULT_RUNNER_CLOUD_INIT derives gcp-<region> and machine family labels dynamically from GCE metadata
+        self.assertNotIn("gcp-us-south1,c4d", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn("computeMetadata/v1/instance/zone", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn("computeMetadata/v1/instance/machine-type", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn('eff_labels="${eff_labels},gcp-${vm_region}"', DEFAULT_RUNNER_CLOUD_INIT)
+
+        # 5. Real YAML parser rejects invalid YAML scalars, undefined aliases, reserved indicators, and bad escapes
+        for bad_yaml in (
+            "#cloud-config\nruncmd:\n  - foo: a: b\n",
+            "#cloud-config\nruncmd:\n  - *missing_alias\n",
+            "#cloud-config\nruncmd:\n  - @invalid_indicator\n",
+            '#cloud-config\nruncmd:\n  - "bad\\qescape"\n',
+        ):
+            parsed = parse_cloud_init(bad_yaml)
+            self.assertFalse(parsed["valid"], f"Expected invalid cloud-init YAML for: {bad_yaml!r}")
+
+        # 6. Non-loopback bind requires TLS cert+key unless allow_insecure_non_loopback is explicitly enabled
+        with self.assertRaises(ValueError):
+            create_dashboard_server(
+                host="0.0.0.0",
+                port=0,
+                state_path=self.state_file,
+                auth_token="non-loopback-token",
+            )
+        with self.assertRaises(ValueError):
+            create_dashboard_server(
+                host="127.0.0.1",
+                port=0,
+                state_path=self.state_file,
+                tls_certfile="/tmp/only-cert.pem",
+            )
+
+        # 7. Overview includes top-level builder_scaling_evaluation and UI reads scaling_evaluations.rust_builder || builder_scaling_evaluation
+        ov = self._get("/api/overview")
+        self.assertIn("builder_scaling_evaluation", ov)
+        self.assertEqual(
+            ov["builder_scaling_evaluation"],
+            ov["scaling_evaluations"]["rust_builder"],
+        )
+        ui_html = render_dashboard_html()
+        self.assertIn(
+            "(APP_STATE.scaling_evaluations && APP_STATE.scaling_evaluations.rust_builder) || APP_STATE.builder_scaling_evaluation",
+            ui_html,
+        )
+
+        # 8. OOM event is consumed once its scale-up is applied so it does not ratchet capacity on subsequent evaluations
+        now_iso = ov["updated_at"]
+        ratchet_telem = {
+            "current_runners": 4,
+            "current_instances": 1,
+            "jobs_ran_past_hour": 8,
+            "provisioned_jobs": 2,
+            "queued_jobs": 0,
+            "instance_cpu_percentages": [25.0],
+            "github_oom_runs": [
+                {
+                    "id": "oom-ratchet-test",
+                    "repository": "swack-tools/oxidex",
+                    "run_id": 37192272062,
+                    "job_id": 111407847874,
+                    "step_number": 8,
+                    "line_number": 106,
+                    "runner_name": "gha-oxidex-runners-us-south1-a-01",
+                    "failed_at": now_iso,
+                    "error_excerpt": "##[error]Process completed with exit code 137.",
+                }
+            ],
+            "journal_oom_events": [],
+        }
+        ratchet_policy = {
+            "min_runners": 4,
+            "max_runners": 24,
+            "runners_per_instance": 2,
+            "scale_up_step_runners": 2,
+            "max_scale_up_hourly_usd": 10.0,
+            "max_scale_up_daily_usd": 100.0,
+            "max_scale_up_monthly_usd": 1000.0,
+            "enable_github_ci_oom_trigger": True,
+            "enable_journal_oom_trigger": False,
+            "enable_cpu_utilization_trigger": False,
+            "enable_hourly_runs_scale_down": False,
+        }
+        first_eval = evaluate_scaling_decision(ratchet_policy, ratchet_telem)
+        self.assertEqual(first_eval["direction"], "scale_up")
+        self.assertEqual(first_eval["desired_runners"], 6)
+        # Apply the recommended scale-up and re-evaluate: the same OOM must not trigger another scale-up to 8
+        ratchet_telem["current_runners"] = first_eval["desired_runners"]
+        ratchet_telem["current_instances"] = first_eval["desired_instances"]
+        second_eval = evaluate_scaling_decision(ratchet_policy, ratchet_telem)
+        self.assertEqual(second_eval["direction"], "hold")
+        self.assertEqual(second_eval["desired_runners"], 6)
+        self.assertTrue(ratchet_telem["github_oom_runs"][0]["handled"])
+
+        # 9. Scaling budget projections account for actual running fleet hourly rates before adding new instances
+        expensive_fleet_eval = evaluate_scaling_decision(
+            policy={
+                "min_runners": 4,
+                "max_runners": 16,
+                "runners_per_instance": 4,
+                "queued_jobs_threshold": 1,
+                "max_scale_up_hourly_usd": 0.50,
+                "max_scale_up_daily_usd": 50.0,
+                "max_scale_up_monthly_usd": 1000.0,
+                "enable_queued_jobs_trigger": True,
+            },
+            telemetry={
+                "current_runners": 4,
+                "current_instances": 1,
+                "running_instance_hourly_rates": [0.42],
+                "queued_jobs": 4,
+                "instance_cpu_percentages": [40.0],
+                "github_oom_runs": [],
+                "journal_oom_events": [],
+            },
+            per_instance_hourly_usd=0.16,
+        )
+        # Existing VM costs $0.42/hr; adding a second VM at $0.16/hr would reach $0.58/hr > $0.50/hr cap
+        self.assertTrue(expensive_fleet_eval["budget_capped"])
+        self.assertEqual(expensive_fleet_eval["desired_instances"], 1)
+        self.assertEqual(expensive_fleet_eval["projected_hourly_usd"], 0.42)
 
 
 if __name__ == "__main__":
