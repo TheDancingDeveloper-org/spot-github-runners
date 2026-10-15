@@ -10,6 +10,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import os
 from pathlib import Path
 import threading
 import time
@@ -43,6 +44,7 @@ from .rust_build_telemetry import (
     UNFINISHED_BUILD_STATUSES,
     _finite_float,
     _finite_int,
+    _iso_to_epoch,
     classify_ip_and_network,
     enrich_rust_build_record,
 )
@@ -56,8 +58,11 @@ def _iso_hours_ago(hours_ago: float, base_epoch: float | None = None) -> str:
 
 def _iso_seconds_ago(seconds_ago: float, base_epoch: float | None = None) -> str:
     now_ts = base_epoch if base_epoch is not None else time.time()
-    dt = datetime.fromtimestamp(now_ts - seconds_ago, tz=timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    target_ts = now_ts - seconds_ago
+    dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
+    if float(seconds_ago).is_integer():
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _build_instance_record(
@@ -1189,12 +1194,35 @@ class DashboardStore:
             r["is_self_hosted_runner"] = cls_info["is_self_hosted_runner"]
 
     def _persist(self) -> None:
-        self.state["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        new_updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        candidate_state = {**self.state, "updated_at": new_updated_at}
+        serialized = json.dumps(candidate_state, indent=2, allow_nan=False)
         if self.state_path:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.state, indent=2, allow_nan=False), encoding="utf-8")
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    os.chmod(tmp, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(serialized)
+                    fh.flush()
+            except Exception:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    # Best-effort cleanup of the temporary state file when writing fails.
+                    pass
+                raise
             tmp.replace(self.state_path)
+            try:
+                os.chmod(self.state_path, 0o600)
+            except OSError:
+                # Filesystems that do not support POSIX chmod keep the mode set at creation.
+                pass
+        self.state["updated_at"] = new_updated_at
 
     def get_overview(
         self,
@@ -1317,7 +1345,7 @@ class DashboardStore:
         """Filter, compute window-scoped costs, and sort running & deleted instances."""
         with self._lock:
             now_ts = time.time()
-            window_hours = max(0.5, float(window_hours))
+            window_hours = max(0.5, _finite_float(window_hours, "window_hours", min_val=0.0))
             window_start_ts = now_ts - window_hours * 3600.0
             q = (search_filter or "").strip().lower()
             r_filter = (role_filter or "").strip().lower()
@@ -1453,21 +1481,30 @@ class DashboardStore:
             if target not in ("global", "cicd_runner", "rust_builder"):
                 raise ValueError(f"Unsupported budget target: {target}")
             normalized = normalize_budget(payload)
-            if target in ("cicd_runner", "rust_builder"):
-                self.state["profiles"][target]["budget"] = normalized
-                self.state["scaling"][target]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
-                self.state["scaling"][target]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
-                self.state["scaling"][target]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
-                self.state["scaling"][target]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
-            else:
-                self.state["global_budget"] = normalized
-                for role_key in ("cicd_runner", "rust_builder"):
-                    self.state["profiles"][role_key]["budget"] = dict(normalized)
-                    self.state["scaling"][role_key]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
-                    self.state["scaling"][role_key]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
-                    self.state["scaling"][role_key]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
-                    self.state["scaling"][role_key]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
-            self._persist()
+            prev_profiles = copy.deepcopy(self.state["profiles"])
+            prev_scaling = copy.deepcopy(self.state["scaling"])
+            prev_global = copy.deepcopy(self.state.get("global_budget", {}))
+            try:
+                if target in ("cicd_runner", "rust_builder"):
+                    self.state["profiles"][target]["budget"] = normalized
+                    self.state["scaling"][target]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
+                    self.state["scaling"][target]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
+                    self.state["scaling"][target]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
+                    self.state["scaling"][target]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
+                else:
+                    self.state["global_budget"] = normalized
+                    for role_key in ("cicd_runner", "rust_builder"):
+                        self.state["profiles"][role_key]["budget"] = dict(normalized)
+                        self.state["scaling"][role_key]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
+                        self.state["scaling"][role_key]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
+                        self.state["scaling"][role_key]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
+                        self.state["scaling"][role_key]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
+                self._persist()
+            except Exception:
+                self.state["profiles"] = prev_profiles
+                self.state["scaling"] = prev_scaling
+                self.state["global_budget"] = prev_global
+                raise
             return {"status": "ok", "target": target, "budget": normalized}
 
     def update_profile(self, role: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1522,20 +1559,18 @@ class DashboardStore:
             )
             for key in int_positive_keys:
                 if key in payload:
-                    val_int = int(payload[key])
-                    if val_int < 1:
-                        raise ValueError(f"{key} must be >= 1")
+                    val_int = _finite_int(payload[key], key, min_val=1)
                     candidate[key] = val_int
             for key in float_positive_keys:
                 if key in payload:
-                    val_float = float(payload[key])
+                    val_float = _finite_float(payload[key], key, min_val=None)
                     if val_float <= 0:
                         raise ValueError(f"{key} must be > 0")
                     candidate[key] = val_float
             if "host_overhead_gib" in payload:
-                overhead_val = float(payload["host_overhead_gib"])
-                if overhead_val < 0:
-                    raise ValueError("host_overhead_gib must be >= 0")
+                overhead_val = _finite_float(
+                    payload["host_overhead_gib"], "host_overhead_gib", min_val=0.0
+                )
                 candidate["host_overhead_gib"] = overhead_val
             if "disk_category" in payload:
                 d_cat = str(payload["disk_category"]).strip().lower()
@@ -1561,7 +1596,7 @@ class DashboardStore:
 
             active_tpl: dict[str, Any] | None = None
             validated_tpl_units: int | None = None
-            if candidate.get("use_vm_template") and candidate.get("vm_template_id"):
+            if candidate.get("vm_template_id"):
                 active_tpl = next(
                     (
                         t
@@ -1570,6 +1605,7 @@ class DashboardStore:
                     ),
                     None,
                 )
+            if candidate.get("use_vm_template") and candidate.get("vm_template_id"):
                 validated_tpl_units = self._validate_vm_template_compatibility(active_tpl, candidate, role)
 
             qual = qualify_instances(
@@ -1579,29 +1615,43 @@ class DashboardStore:
                 region_latencies_ms=self.state.get("region_latencies_ms"),
             )
 
-            self.state["profiles"][role] = candidate
-            if active_tpl is not None and validated_tpl_units is not None:
-                active_tpl["runner_vcpu"] = int(candidate["runner_vcpu"])
-                active_tpl["runner_ram_gib"] = float(candidate["runner_ram_gib"])
-                active_tpl["runners_count"] = validated_tpl_units
-            if normalized_budget is not None:
-                self.state["scaling"][role]["max_scale_up_hourly_usd"] = normalized_budget["max_hourly_usd"]
-                self.state["scaling"][role]["max_scale_up_daily_usd"] = normalized_budget["max_daily_usd"]
-                self.state["scaling"][role]["max_scale_up_monthly_usd"] = normalized_budget["max_monthly_usd"]
-                self.state["scaling"][role]["include_disk_in_scale_budget"] = normalized_budget["include_disk_costs"]
-            if role == "cicd_runner":
-                self.state["scaling"]["cicd_runner"]["min_runners"] = int(candidate["min_runners"])
-                self.state["scaling"]["cicd_runner"]["runner_vcpu"] = int(candidate["runner_vcpu"])
-                self.state["scaling"]["cicd_runner"]["runner_ram_gib"] = float(candidate["runner_ram_gib"])
-                self._sync_template_density()
-            elif role == "rust_builder":
-                self.state["scaling"]["rust_builder"]["min_instances"] = int(candidate["min_instances"])
-                self.state["scaling"]["rust_builder"]["max_instances"] = int(candidate["max_instances"])
-                self.state["scaling"]["rust_builder"]["container_vcpu"] = int(candidate["runner_vcpu"])
-                self.state["scaling"]["rust_builder"]["builder_vcpu"] = int(candidate["runner_vcpu"])
-                self.state["scaling"]["rust_builder"]["container_ram_gib"] = float(candidate["runner_ram_gib"])
-                self.state["scaling"]["rust_builder"]["builder_ram_gib"] = float(candidate["runner_ram_gib"])
-            self._persist()
+            prev_profiles = copy.deepcopy(self.state["profiles"])
+            prev_scaling = copy.deepcopy(self.state["scaling"])
+            prev_vm_templates = copy.deepcopy(self.state["vm_templates"])
+            prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
+            try:
+                self.state["profiles"][role] = candidate
+                if active_tpl is not None:
+                    if "cloud_init_template_id" in payload and candidate.get("cloud_init_template_id"):
+                        active_tpl["cloud_init_template_id"] = candidate["cloud_init_template_id"]
+                    if validated_tpl_units is not None:
+                        active_tpl["runner_vcpu"] = int(candidate["runner_vcpu"])
+                        active_tpl["runner_ram_gib"] = float(candidate["runner_ram_gib"])
+                        active_tpl["runners_count"] = validated_tpl_units
+                if normalized_budget is not None:
+                    self.state["scaling"][role]["max_scale_up_hourly_usd"] = normalized_budget["max_hourly_usd"]
+                    self.state["scaling"][role]["max_scale_up_daily_usd"] = normalized_budget["max_daily_usd"]
+                    self.state["scaling"][role]["max_scale_up_monthly_usd"] = normalized_budget["max_monthly_usd"]
+                    self.state["scaling"][role]["include_disk_in_scale_budget"] = normalized_budget["include_disk_costs"]
+                if role == "cicd_runner":
+                    self.state["scaling"]["cicd_runner"]["min_runners"] = int(candidate["min_runners"])
+                    self.state["scaling"]["cicd_runner"]["runner_vcpu"] = int(candidate["runner_vcpu"])
+                    self.state["scaling"]["cicd_runner"]["runner_ram_gib"] = float(candidate["runner_ram_gib"])
+                    self._sync_template_density()
+                elif role == "rust_builder":
+                    self.state["scaling"]["rust_builder"]["min_instances"] = int(candidate["min_instances"])
+                    self.state["scaling"]["rust_builder"]["max_instances"] = int(candidate["max_instances"])
+                    self.state["scaling"]["rust_builder"]["container_vcpu"] = int(candidate["runner_vcpu"])
+                    self.state["scaling"]["rust_builder"]["builder_vcpu"] = int(candidate["runner_vcpu"])
+                    self.state["scaling"]["rust_builder"]["container_ram_gib"] = float(candidate["runner_ram_gib"])
+                    self.state["scaling"]["rust_builder"]["builder_ram_gib"] = float(candidate["runner_ram_gib"])
+                self._persist()
+            except Exception:
+                self.state["profiles"] = prev_profiles
+                self.state["scaling"] = prev_scaling
+                self.state["vm_templates"] = prev_vm_templates
+                self.state["scaling_telemetry"] = prev_telemetry
+                raise
             return {"status": "ok", "profile": candidate, "qualification": qual}
 
     def update_scaling(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1747,21 +1797,33 @@ class DashboardStore:
     def update_regions(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Enable/disable regions individually or by latency/capability filter."""
         with self._lock:
-            if "regions_enabled" in payload and isinstance(payload["regions_enabled"], dict):
-                for reg, enabled in payload["regions_enabled"].items():
-                    if reg in self.state["regions_enabled"]:
-                        self.state["regions_enabled"][reg] = bool(enabled)
-            if payload.get("measure_latency"):
-                self.state["region_latencies_ms"] = measure_region_latencies()
-            if "deselect_matching" in payload and isinstance(payload["deselect_matching"], dict):
-                criteria = payload["deselect_matching"]
-                max_lat = criteria.get("min_latency_ms_to_disable")
-                for reg in REGIONS_CATALOG:
-                    r_code = reg["region"]
-                    lat = self.state["region_latencies_ms"].get(r_code, reg["latency_ms"])
-                    if max_lat is not None and lat > float(max_lat):
-                        self.state["regions_enabled"][r_code] = False
-            self._persist()
+            prev_enabled = copy.deepcopy(self.state["regions_enabled"])
+            prev_latencies = copy.deepcopy(self.state["region_latencies_ms"])
+            try:
+                if "regions_enabled" in payload and isinstance(payload["regions_enabled"], dict):
+                    for reg, enabled in payload["regions_enabled"].items():
+                        if reg in self.state["regions_enabled"]:
+                            self.state["regions_enabled"][reg] = bool(enabled)
+                if payload.get("measure_latency"):
+                    self.state["region_latencies_ms"] = measure_region_latencies()
+                if "deselect_matching" in payload and isinstance(payload["deselect_matching"], dict):
+                    criteria = payload["deselect_matching"]
+                    max_lat = criteria.get("min_latency_ms_to_disable")
+                    max_lat_val = (
+                        _finite_float(max_lat, "min_latency_ms_to_disable", min_val=0.0)
+                        if max_lat is not None
+                        else None
+                    )
+                    for reg in REGIONS_CATALOG:
+                        r_code = reg["region"]
+                        lat = self.state["region_latencies_ms"].get(r_code, reg["latency_ms"])
+                        if max_lat_val is not None and lat > max_lat_val:
+                            self.state["regions_enabled"][r_code] = False
+                self._persist()
+            except Exception:
+                self.state["regions_enabled"] = prev_enabled
+                self.state["region_latencies_ms"] = prev_latencies
+                raise
             return {
                 "status": "ok",
                 "regions_enabled": self.state["regions_enabled"],
@@ -1799,7 +1861,19 @@ class DashboardStore:
                 }
                 self.state["cloud_init_templates"].append(record)
                 if payload.get("assign_to_profile", True) and role in self.state["profiles"]:
-                    self.state["profiles"][role]["cloud_init_template_id"] = new_id
+                    prof = self.state["profiles"][role]
+                    prof["cloud_init_template_id"] = new_id
+                    if prof.get("vm_template_id"):
+                        assigned_vm_tpl = next(
+                            (
+                                t
+                                for t in self.state.get("vm_templates", [])
+                                if t.get("id") == prof.get("vm_template_id")
+                            ),
+                            None,
+                        )
+                        if assigned_vm_tpl is not None:
+                            assigned_vm_tpl["cloud_init_template_id"] = new_id
                 self._persist()
                 return {"status": "ok", "template": {**record, "parsed": parsed}}
 
@@ -1816,7 +1890,19 @@ class DashboardStore:
                 existing["description"] = description
             existing["updated_at"] = now_iso
             if payload.get("assign_to_profile", False) and existing["role"] in self.state["profiles"]:
-                self.state["profiles"][existing["role"]]["cloud_init_template_id"] = existing["id"]
+                prof = self.state["profiles"][existing["role"]]
+                prof["cloud_init_template_id"] = existing["id"]
+                if prof.get("vm_template_id"):
+                    assigned_vm_tpl = next(
+                        (
+                            t
+                            for t in self.state.get("vm_templates", [])
+                            if t.get("id") == prof.get("vm_template_id")
+                        ),
+                        None,
+                    )
+                    if assigned_vm_tpl is not None:
+                        assigned_vm_tpl["cloud_init_template_id"] = existing["id"]
             self._persist()
             return {"status": "ok", "template": {**existing, "parsed": parsed}}
 
@@ -1837,6 +1923,8 @@ class DashboardStore:
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            role = inst["role"]
+            prof = self.state["profiles"].get(role)
             tpl_name = str(
                 payload.get("template_name")
                 or f"Template from {inst['name']} ({inst['machine_type']})"
@@ -1844,7 +1932,7 @@ class DashboardStore:
             new_tpl = {
                 "id": f"tpl-{uuid.uuid4().hex[:8]}",
                 "name": tpl_name,
-                "role": inst["role"],
+                "role": role,
                 "machine_type": inst["machine_type"],
                 "vcpu": inst["vcpu"],
                 "ram_gib": inst["ram_gib"],
@@ -1858,15 +1946,25 @@ class DashboardStore:
                 "runners_count": inst["runners_count"],
                 "runner_vcpu": inst["runner_vcpu"],
                 "runner_ram_gib": inst["runner_ram_gib"],
-                "cloud_init_template_id": inst["cloud_init_template_id"],
+                "cloud_init_template_id": (
+                    prof.get("cloud_init_template_id")
+                    if prof and prof.get("cloud_init_template_id")
+                    else inst["cloud_init_template_id"]
+                ),
                 "source_instance": inst["name"],
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
+            assign_to_profile = bool(payload.get("assign_to_profile", True))
+            if assign_to_profile and prof is not None:
+                validated_units = self._validate_vm_template_compatibility(new_tpl, prof, role)
+                new_tpl["runner_vcpu"] = int(prof["runner_vcpu"])
+                new_tpl["runner_ram_gib"] = float(prof["runner_ram_gib"])
+                new_tpl["runners_count"] = validated_units
             self.state["vm_templates"].append(new_tpl)
-            if payload.get("assign_to_profile", True) and inst["role"] in self.state["profiles"]:
-                self.state["profiles"][inst["role"]]["use_vm_template"] = True
-                self.state["profiles"][inst["role"]]["vm_template_id"] = new_tpl["id"]
-                if inst["role"] == "cicd_runner":
+            if assign_to_profile and prof is not None:
+                prof["use_vm_template"] = True
+                prof["vm_template_id"] = new_tpl["id"]
+                if role == "cicd_runner":
                     self._sync_template_density()
             self._persist()
             return {"status": "ok", "vm_template": new_tpl}
@@ -1913,9 +2011,7 @@ class DashboardStore:
         """Scale the number of instances in a specific region/location on demand."""
         with self._lock:
             region = str(payload.get("region", "africa-south1")).strip()
-            raw_target = int(payload.get("target_instances", 1))
-            if raw_target < 0:
-                raise ValueError("target_instances must be >= 0")
+            raw_target = _finite_int(payload.get("target_instances", 1), "target_instances", min_val=0)
             target_count = raw_target
             role = str(payload.get("role", "cicd_runner")).strip()
             if role not in ("cicd_runner", "rust_builder"):
@@ -1924,7 +2020,11 @@ class DashboardStore:
             if reg_info is None:
                 raise ValueError(f"Unknown region: {region}")
             prof = self.state["profiles"].get(role, self.state["profiles"]["cicd_runner"])
-            max_allowed = min(20, max(1, int(prof.get("max_instances", 20))))
+            pol = self.state.get("scaling", {}).get(role, {})
+            prof_max_instances = int(prof.get("max_instances", 20))
+            if role == "rust_builder" and pol.get("max_instances") is not None:
+                prof_max_instances = min(prof_max_instances, int(pol["max_instances"]))
+            max_allowed = min(20, max(1, prof_max_instances))
             running_in_region = [
                 i
                 for i in self.state["instances"]
@@ -2067,6 +2167,7 @@ class DashboardStore:
                             "vm_template_id": None,
                         }
 
+                default_ci_id = "ci-runner-default" if role == "cicd_runner" else "ci-rust-builder-199"
                 new_records: list[dict[str, Any]] = []
                 for idx in range(current_count + 1, target_count + 1):
                     zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]
@@ -2082,9 +2183,9 @@ class DashboardStore:
                     runner_ram = float(source_spec["runner_ram_gib"])
                     runners_cnt = int(source_spec["runners_count"])
                     cloud_init_id = (
-                        source_spec.get("cloud_init_template_id")
-                        if source_spec.get("cloud_init_template_id")
-                        else prof.get("cloud_init_template_id", "ci-runner-default")
+                        prof.get("cloud_init_template_id")
+                        or source_spec.get("cloud_init_template_id")
+                        or default_ci_id
                     )
                     vm_tpl_id = (
                         vm_tpl["id"]
@@ -2123,7 +2224,6 @@ class DashboardStore:
                     )
                     new_records.append(created)
 
-                pol = self.state.get("scaling", {}).get(role, {})
                 budget = prof.get("budget", {})
                 max_hourly_cap = float(
                     pol.get("max_scale_up_hourly_usd", budget.get("max_hourly_usd", 5.0))
@@ -2148,6 +2248,20 @@ class DashboardStore:
                     for i in self.state["instances"]
                     if i["status"] == "RUNNING" and i["role"] == role
                 ]
+                if role == "cicd_runner":
+                    projected_runner_slots = sum(
+                        int(i.get("runners_count", 1)) for i in existing_running_role + new_records
+                    )
+                    max_runners_cap = max(
+                        int(prof.get("min_runners", 1)),
+                        int(pol.get("max_runners", 24)),
+                    )
+                    if projected_runner_slots > max_runners_cap:
+                        raise ValueError(
+                            f"Scaling up in {region} to {target_count} instance(s) "
+                            f"(projected {projected_runner_slots} runner slots across {projected_total} VMs) "
+                            f"exceeds maximum allowed CI/CD runners ({max_runners_cap})"
+                        )
                 projected_fleet_hourly = round(
                     sum(
                         self._instance_hourly_for_budget(
@@ -2240,17 +2354,41 @@ class DashboardStore:
             is_unfinished = status_str.strip().upper() in UNFINISHED_BUILD_STATUSES
 
             raw_duration = payload.get("total_duration_seconds")
-            duration = (
+            raw_delivery = payload.get("delivery_duration_seconds")
+            raw_compile = payload.get("compile_duration_seconds")
+            explicit_total = (
                 _finite_float(raw_duration, "total_duration_seconds", min_val=0.0)
                 if raw_duration is not None
-                else (0.0 if is_unfinished else 95.0)
+                else None
             )
-            raw_delivery = payload.get("delivery_duration_seconds")
-            delivery_sec = (
+            explicit_delivery = (
                 _finite_float(raw_delivery, "delivery_duration_seconds", min_val=0.0)
                 if raw_delivery is not None
-                else (0.0 if is_unfinished else 8.0)
+                else None
             )
+            explicit_compile = (
+                _finite_float(raw_compile, "compile_duration_seconds", min_val=0.0)
+                if raw_compile is not None
+                else None
+            )
+
+            if is_unfinished:
+                duration = explicit_total if explicit_total is not None else 0.0
+                delivery_sec = explicit_delivery if explicit_delivery is not None else 0.0
+            else:
+                if explicit_total is not None:
+                    duration = explicit_total
+                    if explicit_delivery is not None:
+                        delivery_sec = min(explicit_delivery, duration)
+                    elif explicit_compile is not None:
+                        delivery_sec = max(0.0, duration - min(explicit_compile, duration))
+                    else:
+                        delivery_sec = min(8.0, round(duration * 0.2, 2))
+                else:
+                    delivery_sec = explicit_delivery if explicit_delivery is not None else 8.0
+                    c_sec = explicit_compile if explicit_compile is not None else 87.0
+                    duration = c_sec + delivery_sec
+
             has_hits = payload.get("cache_hits") is not None
             has_misses = payload.get("cache_misses") is not None
             has_total = payload.get("total_crates") is not None
@@ -2284,9 +2422,13 @@ class DashboardStore:
                 fin_at = payload.get("finished_at")
                 del_at = payload.get("delivered_at")
             else:
-                req_at = payload.get("requested_at") or _iso_seconds_ago(duration, now_ts)
-                fin_at = payload.get("finished_at") or _iso_seconds_ago(delivery_sec, now_ts)
                 del_at = payload.get("delivered_at") or _iso_seconds_ago(0, now_ts)
+                del_epoch = _iso_to_epoch(str(del_at))
+                fin_at = payload.get("finished_at") or _iso_seconds_ago(delivery_sec, del_epoch)
+                fin_epoch = _iso_to_epoch(str(fin_at))
+                req_at = payload.get("requested_at") or _iso_seconds_ago(
+                    max(0.0, duration - delivery_sec), fin_epoch
+                )
 
             default_peak_ram = 0.0 if is_unfinished else 20.5
             default_cpu_time = 0.0 if is_unfinished else 1120.0

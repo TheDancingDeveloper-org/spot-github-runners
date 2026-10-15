@@ -1034,7 +1034,134 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 400)
             ctx.exception.close()
 
+    def test_round6_codex_regressions(self) -> None:
+        import os
+        import stat
+
+        # 1. Non-finite profile values are rejected before state assignment and do not poison live state
+        for bad_profile in (
+            {"runner_ram_gib": "nan"},
+            {"min_instance_ram_gib": "inf"},
+            {"host_overhead_gib": "-inf"},
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._post("/api/profile/cicd_runner", bad_profile)
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
+        overview_ok = self._get("/api/overview")
+        self.assertEqual(overview_ok["profiles"]["cicd_runner"]["runner_ram_gib"], 16)
+
+        # 2. Persisted state file permissions are restricted to 0o600 even if previously 0o644
+        os.chmod(self.state_file, 0o644)
+        self._post(
+            "/api/budget",
+            {
+                "target": "cicd_runner",
+                "max_hourly_usd": 50.0,
+                "max_daily_usd": 500.0,
+                "max_monthly_usd": 5000.0,
+                "include_disk_costs": True,
+                "include_taxes": False,
+            },
+        )
+        self.assertEqual(stat.S_IMODE(os.stat(self.state_file).st_mode), 0o600)
+
+        # 3. Valid Bash syntax in #!/bin/bash script passes save_cloud_init_template, and active cloud-init is used on scale-up
+        bash_script = "#!/bin/bash\nset -euo pipefail\nfunction greet() {\n  local arr=(one two)\n  echo \"${arr[0]}\"\n}\ngreet\n"
+        saved_ci = self._post(
+            "/api/cloud-init/save",
+            {
+                "mode": "save_as",
+                "name": "Bash Function Runner Init",
+                "role": "cicd_runner",
+                "content": bash_script,
+                "assign_to_profile": True,
+            },
+        )
+        new_ci_id = saved_ci["template"]["id"]
+        scaled_up = self._post(
+            "/api/instances/scale-region",
+            {"region": "us-south1", "target_instances": 2, "role": "cicd_runner"},
+        )
+        newest_vm = scaled_up["running_instances"][0]
+        self.assertEqual(newest_vm["cloud_init_template_id"], new_ci_id)
+
+        # 4. Regional CI scaling enforces scaling.cicd_runner.max_runners (24 runners max)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/instances/scale-region",
+                {"region": "us-south1", "target_instances": 6, "role": "cicd_runner"},
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+
+        # 5. Template Studio rejects creating and assigning an incompatible VM template
+        self._post(
+            "/api/profile/cicd_runner",
+            {
+                "use_vm_template": False,
+                "min_instance_vcpu": 32,
+                "min_instance_ram_gib": 100,
+            },
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/vm-templates/from-instance",
+                {
+                    "instance_name": "oxidex-runners-eu-west4-01",
+                    "template_name": "Too Small 8-vCPU Template",
+                    "assign_to_profile": True,
+                },
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+
+        # 6. Builder-tagged OOM events in journal_oom_events do not trigger CI runner scaling
+        now_iso = self._get("/api/overview")["updated_at"]
+        ci_eval = evaluate_scaling_decision(
+            policy={"enable_journal_oom_trigger": True},
+            telemetry={
+                "current_runners": 4,
+                "current_instances": 1,
+                "jobs_ran_past_hour": 8,
+                "provisioned_jobs": 2,
+                "queued_jobs": 0,
+                "instance_cpu_percentages": [30.0],
+                "github_oom_runs": [],
+                "journal_oom_events": [
+                    {
+                        "instance_name": "builder-oxidex-turin-01",
+                        "role": "rust_builder",
+                        "process": "rustc",
+                        "pid": 9999,
+                        "timestamp": now_iso,
+                        "handled": False,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(ci_eval["scale_up_reasons"], [])
+        self.assertEqual(ci_eval["desired_runners"], 4)
+
+        # 7. Fast completed Rust builds (< 8s or explicit delivery > total) derive valid monotonic timestamps
+        fast_res = self._post(
+            "/api/rust-builds",
+            {"build_id": "rb-fast-3s", "status": "DELIVERED", "total_duration_seconds": 3.0},
+        )
+        self.assertEqual(fast_res["build"]["total_duration_seconds"], 3.0)
+        fast_del_res = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-fast-del-clamp",
+                "status": "DELIVERED",
+                "total_duration_seconds": 4.0,
+                "delivery_duration_seconds": 12.0,
+            },
+        )
+        self.assertEqual(fast_del_res["build"]["total_duration_seconds"], 4.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

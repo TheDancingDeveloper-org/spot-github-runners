@@ -1304,10 +1304,19 @@ def _validate_cloud_init_syntax(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
                     )
     elif is_shell_script:
+        import shutil
+
         script_body = "\n".join(lines) + "\n"
+        shebang = lines[0].strip() if lines else ""
+        if re.search(r"\bbash\b", shebang):
+            checker_bin = shutil.which("bash") or "/bin/bash"
+        elif re.search(r"\bzsh\b", shebang):
+            checker_bin = shutil.which("zsh") or "/bin/zsh"
+        else:
+            checker_bin = "/bin/sh"
         try:
             proc = subprocess.run(
-                ["/bin/sh", "-n"],
+                [checker_bin, "-n"],
                 input=script_body,
                 text=True,
                 capture_output=True,
@@ -1318,7 +1327,7 @@ def _validate_cloud_init_syntax(
                 err_msg = (proc.stderr or "invalid shell syntax").strip().splitlines()[0]
                 errors.append(f"Shell syntax error: {err_msg}")
         except OSError:
-            # /bin/sh is not available in this execution environment; skip external shell syntax check.
+            # Declared shell interpreter is not available in this execution environment; skip external syntax check.
             pass
     return errors
 

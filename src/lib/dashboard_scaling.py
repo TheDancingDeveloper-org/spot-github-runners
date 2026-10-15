@@ -237,6 +237,23 @@ def default_scaling_config() -> dict[str, Any]:
     }
 
 
+def _finite_float_val(val: Any, name: str = "value") -> float:
+    if isinstance(val, bool):
+        raise ValueError(f"{name} must be a finite number")
+    f = float(val)
+    if not math.isfinite(f):
+        raise ValueError(f"{name} must be a finite number (got {val!r})")
+    return f
+
+
+def _finite_int_val(val: Any, name: str = "value") -> int:
+    if isinstance(val, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(val, float) and not math.isfinite(val):
+        raise ValueError(f"{name} must be a finite integer (got {val!r})")
+    return int(val)
+
+
 def evaluate_cpu_scope(
     cpu_percentages: list[float],
     threshold_percent: float,
@@ -273,36 +290,47 @@ def evaluate_scaling_decision(
     and budget compliance details.
     """
     cfg = {**default_scaling_config()["cicd_runner"], **(policy or {})}
-    now_ts = float(now_epoch) if now_epoch is not None else time.time()
-    lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60)) * 60.0)
+    now_ts = _finite_float_val(now_epoch, "now_epoch") if now_epoch is not None else time.time()
+    lookback_seconds = max(
+        60.0, _finite_float_val(cfg.get("oom_lookback_minutes", 60), "oom_lookback_minutes") * 60.0
+    )
 
-    current_runners = max(0, int(telemetry.get("current_runners", 4)))
+    current_runners = max(0, _finite_int_val(telemetry.get("current_runners", 4), "current_runners"))
     explicit_policy_density = (policy or {}).get("runners_per_instance")
     template_density = telemetry.get("template_runners_per_instance") or cfg.get("template_runners_per_instance")
     known_current_instances = telemetry.get("current_instances")
     if explicit_policy_density is not None:
-        runners_per_vm = max(1, int(explicit_policy_density))
+        runners_per_vm = max(1, _finite_int_val(explicit_policy_density, "runners_per_instance"))
     elif template_density is not None:
-        runners_per_vm = max(1, int(template_density))
-    elif known_current_instances is not None and int(known_current_instances) > 0 and current_runners > 0:
-        runners_per_vm = max(1, math.ceil(current_runners / int(known_current_instances)))
+        runners_per_vm = max(1, _finite_int_val(template_density, "template_runners_per_instance"))
+    elif (
+        known_current_instances is not None
+        and _finite_int_val(known_current_instances, "current_instances") > 0
+        and current_runners > 0
+    ):
+        runners_per_vm = max(
+            1, math.ceil(current_runners / _finite_int_val(known_current_instances, "current_instances"))
+        )
     else:
-        runners_per_vm = max(1, int(cfg.get("runners_per_instance", 4)))
+        runners_per_vm = max(1, _finite_int_val(cfg.get("runners_per_instance", 4), "runners_per_instance"))
 
     current_instances_count = (
-        max(0, int(known_current_instances))
+        max(0, _finite_int_val(known_current_instances, "current_instances"))
         if known_current_instances is not None
         else (math.ceil(current_runners / runners_per_vm) if current_runners > 0 else 0)
     )
 
-    min_runners = max(1, int(cfg.get("min_runners", 4)))
-    max_runners = max(min_runners, int(cfg.get("max_runners", 24)))
-    step_runners = max(1, int(cfg.get("scale_up_step_runners", 2)))
+    min_runners = max(1, _finite_int_val(cfg.get("min_runners", 4), "min_runners"))
+    max_runners = max(min_runners, _finite_int_val(cfg.get("max_runners", 24), "max_runners"))
+    step_runners = max(1, _finite_int_val(cfg.get("scale_up_step_runners", 2), "scale_up_step_runners"))
 
-    jobs_ran_past_hour = max(0, int(telemetry.get("jobs_ran_past_hour", 0)))
-    provisioned_jobs = max(0, int(telemetry.get("provisioned_jobs", 0)))
-    queued_jobs = max(0, int(telemetry.get("queued_jobs", 0)))
-    cpu_percentages = [float(x) for x in telemetry.get("instance_cpu_percentages", [])]
+    jobs_ran_past_hour = max(0, _finite_int_val(telemetry.get("jobs_ran_past_hour", 0), "jobs_ran_past_hour"))
+    provisioned_jobs = max(0, _finite_int_val(telemetry.get("provisioned_jobs", 0), "provisioned_jobs"))
+    queued_jobs = max(0, _finite_int_val(telemetry.get("queued_jobs", 0), "queued_jobs"))
+    cpu_percentages = [
+        _finite_float_val(x, "instance_cpu_percentages")
+        for x in telemetry.get("instance_cpu_percentages", [])
+    ]
     journal_oom_events = list(telemetry.get("journal_oom_events", []))
     github_oom_runs = list(telemetry.get("github_oom_runs", []))
 
@@ -354,10 +382,15 @@ def evaluate_scaling_decision(
         if any_confirmed_oom:
             desired_runners = max(desired_runners, current_runners + step_runners)
 
-    # 2. VM Journal OOM Trigger (only recent unhandled events)
+    # 2. VM Journal OOM Trigger (only recent unhandled CI runner events; exclude Rust builder OOMs)
     if cfg.get("enable_journal_oom_trigger", True) and journal_oom_events:
         active_journal_ooms = [
-            evt for evt in journal_oom_events if _is_recent_unhandled_oom(evt, now_ts, lookback_seconds)
+            evt
+            for evt in journal_oom_events
+            if isinstance(evt, dict)
+            and str(evt.get("role", "")).strip().lower() != "rust_builder"
+            and not str(evt.get("instance_name", "")).strip().lower().startswith("builder-")
+            and _is_recent_unhandled_oom(evt, now_ts, lookback_seconds)
         ]
         for evt in active_journal_ooms:
             scale_up_reasons.append(
@@ -378,7 +411,7 @@ def evaluate_scaling_decision(
             desired_runners = max(desired_runners, current_runners + step_runners)
 
     # 3. Queued jobs waiting for a runner
-    if cfg.get("enable_queued_jobs_trigger", True) and queued_jobs >= int(cfg.get("queued_jobs_threshold", 2)):
+    if cfg.get("enable_queued_jobs_trigger", True) and queued_jobs >= _finite_int_val(cfg.get("queued_jobs_threshold", 2), "queued_jobs_threshold"):
         scale_up_reasons.append(
             {
                 "trigger": "queued_jobs",
@@ -391,7 +424,7 @@ def evaluate_scaling_decision(
         desired_runners = max(desired_runners, current_runners + max(step_runners, queued_jobs))
 
     # 4. Current provisioned / active jobs
-    if cfg.get("enable_provisioned_jobs_trigger", True) and provisioned_jobs >= int(cfg.get("provisioned_jobs_threshold", 6)):
+    if cfg.get("enable_provisioned_jobs_trigger", True) and provisioned_jobs >= _finite_int_val(cfg.get("provisioned_jobs_threshold", 6), "provisioned_jobs_threshold"):
         scale_up_reasons.append(
             {
                 "trigger": "provisioned_jobs",
@@ -404,8 +437,8 @@ def evaluate_scaling_decision(
         desired_runners = max(desired_runners, current_runners + step_runners)
 
     # 5. Hourly CI/CD runs volume scale-up
-    if cfg.get("enable_hourly_runs_scale_up", True) and jobs_ran_past_hour >= int(cfg.get("hourly_runs_scale_up_threshold", 20)):
-        target_from_hourly = int(cfg.get("hourly_runs_scale_up_target_runners", current_runners + step_runners))
+    if cfg.get("enable_hourly_runs_scale_up", True) and jobs_ran_past_hour >= _finite_int_val(cfg.get("hourly_runs_scale_up_threshold", 20), "hourly_runs_scale_up_threshold"):
+        target_from_hourly = _finite_int_val(cfg.get("hourly_runs_scale_up_target_runners", current_runners + step_runners), "hourly_runs_scale_up_target_runners")
         scale_up_reasons.append(
             {
                 "trigger": "hourly_runs_high",
@@ -421,7 +454,7 @@ def evaluate_scaling_decision(
     if cfg.get("enable_cpu_utilization_trigger", True):
         cpu_triggered, cpu_detail = evaluate_cpu_scope(
             cpu_percentages,
-            float(cfg.get("cpu_threshold_percent", 50.0)),
+            _finite_float_val(cfg.get("cpu_threshold_percent", 50.0), "cpu_threshold_percent"),
             str(cfg.get("cpu_scope", "majority")),
         )
         if cpu_triggered:
@@ -439,10 +472,10 @@ def evaluate_scaling_decision(
     if not scale_up_reasons:
         if (
             cfg.get("enable_hourly_runs_scale_down", True)
-            and jobs_ran_past_hour <= int(cfg.get("scale_down_max_jobs_past_hour", 5))
+            and jobs_ran_past_hour <= _finite_int_val(cfg.get("scale_down_max_jobs_past_hour", 5), "scale_down_max_jobs_past_hour")
             and queued_jobs == 0
         ):
-            low_target = max(capacity_floor, int(cfg.get("scale_down_target_runners", min_runners)))
+            low_target = max(capacity_floor, _finite_int_val(cfg.get("scale_down_target_runners", min_runners), "scale_down_target_runners"))
             if low_target < current_runners:
                 scale_down_reasons.append(
                     {
@@ -461,7 +494,7 @@ def evaluate_scaling_decision(
             cfg.get("enable_idle_cpu_scale_down", True)
             and queued_jobs == 0
             and cpu_percentages
-            and all(c < float(cfg.get("scale_down_cpu_percent", 25.0)) for c in cpu_percentages)
+            and all(c < _finite_float_val(cfg.get("scale_down_cpu_percent", 25.0), "scale_down_cpu_percent") for c in cpu_percentages)
         ):
             idle_target = max(capacity_floor, current_runners - runners_per_vm)
             if idle_target < current_runners:
@@ -493,10 +526,10 @@ def evaluate_scaling_decision(
         desired_instances = math.ceil(desired_runners / runners_per_vm) if desired_runners > 0 else 0
 
     # Enforce max scale-up budget caps (hourly, daily, monthly) without turning a blocked scale-up into a scale-down
-    unit_hourly = max(0.0001, float(per_instance_hourly_usd))
-    max_hourly_cap = float(cfg.get("max_scale_up_hourly_usd", 5.00))
-    max_daily_cap = float(cfg.get("max_scale_up_daily_usd", 10.00))
-    max_monthly_cap = float(cfg.get("max_scale_up_monthly_usd", 50.00))
+    unit_hourly = max(0.0001, _finite_float_val(per_instance_hourly_usd, "per_instance_hourly_usd"))
+    max_hourly_cap = _finite_float_val(cfg.get("max_scale_up_hourly_usd", 5.00), "max_scale_up_hourly_usd")
+    max_daily_cap = _finite_float_val(cfg.get("max_scale_up_daily_usd", 10.00), "max_scale_up_daily_usd")
+    max_monthly_cap = _finite_float_val(cfg.get("max_scale_up_monthly_usd", 50.00), "max_scale_up_monthly_usd")
 
     effective_hourly_cap = min(
         max_hourly_cap,
@@ -532,6 +565,9 @@ def evaluate_scaling_decision(
         else ("scale_down" if desired_runners < current_runners else "hold")
     )
 
+    runner_ram_val = _finite_float_val(cfg.get("runner_ram_gib", 16), "runner_ram_gib")
+    total_req_ram = runners_per_vm * runner_ram_val
+
     return {
         "role": "cicd_runner",
         "direction": direction,
@@ -540,8 +576,8 @@ def evaluate_scaling_decision(
         "current_instances": current_instances_count,
         "desired_instances": desired_instances,
         "runners_per_instance": runners_per_vm,
-        "instance_required_vcpu": runners_per_vm * int(cfg.get("runner_vcpu", 4)),
-        "instance_required_ram_gib": runners_per_vm * int(cfg.get("runner_ram_gib", 16)),
+        "instance_required_vcpu": runners_per_vm * _finite_int_val(cfg.get("runner_vcpu", 4), "runner_vcpu"),
+        "instance_required_ram_gib": int(total_req_ram) if total_req_ram.is_integer() else round(total_req_ram, 2),
         "scale_up_reasons": scale_up_reasons,
         "scale_down_reasons": scale_down_reasons,
         "budget_capped": budget_capped,
@@ -562,21 +598,28 @@ def evaluate_builder_scaling_decision(
     """Evaluate dedicated Rust builder telemetry against builder scaling triggers and budgets."""
     raw_policy = policy or {}
     cfg = {**default_scaling_config()["rust_builder"], **raw_policy}
-    now_ts = float(now_epoch) if now_epoch is not None else time.time()
-    lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60)) * 60.0)
+    now_ts = _finite_float_val(now_epoch, "now_epoch") if now_epoch is not None else time.time()
+    lookback_seconds = max(
+        60.0, _finite_float_val(cfg.get("oom_lookback_minutes", 60), "oom_lookback_minutes") * 60.0
+    )
 
     current_instances = max(
         0,
-        int(telemetry.get("current_builder_instances", telemetry.get("current_builders", 2))),
+        _finite_int_val(
+            telemetry.get("current_builder_instances", telemetry.get("current_builders", 2)),
+            "current_builder_instances",
+        ),
     )
-    min_instances = max(1, int(cfg.get("min_instances", 1)))
-    max_instances = max(min_instances, int(cfg.get("max_instances", 4)))
+    min_instances = max(1, _finite_int_val(cfg.get("min_instances", 1), "min_instances"))
+    max_instances = max(min_instances, _finite_int_val(cfg.get("max_instances", 4), "max_instances"))
 
-    builds_ran_past_hour = max(0, int(telemetry.get("builds_ran_past_hour", 5)))
-    active_builds = max(0, int(telemetry.get("active_builds", 0)))
-    queued_builds = max(0, int(telemetry.get("queued_builds", 0)))
+    builds_ran_past_hour = max(
+        0, _finite_int_val(telemetry.get("builds_ran_past_hour", 5), "builds_ran_past_hour")
+    )
+    active_builds = max(0, _finite_int_val(telemetry.get("active_builds", 0), "active_builds"))
+    queued_builds = max(0, _finite_int_val(telemetry.get("queued_builds", 0), "queued_builds"))
     cpu_percentages = [
-        float(x)
+        _finite_float_val(x, "builder_cpu_percentages")
         for x in telemetry.get("builder_cpu_percentages", [])
     ]
     if "builder_journal_oom_events" in telemetry:
@@ -590,18 +633,20 @@ def evaluate_builder_scaling_decision(
         ]
 
     if "container_vcpu" in raw_policy:
-        req_vcpu = int(raw_policy["container_vcpu"])
+        req_vcpu = _finite_int_val(raw_policy["container_vcpu"], "container_vcpu")
     elif "builder_vcpu" in raw_policy:
-        req_vcpu = int(raw_policy["builder_vcpu"])
+        req_vcpu = _finite_int_val(raw_policy["builder_vcpu"], "builder_vcpu")
     else:
-        req_vcpu = int(cfg.get("container_vcpu", cfg.get("builder_vcpu", 16)))
+        req_vcpu = _finite_int_val(cfg.get("container_vcpu", cfg.get("builder_vcpu", 16)), "container_vcpu")
 
     if "container_ram_gib" in raw_policy:
-        req_ram = float(raw_policy["container_ram_gib"])
+        req_ram = _finite_float_val(raw_policy["container_ram_gib"], "container_ram_gib")
     elif "builder_ram_gib" in raw_policy:
-        req_ram = float(raw_policy["builder_ram_gib"])
+        req_ram = _finite_float_val(raw_policy["builder_ram_gib"], "builder_ram_gib")
     else:
-        req_ram = float(cfg.get("container_ram_gib", cfg.get("builder_ram_gib", 28)))
+        req_ram = _finite_float_val(
+            cfg.get("container_ram_gib", cfg.get("builder_ram_gib", 28)), "container_ram_gib"
+        )
 
     scale_up_reasons: list[dict[str, Any]] = []
     scale_down_reasons: list[dict[str, Any]] = []
@@ -624,7 +669,7 @@ def evaluate_builder_scaling_decision(
         if active_ooms:
             desired_instances = max(desired_instances, current_instances + 1)
 
-    if cfg.get("enable_queue_trigger", True) and queued_builds >= int(cfg.get("queued_builds_threshold", 2)):
+    if cfg.get("enable_queue_trigger", True) and queued_builds >= _finite_int_val(cfg.get("queued_builds_threshold", 2), "queued_builds_threshold"):
         scale_up_reasons.append(
             {
                 "trigger": "queued_builds",
@@ -639,7 +684,7 @@ def evaluate_builder_scaling_decision(
     if cfg.get("enable_cpu_utilization_trigger", True):
         cpu_triggered, cpu_detail = evaluate_cpu_scope(
             cpu_percentages,
-            float(cfg.get("cpu_threshold_percent", 65.0)),
+            _finite_float_val(cfg.get("cpu_threshold_percent", 65.0), "cpu_threshold_percent"),
             str(cfg.get("cpu_scope", "majority")),
         )
         if cpu_triggered:
@@ -655,12 +700,12 @@ def evaluate_builder_scaling_decision(
     if not scale_up_reasons:
         if (
             cfg.get("enable_low_builds_scale_down", True)
-            and builds_ran_past_hour <= int(cfg.get("scale_down_max_builds_past_hour", 2))
+            and builds_ran_past_hour <= _finite_int_val(cfg.get("scale_down_max_builds_past_hour", 2), "scale_down_max_builds_past_hour")
             and queued_builds == 0
         ):
             low_target = min(
                 max_instances,
-                max(capacity_floor, int(cfg.get("scale_down_target_instances", min_instances))),
+                max(capacity_floor, _finite_int_val(cfg.get("scale_down_target_instances", min_instances), "scale_down_target_instances")),
             )
             if low_target < current_instances:
                 scale_down_reasons.append(
@@ -681,10 +726,10 @@ def evaluate_builder_scaling_decision(
     else:
         desired_instances = min(max_instances, max(capacity_floor, desired_instances))
 
-    unit_hourly = max(0.0001, float(per_instance_hourly_usd))
-    max_hourly_cap = float(cfg.get("max_scale_up_hourly_usd", 3.50))
-    max_daily_cap = float(cfg.get("max_scale_up_daily_usd", 12.00))
-    max_monthly_cap = float(cfg.get("max_scale_up_monthly_usd", 80.00))
+    unit_hourly = max(0.0001, _finite_float_val(per_instance_hourly_usd, "per_instance_hourly_usd"))
+    max_hourly_cap = _finite_float_val(cfg.get("max_scale_up_hourly_usd", 3.50), "max_scale_up_hourly_usd")
+    max_daily_cap = _finite_float_val(cfg.get("max_scale_up_daily_usd", 12.00), "max_scale_up_daily_usd")
+    max_monthly_cap = _finite_float_val(cfg.get("max_scale_up_monthly_usd", 80.00), "max_scale_up_monthly_usd")
 
     effective_hourly_cap = min(
         max_hourly_cap,
