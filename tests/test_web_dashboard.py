@@ -164,10 +164,27 @@ class DashboardScalingTests(unittest.TestCase):
         self.assertEqual(timeout_cls["failure_classification"], "TIMEOUT")
         self.assertFalse(timeout_cls["is_oom"])
         oom_cls = classify_github_ci_failure(
-            "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)"
+            "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
+            runner_name="gha-oxidex-runners-asianortheast2-a-1791098074-2",
         )
         self.assertEqual(oom_cls["failure_classification"], "OOM")
         self.assertTrue(oom_cls["is_oom"])
+        self.assertTrue(oom_cls["is_self_hosted_runner"])
+
+        external_oom_cls = classify_github_ci_failure(
+            "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
+            runner_name="external-laptop-runner-01",
+        )
+        self.assertEqual(external_oom_cls["failure_classification"], "EXTERNAL_RUNNER_OOM")
+        self.assertFalse(external_oom_cls["is_oom"])
+        self.assertFalse(external_oom_cls["is_self_hosted_runner"])
+
+        missing_runner_cls = classify_github_ci_failure(
+            "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
+            runner_name=None,
+        )
+        self.assertEqual(missing_runner_cls["failure_classification"], "EXTERNAL_RUNNER_OOM")
+        self.assertFalse(missing_runner_cls["is_oom"])
 
     def test_cpu_scope_all_vs_majority(self):
         samples = [62.0, 58.0, 35.0]
@@ -201,9 +218,17 @@ class DashboardScalingTests(unittest.TestCase):
         }
         decision = evaluate_scaling_decision(policy, telemetry)
         self.assertEqual(decision["direction"], "scale_down")
-        self.assertEqual(decision["desired_runners"], 2)
-        self.assertEqual(decision["desired_instances"], 1)
+        # Target is clamped to min_runners=4 even when scale_down_target_runners=2
+        self.assertEqual(decision["desired_runners"], 4)
+        self.assertEqual(decision["desired_instances"], 2)
         self.assertEqual(decision["scale_down_reasons"][0]["trigger"], "hourly_runs_low")
+
+        # Preserve capacity for active provisioned jobs when provisioned_jobs > min_runners
+        busy_telemetry = {**telemetry, "provisioned_jobs": 5}
+        busy_decision = evaluate_scaling_decision(policy, busy_telemetry)
+        self.assertEqual(busy_decision["direction"], "scale_down")
+        self.assertEqual(busy_decision["desired_runners"], 5)
+        self.assertEqual(busy_decision["desired_instances"], 3)
 
     def test_scale_up_on_oom_and_budget_cap_enforcement(self):
         policy = {
@@ -223,17 +248,63 @@ class DashboardScalingTests(unittest.TestCase):
             "instance_cpu_percentages": [75.0, 82.0],
             "github_oom_runs": [
                 {
-                    "repository": "Appz4Fun/nzbget",
-                    "run_id": 38596411473,
-                    "job_id": 115964282184,
-                    "step_number": 2,
-                    "line_number": 50,
+                    "repository": "swack-tools/oxidex",
+                    "run_id": 37192272062,
+                    "job_id": 111407847874,
+                    "runner_name": "gha-oxidex-runners-us-south1-a-01",
+                    "step_number": 8,
+                    "line_number": 106,
+                    "error_excerpt": "Process completed with exit code 137 (OOMKilled)",
                 }
             ],
         }
         decision = evaluate_scaling_decision(policy, telemetry, per_instance_hourly_usd=0.20)
         self.assertTrue(decision["budget_capped"])
-        self.assertEqual(decision["desired_instances"], 1)
+        # Blocked scale-up must hold at current fleet (4 runners / 2 instances), never scale down
+        self.assertEqual(decision["direction"], "hold")
+        self.assertEqual(decision["desired_instances"], 2)
+        self.assertEqual(decision["desired_runners"], 4)
+
+    def test_stale_oom_events_expire_after_lookback_window(self):
+        policy = {
+            "min_runners": 4,
+            "max_runners": 16,
+            "runners_per_instance": 4,
+            "oom_lookback_minutes": 60,
+            "enable_hourly_runs_scale_down": False,
+            "enable_cpu_utilization_trigger": False,
+        }
+        telemetry = {
+            "current_runners": 4,
+            "jobs_ran_past_hour": 2,
+            "provisioned_jobs": 1,
+            "queued_jobs": 0,
+            "instance_cpu_percentages": [25.0],
+            "journal_oom_events": [
+                {
+                    "instance_name": "oxidex-runners-dallas-01",
+                    "zone": "us-south1-a",
+                    "process": "rustc",
+                    "pid": 1234,
+                    "observed_at": "2020-01-01T00:00:00Z",
+                }
+            ],
+            "github_oom_runs": [
+                {
+                    "repository": "swack-tools/oxidex",
+                    "run_id": 37192272062,
+                    "job_id": 111407847874,
+                    "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-2",
+                    "step_number": 8,
+                    "line_number": 106,
+                    "failed_at": "2020-01-01T00:00:00Z",
+                    "error_excerpt": "##[error]Process completed with exit code 137.",
+                }
+            ],
+        }
+        decision = evaluate_scaling_decision(policy, telemetry)
+        self.assertEqual(decision["direction"], "hold")
+        self.assertEqual(decision["scale_up_reasons"], [])
 
 
 class RustBuildTelemetryTests(unittest.TestCase):
@@ -254,6 +325,15 @@ class RustBuildTelemetryTests(unittest.TestCase):
         self.assertFalse(direct["is_vpn"])
         self.assertFalse(direct["is_tor"])
         self.assertEqual(direct["hostname"], "m4air-workstation.local")
+
+        unmatched = classify_ip_and_network("8.8.8.8")
+        self.assertEqual(unmatched["provider_label"], "Unknown")
+        self.assertEqual(unmatched["network_type"], "Unknown")
+        self.assertEqual(unmatched["geolocation"]["city"], "Unknown")
+
+        invalid_ip = classify_ip_and_network("not-an-ip")
+        self.assertEqual(invalid_ip["provider_label"], "Unknown")
+        self.assertEqual(invalid_ip["network_type"], "Invalid IP")
 
     def test_cpu_points_and_rust_build_enrichment(self):
         pts = compute_cpu_points(1000.0, 2485)
@@ -286,6 +366,68 @@ class RustBuildTelemetryTests(unittest.TestCase):
         self.assertEqual(enriched["network_security"]["provider_label"], "ProtonVPN")
         self.assertEqual(enriched["peak_ram_gib"], 22.5)
         self.assertEqual(enriched["cpu_points"], 2000000.0)
+
+        with self.assertRaises(ValueError):
+            enrich_rust_build_record(
+                {
+                    "build_id": "rb-bad-order",
+                    "requested_at": "2026-10-15T00:05:00Z",
+                    "finished_at": "2026-10-15T00:01:00Z",
+                    "delivered_at": "2026-10-15T00:02:00Z",
+                }
+            )
+
+
+class DashboardCodexRegressionTests(unittest.TestCase):
+    def test_qualify_instances_enforces_max_instances_and_fleet_budget(self):
+        # 8 runners of 4vCPU/16GiB with max_instances=1: 8-vCPU/32-GiB VMs need 4 instances -> rejected
+        profile = {
+            "role": "cicd_runner",
+            "min_runners": 8,
+            "min_instances": 1,
+            "max_instances": 1,
+            "runner_vcpu": 4,
+            "runner_ram_gib": 16,
+            "min_instance_vcpu": 8,
+            "min_instance_ram_gib": 32,
+            "min_benchmark_score": 1000,
+            "disk_category": "any",
+            "budget": {
+                "max_hourly_usd": 10.0,
+                "max_daily_usd": 100.0,
+                "max_monthly_usd": 3000.0,
+            },
+        }
+        res = qualify_instances(profile, {"us-south1": True})
+        self.assertGreater(res["disqualified_counts"]["exceeds_max_instances"], 0)
+        for cand in res["hardware_qualifying"]:
+            self.assertLessEqual(cand["instances_needed_for_floor"], 1)
+
+        # Fleet floor budget: 2 instances needed at ~$0.19/hr each -> fleet hourly > $0.30
+        tight_fleet_profile = {
+            **profile,
+            "min_runners": 4,
+            "max_instances": 4,
+            "budget": {
+                "max_hourly_usd": 0.30,
+                "max_daily_usd": 100.0,
+                "max_monthly_usd": 3000.0,
+            },
+        }
+        tight_res = qualify_instances(tight_fleet_profile, {"us-south1": True})
+        for cand in tight_res["spot_price_qualifying"]:
+            self.assertLessEqual(cand["fleet_floor_hourly_usd"], 0.30)
+
+    def test_cloud_init_syntax_validation_rejects_broken_yaml_and_shell(self):
+        bad_yaml = "#cloud-config\npackages:\n  - curl\n\t- git\nunbalanced: [1, 2\n"
+        parsed_yaml = parse_cloud_init(bad_yaml)
+        self.assertFalse(parsed_yaml["valid"])
+        self.assertGreater(len(parsed_yaml["errors"]), 0)
+
+        bad_shell = "#!/usr/bin/env bash\nif [ -f /tmp/foo ; then\n  echo hi\n"
+        parsed_sh = parse_cloud_init(bad_shell)
+        self.assertFalse(parsed_sh["valid"])
+        self.assertGreater(len(parsed_sh["errors"]), 0)
 
 
 class DashboardServerIntegrationTests(unittest.TestCase):
@@ -327,9 +469,11 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             html = resp.read().decode("utf-8")
         self.assertIn("Spot GitHub Runners &amp; Rust Remote Builders Control Plane", html)
         self.assertIn("africa-south1", html)
+        self.assertIn("function esc(val)", html)
 
         overview = self._get("/api/overview?include_deleted=true&window_hours=24")
         self.assertEqual(overview["project"], "homelab-424523")
+        self.assertIn("rust_builder", overview["scaling_evaluations"])
         self.assertGreaterEqual(len(overview["instances_view"]["instances"]), 5)
         # Verify South Africa instance is present with 4 runners of 4vCPU / 8GB RAM
         za = next(
@@ -347,11 +491,15 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                 "active_period": "day",
                 "max_hourly_usd": 4.50,
                 "max_daily_usd": 12.00,
-                "max_monthly_usd": 60.00,
-                "include_disk_costs": True,
+                "max_monthly_usd": 280.00,
+                "include_disk_costs": False,
             },
         )
         self.assertEqual(budget_res["budget"]["max_daily_usd"], 12.00)
+        # Global budget applies to both cicd_runner and rust_builder profiles and scaling policies
+        self.assertEqual(self.store.state["profiles"]["rust_builder"]["budget"]["max_daily_usd"], 12.00)
+        self.assertEqual(self.store.state["scaling"]["rust_builder"]["max_scale_up_daily_usd"], 12.00)
+        self.assertFalse(self.store.state["scaling"]["rust_builder"]["include_disk_in_scale_budget"])
 
         custom_yaml = DEFAULT_RUNNER_CLOUD_INIT + "\n  - wget -qO /tmp/setup.sh https://example.com/setup.sh\n"
         ci_res = self._post(
@@ -368,20 +516,51 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.store.state["profiles"]["cicd_runner"]["cloud_init_template_id"], new_id)
 
     def test_create_vm_template_scale_region_and_delete_instance(self):
+        # Create a VM template from the 32-vCPU Hong Kong instance (8 runners) and assign it
         tpl_res = self._post(
             "/api/vm-templates/from-instance",
             {
-                "instance_name": "oxidex-runners-za-jnb-01",
-                "template_name": "ZA Production Snapshot Template",
+                "instance_name": "oxidex-runners-hk-bulky-02",
+                "template_name": "HK Bulky 32-vCPU Snapshot Template",
+                "assign_to_profile": True,
             },
         )
-        self.assertEqual(tpl_res["vm_template"]["source_instance"], "oxidex-runners-za-jnb-01")
+        self.assertEqual(tpl_res["vm_template"]["source_instance"], "oxidex-runners-hk-bulky-02")
+        self.assertEqual(self.store.state["scaling"]["cicd_runner"]["runners_per_instance"], 8)
 
+        # Scaling up in africa-south1 honors the newly assigned 32-vCPU template (8 runners)
         scale_res = self._post(
             "/api/instances/scale-region",
             {"region": "africa-south1", "role": "cicd_runner", "target_instances": 2},
         )
         self.assertEqual(scale_res["current_count"], 2)
+        newest = next(i for i in scale_res["running_instances"] if i["name"] != "oxidex-runners-za-jnb-01")
+        self.assertEqual(newest["machine_type"], "c4d-standard-32")
+        self.assertEqual(newest["runners_count"], 8)
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 18)
+
+        # Disabling a region blocks scale-up into that region
+        self._post("/api/regions", {"regions_enabled": {"asia-east2": False}})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/instances/scale-region",
+                {"region": "asia-east2", "role": "cicd_runner", "target_instances": 1},
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+
+        # Deleting an already-deleted instance does not rewrite its historical deleted_at or runtime_hours
+        already_del_before = next(
+            dict(i) for i in self.store.state["instances"] if i["name"] == "oxidex-runners-iowa-04"
+        )
+        repeat_del = self._post(
+            "/api/instances/delete",
+            {"instance_name": "oxidex-runners-iowa-04", "reason": "Accidental second delete"},
+        )
+        self.assertEqual(repeat_del["status"], "already_deleted")
+        self.assertEqual(repeat_del["instance"]["deleted_at"], already_del_before["deleted_at"])
+        self.assertEqual(repeat_del["instance"]["runtime_hours"], already_del_before["runtime_hours"])
+        self.assertEqual(repeat_del["instance"]["deletion_trigger"], already_del_before["deletion_trigger"])
 
         del_res = self._post(
             "/api/instances/delete",
@@ -391,6 +570,35 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             },
         )
         self.assertEqual(del_res["instance"]["status"], "DELETED")
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 14)
+
+    def test_rust_builder_scaling_and_project_override_on_reload(self):
+        sc_res = self._post(
+            "/api/scaling",
+            {
+                "role": "rust_builder",
+                "policy": {"min_instances": 2, "max_instances": 4, "cpu_threshold_percent": 60.0},
+            },
+        )
+        self.assertEqual(sc_res["evaluation"]["role"], "rust_builder")
+        self.assertGreaterEqual(sc_res["evaluation"]["desired_instances"], 2)
+
+        # Reload store from existing state_file with a new project & org
+        from lib.dashboard_server import DashboardStore
+
+        reloaded = DashboardStore(
+            state_path=self.state_file,
+            project="custom-gcp-proj-99",
+            org="custom-org",
+        )
+        self.assertEqual(reloaded.state["project"], "custom-gcp-proj-99")
+        self.assertEqual(reloaded.state["org"], "custom-org")
+        self.assertTrue(
+            all("--project=custom-gcp-proj-99" in i["ssh_command"] for i in reloaded.state["instances"])
+        )
+        self.assertTrue(
+            all("--project=custom-gcp-proj-99" in b["ssh_command"] for b in reloaded.state["rust_builds"])
+        )
 
     def test_record_rust_build_and_cli_dump_overview(self):
         import contextlib

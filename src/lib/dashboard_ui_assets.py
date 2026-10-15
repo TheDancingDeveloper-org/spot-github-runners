@@ -1404,6 +1404,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       setTimeout(() => el.remove(), 3400);
     }
 
+    function esc(val) {
+      return String(val ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
     function formatLocalTime(isoOrEpoch) {
       if (!isoOrEpoch) return "—";
       const d = typeof isoOrEpoch === "number" ? new Date(isoOrEpoch * 1000) : new Date(isoOrEpoch);
@@ -1611,14 +1620,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:12px;">
               <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px; margin-bottom:8px;">
                 <div>
-                  <div style="font-size:14.5px; font-weight:700; color:#fff;" class="mono">${inst.name}</div>
-                  <div style="font-size:12px; color:var(--text-muted);">Zone: <span class="mono">${inst.zone}</span> · Instance Type: <strong class="mono">${inst.machine_type}</strong> (${inst.vcpu} vCPU / ${inst.ram_gib} GiB RAM)</div>
+                  <div style="font-size:14.5px; font-weight:700; color:#fff;" class="mono">${esc(inst.name)}</div>
+                  <div style="font-size:12px; color:var(--text-muted);">Zone: <span class="mono">${esc(inst.zone)}</span> · Instance Type: <strong class="mono">${esc(inst.machine_type)}</strong> (${inst.vcpu} vCPU / ${inst.ram_gib} GiB RAM)</div>
                 </div>
                 <span class="badge ${inst.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${inst.role === 'cicd_runner' ? 'CI/CD Runner Host' : 'Rust Builder'}</span>
               </div>
 
               <div style="background:rgba(16, 185, 129, 0.11); border:1px solid rgba(16, 185, 129, 0.3); border-radius:8px; padding:9px 11px; margin-bottom:10px; color:#a7f3d0; font-weight:600; font-size:12.5px;">
-                ⚡ ${inst.workload_summary}
+                ⚡ ${esc(inst.workload_summary)}
               </div>
 
               <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:8px;">
@@ -1636,18 +1645,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 </div>
               </div>
               <div style="font-size:11.5px; color:var(--text-muted); margin-bottom:10px;">
-                💡 ${modeNote} · CPU: <strong>${inst.cpu_platform}</strong> (Benchmark: <strong>${inst.benchmark_score}</strong>)
+                💡 ${esc(modeNote)} · CPU: <strong>${esc(inst.cpu_platform)}</strong> (Benchmark: <strong>${inst.benchmark_score}</strong>)
               </div>
 
               <div style="font-size:11.5px; font-weight:600; color:var(--text-muted);">SSH Into GCloud Instance (Terminal Command):</div>
               <div class="ssh-block">
-                <code id="ssh-code-${inst.instance_id}">${inst.ssh_command}</code>
-                <button class="btn btn-sm" onclick="copyTextToClipboard('${inst.ssh_command}', 'gcloud SSH command')">📋 Copy SSH</button>
+                <code id="ssh-code-${esc(inst.instance_id)}">${esc(inst.ssh_command)}</code>
+                <button class="btn btn-sm" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'gcloud SSH command')">📋 Copy SSH</button>
               </div>
 
               <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
-                <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${inst.instance_id}', '${inst.name}')">🖥️ Create VM Template</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteInstanceNow('${inst.instance_id}', '${inst.name}')">🗑️ Delete Instance</button>
+                <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteInstanceNow('${esc(inst.instance_id)}', '${esc(inst.name)}')">🗑️ Delete Instance</button>
               </div>
             </div>
           `;
@@ -1658,18 +1667,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       panel.innerHTML = `
         <div class="panel-header">
           <div>
-            <div class="panel-title">📍 ${reg.display_name} (<span class="mono">${reg.region}</span>)</div>
-            <div class="panel-subtitle">Continent: ${reg.continent} · Backend Latency: <strong class="mono">${reg.latency_ms} ms</strong> · Status: ${reg.enabled ? '<span style="color:#34d399;">Enabled</span>' : '<span style="color:#fb7185;">Deselected</span>'}</div>
+            <div class="panel-title">📍 ${esc(reg.display_name)} (<span class="mono">${esc(reg.region)}</span>)</div>
+            <div class="panel-subtitle">Continent: ${esc(reg.continent)} · Backend Latency: <strong class="mono">${reg.latency_ms} ms</strong> · Status: ${reg.enabled ? '<span style="color:#34d399;">Enabled</span>' : '<span style="color:#fb7185;">Deselected</span>'}</div>
           </div>
         </div>
 
         <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; background:var(--bg-card); border:1px solid var(--border); padding:10px 12px; border-radius:9px; margin-bottom:12px;">
-          <div style="font-size:12.5px; font-weight:600;">On-Demand Regional Instance Scaling (<span class="mono">${reg.region}</span>):</div>
+          <div style="font-size:12.5px; font-weight:600;">On-Demand Regional Instance Scaling (<span class="mono">${esc(reg.region)}</span>):</div>
           <div style="display:flex; align-items:center; gap:6px;">
-            <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${reg.region}', 'cicd_runner', Math.max(0, ${runnerCountInReg} - 1))">−1</button>
-            <input type="number" id="map-scale-input-${reg.region}" value="${runnerCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
-            <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${reg.region}', 'cicd_runner', ${runnerCountInReg} + 1)">+1</button>
-            <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${reg.region}', 'cicd_runner', parseInt(document.getElementById('map-scale-input-${reg.region}').value || '0', 10))">Apply Scale</button>
+            <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', Math.max(0, ${runnerCountInReg} - 1))">−1</button>
+            <input type="number" id="map-scale-input-${esc(reg.region)}" value="${runnerCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
+            <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', ${runnerCountInReg} + 1)">+1</button>
+            <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', parseInt(document.getElementById('map-scale-input-${esc(reg.region)}').value || '0', 10))">Apply Scale</button>
           </div>
         </div>
 
@@ -1758,7 +1767,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     function renderInstancesTableRows() {
       const iv = APP_STATE.instances_view;
       const summary = document.getElementById("inst-window-summary");
-      summary.innerHTML = `Showing <strong>${iv.instances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${iv.sort_by} (${iv.sort_dir.toUpperCase()})</code> · Timezone: <code class="mono">${BROWSER_TZ}</code>`;
+      summary.innerHTML = `Showing <strong>${iv.instances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
 
       const tbody = document.getElementById("instances-table-body");
       tbody.innerHTML = iv.instances.map(inst => {
@@ -1766,22 +1775,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return `
           <tr>
             <td>
-              <div class="mono" style="font-weight:700; color:#f8fafc;">${inst.name}</div>
-              <div class="mono" style="font-size:11px; color:var(--text-muted);">ID: ${inst.instance_id}</div>
+              <div class="mono" style="font-weight:700; color:#f8fafc;">${esc(inst.name)}</div>
+              <div class="mono" style="font-size:11px; color:var(--text-muted);">ID: ${esc(inst.instance_id)}</div>
             </td>
             <td>
-              <span class="badge ${isRunning ? 'badge-running' : 'badge-deleted'}">${inst.status}</span>
+              <span class="badge ${isRunning ? 'badge-running' : 'badge-deleted'}">${esc(inst.status)}</span>
             </td>
             <td>
               <span class="badge ${inst.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${inst.role === 'cicd_runner' ? 'CI/CD Runner' : 'Rust Builder'}</span>
             </td>
             <td>
-              <div style="font-weight:600;">${inst.display_location}</div>
-              <div class="mono" style="font-size:11px; color:var(--text-muted);">${inst.zone}</div>
+              <div style="font-weight:600;">${esc(inst.display_location)}</div>
+              <div class="mono" style="font-size:11px; color:var(--text-muted);">${esc(inst.zone)}</div>
             </td>
             <td>
-              <div class="mono" style="font-weight:600;">${inst.machine_type} (${inst.vcpu} vCPU / ${inst.ram_gib} GiB)</div>
-              <div style="font-size:11px; color:var(--text-muted);">${inst.cpu_platform} · ${inst.data_disk_gb}GB ${inst.data_disk_type} (${inst.disk_category})</div>
+              <div class="mono" style="font-weight:600;">${esc(inst.machine_type)} (${inst.vcpu} vCPU / ${inst.ram_gib} GiB)</div>
+              <div style="font-size:11px; color:var(--text-muted);">${esc(inst.cpu_platform)} · ${inst.data_disk_gb}GB ${esc(inst.data_disk_type)} (${esc(inst.disk_category)})</div>
             </td>
             <td class="mono" style="font-weight:700; color:#38bdf8;">${inst.benchmark_score}</td>
             <td>
@@ -1800,17 +1809,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               $${inst.total_cost_in_window_usd.toFixed(2)}
             </td>
             <td style="font-size:11.5px;">
-              <div><strong>Start:</strong> ${formatLocalTime(inst.started_at)}</div>
-              <div><strong>End:</strong> ${inst.deleted_at ? formatLocalTime(inst.deleted_at) : '<span style="color:#34d399;">Present (Running)</span>'}</div>
+              <div><strong>Start:</strong> ${esc(formatLocalTime(inst.started_at))}</div>
+              <div><strong>End:</strong> ${inst.deleted_at ? esc(formatLocalTime(inst.deleted_at)) : '<span style="color:#34d399;">Present (Running)</span>'}</div>
             </td>
             <td style="max-width:260px; font-size:11.5px; color:${isRunning ? '#a7f3d0' : '#fda4af'};">
-              ${inst.deletion_trigger}
+              ${esc(inst.deletion_trigger)}
             </td>
             <td>
               <div style="display:flex; gap:5px; flex-wrap:wrap;">
-                <button class="btn btn-sm btn-secondary" onclick="copyTextToClipboard('${inst.ssh_command}', 'SSH command')">📋 SSH</button>
-                <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${inst.instance_id}', '${inst.name}')">Template</button>
-                ${isRunning ? `<button class="btn btn-sm btn-danger" onclick="deleteInstanceNow('${inst.instance_id}', '${inst.name}')">Delete</button>` : ""}
+                <button class="btn btn-sm btn-secondary" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'SSH command')">📋 SSH</button>
+                <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">Template</button>
+                ${isRunning ? `<button class="btn btn-sm btn-danger" onclick="deleteInstanceNow('${esc(inst.instance_id)}', '${esc(inst.name)}')">Delete</button>` : ""}
               </div>
             </td>
           </tr>
@@ -1856,19 +1865,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const ciSelectRunner = document.getElementById("runner-cloudinit-select");
       const ciSelectBuilder = document.getElementById("builder-cloudinit-select");
       ciSelectRunner.innerHTML = APP_STATE.cloud_init_templates.map(t =>
-        `<option value="${t.id}" ${t.id === rp.cloud_init_template_id ? 'selected' : ''}>${t.name}</option>`
+        `<option value="${esc(t.id)}" ${t.id === rp.cloud_init_template_id ? 'selected' : ''}>${esc(t.name)}</option>`
       ).join("");
       ciSelectBuilder.innerHTML = APP_STATE.cloud_init_templates.map(t =>
-        `<option value="${t.id}" ${t.id === bp.cloud_init_template_id ? 'selected' : ''}>${t.name}</option>`
+        `<option value="${esc(t.id)}" ${t.id === bp.cloud_init_template_id ? 'selected' : ''}>${esc(t.name)}</option>`
       ).join("");
 
       const vmSelectRunner = document.getElementById("runner-vmtpl-select");
       const vmSelectBuilder = document.getElementById("builder-vmtpl-select");
       vmSelectRunner.innerHTML = APP_STATE.vm_templates.map(t =>
-        `<option value="${t.id}" ${t.id === rp.vm_template_id ? 'selected' : ''}>${t.name} (${t.machine_type})</option>`
+        `<option value="${esc(t.id)}" ${t.id === rp.vm_template_id ? 'selected' : ''}>${esc(t.name)} (${esc(t.machine_type)})</option>`
       ).join("");
       vmSelectBuilder.innerHTML = APP_STATE.vm_templates.map(t =>
-        `<option value="${t.id}" ${t.id === bp.vm_template_id ? 'selected' : ''}>${t.name} (${t.machine_type})</option>`
+        `<option value="${esc(t.id)}" ${t.id === bp.vm_template_id ? 'selected' : ''}>${esc(t.name)} (${esc(t.machine_type)})</option>`
       ).join("");
 
       updateSizingMathBanners();
@@ -1911,7 +1920,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             active_period: "day",
             max_hourly_usd: parseFloat(document.getElementById("runner-max-hour").value || "5"),
             max_daily_usd: parseFloat(document.getElementById("runner-max-day").value || "10"),
-            max_monthly_usd: parseFloat(document.getElementById("runner-max-month").value || "50"),
+            max_monthly_usd: parseFloat(document.getElementById("runner-max-month").value || "300"),
             include_disk_costs: true,
             include_taxes: false
           }
@@ -1989,17 +1998,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const tbody = document.getElementById("qualification-table-body");
       tbody.innerHTML = rows.slice(0, 45).map(r => `
         <tr>
-          <td class="mono" style="font-weight:700; color:#fff;">${r.machine_type}</td>
+          <td class="mono" style="font-weight:700; color:#fff;">${esc(r.machine_type)}</td>
           <td>
-            <div style="font-weight:600;">${r.display_location}</div>
-            <div class="mono" style="font-size:11px; color:var(--text-muted);">${r.zone} (${r.latency_ms} ms)</div>
+            <div style="font-weight:600;">${esc(r.display_location)}</div>
+            <div class="mono" style="font-size:11px; color:var(--text-muted);">${esc(r.zone)} (${r.latency_ms} ms)</div>
           </td>
-          <td>${r.cpu_platform}</td>
+          <td>${esc(r.cpu_platform)}</td>
           <td class="mono" style="font-weight:700; color:#38bdf8;">${r.benchmark_score}</td>
           <td class="mono">${r.vcpu} vCPU / ${r.ram_gib} GiB</td>
           <td class="mono"><strong>${r.units_per_instance}</strong> (${r.unit_vcpu}c/${r.unit_ram_gib}G each)</td>
           <td class="mono">${r.instances_needed_for_floor} VM(s) (${r.total_units_at_floor} total)</td>
-          <td class="mono">${r.data_disk_gb}GB ${r.data_disk_type}</td>
+          <td class="mono">${r.data_disk_gb}GB ${esc(r.data_disk_type)}</td>
           <td class="mono">$${r.pricing.compute_hourly_usd.toFixed(4)}/hr · $${r.pricing.compute_daily_usd.toFixed(2)}/d</td>
           <td class="mono" style="font-weight:700;">$${r.evaluated_hourly_usd.toFixed(4)}/hr · $${r.evaluated_daily_usd.toFixed(2)}/d · $${r.evaluated_monthly_usd.toFixed(2)}/mo</td>
           <td>
@@ -2046,12 +2055,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const reasons = [...ev.scale_up_reasons, ...ev.scale_down_reasons];
       document.getElementById("scaling-decision-box").innerHTML = `
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-          <div style="font-weight:700; font-size:14px;">Live Controller Evaluation: <span style="color:#38bdf8;">${ev.direction.toUpperCase()}</span> (${ev.current_runners} → ${ev.desired_runners} CI/CD Runners / ${ev.desired_instances} VMs)</div>
+          <div style="font-weight:700; font-size:14px;">Live Controller Evaluation: <span style="color:#38bdf8;">${esc(ev.direction.toUpperCase())}</span> (${ev.current_runners} → ${ev.desired_runners} CI/CD Runners / ${ev.desired_instances} VMs)</div>
           <span class="mono" style="font-size:12px; color:#34d399;">Projected: $${ev.projected_hourly_usd}/hr · $${ev.projected_daily_usd}/day · $${ev.projected_monthly_usd}/mo</span>
         </div>
-        ${ev.budget_capped ? `<div style="color:#fbbf24; font-size:12px; margin-bottom:6px;">⚠️ ${ev.budget_cap_note}</div>` : ""}
+        ${ev.budget_capped ? `<div style="color:#fbbf24; font-size:12px; margin-bottom:6px;">⚠️ ${esc(ev.budget_cap_note)}</div>` : ""}
         <div style="display:flex; flex-direction:column; gap:5px;">
-          ${reasons.map(r => `<div style="font-size:12px; color:#e2e8f0;">• <strong>[${r.trigger}]</strong> ${r.summary} ${r.deep_link ? `<a href="${r.deep_link}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || '<div style="font-size:12px; color:var(--text-muted);">No scale change required.</div>'}
+          ${reasons.map(r => `<div style="font-size:12px; color:#e2e8f0;">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(r.deep_link)}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || '<div style="font-size:12px; color:var(--text-muted);">No scale change required.</div>'}
         </div>
       `;
 
@@ -2067,14 +2076,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return `
         <div style="background:var(--bg-card); border:1px solid ${borderCol}; border-left:4px solid ${leftCol}; border-radius:8px; padding:11px 13px;">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:4px;">
-            <div style="font-weight:700; color:#fff;">${run.repository} — ${run.workflow_name || 'CI Workflow'} (<span class="mono">${run.job_name || 'job'}</span>)</div>
-            <span class="badge ${badgeCls}">${badgeLabel}</span>
+            <div style="font-weight:700; color:#fff;">${esc(run.repository)} — ${esc(run.workflow_name || 'CI Workflow')} (<span class="mono">${esc(run.job_name || 'job')}</span>)</div>
+            <span class="badge ${badgeCls}">${esc(badgeLabel)}</span>
           </div>
-          <div class="mono" style="font-size:11.5px; color:${textCol}; margin-bottom:6px;">${run.error_excerpt}</div>
+          <div class="mono" style="font-size:11.5px; color:${textCol}; margin-bottom:6px;">${esc(run.error_excerpt)}</div>
           <div style="font-size:12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-            <span>Runner: <code class="mono">${run.runner_name || 'self-hosted'}</code> · Run <code class="mono">#${run.run_id}</code> · Job <code class="mono">${run.job_id}</code> · Step <code class="mono">${run.step_number}</code> · Line <code class="mono">${run.line_number}</code> · ${formatLocalTime(run.failed_at)}</span>
-            <a href="${run.deep_link}" target="_blank" rel="noopener" class="btn btn-sm ${btnCls} mono" style="text-decoration:none;">
-              🔗 ${run.deep_link}
+            <span>Runner: <code class="mono">${esc(run.runner_name || 'self-hosted')}</code> · Run <code class="mono">#${esc(run.run_id)}</code> · Job <code class="mono">${esc(run.job_id)}</code> · Step <code class="mono">${esc(run.step_number)}</code> · Line <code class="mono">${esc(run.line_number)}</code> · ${esc(formatLocalTime(run.failed_at))}</span>
+            <a href="${esc(run.deep_link)}" target="_blank" rel="noopener" class="btn btn-sm ${btnCls} mono" style="text-decoration:none;">
+              🔗 ${esc(run.deep_link)}
             </a>
           </div>
         </div>
@@ -2085,10 +2094,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById("journal-oom-events-list").innerHTML = st.journal_oom_events.map(evt => `
         <div style="background:var(--bg-card); border:1px solid rgba(245, 158, 11, 0.4); border-left:4px solid #f59e0b; border-radius:8px; padding:10px 12px;">
           <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-            <strong>Host: <span class="mono">${evt.instance_name}</span> (${evt.zone}) — Process <span class="mono">${evt.process}</span> (PID ${evt.pid})</strong>
-            <span class="mono" style="font-size:11px; color:var(--text-muted);">${formatLocalTime(evt.observed_at)}</span>
+            <strong>Host: <span class="mono">${esc(evt.instance_name)}</span> (${esc(evt.zone)}) — Process <span class="mono">${esc(evt.process)}</span> (PID ${esc(evt.pid)})</strong>
+            <span class="mono" style="font-size:11px; color:var(--text-muted);">${esc(formatLocalTime(evt.observed_at))}</span>
           </div>
-          <div class="mono" style="font-size:11.5px; color:#fde68a; background:#090d16; padding:6px 8px; border-radius:6px;">${evt.journal_line}</div>
+          <div class="mono" style="font-size:11.5px; color:#fde68a; background:#090d16; padding:6px 8px; border-radius:6px;">${esc(evt.journal_line)}</div>
         </div>
       `).join("");
     }
@@ -2103,10 +2112,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         cpu_threshold_percent: parseFloat(document.getElementById("sc-cpu-thresh").value || "50"),
         cpu_scope: document.getElementById("sc-cpu-scope").value,
         scale_down_max_jobs_past_hour: parseInt(document.getElementById("sc-hourly-down-max").value || "5", 10),
-        scale_down_target_runners: parseInt(document.getElementById("sc-hourly-down-target").value || "2", 10),
+        scale_down_target_runners: parseInt(document.getElementById("sc-hourly-down-target").value || "4", 10),
         max_scale_up_hourly_usd: parseFloat(document.getElementById("sc-budget-hr").value || "5"),
         max_scale_up_daily_usd: parseFloat(document.getElementById("sc-budget-day").value || "10"),
-        max_scale_up_monthly_usd: parseFloat(document.getElementById("sc-budget-mo").value || "50"),
+        max_scale_up_monthly_usd: parseFloat(document.getElementById("sc-budget-mo").value || "300"),
         enable_queued_jobs_trigger: document.getElementById("sc-en-queued").checked,
         enable_provisioned_jobs_trigger: document.getElementById("sc-en-prov").checked,
         enable_hourly_runs_scale_up: document.getElementById("sc-en-hourly-up").checked,
@@ -2137,7 +2146,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById("sc-en-journal-oom").checked = false;
       document.getElementById("sc-en-cpu").checked = false;
       await saveAndEvaluateScaling();
-      showToast("Simulated <=5 CI/CD jobs in past hour -> scaled down target to 2 runners");
+      showToast("Simulated <=5 CI/CD jobs in past hour -> scaled down target to minimum runner floor");
     }
 
     async function addGithubOomRun() {
@@ -2173,22 +2182,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const sel = document.getElementById("ci-editor-select");
       const currentVal = sel.value || APP_STATE.cloud_init_templates[0]?.id;
       sel.innerHTML = APP_STATE.cloud_init_templates.map(t =>
-        `<option value="${t.id}" ${t.id === currentVal ? 'selected' : ''}>${t.name} (${t.role === 'cicd_runner' ? 'Runner' : 'Rust Builder'})</option>`
+        `<option value="${esc(t.id)}" ${t.id === currentVal ? 'selected' : ''}>${esc(t.name)} (${t.role === 'cicd_runner' ? 'Runner' : 'Rust Builder'})</option>`
       ).join("");
       loadSelectedCloudInitIntoEditor();
 
       // Source instance dropdown for VM Template creation
       const srcSel = document.getElementById("vmtpl-source-instance");
       srcSel.innerHTML = APP_STATE.instances_view.instances.map(i =>
-        `<option value="${i.instance_id}">${i.name} (${i.machine_type} · ${i.zone})</option>`
+        `<option value="${esc(i.instance_id)}">${esc(i.name)} (${esc(i.machine_type)} · ${esc(i.zone)})</option>`
       ).join("");
 
       // VM Templates list
       document.getElementById("vm-templates-list").innerHTML = APP_STATE.vm_templates.map(tpl => `
         <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:10px 12px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
           <div>
-            <div style="font-weight:700; color:#fff;">${tpl.name} <span class="mono" style="font-size:11px; color:var(--text-muted);">(${tpl.id})</span></div>
-            <div style="font-size:11.5px; color:var(--text-muted);">Shape: <code class="mono">${tpl.machine_type}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${tpl.cpu_platform} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${tpl.data_disk_type}</code> (${tpl.disk_category}) · Source: <code class="mono">${tpl.source_instance}</code></div>
+            <div style="font-weight:700; color:#fff;">${esc(tpl.name)} <span class="mono" style="font-size:11px; color:var(--text-muted);">(${esc(tpl.id)})</span></div>
+            <div style="font-size:11.5px; color:var(--text-muted);">Shape: <code class="mono">${esc(tpl.machine_type)}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${esc(tpl.cpu_platform)} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${esc(tpl.data_disk_type)}</code> (${esc(tpl.disk_category)}) · Source: <code class="mono">${esc(tpl.source_instance)}</code></div>
           </div>
           <span class="badge ${tpl.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${tpl.role === 'cicd_runner' ? 'Runner Template' : 'Builder Template'}</span>
         </div>
@@ -2227,23 +2236,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     function renderCloudInitVisualizer(parsed) {
       if (!parsed) return;
       const badge = document.getElementById("ci-valid-badge");
+      const errList = parsed.errors || [];
+      const warnList = parsed.warnings || [];
       badge.className = parsed.valid ? "badge badge-running" : "badge badge-warn";
-      badge.textContent = parsed.valid ? `✓ Valid ${parsed.format} (${parsed.line_count} lines)` : `⚠️ ${parsed.warnings.length} Advisory Notice(s)`;
+      badge.textContent = parsed.valid
+        ? `✓ Valid ${parsed.format} (${parsed.line_count} lines)`
+        : `⚠️ ${errList.length + warnList.length} Syntax / Advisory Issue(s)`;
 
       const warnBox = document.getElementById("ci-warnings-box");
-      warnBox.innerHTML = (parsed.warnings || []).map(w =>
-        `<div style="background:rgba(245, 158, 11, 0.14); border:1px solid rgba(245, 158, 11, 0.4); color:#fde68a; padding:7px 10px; border-radius:7px; font-size:12px; margin-bottom:6px;">⚠️ ${w}</div>`
-      ).join("");
+      const errHtml = errList.map(e =>
+        `<div style="background:rgba(244, 63, 94, 0.16); border:1px solid rgba(244, 63, 94, 0.45); color:#fda4af; padding:7px 10px; border-radius:7px; font-size:12px; margin-bottom:6px;">❌ ${esc(e)}</div>`
+      );
+      const warnHtml = warnList.map(w =>
+        `<div style="background:rgba(245, 158, 11, 0.14); border:1px solid rgba(245, 158, 11, 0.4); color:#fde68a; padding:7px 10px; border-radius:7px; font-size:12px; margin-bottom:6px;">⚠️ ${esc(w)}</div>`
+      );
+      warnBox.innerHTML = [...errHtml, ...warnHtml].join("");
 
       const stagesBox = document.getElementById("ci-visualizer-stages");
       stagesBox.innerHTML = (parsed.stages || []).map(st => `
         <div class="stage-card">
           <div class="stage-card-header">
-            <span>Stage ${st.stage}: ${st.title}</span>
-            <span class="badge badge-runner">${st.summary}</span>
+            <span>Stage ${esc(st.stage)}: ${esc(st.title)}</span>
+            <span class="badge badge-runner">${esc(st.summary)}</span>
           </div>
           <div class="stage-items">
-            ${(st.items || []).map(item => `<span class="stage-chip">${item}</span>`).join("") || '<span style="font-size:11.5px; color:var(--text-muted);">No items in this stage</span>'}
+            ${(st.items || []).map(item => `<span class="stage-chip">${esc(item)}</span>`).join("") || '<span style="font-size:11.5px; color:var(--text-muted);">No items in this stage</span>'}
           </div>
         </div>
       `).join("");
@@ -2269,6 +2286,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         await loadOverview();
         document.getElementById("ci-editor-select").value = data.template.id;
         loadSelectedCloudInitIntoEditor();
+      } else if (data.error) {
+        showToast(`Error saving Cloud-Init template: ${data.error}`);
       }
     }
 
@@ -2312,24 +2331,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <tr>
           <td>
             <label class="toggle-label">
-              <input type="checkbox" ${r.enabled ? "checked" : ""} onchange="toggleSingleRegion('${r.region}', this.checked)" />
+              <input type="checkbox" ${r.enabled ? "checked" : ""} onchange="toggleSingleRegion('${esc(r.region)}', this.checked)" />
               <span>${r.enabled ? "Enabled" : "Deselected"}</span>
             </label>
           </td>
           <td class="mono" style="font-weight:700; color:#fff;">
-            ${r.region}
-            <div style="font-size:11px; color:var(--text-muted); font-weight:400;">${r.zones.join(", ")}</div>
+            ${esc(r.region)}
+            <div style="font-size:11px; color:var(--text-muted); font-weight:400;">${esc(r.zones.join(", "))}</div>
           </td>
           <td>
-            <div style="font-weight:600;">${r.display_name}</div>
-            <div style="font-size:11px; color:var(--text-muted);">${r.continent}</div>
+            <div style="font-weight:600;">${esc(r.display_name)}</div>
+            <div style="font-size:11px; color:var(--text-muted);">${esc(r.continent)}</div>
           </td>
           <td class="mono" style="font-weight:700; color:${r.latency_ms < 60 ? '#34d399' : (r.latency_ms < 140 ? '#38bdf8' : '#fbbf24')};">
             ${r.latency_ms} ms
           </td>
-          <td class="mono" style="font-size:11.5px;">${r.families.join(", ")}</td>
-          <td style="font-size:11.5px;">${r.cpu_platforms.join(", ")}</td>
-          <td class="mono" style="font-size:11px;">${r.disk_types.join(", ")}</td>
+          <td class="mono" style="font-size:11.5px;">${esc(r.families.join(", "))}</td>
+          <td style="font-size:11.5px;">${esc(r.cpu_platforms.join(", "))}</td>
+          <td class="mono" style="font-size:11px;">${esc(r.disk_types.join(", "))}</td>
           <td class="mono">${r.running_instances.length} running</td>
         </tr>
       `).join("");
@@ -2430,13 +2449,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return `
           <tr>
             <td>
-              <div class="mono" style="font-weight:700; color:#fff;">${b.build_id}</div>
-              <div style="font-size:11.5px; color:var(--text-muted);">${b.project_name} (<code class="mono">--${b.profile}</code>) · <code class="mono">${b.commit_sha.slice(0, 8)}</code></div>
+              <div class="mono" style="font-weight:700; color:#fff;">${esc(b.build_id)}</div>
+              <div style="font-size:11.5px; color:var(--text-muted);">${esc(b.project_name)} (<code class="mono">--${esc(b.profile)}</code>) · <code class="mono">${esc((b.commit_sha || "").slice(0, 8))}</code></div>
             </td>
             <td style="font-size:11.5px;">
-              <div><strong>Req:</strong> ${formatLocalTime(b.requested_at)}</div>
-              <div><strong>Fin:</strong> ${formatLocalTime(b.finished_at)}</div>
-              <div><strong>Del:</strong> ${formatLocalTime(b.delivered_at)}</div>
+              <div><strong>Req:</strong> ${esc(formatLocalTime(b.requested_at))}</div>
+              <div><strong>Fin:</strong> ${esc(formatLocalTime(b.finished_at))}</div>
+              <div><strong>Del:</strong> ${esc(formatLocalTime(b.delivered_at))}</div>
             </td>
             <td class="mono">
               <div style="font-weight:700; color:#fff;">${b.total_duration_seconds}s total</div>
@@ -2447,19 +2466,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <div style="font-size:11px; color:var(--text-muted);">${b.cache_misses} misses</div>
             </td>
             <td>
-              <div class="mono" style="font-weight:700; color:#c4b5fd;">${b.instance_name}</div>
-              <div style="font-size:11px; color:var(--text-muted);">${b.machine_type} (${b.zone}) · Bench: <strong class="mono">${b.instance_benchmark_score}</strong></div>
+              <div class="mono" style="font-weight:700; color:#c4b5fd;">${esc(b.instance_name)}</div>
+              <div style="font-size:11px; color:var(--text-muted);">${esc(b.machine_type)} (${esc(b.zone)}) · Bench: <strong class="mono">${b.instance_benchmark_score}</strong></div>
             </td>
             <td class="mono">
-              <div style="font-weight:700; color:#f8fafc;">${b.origin_ip}</div>
-              <div style="font-size:11px; color:#93c5fd;">${b.origin_hostname}</div>
+              <div style="font-weight:700; color:#f8fafc;">${esc(b.origin_ip)}</div>
+              <div style="font-size:11px; color:#93c5fd;">${esc(b.origin_hostname)}</div>
             </td>
             <td>
-              <div style="font-weight:600;">${b.geolocation.city}, ${b.geolocation.country} (${b.geolocation.country_code})</div>
-              <div style="font-size:11px; color:var(--text-muted);">${b.geolocation.asn} · ${b.geolocation.isp}</div>
+              <div style="font-weight:600;">${esc(b.geolocation.city)}, ${esc(b.geolocation.country)} (${esc(b.geolocation.country_code)})</div>
+              <div style="font-size:11px; color:var(--text-muted);">${esc(b.geolocation.asn)} · ${esc(b.geolocation.isp)}</div>
             </td>
             <td>
-              <span class="badge ${badgeClass}">${ns.badge_text}</span>
+              <span class="badge ${badgeClass}">${esc(ns.badge_text)}</span>
             </td>
             <td class="mono">
               <div style="font-weight:700; color:#fbbf24;">${b.peak_ram_gib.toFixed(2)} GiB active</div>

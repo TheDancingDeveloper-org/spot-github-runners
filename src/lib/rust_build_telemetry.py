@@ -243,24 +243,46 @@ def classify_ip_and_network(ip_address: str, hostname: str | None = None) -> dic
             },
         }
 
+    if parsed_ip is None:
+        return {
+            "ip_address": clean_ip,
+            "hostname": clean_host or "unknown",
+            "provider_label": "Unknown",
+            "network_type": "Invalid IP",
+            "is_vpn": False,
+            "is_tor": False,
+            "is_proxy": False,
+            "badge_text": "Invalid IP Address",
+            "geolocation": {
+                "city": "Unknown",
+                "region": "Unknown",
+                "country": "Unknown",
+                "country_code": "UN",
+                "lat": None,
+                "lon": None,
+                "asn": "Unknown",
+                "isp": "Unknown",
+            },
+        }
+
     return {
         "ip_address": clean_ip,
-        "hostname": clean_host or f"host-{clean_ip.replace('.', '-')}.client.oxidex.dev",
-        "provider_label": "Direct",
-        "network_type": "Direct",
+        "hostname": clean_host or "unknown",
+        "provider_label": "Unknown",
+        "network_type": "Unknown",
         "is_vpn": False,
         "is_tor": False,
         "is_proxy": False,
-        "badge_text": "Direct (No VPN/Proxy)",
+        "badge_text": "Unclassified Network",
         "geolocation": {
-            "city": "Dallas",
-            "region": "Texas",
-            "country": "United States",
-            "country_code": "US",
-            "lat": 32.7767,
-            "lon": -96.7970,
-            "asn": "AS15169",
-            "isp": "Developer Access Network",
+            "city": "Unknown",
+            "region": "Unknown",
+            "country": "Unknown",
+            "country_code": "UN",
+            "lat": None,
+            "lon": None,
+            "asn": "Unknown",
+            "isp": "Unclassified Network",
         },
     }
 
@@ -292,10 +314,18 @@ def enrich_rust_build_record(
     fin_ts = _iso_to_epoch(finished_at)
     del_ts = _iso_to_epoch(delivered_at)
 
-    compile_seconds = max(0.1, round(fin_ts - req_ts, 2))
-    delivery_seconds = max(0.1, round(del_ts - fin_ts, 2))
+    if not (req_ts <= fin_ts <= del_ts):
+        raise ValueError(
+            "Invalid Rust build timestamps: requested_at <= finished_at <= delivered_at is required"
+        )
+
+    compile_seconds = round(fin_ts - req_ts, 2)
+    delivery_seconds = round(del_ts - fin_ts, 2)
+    raw_total = record.get("total_duration_seconds")
+    if raw_total is not None and float(raw_total) < 0:
+        raise ValueError("total_duration_seconds must be non-negative")
     total_duration_seconds = round(
-        float(record.get("total_duration_seconds") or (del_ts - req_ts)), 2
+        float(raw_total) if raw_total is not None else (del_ts - req_ts), 2
     )
 
     cache_hits = max(0, int(record.get("cache_hits", 0)))

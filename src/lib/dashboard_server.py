@@ -33,6 +33,7 @@ from .dashboard_scaling import (
     build_github_oom_deep_link,
     classify_github_ci_failure,
     default_scaling_config,
+    evaluate_builder_scaling_decision,
     evaluate_scaling_decision,
     parse_github_oom_deep_link,
 )
@@ -277,7 +278,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
                 "active_period": "day",
                 "max_hourly_usd": 5.00,
                 "max_daily_usd": 10.00,
-                "max_monthly_usd": 50.00,
+                "max_monthly_usd": 300.00,
                 "include_disk_costs": True,
                 "include_taxes": True,
                 "tax_rate_percent": 8.25,
@@ -803,7 +804,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "active_period": "day",
             "max_hourly_usd": 5.00,
             "max_daily_usd": 10.00,
-            "max_monthly_usd": 50.00,
+            "max_monthly_usd": 300.00,
             "include_disk_costs": True,
             "include_taxes": True,
             "tax_rate_percent": 8.25,
@@ -840,13 +841,79 @@ class DashboardStore:
                 base = default_dashboard_state(project=project, org=org)
                 base.update(loaded)
                 self.state = base
+                self._normalize_project_derived_fields()
                 self._normalize_github_ci_runs()
+                self._sync_fleet_telemetry()
                 self._persist()
             except (OSError, json.JSONDecodeError):
                 self.state = default_dashboard_state(project=project, org=org)
+                self._sync_fleet_telemetry()
         else:
             self.state = default_dashboard_state(project=project, org=org)
+            self._sync_fleet_telemetry()
             self._persist()
+
+    def _normalize_project_derived_fields(self) -> None:
+        """Ensure project/org metadata and gcloud SSH commands match the active store configuration."""
+        self.state["project"] = self.project
+        self.state["org"] = self.org
+        for inst in self.state.get("instances", []):
+            name = str(inst.get("name", ""))
+            zone = str(inst.get("zone", "us-south1-a"))
+            if name:
+                inst["ssh_command"] = format_gcloud_ssh_command(name, zone, self.project)
+        for build in self.state.get("rust_builds", []):
+            inst_name = str(build.get("instance_name", ""))
+            zone = str(build.get("zone", "us-south1-b"))
+            if inst_name:
+                build["ssh_command"] = format_gcloud_ssh_command(inst_name, zone, self.project)
+
+    def _resolve_template_runners_per_instance(self) -> int:
+        prof = self.state.get("profiles", {}).get("cicd_runner", {})
+        if prof.get("use_vm_template") and prof.get("vm_template_id"):
+            tpl = next(
+                (t for t in self.state.get("vm_templates", []) if t.get("id") == prof.get("vm_template_id")),
+                None,
+            )
+            if tpl and int(tpl.get("runners_count", 0)) > 0:
+                return int(tpl["runners_count"])
+        inst_vcpu = int(prof.get("min_instance_vcpu", 16))
+        inst_ram = float(prof.get("min_instance_ram_gib", 64))
+        r_vcpu = max(1, int(prof.get("runner_vcpu", 4)))
+        r_ram = max(0.5, float(prof.get("runner_ram_gib", 16)))
+        overhead = max(0.0, float(prof.get("host_overhead_gib", 0)))
+        usable_ram = max(r_ram, inst_ram - overhead)
+        return max(1, min(inst_vcpu // r_vcpu, int(usable_ram // r_ram)))
+
+    def _sync_template_density(self) -> None:
+        tpl_runners = self._resolve_template_runners_per_instance()
+        telem = self.state.setdefault("scaling_telemetry", {})
+        telem["template_runners_per_instance"] = tpl_runners
+        self.state.get("scaling", {}).get("cicd_runner", {})["runners_per_instance"] = tpl_runners
+
+    def _sync_fleet_telemetry(self) -> None:
+        """Synchronize scaling telemetry counters and CPU percentages with active fleet instances."""
+        running_runners = [
+            inst
+            for inst in self.state.get("instances", [])
+            if inst.get("status") == "RUNNING" and inst.get("role") == "cicd_runner"
+        ]
+        running_builders = [
+            inst
+            for inst in self.state.get("instances", [])
+            if inst.get("status") == "RUNNING" and inst.get("role") == "rust_builder"
+        ]
+        telem = self.state.setdefault("scaling_telemetry", {})
+        telem["current_runners"] = sum(int(inst.get("runners_count", 0)) for inst in running_runners)
+        telem["current_instances"] = len(running_runners)
+        telem["instance_cpu_percentages"] = [
+            float(inst.get("cpu_utilization_percent", 0.0)) for inst in running_runners
+        ]
+        telem["current_builder_instances"] = len(running_builders)
+        telem["builder_cpu_percentages"] = [
+            float(inst.get("cpu_utilization_percent", 0.0)) for inst in running_builders
+        ]
+        self._sync_template_density()
 
     def _normalize_github_ci_runs(self) -> None:
         runs = self.state.get("scaling_telemetry", {}).get("github_oom_runs", [])
@@ -908,15 +975,18 @@ class DashboardStore:
         role_filter: str = "",
     ) -> dict[str, Any]:
         with self._lock:
+            latencies = self.state.get("region_latencies_ms")
             cicd_qual = qualify_instances(
                 self.state["profiles"]["cicd_runner"],
                 self.state["regions_enabled"],
                 self.project,
+                region_latencies_ms=latencies,
             )
             builder_qual = qualify_instances(
                 self.state["profiles"]["rust_builder"],
                 self.state["regions_enabled"],
                 self.project,
+                region_latencies_ms=latencies,
             )
             scaling_eval = evaluate_scaling_decision(
                 self.state["scaling"]["cicd_runner"],
@@ -925,6 +995,15 @@ class DashboardStore:
                     cicd_qual["spot_price_qualifying"][0]["evaluated_hourly_usd"]
                     if cicd_qual["spot_price_qualifying"]
                     else 0.16
+                ),
+            )
+            builder_scaling_eval = evaluate_builder_scaling_decision(
+                self.state["scaling"]["rust_builder"],
+                self.state["scaling_telemetry"],
+                per_instance_hourly_usd=(
+                    builder_qual["spot_price_qualifying"][0]["evaluated_hourly_usd"]
+                    if builder_qual["spot_price_qualifying"]
+                    else 0.34
                 ),
             )
             instances_view = self.query_instances(
@@ -970,6 +1049,10 @@ class DashboardStore:
                 "scaling": self.state["scaling"],
                 "scaling_telemetry": self.state["scaling_telemetry"],
                 "scaling_evaluation": scaling_eval,
+                "scaling_evaluations": {
+                    "cicd_runner": scaling_eval,
+                    "rust_builder": builder_scaling_eval,
+                },
                 "regions": regions_list,
                 "cloud_init_templates": enriched_templates,
                 "vm_templates": self.state["vm_templates"],
@@ -1003,7 +1086,7 @@ class DashboardStore:
                     continue
                 deleted_ts = inst.get("deleted_epoch")
                 started_ts = float(inst.get("started_epoch", now_ts - 3600.0))
-                end_ts = float(deleted_ts) if deleted_ts is not None else now_ts
+                end_ts = float(deleted_ts) if (is_deleted and deleted_ts is not None) else now_ts
 
                 # Exclude deleted instances whose deletion occurred before the selected window
                 if is_deleted and end_ts < window_start_ts:
@@ -1015,6 +1098,11 @@ class DashboardStore:
                 overlap_start = max(started_ts, window_start_ts)
                 overlap_seconds = max(0.0, end_ts - overlap_start)
                 hours_in_window = round(overlap_seconds / 3600.0, 2)
+                live_runtime_hours = (
+                    round(max(0.0, (now_ts - started_ts) / 3600.0), 2)
+                    if not is_deleted
+                    else float(inst["runtime_hours"])
+                )
 
                 pricing = inst["pricing"]
                 hourly_rate = (
@@ -1033,10 +1121,17 @@ class DashboardStore:
                     else pricing["compute_monthly_usd"]
                 )
                 total_cost_in_window = round(hours_in_window * hourly_rate, 2)
-                lifetime_cost = round(float(inst["runtime_hours"]) * hourly_rate, 2)
+                lifetime_cost = round(live_runtime_hours * hourly_rate, 2)
+                live_total_cost_usd = round(live_runtime_hours * pricing["total_hourly_usd"], 2)
+                live_total_cost_compute_only_usd = round(
+                    live_runtime_hours * pricing["compute_hourly_usd"], 2
+                )
 
                 row = {
                     **inst,
+                    "runtime_hours": live_runtime_hours,
+                    "total_cost_usd": live_total_cost_usd,
+                    "total_cost_compute_only_usd": live_total_cost_compute_only_usd,
                     "active_hourly_usd": hourly_rate,
                     "active_daily_usd": daily_rate,
                     "active_monthly_usd": monthly_rate,
@@ -1108,22 +1203,18 @@ class DashboardStore:
             normalized = normalize_budget(payload)
             if target in ("cicd_runner", "rust_builder"):
                 self.state["profiles"][target]["budget"] = normalized
-                if target == "cicd_runner":
-                    self.state["scaling"]["cicd_runner"]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
-                    self.state["scaling"]["cicd_runner"]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
-                    self.state["scaling"]["cicd_runner"]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
-                    self.state["scaling"]["cicd_runner"]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
-                else:
-                    self.state["scaling"]["rust_builder"]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
-                    self.state["scaling"]["rust_builder"]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
-                    self.state["scaling"]["rust_builder"]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
-                    self.state["scaling"]["rust_builder"]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
+                self.state["scaling"][target]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
+                self.state["scaling"][target]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
+                self.state["scaling"][target]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
+                self.state["scaling"][target]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
             else:
                 self.state["global_budget"] = normalized
-                self.state["profiles"]["cicd_runner"]["budget"] = dict(normalized)
-                self.state["scaling"]["cicd_runner"]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
-                self.state["scaling"]["cicd_runner"]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
-                self.state["scaling"]["cicd_runner"]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
+                for role_key in ("cicd_runner", "rust_builder"):
+                    self.state["profiles"][role_key]["budget"] = dict(normalized)
+                    self.state["scaling"][role_key]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
+                    self.state["scaling"][role_key]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
+                    self.state["scaling"][role_key]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
+                    self.state["scaling"][role_key]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
             self._persist()
             return {"status": "ok", "target": target, "budget": normalized}
 
@@ -1159,8 +1250,19 @@ class DashboardStore:
                 self.state["scaling"]["cicd_runner"]["min_runners"] = int(current["min_runners"])
                 self.state["scaling"]["cicd_runner"]["runner_vcpu"] = int(current["runner_vcpu"])
                 self.state["scaling"]["cicd_runner"]["runner_ram_gib"] = float(current["runner_ram_gib"])
+                self._sync_template_density()
+            elif role == "rust_builder":
+                self.state["scaling"]["rust_builder"]["min_instances"] = int(current["min_instances"])
+                self.state["scaling"]["rust_builder"]["max_instances"] = int(current["max_instances"])
+                self.state["scaling"]["rust_builder"]["container_vcpu"] = int(current["runner_vcpu"])
+                self.state["scaling"]["rust_builder"]["container_ram_gib"] = float(current["runner_ram_gib"])
             self._persist()
-            qual = qualify_instances(current, self.state["regions_enabled"], self.project)
+            qual = qualify_instances(
+                current,
+                self.state["regions_enabled"],
+                self.project,
+                region_latencies_ms=self.state.get("region_latencies_ms"),
+            )
             return {"status": "ok", "profile": current, "qualification": qual}
 
     def update_scaling(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1174,7 +1276,17 @@ class DashboardStore:
                     self.state["profiles"]["cicd_runner"]["min_runners"] = int(pol.get("min_runners", 4))
                     self.state["profiles"]["cicd_runner"]["runner_vcpu"] = int(pol.get("runner_vcpu", 4))
                     self.state["profiles"]["cicd_runner"]["runner_ram_gib"] = float(pol.get("runner_ram_gib", 16))
+                    if "runners_per_instance" not in payload["policy"]:
+                        self._sync_template_density()
+                else:
+                    pol = self.state["scaling"]["rust_builder"]
+                    self.state["profiles"]["rust_builder"]["min_instances"] = int(pol.get("min_instances", 1))
+                    self.state["profiles"]["rust_builder"]["max_instances"] = int(pol.get("max_instances", 4))
+                    self.state["profiles"]["rust_builder"]["runner_vcpu"] = int(pol.get("container_vcpu", 16))
+                    self.state["profiles"]["rust_builder"]["runner_ram_gib"] = float(pol.get("container_ram_gib", 28))
             if "telemetry" in payload and isinstance(payload["telemetry"], dict):
+                if "current_runners" in payload["telemetry"] and "current_instances" not in payload["telemetry"]:
+                    self.state["scaling_telemetry"].pop("current_instances", None)
                 self.state["scaling_telemetry"].update(payload["telemetry"])
             if "add_github_oom_run" in payload and isinstance(payload["add_github_oom_run"], dict):
                 item = dict(payload["add_github_oom_run"])
@@ -1190,8 +1302,12 @@ class DashboardStore:
                         item.get("line_number", 50),
                     )
                     item["deep_link"] = link
+                is_known_timeout_run = (
+                    int(item.get("run_id", 0)) == 38596411473
+                    and int(item.get("job_id", 0)) == 115964282184
+                )
                 if not item.get("error_excerpt"):
-                    if int(item.get("run_id", 0)) == 38596411473 and int(item.get("job_id", 0)) == 115964282184:
+                    if is_known_timeout_run:
                         item["error_excerpt"] = (
                             "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
                         )
@@ -1199,6 +1315,12 @@ class DashboardStore:
                         item["error_excerpt"] = (
                             "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
                         )
+                if "runner_name" not in item:
+                    item["runner_name"] = (
+                        "GitHub Actions 1000014245"
+                        if is_known_timeout_run
+                        else "gha-oxidex-runners-us-south1-a-01"
+                    )
                 cls_info = classify_github_ci_failure(
                     str(item["error_excerpt"]),
                     runner_name=item.get("runner_name"),
@@ -1211,15 +1333,24 @@ class DashboardStore:
                 item.setdefault("failed_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
                 self.state["scaling_telemetry"]["github_oom_runs"].insert(0, item)
             self._persist()
-            evaluation = evaluate_scaling_decision(
+            cicd_eval = evaluate_scaling_decision(
                 self.state["scaling"]["cicd_runner"],
                 self.state["scaling_telemetry"],
             )
+            builder_eval = evaluate_builder_scaling_decision(
+                self.state["scaling"]["rust_builder"],
+                self.state["scaling_telemetry"],
+            )
+            evaluation = builder_eval if role == "rust_builder" else cicd_eval
             return {
                 "status": "ok",
                 "scaling": self.state["scaling"],
                 "scaling_telemetry": self.state["scaling_telemetry"],
                 "evaluation": evaluation,
+                "evaluations": {
+                    "cicd_runner": cicd_eval,
+                    "rust_builder": builder_eval,
+                },
             }
 
     def update_regions(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1253,6 +1384,10 @@ class DashboardStore:
             content = str(payload.get("content", "")).strip()
             if not content:
                 raise ValueError("Cloud-init content cannot be empty")
+            parsed = parse_cloud_init(content)
+            if not parsed["valid"]:
+                errors_str = "; ".join(parsed.get("errors", [])) or "Invalid cloud-init syntax"
+                raise ValueError(f"Invalid cloud-init template: {errors_str}")
             role = str(payload.get("role", "cicd_runner"))
             name = str(payload.get("name", "Custom Cloud-Init Template")).strip()
             description = str(payload.get("description", "Operator-customized cloud-init template")).strip()
@@ -1273,7 +1408,7 @@ class DashboardStore:
                 if payload.get("assign_to_profile", True) and role in self.state["profiles"]:
                     self.state["profiles"][role]["cloud_init_template_id"] = new_id
                 self._persist()
-                return {"status": "ok", "template": {**record, "parsed": parse_cloud_init(content)}}
+                return {"status": "ok", "template": {**record, "parsed": parsed}}
 
             existing = next(
                 (t for t in self.state["cloud_init_templates"] if t["id"] == template_id),
@@ -1290,7 +1425,7 @@ class DashboardStore:
             if payload.get("assign_to_profile", False) and existing["role"] in self.state["profiles"]:
                 self.state["profiles"][existing["role"]]["cloud_init_template_id"] = existing["id"]
             self._persist()
-            return {"status": "ok", "template": {**existing, "parsed": parse_cloud_init(content)}}
+            return {"status": "ok", "template": {**existing, "parsed": parsed}}
 
     def create_vm_template_from_instance(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Create a reusable VM template out of a current or historical instance."""
@@ -1338,6 +1473,8 @@ class DashboardStore:
             if payload.get("assign_to_profile", True) and inst["role"] in self.state["profiles"]:
                 self.state["profiles"][inst["role"]]["use_vm_template"] = True
                 self.state["profiles"][inst["role"]]["vm_template_id"] = new_tpl["id"]
+                if inst["role"] == "cicd_runner":
+                    self._sync_template_density()
             self._persist()
             return {"status": "ok", "vm_template": new_tpl}
 
@@ -1361,6 +1498,8 @@ class DashboardStore:
             )
             if inst is None:
                 raise ValueError("Instance not found")
+            if inst.get("status") != "RUNNING":
+                return {"status": "already_deleted", "instance": inst}
             now_ts = time.time()
             inst["status"] = "DELETED"
             inst["deleted_epoch"] = now_ts
@@ -1373,6 +1512,7 @@ class DashboardStore:
             inst["deletion_trigger"] = reason
             inst["cpu_utilization_percent"] = 0.0
             inst["ram_utilization_percent"] = 0.0
+            self._sync_fleet_telemetry()
             self._persist()
             return {"status": "ok", "instance": inst}
 
@@ -1382,6 +1522,9 @@ class DashboardStore:
             region = str(payload.get("region", "africa-south1")).strip()
             target_count = max(0, int(payload.get("target_instances", 1)))
             role = str(payload.get("role", "cicd_runner")).strip()
+            reg_info = next((r for r in REGIONS_CATALOG if r["region"] == region), None)
+            if reg_info is None:
+                raise ValueError(f"Unknown region: {region}")
             running_in_region = [
                 i
                 for i in self.state["instances"]
@@ -1413,39 +1556,83 @@ class DashboardStore:
                     inst["cpu_utilization_percent"] = 0.0
                     inst["ram_utilization_percent"] = 0.0
             elif target_count > current_count:
-                template_inst = running_in_region[0] if running_in_region else None
-                reg_info = next((r for r in REGIONS_CATALOG if r["region"] == region), REGIONS_CATALOG[0])
+                if not bool(self.state["regions_enabled"].get(region, True)):
+                    raise ValueError(f"Cannot scale up in disabled region '{region}'")
                 prof = self.state["profiles"].get(role, self.state["profiles"]["cicd_runner"])
+                vm_tpl = None
+                if prof.get("use_vm_template") and prof.get("vm_template_id"):
+                    vm_tpl = next(
+                        (
+                            t
+                            for t in self.state.get("vm_templates", [])
+                            if t.get("id") == prof.get("vm_template_id")
+                        ),
+                        None,
+                    )
+                source_spec = vm_tpl or (running_in_region[0] if running_in_region else None)
                 for idx in range(current_count + 1, target_count + 1):
                     zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]
                     machine_type = (
-                        template_inst["machine_type"]
-                        if template_inst
+                        source_spec["machine_type"]
+                        if source_spec
                         else ("n2-standard-16" if "n2" in reg_info["families"] else "n4-standard-16")
                     )
-                    vcpu = template_inst["vcpu"] if template_inst else 16
-                    ram_gib = template_inst["ram_gib"] if template_inst else 64
+                    vcpu = int(source_spec["vcpu"]) if source_spec else int(prof.get("min_instance_vcpu", 16))
+                    ram_gib = (
+                        float(source_spec["ram_gib"])
+                        if source_spec
+                        else float(prof.get("min_instance_ram_gib", 64))
+                    )
                     cpu_platform = (
-                        template_inst["cpu_platform"]
-                        if template_inst
+                        source_spec["cpu_platform"]
+                        if source_spec
                         else reg_info["cpu_platforms"][0]
                     )
-                    boot_disk_type = (
-                        template_inst["boot_disk_type"]
-                        if template_inst
+                    default_disk_type = (
+                        prof.get("disk_type")
+                        if prof.get("disk_type") in reg_info["disk_types"]
                         else reg_info["disk_types"][0]
+                    )
+                    boot_disk_type = (
+                        source_spec["boot_disk_type"]
+                        if source_spec
+                        else default_disk_type
+                    )
+                    boot_disk_gb = (
+                        int(source_spec.get("boot_disk_gb", prof.get("boot_disk_gb", 40)))
+                        if source_spec
+                        else int(prof.get("boot_disk_gb", 40))
                     )
                     data_disk_type = (
-                        template_inst["data_disk_type"]
-                        if template_inst
-                        else reg_info["disk_types"][0]
+                        source_spec["data_disk_type"]
+                        if source_spec
+                        else default_disk_type
                     )
-                    runner_vcpu = template_inst["runner_vcpu"] if template_inst else int(prof["runner_vcpu"])
-                    runner_ram = template_inst["runner_ram_gib"] if template_inst else float(prof["runner_ram_gib"])
+                    data_disk_gb = (
+                        int(source_spec.get("data_disk_gb", prof.get("data_disk_gb", 100)))
+                        if source_spec
+                        else int(prof.get("data_disk_gb", 100))
+                    )
+                    runner_vcpu = int(source_spec["runner_vcpu"]) if source_spec else int(prof["runner_vcpu"])
+                    runner_ram = (
+                        float(source_spec["runner_ram_gib"])
+                        if source_spec
+                        else float(prof["runner_ram_gib"])
+                    )
                     runners_cnt = (
-                        template_inst["runners_count"]
-                        if template_inst
+                        int(source_spec["runners_count"])
+                        if source_spec
                         else max(1, min(vcpu // runner_vcpu, int(ram_gib // runner_ram)))
+                    )
+                    cloud_init_id = (
+                        source_spec.get("cloud_init_template_id")
+                        if source_spec and source_spec.get("cloud_init_template_id")
+                        else prof.get("cloud_init_template_id", "ci-runner-default")
+                    )
+                    vm_tpl_id = (
+                        vm_tpl["id"]
+                        if vm_tpl
+                        else (source_spec.get("vm_template_id") if source_spec else None)
                     )
                     prefix = "oxidex-runners" if role == "cicd_runner" else "builder-oxidex"
                     new_name = f"{prefix}-{region}-{uuid.uuid4().hex[:4]}"
@@ -1461,17 +1648,17 @@ class DashboardStore:
                         ram_gib=ram_gib,
                         cpu_platform=cpu_platform,
                         boot_disk_type=boot_disk_type,
-                        boot_disk_gb=int(prof.get("boot_disk_gb", 40)),
+                        boot_disk_gb=boot_disk_gb,
                         data_disk_type=data_disk_type,
-                        data_disk_gb=int(prof.get("data_disk_gb", 100)),
+                        data_disk_gb=data_disk_gb,
                         runners_count=runners_cnt,
                         runner_vcpu=runner_vcpu,
                         runner_ram_gib=runner_ram,
                         started_hours_ago=0.05,
                         deleted_hours_ago=None,
                         deletion_trigger=f"Active — Scaled up on demand in {region}",
-                        cloud_init_template_id=prof.get("cloud_init_template_id", "ci-runner-default"),
-                        vm_template_id=prof.get("vm_template_id"),
+                        cloud_init_template_id=cloud_init_id,
+                        vm_template_id=vm_tpl_id,
                         cpu_utilization_percent=35.0,
                         ram_utilization_percent=40.0,
                         project=self.project,
@@ -1479,6 +1666,7 @@ class DashboardStore:
                     )
                     self.state["instances"].insert(0, created)
 
+            self._sync_fleet_telemetry()
             self._persist()
             updated_running = [
                 i
@@ -1672,7 +1860,14 @@ def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
                 if path == "/api/qualify":
                     role = str(payload.get("role", "cicd_runner"))
                     merged = {**store.state["profiles"].get(role, {}), **payload}
-                    self._send_json(qualify_instances(merged, store.state["regions_enabled"], store.project))
+                    self._send_json(
+                        qualify_instances(
+                            merged,
+                            store.state["regions_enabled"],
+                            store.project,
+                            region_latencies_ms=store.state.get("region_latencies_ms"),
+                        )
+                    )
                     return
                 if path == "/api/scaling":
                     self._send_json(store.update_scaling(payload))

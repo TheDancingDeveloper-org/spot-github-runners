@@ -657,6 +657,7 @@ def filter_regions(
     required_cpu_platform: str | None = None,
     required_disk_type: str | None = None,
     only_enabled: bool = False,
+    region_latencies_ms: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Filter world data center regions by latency, continent, instance family, CPU type, and disk support."""
     results: list[dict[str, Any]] = []
@@ -664,9 +665,14 @@ def filter_regions(
     for item in REGIONS_CATALOG:
         region = item["region"]
         enabled = bool(regions_state.get(region, True))
+        lat_ms = (
+            int(region_latencies_ms.get(region, item["latency_ms"]))
+            if region_latencies_ms
+            else int(item["latency_ms"])
+        )
         if only_enabled and not enabled:
             continue
-        if max_latency_ms is not None and item["latency_ms"] > max_latency_ms:
+        if max_latency_ms is not None and lat_ms > max_latency_ms:
             continue
         if continent_set and item["continent"] not in continent_set:
             continue
@@ -676,7 +682,7 @@ def filter_regions(
             continue
         if required_disk_type and required_disk_type not in item["disk_types"]:
             continue
-        results.append({**item, "enabled": enabled})
+        results.append({**item, "latency_ms": lat_ms, "enabled": enabled})
     return results
 
 
@@ -701,6 +707,7 @@ def qualify_instances(
     profile_config: dict[str, Any],
     regions_state: dict[str, bool],
     project: str = "homelab-424523",
+    region_latencies_ms: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Evaluate all regional machine shapes against workload sizing, CPU benchmark score,
     disk compatibility, enabled regions, and Spot + disk budget caps.
@@ -738,6 +745,7 @@ def qualify_instances(
     disqualified_counts = {
         "region_disabled": 0,
         "insufficient_vcpu_or_ram": 0,
+        "exceeds_max_instances": 0,
         "below_benchmark_score": 0,
         "incompatible_disk": 0,
         "exceeds_spot_budget": 0,
@@ -748,6 +756,11 @@ def qualify_instances(
         if not regions_state.get(region, True):
             disqualified_counts["region_disabled"] += 1
             continue
+        effective_latency_ms = (
+            int(region_latencies_ms.get(region, reg["latency_ms"]))
+            if region_latencies_ms
+            else int(reg["latency_ms"])
+        )
 
         for shape in MACHINE_SHAPES_CATALOG:
             family = shape["family"]
@@ -770,6 +783,14 @@ def qualify_instances(
 
             if units_per_instance < 1 or vcpu < min_instance_vcpu or ram_gib < min_instance_ram_gib:
                 disqualified_counts["insufficient_vcpu_or_ram"] += 1
+                continue
+
+            instances_for_floor = max(
+                min_instances,
+                (min_runners + units_per_instance - 1) // units_per_instance,
+            )
+            if instances_for_floor > max_instances:
+                disqualified_counts["exceeds_max_instances"] += 1
                 continue
 
             benchmark = compute_cpu_benchmark_score(cpu_platform, vcpu, shape["machine_type"])
@@ -829,14 +850,14 @@ def qualify_instances(
                 eval_daily = pricing["compute_daily_usd"]
                 eval_monthly = pricing["compute_monthly_usd"]
 
-            instances_for_floor = max(
-                min_instances,
-                (min_runners + units_per_instance - 1) // units_per_instance,
-            )
+            fleet_floor_hourly = round(eval_hourly * instances_for_floor, 4)
+            fleet_floor_daily = round(eval_daily * instances_for_floor, 2)
+            fleet_floor_monthly = round(eval_monthly * instances_for_floor, 2)
+
             zone = reg["zones"][0]
-            within_hourly = eval_hourly <= budget["max_hourly_usd"]
-            within_daily = eval_daily <= budget["max_daily_usd"]
-            within_monthly = eval_monthly <= budget["max_monthly_usd"]
+            within_hourly = fleet_floor_hourly <= budget["max_hourly_usd"]
+            within_daily = fleet_floor_daily <= budget["max_daily_usd"]
+            within_monthly = fleet_floor_monthly <= budget["max_monthly_usd"]
             price_qualifies = within_hourly and within_daily and within_monthly
 
             candidate = {
@@ -844,7 +865,7 @@ def qualify_instances(
                 "zone": zone,
                 "display_location": reg["display_name"],
                 "continent": reg["continent"],
-                "latency_ms": reg["latency_ms"],
+                "latency_ms": effective_latency_ms,
                 "machine_type": shape["machine_type"],
                 "family": family,
                 "vcpu": vcpu,
@@ -865,7 +886,9 @@ def qualify_instances(
                 "evaluated_hourly_usd": eval_hourly,
                 "evaluated_daily_usd": eval_daily,
                 "evaluated_monthly_usd": eval_monthly,
-                "fleet_floor_daily_usd": round(eval_daily * instances_for_floor, 2),
+                "fleet_floor_hourly_usd": fleet_floor_hourly,
+                "fleet_floor_daily_usd": fleet_floor_daily,
+                "fleet_floor_monthly_usd": fleet_floor_monthly,
                 "price_qualifies": price_qualifies,
                 "ssh_command_preview": format_gcloud_ssh_command(
                     f"{'oxidex-runners' if role == 'cicd_runner' else 'builder-oxidex'}-{region}",
@@ -910,6 +933,96 @@ def qualify_instances(
         "spot_price_qualifying": spot_price_qualifying,
         "disqualified_counts": disqualified_counts,
     }
+
+
+def _validate_cloud_init_syntax(
+    lines: list[str],
+    *,
+    is_cloud_config: bool,
+    is_shell_script: bool,
+) -> list[str]:
+    """Perform syntax and structural validation on cloud-config YAML or shell startup scripts."""
+    import subprocess
+
+    errors: list[str] = []
+    if is_cloud_config:
+        block_scalar_indent: int | None = None
+        for idx, raw in enumerate(lines[1:], start=2):
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                continue
+            indent = len(raw) - len(raw.lstrip(" "))
+            if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+                errors.append(f"YAML syntax error on line {idx}: tab characters are not allowed for indentation.")
+                continue
+            if block_scalar_indent is not None:
+                if indent > block_scalar_indent:
+                    continue
+                block_scalar_indent = None
+
+            stripped = raw.strip()
+            # Check balanced brackets, braces, and quotes on non-scalar YAML lines
+            in_single = False
+            in_double = False
+            escape = False
+            bracket_depth = 0
+            brace_depth = 0
+            for ch in stripped:
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == "'" and not in_double:
+                    in_single = not in_single
+                elif ch == '"' and not in_single:
+                    in_double = not in_double
+                elif not in_single and not in_double:
+                    if ch == "[":
+                        bracket_depth += 1
+                    elif ch == "]":
+                        bracket_depth -= 1
+                    elif ch == "{":
+                        brace_depth += 1
+                    elif ch == "}":
+                        brace_depth -= 1
+                    elif ch == "#":
+                        break
+                    if bracket_depth < 0 or brace_depth < 0:
+                        break
+            if in_single or in_double or bracket_depth != 0 or brace_depth != 0:
+                errors.append(
+                    f"YAML syntax error on line {idx}: unclosed bracket, brace, or quote in '{stripped}'."
+                )
+                continue
+
+            is_mapping = bool(re.match(r"^[A-Za-z0-9_.-]+\s*:(?:\s+.*|\s*)$", stripped))
+            is_list_item = bool(re.match(r"^-\s+.+$", stripped))
+            if not (is_mapping or is_list_item):
+                errors.append(
+                    f"YAML syntax error on line {idx}: expected mapping 'key: value' or list item '- value'."
+                )
+                continue
+
+            if re.search(r":\s*[|>][-+]?\s*$", stripped):
+                block_scalar_indent = indent
+    elif is_shell_script:
+        script_body = "\n".join(lines) + "\n"
+        try:
+            proc = subprocess.run(
+                ["/bin/sh", "-n"],
+                input=script_body,
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+            if proc.returncode != 0:
+                err_msg = (proc.stderr or "invalid shell syntax").strip().splitlines()[0]
+                errors.append(f"Shell syntax error: {err_msg}")
+        except OSError:
+            pass
+    return errors
 
 
 def parse_cloud_init(content: str) -> dict[str, Any]:
@@ -1049,13 +1162,20 @@ def parse_cloud_init(content: str) -> dict[str, Any]:
     warnings: list[str] = []
     if not (is_cloud_config or is_shell_script):
         warnings.append("Template should begin with '#cloud-config' or a '#!/usr/bin/env bash' shebang.")
+    syntax_errors = _validate_cloud_init_syntax(
+        lines,
+        is_cloud_config=is_cloud_config,
+        is_shell_script=is_shell_script,
+    )
+    warnings.extend(syntax_errors)
     for cmd in runcmd:
         if cmd.strip() == "chmod":
             warnings.append("Incomplete 'chmod' command detected in runcmd (missing mode and target path).")
 
     return {
         "format": "cloud-config" if is_cloud_config else ("shell-script" if is_shell_script else "custom"),
-        "valid": len(warnings) == 0,
+        "valid": len(warnings) == 0 and len(syntax_errors) == 0,
+        "errors": syntax_errors,
         "warnings": warnings,
         "package_update": package_update,
         "package_upgrade": package_upgrade,

@@ -5,14 +5,24 @@ generator for the Web UI Dashboard.
 
 from __future__ import annotations
 
+from datetime import datetime
 import math
 import re
+import time
 from typing import Any
 
 
 GITHUB_STEP_LINE_URL_RE = re.compile(
     r"^https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/actions/runs/"
     r"(?P<run_id>\d+)/job/(?P<job_id>\d+)#step:(?P<step>\d+):(?P<line>\d+)$"
+)
+
+FLEET_RUNNER_NAME_PREFIXES: tuple[str, ...] = (
+    "gha-oxidex-runners-",
+    "oxidex-runners-",
+    "newznab-spot-runners-",
+    "newznab-newznab-spot-runners-",
+    "spot-runner-",
 )
 
 
@@ -58,15 +68,15 @@ def parse_github_oom_deep_link(url: str) -> dict[str, Any]:
 
 
 def is_self_hosted_spot_runner(runner_name: str | None) -> bool:
-    """Return True if runner_name belongs to our self-hosted GCP Spot runner fleet,
-    or False if it is a default GitHub-hosted runner (e.g. 'GitHub Actions 1000014245').
+    """Return True only if runner_name affirmatively matches our self-hosted GCP Spot runner
+    fleet naming convention (e.g. 'gha-oxidex-runners-...'), or False if missing or external.
     """
     if not runner_name:
-        return True
-    norm = str(runner_name).strip().lower()
-    if norm.startswith(("github actions", "hosted agent", "azure pipelines", "ubuntu-latest")):
         return False
-    return True
+    norm = str(runner_name).strip().lower()
+    if not norm:
+        return False
+    return norm.startswith(FLEET_RUNNER_NAME_PREFIXES)
 
 
 def classify_github_ci_failure(
@@ -76,8 +86,7 @@ def classify_github_ci_failure(
     """Classify a GitHub Actions failure log line and runner ownership.
 
     Prevents:
-    1. Default GitHub-hosted runners (e.g. 'GitHub Actions 1000014245') from triggering
-       self-hosted GCP Spot fleet scaling.
+    1. Default GitHub-hosted or unrelated runners from triggering self-hosted GCP Spot fleet scaling.
     2. Deployment/step timeouts (such as `##[error]Timeout reached, aborting!`)
        from being misclassified as out-of-memory (OOM) events.
     """
@@ -95,7 +104,7 @@ def classify_github_ci_failure(
         )
     ):
         badge = (
-            "Timeout · GitHub-Hosted Runner (Not Ours — Ignored)"
+            "Timeout · External/GitHub-Hosted Runner (Not Ours — Ignored)"
             if not our_runner
             else "Timeout (Not OOM — Ignored)"
         )
@@ -128,7 +137,7 @@ def classify_github_ci_failure(
                 "failure_classification": "EXTERNAL_RUNNER_OOM",
                 "is_oom": False,
                 "is_self_hosted_runner": False,
-                "badge_text": "OOM on GitHub-Hosted Runner (Not Ours — Ignored)",
+                "badge_text": "OOM on External/GitHub-Hosted Runner (Not Ours — Ignored)",
             }
         return {
             "failure_classification": "OOM",
@@ -141,11 +150,30 @@ def classify_github_ci_failure(
         "is_oom": False,
         "is_self_hosted_runner": our_runner,
         "badge_text": (
-            "GitHub-Hosted Runner (Not Ours — Ignored)"
+            "External/GitHub-Hosted Runner (Not Ours — Ignored)"
             if not our_runner
             else "Non-OOM Failure (Ignored)"
         ),
     }
+
+
+def _is_recent_unhandled_oom(
+    evt: dict[str, Any],
+    now_ts: float,
+    lookback_seconds: float,
+) -> bool:
+    """Return True if an OOM event is unhandled and occurred within the active lookback window."""
+    if evt.get("acknowledged") or evt.get("resolved") or evt.get("handled"):
+        return False
+    ts_raw = evt.get("failed_at") or evt.get("observed_at")
+    if not ts_raw:
+        return bool(evt.get("active", True))
+    try:
+        dt = datetime.fromisoformat(str(ts_raw).strip().replace("Z", "+00:00"))
+        age_seconds = now_ts - dt.timestamp()
+        return age_seconds <= lookback_seconds
+    except ValueError:
+        return False
 
 
 def default_scaling_config() -> dict[str, Any]:
@@ -154,7 +182,7 @@ def default_scaling_config() -> dict[str, Any]:
         "cicd_runner": {
             "min_runners": 4,
             "max_runners": 24,
-            "runners_per_instance": 2,
+            "runners_per_instance": 4,
             "runner_vcpu": 4,
             "runner_ram_gib": 16,
             "scale_up_step_runners": 2,
@@ -171,16 +199,17 @@ def default_scaling_config() -> dict[str, Any]:
             "cpu_scope": "majority",  # "all", "majority", or "any"
             "enable_journal_oom_trigger": True,
             "enable_github_ci_oom_trigger": True,
+            "oom_lookback_minutes": 60,
             # Scale-down triggers
             "enable_hourly_runs_scale_down": True,
             "scale_down_max_jobs_past_hour": 5,
-            "scale_down_target_runners": 2,
+            "scale_down_target_runners": 4,
             "enable_idle_cpu_scale_down": True,
             "scale_down_cpu_percent": 25.0,
             # Max scale-up budget (including disk costs)
             "max_scale_up_hourly_usd": 5.00,
             "max_scale_up_daily_usd": 10.00,
-            "max_scale_up_monthly_usd": 50.00,
+            "max_scale_up_monthly_usd": 300.00,
             "include_disk_in_scale_budget": True,
         },
         "rust_builder": {
@@ -194,6 +223,7 @@ def default_scaling_config() -> dict[str, Any]:
             "cpu_threshold_percent": 65.0,
             "cpu_scope": "majority",
             "enable_journal_oom_trigger": True,
+            "oom_lookback_minutes": 60,
             "enable_low_builds_scale_down": True,
             "scale_down_max_builds_past_hour": 2,
             "scale_down_target_instances": 1,
@@ -233,6 +263,7 @@ def evaluate_scaling_decision(
     policy: dict[str, Any],
     telemetry: dict[str, Any],
     per_instance_hourly_usd: float = 0.14,
+    now_epoch: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate live telemetry against scaling triggers and max scale-up budgets.
 
@@ -240,9 +271,28 @@ def evaluate_scaling_decision(
     and budget compliance details.
     """
     cfg = {**default_scaling_config()["cicd_runner"], **(policy or {})}
+    now_ts = float(now_epoch) if now_epoch is not None else time.time()
+    lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60)) * 60.0)
 
     current_runners = max(0, int(telemetry.get("current_runners", 4)))
-    runners_per_vm = max(1, int(cfg.get("runners_per_instance", 2)))
+    explicit_policy_density = (policy or {}).get("runners_per_instance")
+    template_density = telemetry.get("template_runners_per_instance") or cfg.get("template_runners_per_instance")
+    known_current_instances = telemetry.get("current_instances")
+    if explicit_policy_density is not None:
+        runners_per_vm = max(1, int(explicit_policy_density))
+    elif template_density is not None:
+        runners_per_vm = max(1, int(template_density))
+    elif known_current_instances is not None and int(known_current_instances) > 0 and current_runners > 0:
+        runners_per_vm = max(1, math.ceil(current_runners / int(known_current_instances)))
+    else:
+        runners_per_vm = max(1, int(cfg.get("runners_per_instance", 4)))
+
+    current_instances_count = (
+        max(0, int(known_current_instances))
+        if known_current_instances is not None
+        else (math.ceil(current_runners / runners_per_vm) if current_runners > 0 else 0)
+    )
+
     min_runners = max(1, int(cfg.get("min_runners", 4)))
     max_runners = max(min_runners, int(cfg.get("max_runners", 24)))
     step_runners = max(1, int(cfg.get("scale_up_step_runners", 2)))
@@ -258,15 +308,18 @@ def evaluate_scaling_decision(
     scale_down_reasons: list[dict[str, Any]] = []
     desired_runners = current_runners
 
-    # 1. GitHub Actions CI Run OOM Trigger (ignores TIMEOUT or non-OOM failures)
+    # 1. GitHub Actions CI Run OOM Trigger (ignores TIMEOUT, external runners, or expired events)
     if cfg.get("enable_github_ci_oom_trigger", True) and github_oom_runs:
         any_confirmed_oom = False
         for run in github_oom_runs:
+            if not _is_recent_unhandled_oom(run, now_ts, lookback_seconds):
+                continue
             excerpt = run.get(
                 "error_excerpt",
                 "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)",
             )
-            classification = classify_github_ci_failure(excerpt, runner_name=run.get("runner_name"))
+            runner_name = run.get("runner_name")
+            classification = classify_github_ci_failure(excerpt, runner_name=runner_name)
             if not classification["is_self_hosted_runner"]:
                 continue
             is_oom = run.get("is_oom") if "is_oom" in run else classification["is_oom"]
@@ -275,10 +328,10 @@ def evaluate_scaling_decision(
             any_confirmed_oom = True
             link = run.get("deep_link") or build_github_oom_deep_link(
                 run.get("repository", "swack-tools/oxidex"),
-                run.get("run_id", 38601924810),
-                run.get("job_id", 116012948102),
-                run.get("step_number", 4),
-                run.get("line_number", 118),
+                run.get("run_id", 37192272062),
+                run.get("job_id", 111407847874),
+                run.get("step_number", 8),
+                run.get("line_number", 106),
             )
             scale_up_reasons.append(
                 {
@@ -299,9 +352,12 @@ def evaluate_scaling_decision(
         if any_confirmed_oom:
             desired_runners = max(desired_runners, current_runners + step_runners)
 
-    # 2. VM Journal OOM Trigger
+    # 2. VM Journal OOM Trigger (only recent unhandled events)
     if cfg.get("enable_journal_oom_trigger", True) and journal_oom_events:
-        for evt in journal_oom_events:
+        active_journal_ooms = [
+            evt for evt in journal_oom_events if _is_recent_unhandled_oom(evt, now_ts, lookback_seconds)
+        ]
+        for evt in active_journal_ooms:
             scale_up_reasons.append(
                 {
                     "trigger": "vm_journal_oom",
@@ -316,7 +372,8 @@ def evaluate_scaling_decision(
                     ),
                 }
             )
-        desired_runners = max(desired_runners, current_runners + step_runners)
+        if active_journal_ooms:
+            desired_runners = max(desired_runners, current_runners + step_runners)
 
     # 3. Queued jobs waiting for a runner
     if cfg.get("enable_queued_jobs_trigger", True) and queued_jobs >= int(cfg.get("queued_jobs_threshold", 2)):
@@ -374,32 +431,37 @@ def evaluate_scaling_decision(
             )
             desired_runners = max(desired_runners, current_runners + step_runners)
 
-    # Scale-down evaluation (only when no scale-up triggers fired and no jobs are queued)
+    # Scale-down evaluation (only when no scale-up triggers fired, no jobs are queued,
+    # and target preserves capacity for both min_runners and active provisioned_jobs)
+    capacity_floor = max(min_runners, provisioned_jobs)
     if not scale_up_reasons:
         if (
             cfg.get("enable_hourly_runs_scale_down", True)
             and jobs_ran_past_hour <= int(cfg.get("scale_down_max_jobs_past_hour", 5))
             and queued_jobs == 0
         ):
-            low_target = max(1, int(cfg.get("scale_down_target_runners", 2)))
-            scale_down_reasons.append(
-                {
-                    "trigger": "hourly_runs_low",
-                    "summary": (
-                        f"Only {jobs_ran_past_hour} CI/CD jobs ran in the last hour "
-                        f"(<= {cfg.get('scale_down_max_jobs_past_hour', 5)} threshold) -> "
-                        f"scaling down to {low_target} CI/CD runners"
-                    ),
-                }
-            )
-            desired_runners = low_target
+            low_target = max(capacity_floor, int(cfg.get("scale_down_target_runners", min_runners)))
+            if low_target < current_runners:
+                scale_down_reasons.append(
+                    {
+                        "trigger": "hourly_runs_low",
+                        "summary": (
+                            f"Only {jobs_ran_past_hour} CI/CD jobs ran in the last hour "
+                            f"(<= {cfg.get('scale_down_max_jobs_past_hour', 5)} threshold) -> "
+                            f"scaling down to {low_target} CI/CD runners"
+                        ),
+                    }
+                )
+                desired_runners = low_target
+            else:
+                desired_runners = max(capacity_floor, current_runners)
         elif (
             cfg.get("enable_idle_cpu_scale_down", True)
             and queued_jobs == 0
             and cpu_percentages
             and all(c < float(cfg.get("scale_down_cpu_percent", 25.0)) for c in cpu_percentages)
         ):
-            idle_target = max(min_runners, current_runners - runners_per_vm)
+            idle_target = max(capacity_floor, current_runners - runners_per_vm)
             if idle_target < current_runners:
                 scale_down_reasons.append(
                     {
@@ -411,17 +473,28 @@ def evaluate_scaling_decision(
                     }
                 )
                 desired_runners = idle_target
+            else:
+                desired_runners = max(capacity_floor, current_runners)
         else:
-            desired_runners = max(min_runners, current_runners)
+            desired_runners = max(capacity_floor, current_runners)
     else:
-        desired_runners = min(max_runners, max(min_runners, desired_runners))
+        desired_runners = min(max_runners, max(capacity_floor, desired_runners))
 
-    # Enforce max scale-up budget caps (hourly, daily, monthly)
-    desired_instances = math.ceil(desired_runners / runners_per_vm) if desired_runners > 0 else 0
+    # Compute desired instances from fleet state and runner density
+    if desired_runners == current_runners and known_current_instances is not None:
+        desired_instances = current_instances_count
+    elif desired_runners > current_runners and known_current_instances is not None:
+        desired_instances = current_instances_count + math.ceil(
+            (desired_runners - current_runners) / runners_per_vm
+        )
+    else:
+        desired_instances = math.ceil(desired_runners / runners_per_vm) if desired_runners > 0 else 0
+
+    # Enforce max scale-up budget caps (hourly, daily, monthly) without turning a blocked scale-up into a scale-down
     unit_hourly = max(0.0001, float(per_instance_hourly_usd))
     max_hourly_cap = float(cfg.get("max_scale_up_hourly_usd", 5.00))
     max_daily_cap = float(cfg.get("max_scale_up_daily_usd", 10.00))
-    max_monthly_cap = float(cfg.get("max_scale_up_monthly_usd", 50.00))
+    max_monthly_cap = float(cfg.get("max_scale_up_monthly_usd", 300.00))
 
     effective_hourly_cap = min(
         max_hourly_cap,
@@ -434,8 +507,16 @@ def evaluate_scaling_decision(
 
     if scale_up_reasons and desired_instances > max_affordable_instances:
         budget_capped = True
-        desired_instances = max_affordable_instances
-        desired_runners = desired_instances * runners_per_vm
+        floor_runners = max(current_runners, min_runners)
+        floor_instances = max(
+            current_instances_count,
+            math.ceil(floor_runners / runners_per_vm) if floor_runners > 0 else 0,
+        )
+        desired_instances = max(floor_instances, max_affordable_instances)
+        if desired_instances == current_instances_count and current_runners >= min_runners:
+            desired_runners = current_runners
+        else:
+            desired_runners = max(floor_runners, desired_instances * runners_per_vm)
         budget_cap_note = (
             f"Scale-up capped at {desired_instances} instance(s) ({desired_runners} runners) "
             f"by max scale-up budget (${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, "
@@ -453,14 +534,174 @@ def evaluate_scaling_decision(
     )
 
     return {
+        "role": "cicd_runner",
         "direction": direction,
         "current_runners": current_runners,
         "desired_runners": desired_runners,
-        "current_instances": math.ceil(current_runners / runners_per_vm) if current_runners > 0 else 0,
+        "current_instances": current_instances_count,
         "desired_instances": desired_instances,
         "runners_per_instance": runners_per_vm,
         "instance_required_vcpu": runners_per_vm * int(cfg.get("runner_vcpu", 4)),
         "instance_required_ram_gib": runners_per_vm * int(cfg.get("runner_ram_gib", 16)),
+        "scale_up_reasons": scale_up_reasons,
+        "scale_down_reasons": scale_down_reasons,
+        "budget_capped": budget_capped,
+        "budget_cap_note": budget_cap_note,
+        "projected_hourly_usd": projected_hourly,
+        "projected_daily_usd": projected_daily,
+        "projected_monthly_usd": projected_monthly,
+        "effective_hourly_cap_usd": round(effective_hourly_cap, 4),
+    }
+
+
+def evaluate_builder_scaling_decision(
+    policy: dict[str, Any],
+    telemetry: dict[str, Any],
+    per_instance_hourly_usd: float = 0.25,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """Evaluate dedicated Rust builder telemetry against builder scaling triggers and budgets."""
+    cfg = {**default_scaling_config()["rust_builder"], **(policy or {})}
+    now_ts = float(now_epoch) if now_epoch is not None else time.time()
+    lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60)) * 60.0)
+
+    current_instances = max(0, int(telemetry.get("current_builders", telemetry.get("current_instances", 2))))
+    min_instances = max(1, int(cfg.get("min_instances", 1)))
+    max_instances = max(min_instances, int(cfg.get("max_instances", 4)))
+
+    builds_ran_past_hour = max(0, int(telemetry.get("builds_ran_past_hour", 5)))
+    active_builds = max(0, int(telemetry.get("active_builds", 0)))
+    queued_builds = max(0, int(telemetry.get("queued_builds", 0)))
+    cpu_percentages = [
+        float(x)
+        for x in telemetry.get(
+            "builder_cpu_percentages",
+            telemetry.get("instance_cpu_percentages", []),
+        )
+    ]
+    journal_oom_events = list(
+        telemetry.get("builder_journal_oom_events", telemetry.get("journal_oom_events", []))
+    )
+
+    scale_up_reasons: list[dict[str, Any]] = []
+    scale_down_reasons: list[dict[str, Any]] = []
+    desired_instances = current_instances
+
+    if cfg.get("enable_journal_oom_trigger", True) and journal_oom_events:
+        active_ooms = [
+            evt for evt in journal_oom_events if _is_recent_unhandled_oom(evt, now_ts, lookback_seconds)
+        ]
+        for evt in active_ooms:
+            scale_up_reasons.append(
+                {
+                    "trigger": "vm_journal_oom",
+                    "summary": (
+                        f"Builder VM journalctl on {evt.get('instance_name', 'builder')} recorded OOM kill: "
+                        f"{evt.get('process', 'rustc')} (PID {evt.get('pid', 0)})"
+                    ),
+                }
+            )
+        if active_ooms:
+            desired_instances = max(desired_instances, current_instances + 1)
+
+    if cfg.get("enable_queue_trigger", True) and queued_builds >= int(cfg.get("queued_builds_threshold", 2)):
+        scale_up_reasons.append(
+            {
+                "trigger": "queued_builds",
+                "summary": (
+                    f"{queued_builds} queued Rust builds waiting for a builder "
+                    f"(threshold >= {cfg.get('queued_builds_threshold', 2)})"
+                ),
+            }
+        )
+        desired_instances = max(desired_instances, current_instances + 1)
+
+    if cfg.get("enable_cpu_utilization_trigger", True):
+        cpu_triggered, cpu_detail = evaluate_cpu_scope(
+            cpu_percentages,
+            float(cfg.get("cpu_threshold_percent", 65.0)),
+            str(cfg.get("cpu_scope", "majority")),
+        )
+        if cpu_triggered:
+            scale_up_reasons.append(
+                {
+                    "trigger": f"cpu_{cfg.get('cpu_scope', 'majority')}",
+                    "summary": f"Builder CPU threshold exceeded: {cpu_detail}",
+                }
+            )
+            desired_instances = max(desired_instances, current_instances + 1)
+
+    capacity_floor = max(min_instances, active_builds)
+    if not scale_up_reasons:
+        if (
+            cfg.get("enable_low_builds_scale_down", True)
+            and builds_ran_past_hour <= int(cfg.get("scale_down_max_builds_past_hour", 2))
+            and queued_builds == 0
+        ):
+            low_target = max(capacity_floor, int(cfg.get("scale_down_target_instances", min_instances)))
+            if low_target < current_instances:
+                scale_down_reasons.append(
+                    {
+                        "trigger": "low_builds",
+                        "summary": (
+                            f"Only {builds_ran_past_hour} Rust builds ran in the last hour "
+                            f"(<= {cfg.get('scale_down_max_builds_past_hour', 2)}) -> "
+                            f"scaling down to {low_target} builder instance(s)"
+                        ),
+                    }
+                )
+                desired_instances = low_target
+            else:
+                desired_instances = max(capacity_floor, current_instances)
+        else:
+            desired_instances = max(capacity_floor, current_instances)
+    else:
+        desired_instances = min(max_instances, max(capacity_floor, desired_instances))
+
+    unit_hourly = max(0.0001, float(per_instance_hourly_usd))
+    max_hourly_cap = float(cfg.get("max_scale_up_hourly_usd", 3.50))
+    max_daily_cap = float(cfg.get("max_scale_up_daily_usd", 12.00))
+    max_monthly_cap = float(cfg.get("max_scale_up_monthly_usd", 80.00))
+
+    effective_hourly_cap = min(
+        max_hourly_cap,
+        max_daily_cap / 24.0,
+        max_monthly_cap / (24.0 * 365.0 / 12.0),
+    )
+    max_affordable_instances = max(1, int(math.floor(effective_hourly_cap / unit_hourly)))
+    budget_capped = False
+    budget_cap_note = ""
+
+    if scale_up_reasons and desired_instances > max_affordable_instances:
+        budget_capped = True
+        floor_instances = max(current_instances, min_instances)
+        desired_instances = max(floor_instances, max_affordable_instances)
+        budget_cap_note = (
+            f"Builder scale-up capped at {desired_instances} instance(s) "
+            f"by max scale-up budget (${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, "
+            f"${max_monthly_cap:.2f}/mo incl. disks)"
+        )
+
+    projected_hourly = round(desired_instances * unit_hourly, 4)
+    projected_daily = round(projected_hourly * 24.0, 2)
+    projected_monthly = round(projected_daily * (365.0 / 12.0), 2)
+
+    direction = (
+        "scale_up"
+        if desired_instances > current_instances
+        else ("scale_down" if desired_instances < current_instances else "hold")
+    )
+
+    return {
+        "role": "rust_builder",
+        "direction": direction,
+        "current_runners": current_instances,
+        "desired_runners": desired_instances,
+        "current_instances": current_instances,
+        "desired_instances": desired_instances,
+        "runners_per_instance": 1,
+        "instance_required_vcpu": int(cfg.get("builder_vcpu", 16)),
+        "instance_required_ram_gib": int(cfg.get("builder_ram_gib", 32)),
         "scale_up_reasons": scale_up_reasons,
         "scale_down_reasons": scale_down_reasons,
         "budget_capped": budget_capped,
