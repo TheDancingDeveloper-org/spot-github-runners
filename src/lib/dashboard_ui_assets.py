@@ -1687,17 +1687,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     async function scaleRegion(region, role, targetCount) {
-      await fetch("/api/instances/scale-region", {
+      const res = await fetch("/api/instances/scale-region", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ region, role, target_instances: targetCount })
       });
-      showToast(`Scaled ${region} (${role}) to ${targetCount} instance(s)`);
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error scaling ${region}: ${data.error || res.statusText}`);
+        return;
+      }
+      showToast(`Scaled ${region} (${role}) to ${data.current_count ?? targetCount} instance(s)`);
       await loadOverview();
     }
 
     async function deleteInstanceNow(instanceId, name) {
-      await fetch("/api/instances/delete", {
+      const res = await fetch("/api/instances/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1706,7 +1711,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           reason: "On-demand operator deletion from World Map / Instance Inspector"
         })
       });
-      showToast(`Deleted instance ${name}`);
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error deleting ${name}: ${data.error || res.statusText}`);
+        return;
+      }
+      showToast(data.status === "already_deleted" ? `Instance ${name} was already deleted` : `Deleted instance ${name}`);
       await loadOverview();
     }
 
@@ -1721,6 +1731,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         })
       });
       const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error creating VM Template: ${data.error || res.statusText}`);
+        return;
+      }
       if (data.vm_template) {
         showToast(`Created VM Template "${data.vm_template.name}" from ${name}`);
         await loadOverview();
@@ -1861,24 +1875,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById("builder-max-month").value = bp.budget.max_monthly_usd;
       document.getElementById("builder-use-vmtpl").checked = Boolean(bp.use_vm_template);
 
-      // Populate Cloud-Init and VM template dropdowns
+      // Populate Cloud-Init and VM template dropdowns filtered by workload role
       const ciSelectRunner = document.getElementById("runner-cloudinit-select");
       const ciSelectBuilder = document.getElementById("builder-cloudinit-select");
-      ciSelectRunner.innerHTML = APP_STATE.cloud_init_templates.map(t =>
-        `<option value="${esc(t.id)}" ${t.id === rp.cloud_init_template_id ? 'selected' : ''}>${esc(t.name)}</option>`
-      ).join("");
-      ciSelectBuilder.innerHTML = APP_STATE.cloud_init_templates.map(t =>
-        `<option value="${esc(t.id)}" ${t.id === bp.cloud_init_template_id ? 'selected' : ''}>${esc(t.name)}</option>`
-      ).join("");
+      ciSelectRunner.innerHTML = APP_STATE.cloud_init_templates
+        .filter(t => (t.role || "cicd_runner") === "cicd_runner")
+        .map(t => `<option value="${esc(t.id)}" ${t.id === rp.cloud_init_template_id ? 'selected' : ''}>${esc(t.name)}</option>`)
+        .join("");
+      ciSelectBuilder.innerHTML = APP_STATE.cloud_init_templates
+        .filter(t => t.role === "rust_builder")
+        .map(t => `<option value="${esc(t.id)}" ${t.id === bp.cloud_init_template_id ? 'selected' : ''}>${esc(t.name)}</option>`)
+        .join("");
 
       const vmSelectRunner = document.getElementById("runner-vmtpl-select");
       const vmSelectBuilder = document.getElementById("builder-vmtpl-select");
-      vmSelectRunner.innerHTML = APP_STATE.vm_templates.map(t =>
-        `<option value="${esc(t.id)}" ${t.id === rp.vm_template_id ? 'selected' : ''}>${esc(t.name)} (${esc(t.machine_type)})</option>`
-      ).join("");
-      vmSelectBuilder.innerHTML = APP_STATE.vm_templates.map(t =>
-        `<option value="${esc(t.id)}" ${t.id === bp.vm_template_id ? 'selected' : ''}>${esc(t.name)} (${esc(t.machine_type)})</option>`
-      ).join("");
+      vmSelectRunner.innerHTML = APP_STATE.vm_templates
+        .filter(t => (t.role || "cicd_runner") === "cicd_runner")
+        .map(t => `<option value="${esc(t.id)}" ${t.id === rp.vm_template_id ? 'selected' : ''}>${esc(t.name)} (${esc(t.machine_type)})</option>`)
+        .join("");
+      vmSelectBuilder.innerHTML = APP_STATE.vm_templates
+        .filter(t => t.role === "rust_builder")
+        .map(t => `<option value="${esc(t.id)}" ${t.id === bp.vm_template_id ? 'selected' : ''}>${esc(t.name)} (${esc(t.machine_type)})</option>`)
+        .join("");
 
       updateSizingMathBanners();
     }
@@ -1973,6 +1991,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         body: JSON.stringify(payload)
       });
       const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error saving profile: ${data.error || res.statusText}`);
+        return;
+      }
       LAST_QUAL_DATA[role] = data.qualification;
       showToast(`Saved ${role === 'cicd_runner' ? 'CI/CD Runner' : 'Rust Builder'} profile (${data.qualification.spot_price_qualifying_count} Spot offers qualify)`);
       await loadOverview();
@@ -2294,11 +2316,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     async function createVmTemplateFromSelected() {
       const instance_id = document.getElementById("vmtpl-source-instance").value;
       const template_name = document.getElementById("vmtpl-new-name").value.trim();
-      await fetch("/api/vm-templates/from-instance", {
+      const res = await fetch("/api/vm-templates/from-instance", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ instance_id, template_name })
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error creating VM Template: ${data.error || res.statusText}`);
+        return;
+      }
       document.getElementById("vmtpl-new-name").value = "";
       showToast("Created new VM Template from instance");
       await loadOverview();

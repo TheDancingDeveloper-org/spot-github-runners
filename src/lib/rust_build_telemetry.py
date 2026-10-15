@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import ipaddress
+import re
 from typing import Any
 
 from .dashboard_models import compute_cpu_benchmark_score, format_gcloud_ssh_command
@@ -221,7 +222,7 @@ def classify_ip_and_network(ip_address: str, hostname: str | None = None) -> dic
                 "isp": "Proton AG",
             },
         }
-    if "tor" in lower_host or "onion" in lower_host:
+    if re.search(r"(?:^|[.-])(?:tor|torexit|torproject|zwiebelfreunde)(?:[.-]|$)", lower_host) or lower_host.endswith(".onion"):
         return {
             "ip_address": clean_ip,
             "hostname": clean_host or f"tor-exit-{clean_ip.replace('.', '-')}.torproject.org",
@@ -329,8 +330,16 @@ def enrich_rust_build_record(
     )
 
     cache_hits = max(0, int(record.get("cache_hits", 0)))
-    cache_misses = max(0, int(record.get("cache_misses", 0)))
-    total_crates = max(cache_hits, int(record.get("total_crates", cache_hits + cache_misses)))
+    if record.get("cache_misses") is not None:
+        cache_misses = max(0, int(record["cache_misses"]))
+    elif record.get("total_crates") is not None:
+        cache_misses = max(0, int(record["total_crates"]) - cache_hits)
+    else:
+        cache_misses = 0
+    if record.get("total_crates") is not None:
+        total_crates = max(cache_hits + cache_misses, int(record["total_crates"]))
+    else:
+        total_crates = cache_hits + cache_misses
     cache_hit_rate = round((cache_hits / total_crates * 100.0) if total_crates > 0 else 0.0, 1)
 
     instance_name = str(record.get("instance_name", "builder-oxidex-turin-01"))

@@ -216,7 +216,9 @@ def default_scaling_config() -> dict[str, Any]:
             "min_instances": 1,
             "max_instances": 4,
             "builder_vcpu": 16,
-            "builder_ram_gib": 32,
+            "builder_ram_gib": 28,
+            "container_vcpu": 16,
+            "container_ram_gib": 28,
             "enable_queue_trigger": True,
             "queued_builds_threshold": 2,
             "enable_cpu_utilization_trigger": True,
@@ -561,11 +563,15 @@ def evaluate_builder_scaling_decision(
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate dedicated Rust builder telemetry against builder scaling triggers and budgets."""
-    cfg = {**default_scaling_config()["rust_builder"], **(policy or {})}
+    raw_policy = policy or {}
+    cfg = {**default_scaling_config()["rust_builder"], **raw_policy}
     now_ts = float(now_epoch) if now_epoch is not None else time.time()
     lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60)) * 60.0)
 
-    current_instances = max(0, int(telemetry.get("current_builders", telemetry.get("current_instances", 2))))
+    current_instances = max(
+        0,
+        int(telemetry.get("current_builder_instances", telemetry.get("current_builders", 2))),
+    )
     min_instances = max(1, int(cfg.get("min_instances", 1)))
     max_instances = max(min_instances, int(cfg.get("max_instances", 4)))
 
@@ -574,14 +580,31 @@ def evaluate_builder_scaling_decision(
     queued_builds = max(0, int(telemetry.get("queued_builds", 0)))
     cpu_percentages = [
         float(x)
-        for x in telemetry.get(
-            "builder_cpu_percentages",
-            telemetry.get("instance_cpu_percentages", []),
-        )
+        for x in telemetry.get("builder_cpu_percentages", [])
     ]
-    journal_oom_events = list(
-        telemetry.get("builder_journal_oom_events", telemetry.get("journal_oom_events", []))
-    )
+    if "builder_journal_oom_events" in telemetry:
+        journal_oom_events = list(telemetry.get("builder_journal_oom_events") or [])
+    else:
+        journal_oom_events = [
+            evt
+            for evt in telemetry.get("journal_oom_events", [])
+            if str(evt.get("role", "")) == "rust_builder"
+            or str(evt.get("instance_name", "")).lower().startswith("builder-")
+        ]
+
+    if "container_vcpu" in raw_policy:
+        req_vcpu = int(raw_policy["container_vcpu"])
+    elif "builder_vcpu" in raw_policy:
+        req_vcpu = int(raw_policy["builder_vcpu"])
+    else:
+        req_vcpu = int(cfg.get("container_vcpu", cfg.get("builder_vcpu", 16)))
+
+    if "container_ram_gib" in raw_policy:
+        req_ram = float(raw_policy["container_ram_gib"])
+    elif "builder_ram_gib" in raw_policy:
+        req_ram = float(raw_policy["builder_ram_gib"])
+    else:
+        req_ram = float(cfg.get("container_ram_gib", cfg.get("builder_ram_gib", 28)))
 
     scale_up_reasons: list[dict[str, Any]] = []
     scale_down_reasons: list[dict[str, Any]] = []
@@ -700,8 +723,8 @@ def evaluate_builder_scaling_decision(
         "current_instances": current_instances,
         "desired_instances": desired_instances,
         "runners_per_instance": 1,
-        "instance_required_vcpu": int(cfg.get("builder_vcpu", 16)),
-        "instance_required_ram_gib": int(cfg.get("builder_ram_gib", 32)),
+        "instance_required_vcpu": req_vcpu,
+        "instance_required_ram_gib": req_ram,
         "scale_up_reasons": scale_up_reasons,
         "scale_down_reasons": scale_down_reasons,
         "budget_capped": budget_capped,

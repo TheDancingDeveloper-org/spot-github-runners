@@ -947,6 +947,7 @@ def _validate_cloud_init_syntax(
     errors: list[str] = []
     if is_cloud_config:
         block_scalar_indent: int | None = None
+        scopes: list[dict[str, Any]] = []
         for idx, raw in enumerate(lines[1:], start=2):
             if not raw.strip() or raw.lstrip().startswith("#"):
                 continue
@@ -997,15 +998,100 @@ def _validate_cloud_init_syntax(
                 continue
 
             is_mapping = bool(re.match(r"^[A-Za-z0-9_.-]+\s*:(?:\s+.*|\s*)$", stripped))
-            is_list_item = bool(re.match(r"^-\s+.+$", stripped))
+            is_list_item = bool(re.match(r"^-(?:\s+.*|\s*)$", stripped))
             if not (is_mapping or is_list_item):
                 errors.append(
                     f"YAML syntax error on line {idx}: expected mapping 'key: value' or list item '- value'."
                 )
                 continue
 
-            if re.search(r":\s*[|>][-+]?\s*$", stripped):
-                block_scalar_indent = indent
+            if indent % 2 != 0:
+                errors.append(
+                    f"YAML syntax error on line {idx}: inconsistent indentation ({indent} spaces)."
+                )
+                continue
+
+            while scopes and scopes[-1]["indent"] > indent:
+                scopes.pop()
+
+            if scopes and scopes[-1]["indent"] == indent:
+                prev_kind = scopes[-1]["kind"]
+                cur_kind = "list" if is_list_item else "map"
+                if prev_kind != cur_kind:
+                    errors.append(
+                        f"YAML syntax error on line {idx}: cannot mix mapping and sequence items at indent {indent}."
+                    )
+                    continue
+                scopes.pop()
+
+            if indent > 0:
+                if not scopes:
+                    errors.append(
+                        f"YAML syntax error on line {idx}: unexpected top-level indentation ({indent} spaces)."
+                    )
+                    continue
+                parent = scopes[-1]
+                if not parent["allow_children"]:
+                    errors.append(
+                        f"YAML syntax error on line {idx}: unexpected nested block under scalar value."
+                    )
+                    continue
+                if parent["child_indent"] is None:
+                    parent["child_indent"] = indent
+                elif parent["child_indent"] != indent:
+                    errors.append(
+                        f"YAML syntax error on line {idx}: inconsistent indentation ({indent} spaces, expected {parent['child_indent']})."
+                    )
+                    continue
+
+            if is_list_item:
+                after_dash = stripped[1:].lstrip(" ")
+                if not after_dash:
+                    scopes.append(
+                        {"indent": indent, "kind": "list", "child_indent": None, "allow_children": True}
+                    )
+                elif re.match(r"^[A-Za-z0-9_.-]+\s*:(?:\s+.*|\s*)$", after_dash):
+                    key_indent = indent + (len(stripped) - len(after_dash))
+                    scopes.append(
+                        {"indent": indent, "kind": "list", "child_indent": key_indent, "allow_children": True}
+                    )
+                    _, _, v_part = after_dash.partition(":")
+                    v_str = v_part.strip()
+                    if re.search(r":\s*[|>][-+]?\s*$", after_dash):
+                        block_scalar_indent = indent
+                        scopes.append(
+                            {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": False}
+                        )
+                    elif not v_str:
+                        scopes.append(
+                            {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": True}
+                        )
+                    else:
+                        scopes.append(
+                            {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": False}
+                        )
+                else:
+                    if re.search(r"^[|>][-+]?\s*$", after_dash):
+                        block_scalar_indent = indent
+                    scopes.append(
+                        {"indent": indent, "kind": "list", "child_indent": None, "allow_children": False}
+                    )
+            else:
+                _, _, v_part = stripped.partition(":")
+                v_str = v_part.strip()
+                if re.search(r":\s*[|>][-+]?\s*$", stripped):
+                    block_scalar_indent = indent
+                    scopes.append(
+                        {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
+                    )
+                elif not v_str:
+                    scopes.append(
+                        {"indent": indent, "kind": "map", "child_indent": None, "allow_children": True}
+                    )
+                else:
+                    scopes.append(
+                        {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
+                    )
     elif is_shell_script:
         script_body = "\n".join(lines) + "\n"
         try:
@@ -1021,6 +1107,7 @@ def _validate_cloud_init_syntax(
                 err_msg = (proc.stderr or "invalid shell syntax").strip().splitlines()[0]
                 errors.append(f"Shell syntax error: {err_msg}")
         except OSError:
+            # /bin/sh is not available in this execution environment; skip external shell syntax check.
             pass
     return errors
 

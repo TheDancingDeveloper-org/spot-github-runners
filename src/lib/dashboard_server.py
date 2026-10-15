@@ -872,7 +872,12 @@ class DashboardStore:
         prof = self.state.get("profiles", {}).get("cicd_runner", {})
         if prof.get("use_vm_template") and prof.get("vm_template_id"):
             tpl = next(
-                (t for t in self.state.get("vm_templates", []) if t.get("id") == prof.get("vm_template_id")),
+                (
+                    t
+                    for t in self.state.get("vm_templates", [])
+                    if t.get("id") == prof.get("vm_template_id")
+                    and t.get("role", "cicd_runner") == "cicd_runner"
+                ),
                 None,
             )
             if tpl and int(tpl.get("runners_count", 0)) > 0:
@@ -913,7 +918,129 @@ class DashboardStore:
         telem["builder_cpu_percentages"] = [
             float(inst.get("cpu_utilization_percent", 0.0)) for inst in running_builders
         ]
+        raw_journal_ooms = telem.get("journal_oom_events", [])
+        if isinstance(raw_journal_ooms, list):
+            telem["builder_journal_oom_events"] = [
+                evt
+                for evt in raw_journal_ooms
+                if isinstance(evt, dict)
+                and (
+                    evt.get("role") == "rust_builder"
+                    or str(evt.get("instance_name", "")).startswith("builder-")
+                )
+            ]
         self._sync_template_density()
+
+    def _resolve_scaling_unit_hourly_usd(
+        self,
+        role: str,
+        qual: dict[str, Any] | None = None,
+    ) -> float:
+        """Resolve per-instance hourly USD for scaling evaluation matching active template or density."""
+        prof = self.state.get("profiles", {}).get(role, {})
+        pol = self.state.get("scaling", {}).get(role, {})
+        budget = prof.get("budget", {})
+        include_disk = bool(
+            pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
+        )
+        include_tax = bool(budget.get("include_taxes", False))
+        target_units = (
+            max(
+                1,
+                int(
+                    pol.get("runners_per_instance")
+                    or self.state.get("scaling_telemetry", {}).get("template_runners_per_instance")
+                    or 4
+                ),
+            )
+            if role == "cicd_runner"
+            else 1
+        )
+
+        def _offer_hourly(offer: dict[str, Any]) -> float:
+            pricing = offer.get("pricing", {})
+            if not include_disk:
+                return float(pricing.get("compute_hourly_usd", offer.get("evaluated_hourly_usd", 0.16)))
+            if include_tax:
+                return float(pricing.get("total_hourly_usd", offer.get("evaluated_hourly_usd", 0.16)))
+            return round(
+                float(pricing.get("compute_hourly_usd", 0.0))
+                + float(pricing.get("disk_hourly_usd", 0.0)),
+                4,
+            )
+
+        if qual is None:
+            qual = qualify_instances(
+                prof,
+                self.state.get("regions_enabled", {}),
+                self.project,
+                region_latencies_ms=self.state.get("region_latencies_ms"),
+            )
+
+        spot_offers = qual.get("spot_price_qualifying", [])
+        hw_offers = qual.get("hardware_qualifying", [])
+
+        if prof.get("use_vm_template") and prof.get("vm_template_id"):
+            vm_tpl = next(
+                (
+                    t
+                    for t in self.state.get("vm_templates", [])
+                    if t.get("id") == prof.get("vm_template_id") and t.get("role", role) == role
+                ),
+                None,
+            )
+            if vm_tpl and (
+                role != "cicd_runner" or int(vm_tpl.get("runners_count", 0)) == target_units
+            ):
+                tpl_machine = vm_tpl.get("machine_type")
+                matching_spot = [o for o in spot_offers if o.get("machine_type") == tpl_machine]
+                if matching_spot:
+                    return min(_offer_hourly(o) for o in matching_spot)
+                matching_hw = [o for o in hw_offers if o.get("machine_type") == tpl_machine]
+                if matching_hw:
+                    return min(_offer_hourly(o) for o in matching_hw)
+                family = str(tpl_machine or "n2-standard-16").split("-", 1)[0]
+                enabled_regs = [
+                    r
+                    for r in REGIONS_CATALOG
+                    if self.state.get("regions_enabled", {}).get(r["region"], True)
+                    and family in r.get("families", [])
+                ] or [REGIONS_CATALOG[0]]
+                tpl_rates: list[float] = []
+                for reg_info in enabled_regs:
+                    pricing = calculate_spot_pricing(
+                        family=family,
+                        vcpu=int(vm_tpl.get("vcpu", 16)),
+                        ram_gib=float(vm_tpl.get("ram_gib", 64)),
+                        region=reg_info["region"],
+                        boot_disk_type=str(vm_tpl.get("boot_disk_type", "hyperdisk-balanced")),
+                        boot_disk_gb=int(vm_tpl.get("boot_disk_gb", 40)),
+                        data_disk_type=str(vm_tpl.get("data_disk_type", "hyperdisk-balanced")),
+                        data_disk_gb=int(vm_tpl.get("data_disk_gb", 100)),
+                        tax_rate_percent=float(reg_info.get("tax_rate_default", 8.25)),
+                    )
+                    tpl_rates.append(_offer_hourly({"pricing": pricing}))
+                if tpl_rates:
+                    return min(tpl_rates)
+
+        capable_spot = [
+            o for o in spot_offers if int(o.get("units_per_instance", 1)) >= target_units
+        ]
+        if capable_spot:
+            return min(_offer_hourly(o) for o in capable_spot)
+
+        capable_hw = [
+            o for o in hw_offers if int(o.get("units_per_instance", 1)) >= target_units
+        ]
+        if capable_hw:
+            return min(_offer_hourly(o) for o in capable_hw)
+
+        if spot_offers:
+            best = spot_offers[0]
+            best_units = max(1, int(best.get("units_per_instance", 1)))
+            return round(_offer_hourly(best) * (target_units / best_units), 4)
+
+        return 0.16 if role == "cicd_runner" else 0.34
 
     def _normalize_github_ci_runs(self) -> None:
         runs = self.state.get("scaling_telemetry", {}).get("github_oom_runs", [])
@@ -991,19 +1118,15 @@ class DashboardStore:
             scaling_eval = evaluate_scaling_decision(
                 self.state["scaling"]["cicd_runner"],
                 self.state["scaling_telemetry"],
-                per_instance_hourly_usd=(
-                    cicd_qual["spot_price_qualifying"][0]["evaluated_hourly_usd"]
-                    if cicd_qual["spot_price_qualifying"]
-                    else 0.16
+                per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd(
+                    "cicd_runner", cicd_qual
                 ),
             )
             builder_scaling_eval = evaluate_builder_scaling_decision(
                 self.state["scaling"]["rust_builder"],
                 self.state["scaling_telemetry"],
-                per_instance_hourly_usd=(
-                    builder_qual["spot_price_qualifying"][0]["evaluated_hourly_usd"]
-                    if builder_qual["spot_price_qualifying"]
-                    else 0.34
+                per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd(
+                    "rust_builder", builder_qual
                 ),
             )
             instances_view = self.query_instances(
@@ -1223,6 +1346,32 @@ class DashboardStore:
         if role not in ("cicd_runner", "rust_builder"):
             raise ValueError(f"Unsupported workload role: {role}")
         with self._lock:
+            if payload.get("vm_template_id"):
+                vm_tpl = next(
+                    (
+                        t
+                        for t in self.state.get("vm_templates", [])
+                        if t.get("id") == payload["vm_template_id"]
+                    ),
+                    None,
+                )
+                if vm_tpl is None or vm_tpl.get("role", role) != role:
+                    raise ValueError(
+                        f"VM template '{payload['vm_template_id']}' does not belong to role '{role}'"
+                    )
+            if payload.get("cloud_init_template_id"):
+                ci_tpl = next(
+                    (
+                        t
+                        for t in self.state.get("cloud_init_templates", [])
+                        if t.get("id") == payload["cloud_init_template_id"]
+                    ),
+                    None,
+                )
+                if ci_tpl is None or ci_tpl.get("role", role) != role:
+                    raise ValueError(
+                        f"Cloud-init template '{payload['cloud_init_template_id']}' does not belong to role '{role}'"
+                    )
             current = self.state["profiles"][role]
             for key in (
                 "min_runners",
@@ -1245,7 +1394,12 @@ class DashboardStore:
                 if key in payload:
                     current[key] = payload[key]
             if "budget" in payload and isinstance(payload["budget"], dict):
-                current["budget"] = normalize_budget(payload["budget"])
+                normalized_budget = normalize_budget(payload["budget"])
+                current["budget"] = normalized_budget
+                self.state["scaling"][role]["max_scale_up_hourly_usd"] = normalized_budget["max_hourly_usd"]
+                self.state["scaling"][role]["max_scale_up_daily_usd"] = normalized_budget["max_daily_usd"]
+                self.state["scaling"][role]["max_scale_up_monthly_usd"] = normalized_budget["max_monthly_usd"]
+                self.state["scaling"][role]["include_disk_in_scale_budget"] = normalized_budget["include_disk_costs"]
             if role == "cicd_runner":
                 self.state["scaling"]["cicd_runner"]["min_runners"] = int(current["min_runners"])
                 self.state["scaling"]["cicd_runner"]["runner_vcpu"] = int(current["runner_vcpu"])
@@ -1255,7 +1409,9 @@ class DashboardStore:
                 self.state["scaling"]["rust_builder"]["min_instances"] = int(current["min_instances"])
                 self.state["scaling"]["rust_builder"]["max_instances"] = int(current["max_instances"])
                 self.state["scaling"]["rust_builder"]["container_vcpu"] = int(current["runner_vcpu"])
+                self.state["scaling"]["rust_builder"]["builder_vcpu"] = int(current["runner_vcpu"])
                 self.state["scaling"]["rust_builder"]["container_ram_gib"] = float(current["runner_ram_gib"])
+                self.state["scaling"]["rust_builder"]["builder_ram_gib"] = float(current["runner_ram_gib"])
             self._persist()
             qual = qualify_instances(
                 current,
@@ -1268,9 +1424,21 @@ class DashboardStore:
     def update_scaling(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Update scaling rules, triggers, hourly thresholds, CPU scope, and telemetry."""
         with self._lock:
-            role = payload.get("role", "cicd_runner")
-            if role in ("cicd_runner", "rust_builder") and "policy" in payload:
+            role = str(payload.get("role", "cicd_runner")).strip()
+            if role not in ("cicd_runner", "rust_builder"):
+                raise ValueError(f"Unsupported workload role: {role}")
+            if "policy" in payload and isinstance(payload["policy"], dict):
                 self.state["scaling"][role].update(payload["policy"])
+                pol_target = self.state["scaling"][role]
+                prof_budget = self.state["profiles"][role].setdefault("budget", {})
+                if "max_scale_up_hourly_usd" in payload["policy"]:
+                    prof_budget["max_hourly_usd"] = float(pol_target["max_scale_up_hourly_usd"])
+                if "max_scale_up_daily_usd" in payload["policy"]:
+                    prof_budget["max_daily_usd"] = float(pol_target["max_scale_up_daily_usd"])
+                if "max_scale_up_monthly_usd" in payload["policy"]:
+                    prof_budget["max_monthly_usd"] = float(pol_target["max_scale_up_monthly_usd"])
+                if "include_disk_in_scale_budget" in payload["policy"]:
+                    prof_budget["include_disk_costs"] = bool(pol_target["include_disk_in_scale_budget"])
                 if role == "cicd_runner":
                     pol = self.state["scaling"]["cicd_runner"]
                     self.state["profiles"]["cicd_runner"]["min_runners"] = int(pol.get("min_runners", 4))
@@ -1280,14 +1448,41 @@ class DashboardStore:
                         self._sync_template_density()
                 else:
                     pol = self.state["scaling"]["rust_builder"]
+                    if "builder_vcpu" in payload["policy"] and "container_vcpu" not in payload["policy"]:
+                        pol["container_vcpu"] = int(pol["builder_vcpu"])
+                    elif "container_vcpu" in payload["policy"] and "builder_vcpu" not in payload["policy"]:
+                        pol["builder_vcpu"] = int(pol["container_vcpu"])
+                    if "builder_ram_gib" in payload["policy"] and "container_ram_gib" not in payload["policy"]:
+                        pol["container_ram_gib"] = float(pol["builder_ram_gib"])
+                    elif "container_ram_gib" in payload["policy"] and "builder_ram_gib" not in payload["policy"]:
+                        pol["builder_ram_gib"] = float(pol["container_ram_gib"])
                     self.state["profiles"]["rust_builder"]["min_instances"] = int(pol.get("min_instances", 1))
                     self.state["profiles"]["rust_builder"]["max_instances"] = int(pol.get("max_instances", 4))
-                    self.state["profiles"]["rust_builder"]["runner_vcpu"] = int(pol.get("container_vcpu", 16))
-                    self.state["profiles"]["rust_builder"]["runner_ram_gib"] = float(pol.get("container_ram_gib", 28))
+                    self.state["profiles"]["rust_builder"]["runner_vcpu"] = int(
+                        pol.get("container_vcpu", pol.get("builder_vcpu", 16))
+                    )
+                    self.state["profiles"]["rust_builder"]["runner_ram_gib"] = float(
+                        pol.get("container_ram_gib", pol.get("builder_ram_gib", 28))
+                    )
             if "telemetry" in payload and isinstance(payload["telemetry"], dict):
                 if "current_runners" in payload["telemetry"] and "current_instances" not in payload["telemetry"]:
                     self.state["scaling_telemetry"].pop("current_instances", None)
                 self.state["scaling_telemetry"].update(payload["telemetry"])
+                if (
+                    "journal_oom_events" in payload["telemetry"]
+                    and "builder_journal_oom_events" not in payload["telemetry"]
+                ):
+                    raw_journal_ooms = self.state["scaling_telemetry"].get("journal_oom_events", [])
+                    if isinstance(raw_journal_ooms, list):
+                        self.state["scaling_telemetry"]["builder_journal_oom_events"] = [
+                            evt
+                            for evt in raw_journal_ooms
+                            if isinstance(evt, dict)
+                            and (
+                                evt.get("role") == "rust_builder"
+                                or str(evt.get("instance_name", "")).startswith("builder-")
+                            )
+                        ]
             if "add_github_oom_run" in payload and isinstance(payload["add_github_oom_run"], dict):
                 item = dict(payload["add_github_oom_run"])
                 if "deep_link" in item and not item.get("run_id"):
@@ -1336,10 +1531,12 @@ class DashboardStore:
             cicd_eval = evaluate_scaling_decision(
                 self.state["scaling"]["cicd_runner"],
                 self.state["scaling_telemetry"],
+                per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("cicd_runner"),
             )
             builder_eval = evaluate_builder_scaling_decision(
                 self.state["scaling"]["rust_builder"],
                 self.state["scaling_telemetry"],
+                per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
             )
             evaluation = builder_eval if role == "rust_builder" else cicd_eval
             return {
@@ -1388,7 +1585,9 @@ class DashboardStore:
             if not parsed["valid"]:
                 errors_str = "; ".join(parsed.get("errors", [])) or "Invalid cloud-init syntax"
                 raise ValueError(f"Invalid cloud-init template: {errors_str}")
-            role = str(payload.get("role", "cicd_runner"))
+            role = str(payload.get("role", "cicd_runner")).strip()
+            if role not in ("cicd_runner", "rust_builder"):
+                raise ValueError(f"Unsupported workload role: {role}")
             name = str(payload.get("name", "Custom Cloud-Init Template")).strip()
             description = str(payload.get("description", "Operator-customized cloud-init template")).strip()
             template_id = str(payload.get("id", "")).strip()
@@ -1522,6 +1721,8 @@ class DashboardStore:
             region = str(payload.get("region", "africa-south1")).strip()
             target_count = max(0, int(payload.get("target_instances", 1)))
             role = str(payload.get("role", "cicd_runner")).strip()
+            if role not in ("cicd_runner", "rust_builder"):
+                raise ValueError(f"Unsupported workload role: {role}")
             reg_info = next((r for r in REGIONS_CATALOG if r["region"] == region), None)
             if reg_info is None:
                 raise ValueError(f"Unknown region: {region}")
@@ -1566,6 +1767,7 @@ class DashboardStore:
                             t
                             for t in self.state.get("vm_templates", [])
                             if t.get("id") == prof.get("vm_template_id")
+                            and t.get("role", role) == role
                         ),
                         None,
                     )
@@ -1719,6 +1921,28 @@ class DashboardStore:
             now_ts = time.time()
             duration = float(payload.get("total_duration_seconds", 95.0))
             delivery_sec = float(payload.get("delivery_duration_seconds", 8.0))
+            has_hits = payload.get("cache_hits") is not None
+            has_misses = payload.get("cache_misses") is not None
+            has_total = payload.get("total_crates") is not None
+            if has_hits:
+                cache_hits = int(payload["cache_hits"])
+            elif has_total and has_misses:
+                cache_hits = max(0, int(payload["total_crates"]) - int(payload["cache_misses"]))
+            else:
+                cache_hits = 380
+
+            if has_misses:
+                cache_misses = int(payload["cache_misses"])
+            elif has_total:
+                cache_misses = max(0, int(payload["total_crates"]) - cache_hits)
+            else:
+                cache_misses = 25
+
+            if has_total:
+                total_crates = int(payload["total_crates"])
+            else:
+                total_crates = cache_hits + cache_misses
+
             raw = {
                 "build_id": payload.get("build_id") or f"rb-{uuid.uuid4().hex[:8]}",
                 "project_name": payload.get("project_name", "oxidex"),
@@ -1729,9 +1953,9 @@ class DashboardStore:
                 "requested_at": payload.get("requested_at") or _iso_seconds_ago(duration, now_ts),
                 "finished_at": payload.get("finished_at") or _iso_seconds_ago(delivery_sec, now_ts),
                 "delivered_at": payload.get("delivered_at") or _iso_seconds_ago(0, now_ts),
-                "cache_hits": int(payload.get("cache_hits", 380)),
-                "cache_misses": int(payload.get("cache_misses", 25)),
-                "total_crates": int(payload.get("total_crates", 405)),
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "total_crates": total_crates,
                 "instance_name": payload.get("instance_name", "builder-oxidex-turin-01"),
                 "zone": payload.get("zone", "us-south1-b"),
                 "machine_type": payload.get("machine_type", "c4d-highcpu-16"),
@@ -1744,7 +1968,18 @@ class DashboardStore:
                 "cpu_time_seconds": float(payload.get("cpu_time_seconds", 1120.0)),
             }
             enriched = enrich_rust_build_record(raw, project=self.project)
-            self.state["rust_builds"].insert(0, enriched)
+            existing_idx = next(
+                (
+                    idx
+                    for idx, b in enumerate(self.state["rust_builds"])
+                    if b.get("build_id") == enriched["build_id"]
+                ),
+                None,
+            )
+            if existing_idx is not None:
+                self.state["rust_builds"][existing_idx] = enriched
+            else:
+                self.state["rust_builds"].insert(0, enriched)
             self._persist()
             return {"status": "ok", "build": enriched}
 
@@ -1774,6 +2009,43 @@ def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def _validate_same_origin_json_post(self) -> tuple[bool, HTTPStatus, str]:
+            """Verify mutating POST requests carry application/json and are not cross-origin."""
+            sec_fetch_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if sec_fetch_site == "cross-site":
+                return (
+                    False,
+                    HTTPStatus.FORBIDDEN,
+                    "Cross-site POST requests are forbidden",
+                )
+            origin = (self.headers.get("Origin") or "").strip()
+            if origin:
+                if origin.lower() == "null":
+                    return (
+                        False,
+                        HTTPStatus.FORBIDDEN,
+                        "Cross-origin POST request from null Origin is forbidden",
+                    )
+                parsed_origin = urlparse(origin)
+                req_host = (self.headers.get("Host") or "").strip().lower()
+                origin_host = parsed_origin.netloc.lower()
+                if parsed_origin.scheme not in ("http", "https") or (
+                    req_host and origin_host != req_host
+                ):
+                    return (
+                        False,
+                        HTTPStatus.FORBIDDEN,
+                        f"Cross-origin POST request from '{origin}' is forbidden",
+                    )
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                return (
+                    False,
+                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                    "Content-Type must be application/json",
+                )
+            return True, HTTPStatus.OK, ""
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -1846,6 +2118,10 @@ def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             path = parsed.path
+            ok_req, err_status, err_msg = self._validate_same_origin_json_post()
+            if not ok_req:
+                self._send_json({"error": err_msg}, status=err_status)
+                return
             try:
                 payload = self._read_json()
                 if path == "/api/budget":
@@ -1858,7 +2134,9 @@ def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
                     self._send_json(store.update_profile("rust_builder", payload))
                     return
                 if path == "/api/qualify":
-                    role = str(payload.get("role", "cicd_runner"))
+                    role = str(payload.get("role", "cicd_runner")).strip()
+                    if role not in ("cicd_runner", "rust_builder"):
+                        raise ValueError(f"Unsupported workload role: {role}")
                     merged = {**store.state["profiles"].get(role, {}), **payload}
                     self._send_json(
                         qualify_instances(

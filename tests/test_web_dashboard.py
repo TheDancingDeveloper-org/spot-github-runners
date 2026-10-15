@@ -625,6 +625,105 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         dumped = json.loads(buf.getvalue())
         self.assertEqual(dumped["project"], "homelab-424523")
 
+    def test_round2_codex_regressions(self):
+        # 1. YAML structure validation rejects inconsistent indentation and nesting under scalars
+        bad_indent = parse_cloud_init("#cloud-config\nusers:\n  - name: foo\n   shell: /bin/bash\n")
+        self.assertFalse(bad_indent["valid"])
+        bad_scalar_nest = parse_cloud_init("#cloud-config\npackage_update: true\n  nested: 1\n")
+        self.assertFalse(bad_scalar_nest["valid"])
+
+        # 2. Tor hostname matching uses delimited labels, not substrings
+        tor_host = classify_ip_and_network("8.8.8.8", "tor-exit-01.zwiebelfreunde.de")
+        self.assertTrue(tor_host["is_tor"])
+        benign_host = classify_ip_and_network("8.8.8.8", "refactor-worker.toronto.corp.example")
+        self.assertFalse(benign_host["is_tor"])
+
+        # 3. Profile updates propagate budgets to scaling caps, sync builder resource keys, and reject cross-role templates
+        prof_res = self._post(
+            "/api/profile/rust_builder",
+            {
+                "min_instances": 2,
+                "max_instances": 5,
+                "runner_vcpu": 24,
+                "runner_ram_gib": 48,
+                "budget": {
+                    "max_hourly_usd": 2.25,
+                    "max_daily_usd": 18.00,
+                    "max_monthly_usd": 120.00,
+                    "include_disk_costs": False,
+                },
+            },
+        )
+        self.assertEqual(prof_res["status"], "ok")
+        b_sc = self.store.state["scaling"]["rust_builder"]
+        self.assertEqual(b_sc["max_scale_up_hourly_usd"], 2.25)
+        self.assertEqual(b_sc["max_scale_up_daily_usd"], 18.00)
+        self.assertEqual(b_sc["max_scale_up_monthly_usd"], 120.00)
+        self.assertFalse(b_sc["include_disk_in_scale_budget"])
+        self.assertEqual(b_sc["container_vcpu"], 24)
+        self.assertEqual(b_sc["builder_vcpu"], 24)
+        self.assertEqual(b_sc["container_ram_gib"], 48.0)
+        self.assertEqual(b_sc["builder_ram_gib"], 48.0)
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/profile/cicd_runner",
+                {"use_vm_template": True, "vm_template_id": "tpl-builder-c4d-16"},
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+
+        # 4. Unsupported roles are rejected in scale-region, scaling, and qualify
+        for endpoint, body in (
+            ("/api/instances/scale-region", {"region": "us-south1", "role": "invalid_role", "target_instances": 1}),
+            ("/api/scaling", {"role": "invalid_role", "policy": {}}),
+            ("/api/qualify", {"role": "invalid_role"}),
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._post(endpoint, body)
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
+
+        # 5. Rust build telemetry derives omitted total_crates from hits+misses and deduplicates build_id
+        before_count = self._get("/api/rust-builds")["total_builds"]
+        b1 = self._post(
+            "/api/rust-builds",
+            {"build_id": "rb-idempotent-01", "cache_hits": 10, "cache_misses": 2},
+        )
+        self.assertEqual(b1["build"]["total_crates"], 12)
+        self.assertEqual(b1["build"]["cache_hit_rate_percent"], 83.3)
+        b2 = self._post(
+            "/api/rust-builds",
+            {"build_id": "rb-idempotent-01", "cache_hits": 11, "cache_misses": 1},
+        )
+        self.assertEqual(b2["build"]["total_crates"], 12)
+        self.assertEqual(b2["build"]["cache_hits"], 11)
+        after_count = self._get("/api/rust-builds")["total_builds"]
+        self.assertEqual(after_count, before_count + 1)
+
+        # 6. Cross-origin POSTs and non-JSON POSTs are rejected
+        cross_req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/budget",
+            data=json.dumps({"max_daily_usd": 999}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(cross_req, timeout=10)
+        self.assertEqual(ctx.exception.code, 403)
+        ctx.exception.close()
+
+        text_req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/budget",
+            data=json.dumps({"max_daily_usd": 999}).encode("utf-8"),
+            headers={"Content-Type": "text/plain"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(text_req, timeout=10)
+        self.assertEqual(ctx.exception.code, 415)
+        ctx.exception.close()
+
 
 if __name__ == "__main__":
     unittest.main()
