@@ -24,7 +24,10 @@ add-apt-repository -y -n universe
 $APT update
 $APT install -y --no-install-recommends ca-certificates curl git jq unzip zip xz-utils zstd gnupg \
   build-essential cmake pkg-config libssl-dev python3 clang protobuf-compiler python3-pip \
-  libcap-dev libasound2-dev bubblewrap
+  libcap-dev libasound2-dev bubblewrap \
+  musl-tools lld libc++-dev libc++abi-dev
+# musl-tools .. libc++abi-dev: codex fork-release's static musl build
+# (.github/scripts/install-musl-build-tools.sh), which jobs here cannot apt-install.
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo "$VERSION_CODENAME") stable" \
