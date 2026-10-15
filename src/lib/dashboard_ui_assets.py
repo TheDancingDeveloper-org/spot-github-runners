@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 
-def render_dashboard_html() -> str:
+import html
+
+
+def render_dashboard_html(
+    project: str = "homelab-424523",
+    org: str = "swack-tools",
+) -> str:
     """Return the complete HTML document for the Spot Fleet & Rust Builder Web UI Dashboard."""
-    return DASHBOARD_HTML
+    safe_project = html.escape(str(project or "homelab-424523"), quote=True)
+    safe_org = html.escape(str(org or "swack-tools"), quote=True)
+    return DASHBOARD_HTML.replace(
+        '<span id="hdr-project-org">GCP Project: homelab-424523 · GitHub Org: swack-tools</span>',
+        f'<span id="hdr-project-org">GCP Project: {safe_project} · GitHub Org: {safe_org}</span>',
+        1,
+    )
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -1470,6 +1482,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     function renderAll() {
       if (!APP_STATE) return;
+      const hdrProjOrg = document.getElementById("hdr-project-org");
+      if (hdrProjOrg && APP_STATE.project && APP_STATE.org) {
+        hdrProjOrg.textContent = `GCP Project: ${APP_STATE.project} · GitHub Org: ${APP_STATE.org}`;
+      }
       document.getElementById("browser-tz-pill").textContent = `🕒 Browser TZ: ${BROWSER_TZ}`;
       document.getElementById("instances-tz-label").textContent = BROWSER_TZ;
 

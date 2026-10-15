@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import math
 import os
@@ -964,6 +966,11 @@ class DashboardStore:
                 f"VM template '{tpl_name}' benchmark ({tpl_bench}) is below profile minimum ({min_bench})"
             )
         disk_mode = str(profile.get("disk_category", "any")).lower()
+        tpl_boot_disk = str(vm_tpl.get("boot_disk_type", "")).strip()
+        if tpl_boot_disk == "hyperdisk-throughput":
+            raise ValueError(
+                f"VM template '{tpl_name}' boot disk type 'hyperdisk-throughput' is not supported as a boot disk"
+            )
         tpl_disk_cat = str(
             vm_tpl.get("disk_category") or disk_category(str(vm_tpl.get("data_disk_type", "pd-ssd")))
         ).lower()
@@ -1480,7 +1487,12 @@ class DashboardStore:
             target = str(payload.get("target", "global")).strip()
             if target not in ("global", "cicd_runner", "rust_builder"):
                 raise ValueError(f"Unsupported budget target: {target}")
-            normalized = normalize_budget(payload)
+            base_budget = (
+                dict(self.state["profiles"][target].get("budget", {}))
+                if target in ("cicd_runner", "rust_builder")
+                else dict(self.state.get("global_budget", {}))
+            )
+            normalized = normalize_budget({**base_budget, **payload})
             prev_profiles = copy.deepcopy(self.state["profiles"])
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_global = copy.deepcopy(self.state.get("global_budget", {}))
@@ -1883,12 +1895,30 @@ class DashboardStore:
             )
             if existing is None:
                 raise ValueError(f"Cloud-init template '{template_id}' not found")
+            old_role = str(existing.get("role", "cicd_runner")).strip()
+            target_role = role if "role" in payload else old_role
+            existing["role"] = target_role
             existing["content"] = content
             if name:
                 existing["name"] = name
             if description:
                 existing["description"] = description
             existing["updated_at"] = now_iso
+            if old_role != target_role and old_role in self.state["profiles"]:
+                fallback_tpl = next(
+                    (
+                        t["id"]
+                        for t in self.state["cloud_init_templates"]
+                        if t.get("role") == old_role and t.get("id") != existing["id"]
+                    ),
+                    None,
+                )
+                old_prof = self.state["profiles"][old_role]
+                if old_prof.get("cloud_init_template_id") == existing["id"]:
+                    old_prof["cloud_init_template_id"] = fallback_tpl
+                for vm_t in self.state.get("vm_templates", []):
+                    if vm_t.get("role") == old_role and vm_t.get("cloud_init_template_id") == existing["id"]:
+                        vm_t["cloud_init_template_id"] = fallback_tpl
             if payload.get("assign_to_profile", False) and existing["role"] in self.state["profiles"]:
                 prof = self.state["profiles"][existing["role"]]
                 prof["cloud_init_template_id"] = existing["id"]
@@ -2347,15 +2377,51 @@ class DashboardStore:
             }
 
     def record_rust_build(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Record a new Rust remote builder telemetry event."""
+        """Record a new Rust remote builder telemetry event or merge a partial update."""
         with self._lock:
             now_ts = time.time()
-            status_str = str(payload.get("status", "DELIVERED"))
-            is_unfinished = status_str.strip().upper() in UNFINISHED_BUILD_STATUSES
+            incoming_build_id = str(payload.get("build_id") or "").strip()
+            existing_idx = (
+                next(
+                    (
+                        idx
+                        for idx, b in enumerate(self.state["rust_builds"])
+                        if b.get("build_id") == incoming_build_id
+                    ),
+                    None,
+                )
+                if incoming_build_id
+                else None
+            )
+            existing_build = (
+                self.state["rust_builds"][existing_idx]
+                if existing_idx is not None
+                else {}
+            )
 
-            raw_duration = payload.get("total_duration_seconds")
-            raw_delivery = payload.get("delivery_duration_seconds")
-            raw_compile = payload.get("compile_duration_seconds")
+            status_str = str(payload.get("status", existing_build.get("status", "DELIVERED")))
+            is_unfinished = status_str.strip().upper() in UNFINISHED_BUILD_STATUSES
+            was_unfinished = (
+                str(existing_build.get("status", "QUEUED")).strip().upper() in UNFINISHED_BUILD_STATUSES
+                if existing_build
+                else True
+            )
+
+            raw_duration = (
+                payload.get("total_duration_seconds")
+                if "total_duration_seconds" in payload
+                else (existing_build.get("total_duration_seconds") if not was_unfinished else None)
+            )
+            raw_delivery = (
+                payload.get("delivery_duration_seconds")
+                if "delivery_duration_seconds" in payload
+                else (existing_build.get("delivery_duration_seconds") if not was_unfinished else None)
+            )
+            raw_compile = (
+                payload.get("compile_duration_seconds")
+                if "compile_duration_seconds" in payload
+                else (existing_build.get("compile_duration_seconds") if not was_unfinished else None)
+            )
             explicit_total = (
                 _finite_float(raw_duration, "total_duration_seconds", min_val=0.0)
                 if raw_duration is not None
@@ -2392,6 +2458,7 @@ class DashboardStore:
             has_hits = payload.get("cache_hits") is not None
             has_misses = payload.get("cache_misses") is not None
             has_total = payload.get("total_crates") is not None
+            has_existing_crates = bool(existing_build and int(existing_build.get("total_crates", 0)) > 0)
             if has_hits:
                 cache_hits = _finite_int(payload["cache_hits"], "cache_hits", min_val=0)
             elif has_total and has_misses:
@@ -2400,6 +2467,8 @@ class DashboardStore:
                     _finite_int(payload["total_crates"], "total_crates", min_val=0)
                     - _finite_int(payload["cache_misses"], "cache_misses", min_val=0),
                 )
+            elif has_existing_crates:
+                cache_hits = _finite_int(existing_build.get("cache_hits", 0), "cache_hits", min_val=0)
             else:
                 cache_hits = 0 if is_unfinished else 380
 
@@ -2409,18 +2478,61 @@ class DashboardStore:
                 cache_misses = max(
                     0, _finite_int(payload["total_crates"], "total_crates", min_val=0) - cache_hits
                 )
+            elif has_existing_crates:
+                cache_misses = _finite_int(existing_build.get("cache_misses", 0), "cache_misses", min_val=0)
             else:
                 cache_misses = 0 if is_unfinished else 25
 
             if has_total:
                 total_crates = _finite_int(payload["total_crates"], "total_crates", min_val=0)
+            elif has_existing_crates and not (has_hits or has_misses):
+                total_crates = _finite_int(existing_build.get("total_crates", 0), "total_crates", min_val=0)
             else:
                 total_crates = cache_hits + cache_misses
 
             if is_unfinished:
-                req_at = payload.get("requested_at") or _iso_seconds_ago(0, now_ts)
-                fin_at = payload.get("finished_at")
-                del_at = payload.get("delivered_at")
+                req_at = (
+                    payload.get("requested_at")
+                    or existing_build.get("requested_at")
+                    or _iso_seconds_ago(0, now_ts)
+                )
+                fin_at = (
+                    payload.get("finished_at")
+                    if "finished_at" in payload
+                    else existing_build.get("finished_at")
+                )
+                del_at = (
+                    payload.get("delivered_at")
+                    if "delivered_at" in payload
+                    else existing_build.get("delivered_at")
+                )
+            elif existing_build.get("requested_at") and not payload.get("requested_at"):
+                req_at = str(existing_build["requested_at"])
+                req_epoch = _iso_to_epoch(req_at)
+                if payload.get("finished_at"):
+                    fin_at = str(payload["finished_at"])
+                    fin_epoch = _iso_to_epoch(fin_at)
+                elif (
+                    existing_build.get("finished_at")
+                    and "total_duration_seconds" not in payload
+                    and "compile_duration_seconds" not in payload
+                ):
+                    fin_at = str(existing_build["finished_at"])
+                    fin_epoch = _iso_to_epoch(fin_at)
+                else:
+                    fin_epoch = req_epoch + max(0.0, duration - delivery_sec)
+                    fin_at = _iso_seconds_ago(0, fin_epoch)
+                if payload.get("delivered_at"):
+                    del_at = str(payload["delivered_at"])
+                elif (
+                    existing_build.get("delivered_at")
+                    and "total_duration_seconds" not in payload
+                    and "delivery_duration_seconds" not in payload
+                ):
+                    del_at = str(existing_build["delivered_at"])
+                else:
+                    del_epoch = fin_epoch + delivery_sec
+                    del_at = _iso_seconds_ago(0, del_epoch)
             else:
                 del_at = payload.get("delivered_at") or _iso_seconds_ago(0, now_ts)
                 del_epoch = _iso_to_epoch(str(del_at))
@@ -2430,15 +2542,32 @@ class DashboardStore:
                     max(0.0, duration - delivery_sec), fin_epoch
                 )
 
-            default_peak_ram = 0.0 if is_unfinished else 20.5
-            default_cpu_time = 0.0 if is_unfinished else 1120.0
+            existing_peak_ram = existing_build.get("peak_ram_gib")
+            default_peak_ram = (
+                existing_peak_ram
+                if (existing_peak_ram is not None and float(existing_peak_ram) > 0.0)
+                else (0.0 if is_unfinished else 20.5)
+            )
+            existing_cpu_time = existing_build.get("cpu_time_seconds")
+            default_cpu_time = (
+                existing_cpu_time
+                if (existing_cpu_time is not None and float(existing_cpu_time) > 0.0)
+                else (0.0 if is_unfinished else 1120.0)
+            )
 
             raw = {
-                "build_id": payload.get("build_id") or f"rb-{uuid.uuid4().hex[:8]}",
-                "project_name": payload.get("project_name", "oxidex"),
-                "profile": payload.get("profile", "release"),
-                "target_triple": payload.get("target_triple", "x86_64-unknown-linux-gnu"),
-                "commit_sha": payload.get("commit_sha", "af7c14f8cb2c"),
+                "build_id": incoming_build_id or f"rb-{uuid.uuid4().hex[:8]}",
+                "project_name": payload.get(
+                    "project_name", existing_build.get("project_name", "oxidex")
+                ),
+                "profile": payload.get("profile", existing_build.get("profile", "release")),
+                "target_triple": payload.get(
+                    "target_triple",
+                    existing_build.get("target_triple", "x86_64-unknown-linux-gnu"),
+                ),
+                "commit_sha": payload.get(
+                    "commit_sha", existing_build.get("commit_sha", "af7c14f8cb2c")
+                ),
                 "status": status_str,
                 "requested_at": req_at,
                 "finished_at": fin_at,
@@ -2447,18 +2576,36 @@ class DashboardStore:
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
                 "total_crates": total_crates,
-                "instance_name": payload.get("instance_name", "builder-oxidex-turin-01"),
-                "zone": payload.get("zone", "us-south1-b"),
-                "machine_type": payload.get("machine_type", "c4d-highcpu-16"),
-                "vcpu": _finite_int(payload.get("vcpu", 16), "vcpu", min_val=1),
-                "cpu_platform": payload.get("cpu_platform", "AMD Turin"),
-                "origin_ip": payload.get("origin_ip", "185.159.157.42"),
-                "origin_hostname": payload.get("origin_hostname"),
+                "instance_name": payload.get(
+                    "instance_name",
+                    existing_build.get("instance_name", "builder-oxidex-turin-01"),
+                ),
+                "zone": payload.get("zone", existing_build.get("zone", "us-south1-b")),
+                "machine_type": payload.get(
+                    "machine_type", existing_build.get("machine_type", "c4d-highcpu-16")
+                ),
+                "vcpu": _finite_int(
+                    payload.get("vcpu", existing_build.get("vcpu", 16)), "vcpu", min_val=1
+                ),
+                "cpu_platform": payload.get(
+                    "cpu_platform", existing_build.get("cpu_platform", "AMD Turin")
+                ),
+                "origin_ip": payload.get(
+                    "origin_ip", existing_build.get("origin_ip", "185.159.157.42")
+                ),
+                "origin_hostname": (
+                    payload.get("origin_hostname")
+                    if "origin_hostname" in payload
+                    else existing_build.get("origin_hostname")
+                ),
                 "peak_ram_gib": _finite_float(
                     payload.get("peak_ram_gib", default_peak_ram), "peak_ram_gib", min_val=0.0
                 ),
                 "container_ram_cap_gib": _finite_float(
-                    payload.get("container_ram_cap_gib", 28.0),
+                    payload.get(
+                        "container_ram_cap_gib",
+                        existing_build.get("container_ram_cap_gib", 28.0),
+                    ),
                     "container_ram_cap_gib",
                     min_val=0.1,
                 ),
@@ -2469,14 +2616,6 @@ class DashboardStore:
                 ),
             }
             enriched = enrich_rust_build_record(raw, project=self.project)
-            existing_idx = next(
-                (
-                    idx
-                    for idx, b in enumerate(self.state["rust_builds"])
-                    if b.get("build_id") == enriched["build_id"]
-                ),
-                None,
-            )
             if existing_idx is not None:
                 self.state["rust_builds"][existing_idx] = enriched
             else:
@@ -2496,20 +2635,49 @@ class DashboardStore:
             }
 
 
-def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
+def _is_loopback_host(host: str) -> bool:
+    """Return True only if host is localhost or an IPv4/IPv6 loopback address."""
+    cleaned = (host or "").strip().lower()
+    if not cleaned:
+        return False
+    if cleaned == "localhost":
+        return True
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def make_handler(
+    store: DashboardStore,
+    *,
+    auth_token: str | None = None,
+) -> type[BaseHTTPRequestHandler]:
     """Create the HTTP handler bound to a DashboardStore instance."""
     from .dashboard_ui_assets import render_dashboard_html
+
+    expected_token = str(auth_token).strip() if auth_token else ""
 
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
 
-        def _send_json(self, data: Any, status: int = HTTPStatus.OK) -> None:
+        def _send_json(
+            self,
+            data: Any,
+            status: int = HTTPStatus.OK,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             body = json.dumps(data, allow_nan=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -2521,6 +2689,25 @@ def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def _check_auth(self) -> bool:
+            """Verify Bearer token or X-Dashboard-Token when authentication is configured."""
+            if not expected_token:
+                return True
+            auth_hdr = (self.headers.get("Authorization") or "").strip()
+            candidate = ""
+            if auth_hdr.lower().startswith("bearer "):
+                candidate = auth_hdr[7:].strip()
+            if not candidate:
+                candidate = (self.headers.get("X-Dashboard-Token") or "").strip()
+            if candidate and hmac.compare_digest(candidate, expected_token):
+                return True
+            self._send_json(
+                {"error": "Unauthorized: valid Bearer token or X-Dashboard-Token required"},
+                status=HTTPStatus.UNAUTHORIZED,
+                extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
+            )
+            return False
 
         def _validate_same_origin_json_post(self) -> tuple[bool, HTTPStatus, str]:
             """Verify mutating POST requests carry application/json and are not cross-origin."""
@@ -2567,12 +2754,14 @@ def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
             return json.loads(raw) if raw.strip() else {}
 
         def do_GET(self) -> None:  # noqa: N802
+            if not self._check_auth():
+                return
             parsed = urlparse(self.path)
             path = parsed.path
             qs = parse_qs(parsed.query)
 
             if path in ("/", "/index.html"):
-                self._send_html(render_dashboard_html())
+                self._send_html(render_dashboard_html(project=store.project, org=store.org))
                 return
 
             if path == "/api/health":
@@ -2628,6 +2817,8 @@ def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
             self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._check_auth():
+                return
             parsed = urlparse(self.path)
             path = parsed.path
             ok_req, err_status, err_msg = self._validate_same_origin_json_post()
@@ -2704,10 +2895,22 @@ def create_dashboard_server(
     state_path: Path | None = None,
     project: str = "homelab-424523",
     org: str = "swack-tools",
+    auth_token: str | None = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
     """Instantiate the ThreadingHTTPServer and DashboardStore."""
+    resolved_token = (
+        auth_token
+        if auth_token is not None
+        else os.environ.get("DASHBOARD_AUTH_TOKEN")
+    )
+    cleaned_token = str(resolved_token).strip() if resolved_token else ""
+    if not _is_loopback_host(host) and not cleaned_token:
+        raise ValueError(
+            f"Refusing to bind Web UI Dashboard to non-loopback address '{host}' without authentication. "
+            "Provide --auth-token or set DASHBOARD_AUTH_TOKEN, or bind to 127.0.0.1 / ::1 / localhost."
+        )
     store = DashboardStore(state_path=state_path, project=project, org=org)
-    handler = make_handler(store)
+    handler = make_handler(store, auth_token=cleaned_token or None)
     server = ThreadingHTTPServer((host, port), handler)
     return server, store
 
@@ -2722,6 +2925,11 @@ def args_parser():
     parser.add_argument("--port", type=int, default=8787, help="HTTP port (default: 8787)")
     parser.add_argument("--project", default="homelab-424523", help="GCP project ID")
     parser.add_argument("--org", default="swack-tools", help="GitHub organization")
+    parser.add_argument(
+        "--auth-token",
+        default=None,
+        help="Bearer token required for HTTP requests (mandatory for non-loopback --host; or set DASHBOARD_AUTH_TOKEN)",
+    )
     parser.add_argument(
         "--state-file",
         type=Path,
@@ -2749,6 +2957,7 @@ def main(argv: list[str] | None = None) -> int:
         state_path=args.state_file,
         project=args.project,
         org=args.org,
+        auth_token=args.auth_token,
     )
     actual_host, actual_port = server.server_address[:2]
     print(f"Spot Fleet & Rust Builder Web UI Dashboard listening on http://{actual_host}:{actual_port}")

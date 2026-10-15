@@ -1160,8 +1160,274 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(fast_del_res["build"]["total_duration_seconds"], 4.0)
 
+    def test_round7_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            set_live_spot_pricing_override,
+        )
+        from lib.dashboard_ui_assets import render_dashboard_html
+
+        # 1. Live Spot pricing catalog / capacityHistory rates are used in calculate_spot_pricing and qualify_instances
+        try:
+            set_live_spot_pricing_override(
+                {
+                    "source": "gcp_capacity_history",
+                    "machine_hourly": {("us-south1", "c4d-standard-16"): 0.0550},
+                    "component_rates": {
+                        ("spot", "us-south1", "n4", "CPU"): 0.0020,
+                        ("spot", "us-south1", "n4", "RAM"): 0.00025,
+                    },
+                    "disk_monthly_gib": {("us-south1", "hyperdisk-balanced"): 0.050},
+                }
+            )
+            live_qual = qualify_instances(
+                self.store.state["profiles"]["cicd_runner"],
+                {"us-south1": True},
+            )
+            self.assertEqual(live_qual["pricing_source"], "gcp_capacity_history")
+            c4d_16 = next(
+                c
+                for c in live_qual["hardware_qualifying"]
+                if c["machine_type"] == "c4d-standard-16"
+            )
+            self.assertEqual(c4d_16["pricing"]["pricing_source"], "gcp_capacity_history")
+            self.assertEqual(c4d_16["pricing"]["compute_hourly_usd"], 0.0550)
+            self.assertEqual(c4d_16["pricing"]["disk_monthly_usd"], 7.00)
+            n4_16 = next(
+                c
+                for c in live_qual["hardware_qualifying"]
+                if c["machine_type"] == "n4-standard-16"
+            )
+            self.assertEqual(n4_16["pricing"]["pricing_source"], "gcp_billing_catalog")
+            self.assertEqual(n4_16["pricing"]["compute_hourly_usd"], 0.0480)
+        finally:
+            set_live_spot_pricing_override(None)
+
+        # 2 & 3. Stale is_oom=True on timeout runs and undated OOM events are rejected by evaluate_scaling_decision
+        now_iso = self._get("/api/overview")["updated_at"]
+        oom_guard_eval = evaluate_scaling_decision(
+            policy={
+                "min_runners": 4,
+                "max_runners": 16,
+                "runners_per_instance": 4,
+                "enable_github_ci_oom_trigger": True,
+                "enable_journal_oom_trigger": True,
+                "enable_cpu_utilization_trigger": False,
+                "enable_hourly_runs_scale_down": False,
+            },
+            telemetry={
+                "current_runners": 4,
+                "current_instances": 1,
+                "jobs_ran_past_hour": 6,
+                "provisioned_jobs": 1,
+                "queued_jobs": 0,
+                "instance_cpu_percentages": [20.0],
+                "github_oom_runs": [
+                    {
+                        "id": "stale-timeout-with-is-oom",
+                        "run_id": 38596411473,
+                        "job_id": 115964282184,
+                        "runner_name": "gha-oxidex-runners-us-south1-a-01",
+                        "failed_at": now_iso,
+                        "is_oom": True,
+                        "error_excerpt": "##[error]Timeout reached, aborting!",
+                    },
+                    {
+                        "id": "undated-gh-oom",
+                        "run_id": 37192272062,
+                        "job_id": 111407847874,
+                        "runner_name": "gha-oxidex-runners-us-south1-a-01",
+                        "error_excerpt": "##[error]Process completed with exit code 137.",
+                    },
+                ],
+                "journal_oom_events": [
+                    {
+                        "id": "undated-journal-oom",
+                        "instance_name": "oxidex-runners-dallas-01",
+                        "process": "rustc",
+                        "pid": 4242,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(oom_guard_eval["scale_up_reasons"], [])
+        self.assertEqual(oom_guard_eval["direction"], "hold")
+
+        # 4. Partial updates to an existing Rust build_id merge with existing build fields instead of resetting to defaults
+        self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-partial-merge-01",
+                "status": "QUEUED",
+                "project_name": "custom-rust-workspace",
+                "profile": "bench",
+                "target_triple": "aarch64-unknown-linux-gnu",
+                "commit_sha": "deadbeef1234",
+                "requested_at": "2026-10-15T10:00:00Z",
+                "instance_name": "builder-oxidex-eu-01",
+                "zone": "europe-west4-a",
+                "machine_type": "n4-highcpu-16",
+                "cpu_platform": "Intel Emerald Rapids",
+                "origin_ip": "185.220.101.55",
+            },
+        )
+        completed_merge = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-partial-merge-01",
+                "status": "DELIVERED",
+                "total_duration_seconds": 60.0,
+                "cache_hits": 200,
+                "total_crates": 220,
+            },
+        )["build"]
+        self.assertEqual(completed_merge["project_name"], "custom-rust-workspace")
+        self.assertEqual(completed_merge["profile"], "bench")
+        self.assertEqual(completed_merge["target_triple"], "aarch64-unknown-linux-gnu")
+        self.assertEqual(completed_merge["commit_sha"], "deadbeef1234")
+        self.assertEqual(completed_merge["requested_at"], "2026-10-15T10:00:00Z")
+        self.assertEqual(completed_merge["instance_name"], "builder-oxidex-eu-01")
+        self.assertEqual(completed_merge["zone"], "europe-west4-a")
+        self.assertEqual(completed_merge["origin_ip"], "185.220.101.55")
+        self.assertEqual(completed_merge["total_duration_seconds"], 60.0)
+
+        # 5. Non-loopback bind requires auth_token, and auth_token enforces Bearer / X-Dashboard-Token
+        with self.assertRaises(ValueError):
+            create_dashboard_server(host="0.0.0.0", port=0, state_path=self.state_file)
+
+        auth_srv, _ = create_dashboard_server(
+            host="127.0.0.1",
+            port=0,
+            state_path=self.state_file,
+            project="custom-proj-777",
+            org="custom-org-777",
+            auth_token="super-secret-token-777",
+        )
+        auth_port = auth_srv.server_address[1]
+        auth_thread = threading.Thread(target=auth_srv.serve_forever, daemon=True)
+        auth_thread.start()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(f"http://127.0.0.1:{auth_port}/api/overview", timeout=5)
+            self.assertEqual(ctx.exception.code, 401)
+            ctx.exception.close()
+
+            authed_req = urllib.request.Request(
+                f"http://127.0.0.1:{auth_port}/",
+                headers={"Authorization": "Bearer super-secret-token-777"},
+            )
+            with urllib.request.urlopen(authed_req, timeout=5) as resp:
+                authed_html = resp.read().decode("utf-8")
+            # 10. Header renders configured project and org
+            self.assertIn("GCP Project: custom-proj-777 · GitHub Org: custom-org-777", authed_html)
+        finally:
+            auth_srv.shutdown()
+            auth_srv.server_close()
+            auth_thread.join(timeout=5)
+
+        self.assertIn(
+            "GCP Project: p-alpha · GitHub Org: o-beta",
+            render_dashboard_html(project="p-alpha", org="o-beta"),
+        )
+
+        # 6. Partial POST /api/budget preserves omitted fields on the target budget
+        self._post(
+            "/api/budget",
+            {
+                "target": "rust_builder",
+                "active_period": "month",
+                "max_hourly_usd": 3.25,
+                "max_daily_usd": 19.50,
+                "max_monthly_usd": 240.00,
+                "include_disk_costs": False,
+                "include_taxes": True,
+                "tax_rate_percent": 11.5,
+            },
+        )
+        partial_b = self._post(
+            "/api/budget",
+            {"target": "rust_builder", "max_daily_usd": 22.00},
+        )["budget"]
+        self.assertEqual(partial_b["max_daily_usd"], 22.00)
+        self.assertEqual(partial_b["max_hourly_usd"], 3.25)
+        self.assertEqual(partial_b["max_monthly_usd"], 240.00)
+        self.assertEqual(partial_b["active_period"], "month")
+        self.assertFalse(partial_b["include_disk_costs"])
+        self.assertTrue(partial_b["include_taxes"])
+        self.assertEqual(partial_b["tax_rate_percent"], 11.5)
+
+        # 7. Default runner cloud-init templates add Docker apt repo and bootstrap the GitHub Actions runner service
+        for tpl_str in (DEFAULT_RUNNER_CLOUD_INIT, DEFAULT_RUNNER_STRICT_CLOUD_INIT):
+            parsed_def = parse_cloud_init(tpl_str)
+            self.assertTrue(parsed_def["valid"], parsed_def["warnings"])
+            self.assertIn("/etc/apt/sources.list.d/docker.list", tpl_str)
+            self.assertIn("actions-runner-linux-x64", tpl_str)
+            self.assertIn("./config.sh --unattended", tpl_str)
+            self.assertIn("./svc.sh install runner && ./svc.sh start", tpl_str)
+
+        # 8. Saving an existing cloud-init template with an updated role persists the new role and assigns to that role
+        created_ci = self._post(
+            "/api/cloud-init/save",
+            {
+                "mode": "save_as",
+                "name": "Role Switchable Template",
+                "role": "cicd_runner",
+                "content": DEFAULT_RUNNER_CLOUD_INIT,
+                "assign_to_profile": True,
+            },
+        )["template"]
+        switched_ci = self._post(
+            "/api/cloud-init/save",
+            {
+                "mode": "save",
+                "id": created_ci["id"],
+                "name": "Role Switchable Template (Builder)",
+                "role": "rust_builder",
+                "content": DEFAULT_RUNNER_CLOUD_INIT,
+                "assign_to_profile": True,
+            },
+        )["template"]
+        self.assertEqual(switched_ci["role"], "rust_builder")
+        self.assertEqual(
+            self.store.state["profiles"]["rust_builder"]["cloud_init_template_id"],
+            created_ci["id"],
+        )
+        self.assertNotEqual(
+            self.store.state["profiles"]["cicd_runner"]["cloud_init_template_id"],
+            created_ci["id"],
+        )
+
+        # 9. qualify_instances never selects hyperdisk-throughput as a boot disk even when data_disk_gb >= 2048
+        hd_tp_qual = qualify_instances(
+            {
+                "role": "cicd_runner",
+                "min_runners": 4,
+                "min_instances": 1,
+                "max_instances": 8,
+                "runner_vcpu": 4,
+                "runner_ram_gib": 16,
+                "min_instance_vcpu": 16,
+                "min_instance_ram_gib": 64,
+                "min_benchmark_score": 1000,
+                "disk_category": "any",
+                "disk_type": "hyperdisk-throughput",
+                "boot_disk_gb": 40,
+                "data_disk_gb": 2048,
+                "budget": {
+                    "max_hourly_usd": 20.0,
+                    "max_daily_usd": 200.0,
+                    "max_monthly_usd": 5000.0,
+                },
+            },
+            {"us-south1": True, "africa-south1": True},
+        )
+        self.assertGreater(len(hd_tp_qual["hardware_qualifying"]), 0)
+        for cand in hd_tp_qual["hardware_qualifying"]:
+            self.assertNotEqual(cand["boot_disk_type"], "hyperdisk-throughput")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

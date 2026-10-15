@@ -163,11 +163,16 @@ def _is_recent_unhandled_oom(
     lookback_seconds: float,
 ) -> bool:
     """Return True if an OOM event is unhandled and occurred within the active lookback window."""
-    if evt.get("acknowledged") or evt.get("resolved") or evt.get("handled"):
+    if (
+        evt.get("acknowledged")
+        or evt.get("resolved")
+        or evt.get("handled")
+        or evt.get("active") is False
+    ):
         return False
-    ts_raw = evt.get("failed_at") or evt.get("observed_at")
+    ts_raw = evt.get("failed_at") or evt.get("observed_at") or evt.get("timestamp")
     if not ts_raw:
-        return bool(evt.get("active", True))
+        return False
     try:
         dt = datetime.fromisoformat(str(ts_raw).strip().replace("Z", "+00:00"))
         age_seconds = now_ts - dt.timestamp()
@@ -352,7 +357,12 @@ def evaluate_scaling_decision(
             classification = classify_github_ci_failure(excerpt, runner_name=runner_name)
             if not classification["is_self_hosted_runner"]:
                 continue
-            is_oom = run.get("is_oom") if "is_oom" in run else classification["is_oom"]
+            if (
+                run.get("is_oom") is False
+                or str(run.get("failure_classification", "")).strip().upper() == "TIMEOUT"
+            ):
+                continue
+            is_oom = bool(classification["is_oom"])
             if not is_oom:
                 continue
             any_confirmed_oom = True

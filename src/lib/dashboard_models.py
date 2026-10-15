@@ -4,13 +4,17 @@ VM templates, and Cloud-Init parser/visualizer for the Web UI Dashboard.
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import os
 import re
 import socket
 import time
 from typing import Any
 
+from .compute_api import AsyncGoogleApi
 from .machine_profiles import MACHINE_PROFILES
+from .spot_pricing import load_catalog_rates, spot_price
 
 
 HOURS_PER_DAY = Decimal("24")
@@ -83,8 +87,15 @@ runcmd:
   - install -m 0755 -d /etc/apt/keyrings
   - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   - chmod a+r /etc/apt/keyrings/docker.asc
+  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now docker
+  # 2. Download, Configure & Start GitHub Actions Runner Service
+  - install -d -m 0755 -o runner -g runner /opt/actions-runner
+  - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
+  - tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner && chown -R runner:runner /opt/actions-runner && rm -f /tmp/actions-runner.tar.gz
+  - 'bash -lc "set -a && . /etc/runner-setup.env && set +a && su - runner -c \"cd /opt/actions-runner && ./config.sh --unattended --replace --url ${GITHUB_ORG_URL} --token ${GITHUB_RUNNER_TOKEN} --runnergroup ${RUNNER_GROUP} --labels ${RUNNER_LABELS} --ephemeral\""'
+  - cd /opt/actions-runner && ./svc.sh install runner && ./svc.sh start
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -133,7 +144,14 @@ runcmd:
   - install -m 0755 -d /etc/apt/keyrings
   - curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
   - chmod a+r /etc/apt/keyrings/docker.asc
+  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
+  - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now containerd docker
+  - install -d -m 0755 -o runner -g runner /opt/actions-runner
+  - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
+  - tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner && chown -R runner:runner /opt/actions-runner && rm -f /tmp/actions-runner.tar.gz
+  - 'bash -lc "set -a && . /etc/runner-setup.env && set +a && su - runner -c \"cd /opt/actions-runner && ./config.sh --unattended --replace --url ${GITHUB_ORG_URL} --token ${GITHUB_RUNNER_TOKEN} --runnergroup ${RUNNER_GROUP} --labels ${RUNNER_LABELS} --ephemeral\""'
+  - cd /opt/actions-runner && ./svc.sh install runner && ./svc.sh start
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -571,6 +589,108 @@ def compatible_disk_types(family: str) -> list[str]:
     return ["pd-balanced", "pd-ssd", "pd-standard"]
 
 
+_LIVE_SPOT_PRICING_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_LIVE_PRICING_OVERRIDE: dict[str, Any] | None = None
+
+
+def set_live_spot_pricing_override(override: dict[str, Any] | None) -> None:
+    """Set or clear a live Spot pricing catalog override (used for testing or manual cache injection)."""
+    global _LIVE_PRICING_OVERRIDE
+    _LIVE_PRICING_OVERRIDE = override
+
+
+def fetch_live_spot_pricing(
+    project: str = "homelab-424523",
+    *,
+    regions: list[str] | None = None,
+    machine_types: list[str] | None = None,
+    api_key: str | None = None,
+    access_token: str | None = None,
+    ttl_seconds: float = 300.0,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Fetch and cache current regional Spot prices from GCP Billing Catalog and Compute capacityHistory."""
+    if _LIVE_PRICING_OVERRIDE is not None and not force_refresh:
+        return _LIVE_PRICING_OVERRIDE
+
+    eff_api_key = (
+        api_key
+        if api_key is not None
+        else (os.environ.get("GCP_BILLING_API_KEY") or os.environ.get("GOOGLE_CLOUD_BILLING_API_KEY"))
+    )
+    eff_token = (
+        access_token
+        if access_token is not None
+        else (os.environ.get("GCP_ACCESS_TOKEN") or os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN"))
+    )
+    if not eff_api_key and not eff_token:
+        return {
+            "source": "catalog_baseline",
+            "component_rates": {},
+            "machine_hourly": {},
+            "disk_monthly_gib": {},
+        }
+
+    target_regions = tuple(sorted(regions or [r["region"] for r in REGIONS_CATALOG]))
+    target_machines = tuple(sorted(machine_types or [s["machine_type"] for s in MACHINE_SHAPES_CATALOG]))
+    cache_key = (project, target_regions, target_machines, bool(eff_api_key), bool(eff_token))
+    now_ts = time.time()
+    cached = _LIVE_SPOT_PRICING_CACHE.get(cache_key)
+    if cached is not None and not force_refresh and (now_ts - float(cached.get("fetched_at", 0.0))) < ttl_seconds:
+        return cached
+
+    async def _query_gcp_pricing() -> tuple[dict[tuple[str, str, str, str], float], dict[tuple[str, str], float]]:
+        comp_rates: dict[tuple[str, str, str, str], float] = {}
+        mach_hourly: dict[tuple[str, str], float] = {}
+        if eff_api_key:
+            try:
+                comp_rates = await load_catalog_rates(eff_api_key)
+            except (OSError, ValueError, RuntimeError):
+                # Network or Billing API errors fall back to Compute capacityHistory or catalog baseline rates.
+                comp_rates = {}
+        if eff_token:
+            api = AsyncGoogleApi(eff_token, concurrency=32)
+            reg_map = {r["region"]: r for r in REGIONS_CATALOG}
+            shape_map = {s["machine_type"]: s for s in MACHINE_SHAPES_CATALOG}
+            tasks = []
+            for reg_code in target_regions:
+                reg_meta = reg_map.get(reg_code)
+                for m_type in target_machines:
+                    s_meta = shape_map.get(m_type)
+                    if reg_meta and s_meta and s_meta["family"] not in reg_meta["families"]:
+                        continue
+                    tasks.append(spot_price(api, project, reg_code, m_type))
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, tuple) and len(res) == 3:
+                        r_code, m_name, hr_price = res
+                        if hr_price is not None and hr_price > 0:
+                            mach_hourly[(str(r_code), str(m_name))] = float(hr_price)
+        return comp_rates, mach_hourly
+
+    try:
+        comp_rates, mach_hourly = asyncio.run(_query_gcp_pricing())
+    except (OSError, ValueError, RuntimeError):
+        # If an event loop is already running or GCP API calls fail, fall back cleanly to baseline rates.
+        comp_rates, mach_hourly = {}, {}
+
+    source = (
+        "gcp_capacity_history"
+        if mach_hourly
+        else ("gcp_billing_catalog" if comp_rates else "catalog_baseline")
+    )
+    payload = {
+        "source": source,
+        "fetched_at": now_ts,
+        "component_rates": comp_rates,
+        "machine_hourly": mach_hourly,
+        "disk_monthly_gib": {},
+    }
+    _LIVE_SPOT_PRICING_CACHE[cache_key] = payload
+    return payload
+
+
 def calculate_spot_pricing(
     *,
     family: str,
@@ -582,20 +702,73 @@ def calculate_spot_pricing(
     data_disk_type: str,
     data_disk_gb: int,
     tax_rate_percent: float = 0.0,
-) -> dict[str, float]:
+    machine_type: str | None = None,
+    live_pricing: dict[str, Any] | None = None,
+    project: str = "homelab-424523",
+) -> dict[str, Any]:
     """Calculate compute-only and all-in (with disk & taxes) hourly, daily, and monthly prices."""
     reg_info = next((r for r in REGIONS_CATALOG if r["region"] == region), None)
     mult = _dec(reg_info["price_multiplier"] if reg_info else "1.0")
-    cpu_rate, ram_rate = SERIES_SPOT_BASE_RATES.get(
-        family, (Decimal("0.0040"), Decimal("0.00045"))
+    resolved_live = (
+        live_pricing
+        if live_pricing is not None
+        else fetch_live_spot_pricing(
+            project=project,
+            regions=[region],
+            machine_types=[machine_type] if machine_type else None,
+        )
     )
-    compute_hourly = (cpu_rate * _dec(vcpu) + ram_rate * _dec(ram_gib)) * mult
+    machine_hourly_map = (resolved_live or {}).get("machine_hourly") or {}
+    comp_rates_map = (resolved_live or {}).get("component_rates") or {}
+    disk_rates_map = (resolved_live or {}).get("disk_monthly_gib") or {}
+
+    live_machine_rate = None
+    if machine_type:
+        live_machine_rate = machine_hourly_map.get((region, machine_type))
+        if live_machine_rate is None:
+            live_machine_rate = machine_hourly_map.get(f"{region}/{machine_type}")
+
+    series_key = family.lower()
+    live_cpu_rate = comp_rates_map.get(("spot", region, series_key, "CPU"))
+    live_ram_rate = comp_rates_map.get(("spot", region, series_key, "RAM"))
+
+    if live_machine_rate is not None:
+        compute_hourly = _dec(live_machine_rate)
+        pricing_source = "gcp_capacity_history"
+    elif live_cpu_rate is not None and live_ram_rate is not None:
+        compute_hourly = _dec(live_cpu_rate) * _dec(vcpu) + _dec(live_ram_rate) * _dec(ram_gib)
+        pricing_source = "gcp_billing_catalog"
+    else:
+        cpu_rate, ram_rate = SERIES_SPOT_BASE_RATES.get(
+            family, (Decimal("0.0040"), Decimal("0.00045"))
+        )
+        compute_hourly = (cpu_rate * _dec(vcpu) + ram_rate * _dec(ram_gib)) * mult
+        pricing_source = str((resolved_live or {}).get("source") or "catalog_baseline")
+
     compute_daily = compute_hourly * HOURS_PER_DAY
     compute_monthly = compute_hourly * HOURS_PER_MONTH
 
-    boot_rate = DISK_MONTHLY_RATES_USD_PER_GIB.get(boot_disk_type, Decimal("0.080"))
-    data_rate = DISK_MONTHLY_RATES_USD_PER_GIB.get(data_disk_type, Decimal("0.080"))
-    disk_monthly = (boot_rate * _dec(boot_disk_gb) + data_rate * _dec(data_disk_gb)) * mult
+    live_boot_disk = (
+        disk_rates_map.get((region, boot_disk_type))
+        or disk_rates_map.get(f"{region}/{boot_disk_type}")
+        or disk_rates_map.get(boot_disk_type)
+    )
+    live_data_disk = (
+        disk_rates_map.get((region, data_disk_type))
+        or disk_rates_map.get(f"{region}/{data_disk_type}")
+        or disk_rates_map.get(data_disk_type)
+    )
+    boot_rate = (
+        _dec(live_boot_disk)
+        if live_boot_disk is not None
+        else DISK_MONTHLY_RATES_USD_PER_GIB.get(boot_disk_type, Decimal("0.080")) * mult
+    )
+    data_rate = (
+        _dec(live_data_disk)
+        if live_data_disk is not None
+        else DISK_MONTHLY_RATES_USD_PER_GIB.get(data_disk_type, Decimal("0.080")) * mult
+    )
+    disk_monthly = boot_rate * _dec(boot_disk_gb) + data_rate * _dec(data_disk_gb)
     disk_daily = disk_monthly / DAYS_PER_MONTH
     disk_hourly = disk_daily / HOURS_PER_DAY
 
@@ -610,6 +783,7 @@ def calculate_spot_pricing(
     total_monthly = total_hourly * HOURS_PER_MONTH
 
     return {
+        "pricing_source": pricing_source,
         "compute_hourly_usd": _money4(compute_hourly),
         "compute_daily_usd": _money(compute_daily),
         "compute_monthly_usd": _money(compute_monthly),
@@ -729,6 +903,7 @@ def qualify_instances(
     regions_state: dict[str, bool],
     project: str = "homelab-424523",
     region_latencies_ms: dict[str, int] | None = None,
+    live_pricing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate all regional machine shapes against workload sizing, CPU benchmark score,
     disk compatibility, enabled regions, and Spot + disk budget caps.
@@ -760,6 +935,13 @@ def qualify_instances(
     include_disk = budget["include_disk_costs"]
     include_taxes = budget["include_taxes"]
     override_regional_tax = bool(budget.get("override_regional_tax", False))
+
+    enabled_regions = [r["region"] for r in REGIONS_CATALOG if regions_state.get(r["region"], True)]
+    resolved_live_pricing = (
+        live_pricing
+        if live_pricing is not None
+        else fetch_live_spot_pricing(project=project, regions=enabled_regions)
+    )
 
     hardware_qualifying: list[dict[str, Any]] = []
     spot_price_qualifying: list[dict[str, Any]] = []
@@ -844,11 +1026,22 @@ def qualify_instances(
                     continue
                 chosen_data_disk = fallback[0]
 
-            chosen_boot_disk = (
-                "hyperdisk-balanced"
-                if "hyperdisk-balanced" in allowed_disks and family in ("c4d", "n4d", "c4", "n4")
-                else chosen_data_disk
-            )
+            # GCP does not allow hyperdisk-throughput as a boot disk on any machine series.
+            boot_candidates = [d for d in allowed_disks if d != "hyperdisk-throughput"]
+            if not boot_candidates:
+                disqualified_counts["incompatible_disk"] += 1
+                continue
+            if family in ("c4d", "n4d", "c4", "n4"):
+                if "hyperdisk-balanced" not in boot_candidates:
+                    disqualified_counts["incompatible_disk"] += 1
+                    continue
+                chosen_boot_disk = "hyperdisk-balanced"
+            elif chosen_data_disk != "hyperdisk-throughput":
+                chosen_boot_disk = chosen_data_disk
+            elif "hyperdisk-balanced" in boot_candidates:
+                chosen_boot_disk = "hyperdisk-balanced"
+            else:
+                chosen_boot_disk = boot_candidates[0]
 
             pricing = calculate_spot_pricing(
                 family=family,
@@ -860,6 +1053,9 @@ def qualify_instances(
                 data_disk_type=chosen_data_disk,
                 data_disk_gb=data_disk_gb,
                 tax_rate_percent=tax_rate,
+                machine_type=shape["machine_type"],
+                live_pricing=resolved_live_pricing,
+                project=project,
             )
 
             if include_disk:
@@ -944,6 +1140,7 @@ def qualify_instances(
 
     return {
         "role": role,
+        "pricing_source": str((resolved_live_pricing or {}).get("source") or "catalog_baseline"),
         "requirements": {
             "min_runners": min_runners,
             "min_instances": min_instances,
