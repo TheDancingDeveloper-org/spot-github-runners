@@ -209,7 +209,7 @@ def default_scaling_config() -> dict[str, Any]:
             # Max scale-up budget (including disk costs)
             "max_scale_up_hourly_usd": 5.00,
             "max_scale_up_daily_usd": 10.00,
-            "max_scale_up_monthly_usd": 300.00,
+            "max_scale_up_monthly_usd": 50.00,
             "include_disk_in_scale_budget": True,
         },
         "rust_builder": {
@@ -435,7 +435,7 @@ def evaluate_scaling_decision(
 
     # Scale-down evaluation (only when no scale-up triggers fired, no jobs are queued,
     # and target preserves capacity for both min_runners and active provisioned_jobs)
-    capacity_floor = max(min_runners, provisioned_jobs)
+    capacity_floor = min(max_runners, max(min_runners, provisioned_jobs))
     if not scale_up_reasons:
         if (
             cfg.get("enable_hourly_runs_scale_down", True)
@@ -496,7 +496,7 @@ def evaluate_scaling_decision(
     unit_hourly = max(0.0001, float(per_instance_hourly_usd))
     max_hourly_cap = float(cfg.get("max_scale_up_hourly_usd", 5.00))
     max_daily_cap = float(cfg.get("max_scale_up_daily_usd", 10.00))
-    max_monthly_cap = float(cfg.get("max_scale_up_monthly_usd", 300.00))
+    max_monthly_cap = float(cfg.get("max_scale_up_monthly_usd", 50.00))
 
     effective_hourly_cap = min(
         max_hourly_cap,
@@ -651,14 +651,17 @@ def evaluate_builder_scaling_decision(
             )
             desired_instances = max(desired_instances, current_instances + 1)
 
-    capacity_floor = max(min_instances, active_builds)
+    capacity_floor = min(max_instances, max(min_instances, active_builds))
     if not scale_up_reasons:
         if (
             cfg.get("enable_low_builds_scale_down", True)
             and builds_ran_past_hour <= int(cfg.get("scale_down_max_builds_past_hour", 2))
             and queued_builds == 0
         ):
-            low_target = max(capacity_floor, int(cfg.get("scale_down_target_instances", min_instances)))
+            low_target = min(
+                max_instances,
+                max(capacity_floor, int(cfg.get("scale_down_target_instances", min_instances))),
+            )
             if low_target < current_instances:
                 scale_down_reasons.append(
                     {
@@ -672,9 +675,9 @@ def evaluate_builder_scaling_decision(
                 )
                 desired_instances = low_target
             else:
-                desired_instances = max(capacity_floor, current_instances)
+                desired_instances = min(max_instances, max(capacity_floor, current_instances))
         else:
-            desired_instances = max(capacity_floor, current_instances)
+            desired_instances = min(max_instances, max(capacity_floor, current_instances))
     else:
         desired_instances = min(max_instances, max(capacity_floor, desired_instances))
 

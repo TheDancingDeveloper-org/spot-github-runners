@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -39,6 +40,9 @@ from .dashboard_scaling import (
     parse_github_oom_deep_link,
 )
 from .rust_build_telemetry import (
+    UNFINISHED_BUILD_STATUSES,
+    _finite_float,
+    _finite_int,
     classify_ip_and_network,
     enrich_rust_build_record,
 )
@@ -279,7 +283,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
                 "active_period": "day",
                 "max_hourly_usd": 5.00,
                 "max_daily_usd": 10.00,
-                "max_monthly_usd": 300.00,
+                "max_monthly_usd": 50.00,
                 "include_disk_costs": True,
                 "include_taxes": True,
                 "tax_rate_percent": 8.25,
@@ -805,7 +809,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "active_period": "day",
             "max_hourly_usd": 5.00,
             "max_daily_usd": 10.00,
-            "max_monthly_usd": 300.00,
+            "max_monthly_usd": 50.00,
             "include_disk_costs": True,
             "include_taxes": True,
             "tax_rate_percent": 8.25,
@@ -1014,6 +1018,28 @@ class DashboardStore:
         self._sync_rust_build_telemetry()
         self._sync_template_density()
 
+    @staticmethod
+    def _instance_hourly_for_budget(
+        pricing: dict[str, Any],
+        *,
+        include_disk: bool,
+        include_tax: bool,
+        fallback_hourly: float = 0.16,
+    ) -> float:
+        """Compute hourly USD for a single instance under the configured disk and tax flags."""
+        compute_hr = float(pricing.get("compute_hourly_usd", fallback_hourly))
+        if not include_disk:
+            if include_tax:
+                tax_pct = float(pricing.get("tax_rate_percent", 0.0))
+                return round(compute_hr * (1.0 + tax_pct / 100.0), 4)
+            return compute_hr
+        if include_tax:
+            return float(pricing.get("total_hourly_usd", fallback_hourly))
+        return round(
+            compute_hr + float(pricing.get("disk_hourly_usd", 0.0)),
+            4,
+        )
+
     def _resolve_scaling_unit_hourly_usd(
         self,
         role: str,
@@ -1042,14 +1068,11 @@ class DashboardStore:
 
         def _offer_hourly(offer: dict[str, Any]) -> float:
             pricing = offer.get("pricing", {})
-            if not include_disk:
-                return float(pricing.get("compute_hourly_usd", offer.get("evaluated_hourly_usd", 0.16)))
-            if include_tax:
-                return float(pricing.get("total_hourly_usd", offer.get("evaluated_hourly_usd", 0.16)))
-            return round(
-                float(pricing.get("compute_hourly_usd", 0.0))
-                + float(pricing.get("disk_hourly_usd", 0.0)),
-                4,
+            return self._instance_hourly_for_budget(
+                pricing,
+                include_disk=include_disk,
+                include_tax=include_tax,
+                fallback_hourly=float(offer.get("evaluated_hourly_usd", 0.16)),
             )
 
         if qual is None:
@@ -1170,7 +1193,7 @@ class DashboardStore:
         if self.state_path:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(self.state, indent=2, allow_nan=False), encoding="utf-8")
             tmp.replace(self.state_path)
 
     def get_overview(
@@ -1994,70 +2017,79 @@ class DashboardStore:
                             f"is not available in region '{region}' "
                             f"(supported: {', '.join(reg_info.get('disk_types', []))})"
                         )
-                source_spec = vm_tpl or (running_in_region[0] if running_in_region else None)
+                source_spec: dict[str, Any] | None = vm_tpl
+                if source_spec is None:
+                    existing_cand = running_in_region[0] if running_in_region else None
+                    if existing_cand is not None:
+                        try:
+                            self._validate_vm_template_compatibility(existing_cand, prof, role)
+                            if (
+                                int(existing_cand.get("runner_vcpu", 0)) == int(prof["runner_vcpu"])
+                                and float(existing_cand.get("runner_ram_gib", 0.0))
+                                == float(prof["runner_ram_gib"])
+                            ):
+                                source_spec = existing_cand
+                        except ValueError:
+                            # Existing instance no longer matches updated profile requirements; select a qualifying offer below.
+                            source_spec = None
+                    if source_spec is None:
+                        reg_qual = qualify_instances(
+                            prof,
+                            {r["region"]: (r["region"] == region) for r in REGIONS_CATALOG},
+                            self.project,
+                            region_latencies_ms=self.state.get("region_latencies_ms"),
+                        )
+                        best_offer = (
+                            reg_qual["spot_price_qualifying"]
+                            or reg_qual["hardware_qualifying"]
+                            or [None]
+                        )[0]
+                        if best_offer is None:
+                            raise ValueError(
+                                f"No machine shape in region '{region}' satisfies the sizing and hardware "
+                                f"requirements for role '{role}'"
+                            )
+                        source_spec = {
+                            "machine_type": best_offer["machine_type"],
+                            "vcpu": best_offer["vcpu"],
+                            "ram_gib": best_offer["ram_gib"],
+                            "cpu_platform": best_offer["cpu_platform"],
+                            "boot_disk_type": best_offer["boot_disk_type"],
+                            "boot_disk_gb": best_offer["boot_disk_gb"],
+                            "data_disk_type": best_offer["data_disk_type"],
+                            "data_disk_gb": best_offer["data_disk_gb"],
+                            "runner_vcpu": best_offer["unit_vcpu"],
+                            "runner_ram_gib": best_offer["unit_ram_gib"],
+                            "runners_count": best_offer["units_per_instance"],
+                            "cloud_init_template_id": prof.get(
+                                "cloud_init_template_id", "ci-runner-default"
+                            ),
+                            "vm_template_id": None,
+                        }
+
+                new_records: list[dict[str, Any]] = []
                 for idx in range(current_count + 1, target_count + 1):
                     zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]
-                    machine_type = (
-                        source_spec["machine_type"]
-                        if source_spec
-                        else ("n2-standard-16" if "n2" in reg_info["families"] else "n4-standard-16")
-                    )
-                    vcpu = int(source_spec["vcpu"]) if source_spec else int(prof.get("min_instance_vcpu", 16))
-                    ram_gib = (
-                        float(source_spec["ram_gib"])
-                        if source_spec
-                        else float(prof.get("min_instance_ram_gib", 64))
-                    )
-                    cpu_platform = (
-                        source_spec["cpu_platform"]
-                        if source_spec
-                        else reg_info["cpu_platforms"][0]
-                    )
-                    default_disk_type = (
-                        prof.get("disk_type")
-                        if prof.get("disk_type") in reg_info["disk_types"]
-                        else reg_info["disk_types"][0]
-                    )
-                    boot_disk_type = (
-                        source_spec["boot_disk_type"]
-                        if source_spec
-                        else default_disk_type
-                    )
-                    boot_disk_gb = (
-                        int(source_spec.get("boot_disk_gb", prof.get("boot_disk_gb", 40)))
-                        if source_spec
-                        else int(prof.get("boot_disk_gb", 40))
-                    )
-                    data_disk_type = (
-                        source_spec["data_disk_type"]
-                        if source_spec
-                        else default_disk_type
-                    )
-                    data_disk_gb = (
-                        int(source_spec.get("data_disk_gb", prof.get("data_disk_gb", 100)))
-                        if source_spec
-                        else int(prof.get("data_disk_gb", 100))
-                    )
-                    runner_vcpu = int(source_spec["runner_vcpu"]) if source_spec else int(prof["runner_vcpu"])
-                    runner_ram = (
-                        float(source_spec["runner_ram_gib"])
-                        if source_spec
-                        else float(prof["runner_ram_gib"])
-                    )
-                    runners_cnt = (
-                        int(source_spec["runners_count"])
-                        if source_spec
-                        else max(1, min(vcpu // runner_vcpu, int(ram_gib // runner_ram)))
-                    )
+                    machine_type = source_spec["machine_type"]
+                    vcpu = int(source_spec["vcpu"])
+                    ram_gib = float(source_spec["ram_gib"])
+                    cpu_platform = source_spec["cpu_platform"]
+                    boot_disk_type = source_spec["boot_disk_type"]
+                    boot_disk_gb = int(source_spec.get("boot_disk_gb", prof.get("boot_disk_gb", 40)))
+                    data_disk_type = source_spec["data_disk_type"]
+                    data_disk_gb = int(source_spec.get("data_disk_gb", prof.get("data_disk_gb", 100)))
+                    runner_vcpu = int(source_spec["runner_vcpu"])
+                    runner_ram = float(source_spec["runner_ram_gib"])
+                    runners_cnt = int(source_spec["runners_count"])
                     cloud_init_id = (
                         source_spec.get("cloud_init_template_id")
-                        if source_spec and source_spec.get("cloud_init_template_id")
+                        if source_spec.get("cloud_init_template_id")
                         else prof.get("cloud_init_template_id", "ci-runner-default")
                     )
                     vm_tpl_id = (
                         vm_tpl["id"]
                         if vm_tpl
-                        else (source_spec.get("vm_template_id") if source_spec else None)
+                        else source_spec.get("vm_template_id")
                     )
                     prefix = "oxidex-runners" if role == "cicd_runner" else "builder-oxidex"
                     new_name = f"{prefix}-{region}-{uuid.uuid4().hex[:4]}"
@@ -2089,6 +2121,58 @@ class DashboardStore:
                         project=self.project,
                         now_epoch=now_ts,
                     )
+                    new_records.append(created)
+
+                pol = self.state.get("scaling", {}).get(role, {})
+                budget = prof.get("budget", {})
+                max_hourly_cap = float(
+                    pol.get("max_scale_up_hourly_usd", budget.get("max_hourly_usd", 5.0))
+                )
+                max_daily_cap = float(
+                    pol.get("max_scale_up_daily_usd", budget.get("max_daily_usd", 10.0))
+                )
+                max_monthly_cap = float(
+                    pol.get("max_scale_up_monthly_usd", budget.get("max_monthly_usd", 50.0))
+                )
+                include_disk = bool(
+                    pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
+                )
+                include_tax = bool(budget.get("include_taxes", False))
+                effective_hourly_cap = min(
+                    max_hourly_cap,
+                    max_daily_cap / 24.0,
+                    max_monthly_cap / (24.0 * 365.0 / 12.0),
+                )
+                existing_running_role = [
+                    i
+                    for i in self.state["instances"]
+                    if i["status"] == "RUNNING" and i["role"] == role
+                ]
+                projected_fleet_hourly = round(
+                    sum(
+                        self._instance_hourly_for_budget(
+                            i["pricing"], include_disk=include_disk, include_tax=include_tax
+                        )
+                        for i in existing_running_role + new_records
+                    ),
+                    4,
+                )
+                evaluator_unit_hourly = max(
+                    0.0001, float(self._resolve_scaling_unit_hourly_usd(role))
+                )
+                max_affordable_instances = max(
+                    0, int(math.floor(effective_hourly_cap / evaluator_unit_hourly))
+                )
+                if (
+                    projected_fleet_hourly > effective_hourly_cap
+                    or projected_total > max_affordable_instances
+                ):
+                    raise ValueError(
+                        f"Scaling up in {region} to {target_count} instance(s) (total fleet: {projected_total}, "
+                        f"projected ${projected_fleet_hourly:.4f}/hr) exceeds scale-up budget cap "
+                        f"(${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, ${max_monthly_cap:.2f}/mo) for role '{role}'"
+                    )
+                for created in new_records:
                     self.state["instances"].insert(0, created)
 
             self._sync_fleet_telemetry()
@@ -2112,22 +2196,32 @@ class DashboardStore:
         with self._lock:
             builds = list(self.state["rust_builds"])
             total_builds = len(builds)
+            completed_builds = [
+                b
+                for b in builds
+                if str(b.get("status", "DELIVERED")).strip().upper() not in UNFINISHED_BUILD_STATUSES
+            ]
+            completed_count = len(completed_builds)
             avg_duration = (
-                round(sum(b["total_duration_seconds"] for b in builds) / total_builds, 2)
-                if total_builds
+                round(
+                    sum(b["total_duration_seconds"] for b in completed_builds) / completed_count,
+                    2,
+                )
+                if completed_count
                 else 0.0
             )
-            total_hits = sum(b["cache_hits"] for b in builds)
-            total_crates = sum(b["total_crates"] for b in builds)
+            total_hits = sum(b["cache_hits"] for b in completed_builds)
+            total_crates = sum(b["total_crates"] for b in completed_builds)
             overall_hit_rate = round((total_hits / total_crates * 100.0) if total_crates else 0.0, 1)
-            max_peak_ram = max((b["peak_ram_gib"] for b in builds), default=0.0)
-            total_cpu_time = round(sum(b["cpu_time_seconds"] for b in builds), 2)
-            total_cpu_points = round(sum(b["cpu_points"] for b in builds), 2)
+            max_peak_ram = max((b["peak_ram_gib"] for b in completed_builds), default=0.0)
+            total_cpu_time = round(sum(b["cpu_time_seconds"] for b in completed_builds), 2)
+            total_cpu_points = round(sum(b["cpu_points"] for b in completed_builds), 2)
             vpn_or_tor_count = sum(
                 1 for b in builds if b["network_security"]["is_vpn"] or b["network_security"]["is_tor"]
             )
             return {
                 "total_builds": total_builds,
+                "completed_builds": completed_count,
                 "average_duration_seconds": avg_duration,
                 "total_cache_hits": total_hits,
                 "overall_cache_hit_rate_percent": overall_hit_rate,
@@ -2142,29 +2236,60 @@ class DashboardStore:
         """Record a new Rust remote builder telemetry event."""
         with self._lock:
             now_ts = time.time()
-            duration = float(payload.get("total_duration_seconds", 95.0))
-            delivery_sec = float(payload.get("delivery_duration_seconds", 8.0))
+            status_str = str(payload.get("status", "DELIVERED"))
+            is_unfinished = status_str.strip().upper() in UNFINISHED_BUILD_STATUSES
+
+            raw_duration = payload.get("total_duration_seconds")
+            duration = (
+                _finite_float(raw_duration, "total_duration_seconds", min_val=0.0)
+                if raw_duration is not None
+                else (0.0 if is_unfinished else 95.0)
+            )
+            raw_delivery = payload.get("delivery_duration_seconds")
+            delivery_sec = (
+                _finite_float(raw_delivery, "delivery_duration_seconds", min_val=0.0)
+                if raw_delivery is not None
+                else (0.0 if is_unfinished else 8.0)
+            )
             has_hits = payload.get("cache_hits") is not None
             has_misses = payload.get("cache_misses") is not None
             has_total = payload.get("total_crates") is not None
             if has_hits:
-                cache_hits = int(payload["cache_hits"])
+                cache_hits = _finite_int(payload["cache_hits"], "cache_hits", min_val=0)
             elif has_total and has_misses:
-                cache_hits = max(0, int(payload["total_crates"]) - int(payload["cache_misses"]))
+                cache_hits = max(
+                    0,
+                    _finite_int(payload["total_crates"], "total_crates", min_val=0)
+                    - _finite_int(payload["cache_misses"], "cache_misses", min_val=0),
+                )
             else:
-                cache_hits = 380
+                cache_hits = 0 if is_unfinished else 380
 
             if has_misses:
-                cache_misses = int(payload["cache_misses"])
+                cache_misses = _finite_int(payload["cache_misses"], "cache_misses", min_val=0)
             elif has_total:
-                cache_misses = max(0, int(payload["total_crates"]) - cache_hits)
+                cache_misses = max(
+                    0, _finite_int(payload["total_crates"], "total_crates", min_val=0) - cache_hits
+                )
             else:
-                cache_misses = 25
+                cache_misses = 0 if is_unfinished else 25
 
             if has_total:
-                total_crates = int(payload["total_crates"])
+                total_crates = _finite_int(payload["total_crates"], "total_crates", min_val=0)
             else:
                 total_crates = cache_hits + cache_misses
+
+            if is_unfinished:
+                req_at = payload.get("requested_at") or _iso_seconds_ago(0, now_ts)
+                fin_at = payload.get("finished_at")
+                del_at = payload.get("delivered_at")
+            else:
+                req_at = payload.get("requested_at") or _iso_seconds_ago(duration, now_ts)
+                fin_at = payload.get("finished_at") or _iso_seconds_ago(delivery_sec, now_ts)
+                del_at = payload.get("delivered_at") or _iso_seconds_ago(0, now_ts)
+
+            default_peak_ram = 0.0 if is_unfinished else 20.5
+            default_cpu_time = 0.0 if is_unfinished else 1120.0
 
             raw = {
                 "build_id": payload.get("build_id") or f"rb-{uuid.uuid4().hex[:8]}",
@@ -2172,23 +2297,34 @@ class DashboardStore:
                 "profile": payload.get("profile", "release"),
                 "target_triple": payload.get("target_triple", "x86_64-unknown-linux-gnu"),
                 "commit_sha": payload.get("commit_sha", "af7c14f8cb2c"),
-                "status": payload.get("status", "DELIVERED"),
-                "requested_at": payload.get("requested_at") or _iso_seconds_ago(duration, now_ts),
-                "finished_at": payload.get("finished_at") or _iso_seconds_ago(delivery_sec, now_ts),
-                "delivered_at": payload.get("delivered_at") or _iso_seconds_ago(0, now_ts),
+                "status": status_str,
+                "requested_at": req_at,
+                "finished_at": fin_at,
+                "delivered_at": del_at,
+                "total_duration_seconds": raw_duration,
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
                 "total_crates": total_crates,
                 "instance_name": payload.get("instance_name", "builder-oxidex-turin-01"),
                 "zone": payload.get("zone", "us-south1-b"),
                 "machine_type": payload.get("machine_type", "c4d-highcpu-16"),
-                "vcpu": int(payload.get("vcpu", 16)),
+                "vcpu": _finite_int(payload.get("vcpu", 16), "vcpu", min_val=1),
                 "cpu_platform": payload.get("cpu_platform", "AMD Turin"),
                 "origin_ip": payload.get("origin_ip", "185.159.157.42"),
                 "origin_hostname": payload.get("origin_hostname"),
-                "peak_ram_gib": float(payload.get("peak_ram_gib", 20.5)),
-                "container_ram_cap_gib": float(payload.get("container_ram_cap_gib", 28.0)),
-                "cpu_time_seconds": float(payload.get("cpu_time_seconds", 1120.0)),
+                "peak_ram_gib": _finite_float(
+                    payload.get("peak_ram_gib", default_peak_ram), "peak_ram_gib", min_val=0.0
+                ),
+                "container_ram_cap_gib": _finite_float(
+                    payload.get("container_ram_cap_gib", 28.0),
+                    "container_ram_cap_gib",
+                    min_val=0.1,
+                ),
+                "cpu_time_seconds": _finite_float(
+                    payload.get("cpu_time_seconds", default_cpu_time),
+                    "cpu_time_seconds",
+                    min_val=0.0,
+                ),
             }
             enriched = enrich_rust_build_record(raw, project=self.project)
             existing_idx = next(
@@ -2227,7 +2363,7 @@ def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:
             return
 
         def _send_json(self, data: Any, status: int = HTTPStatus.OK) -> None:
-            body = json.dumps(data).encode("utf-8")
+            body = json.dumps(data, allow_nan=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

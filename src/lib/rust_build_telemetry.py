@@ -7,10 +7,25 @@ from __future__ import annotations
 
 from datetime import datetime
 import ipaddress
+import math
 import re
 from typing import Any
 
 from .dashboard_models import compute_cpu_benchmark_score, format_gcloud_ssh_command
+
+
+UNFINISHED_BUILD_STATUSES: frozenset[str] = frozenset(
+    {
+        "QUEUED",
+        "PENDING",
+        "WAITING",
+        "RUNNING",
+        "COMPILING",
+        "ACTIVE",
+        "IN_PROGRESS",
+        "BUILDING",
+    }
+)
 
 
 # Curated IP intelligence database covering ProtonVPN, Tor exit nodes, Mullvad, NordVPN,
@@ -288,11 +303,33 @@ def classify_ip_and_network(ip_address: str, hostname: str | None = None) -> dic
     }
 
 
+def _finite_float(val: Any, name: str, *, min_val: float | None = 0.0) -> float:
+    if isinstance(val, bool):
+        raise ValueError(f"{name} must be a finite number")
+    f = float(val)
+    if not math.isfinite(f):
+        raise ValueError(f"{name} must be a finite number (got {val!r})")
+    if min_val is not None and f < min_val:
+        raise ValueError(f"{name} must be >= {min_val} (got {val!r})")
+    return f
+
+
+def _finite_int(val: Any, name: str, *, min_val: int = 0) -> int:
+    if isinstance(val, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(val, float) and not math.isfinite(val):
+        raise ValueError(f"{name} must be a finite integer (got {val!r})")
+    i = int(val)
+    if i < min_val:
+        raise ValueError(f"{name} must be >= {min_val} (got {val!r})")
+    return i
+
+
 def compute_cpu_points(cpu_time_seconds: float, instance_benchmark_score: int) -> float:
     """Compute CPU 'points' = CPU time (seconds) * instance CPU benchmark score."""
-    if cpu_time_seconds < 0 or instance_benchmark_score < 0:
-        raise ValueError("cpu_time_seconds and instance_benchmark_score must be non-negative")
-    return round(float(cpu_time_seconds) * int(instance_benchmark_score), 2)
+    cpu_sec = _finite_float(cpu_time_seconds, "cpu_time_seconds", min_val=0.0)
+    bench = _finite_int(instance_benchmark_score, "instance_benchmark_score", min_val=0)
+    return round(cpu_sec * bench, 2)
 
 
 def _iso_to_epoch(iso_str: str) -> float:
@@ -307,37 +344,69 @@ def enrich_rust_build_record(
     """Normalize and enrich a Rust remote build telemetry record with durations,
     cache hit rate, IP geolocation, VPN/Tor lookup, active RAM OOM floor, and CPU points.
     """
+    status_str = str(record.get("status", "DELIVERED"))
+    is_unfinished = status_str.strip().upper() in UNFINISHED_BUILD_STATUSES
+
     requested_at = str(record["requested_at"])
-    finished_at = str(record["finished_at"])
-    delivered_at = str(record["delivered_at"])
-
     req_ts = _iso_to_epoch(requested_at)
-    fin_ts = _iso_to_epoch(finished_at)
-    del_ts = _iso_to_epoch(delivered_at)
 
-    if not (req_ts <= fin_ts <= del_ts):
+    raw_finished = record.get("finished_at")
+    if raw_finished is not None and str(raw_finished).strip() != "":
+        finished_at: str | None = str(raw_finished)
+        fin_ts: float | None = _iso_to_epoch(finished_at)
+    else:
+        finished_at = None
+        fin_ts = None
+
+    raw_delivered = record.get("delivered_at")
+    if raw_delivered is not None and str(raw_delivered).strip() != "":
+        delivered_at: str | None = str(raw_delivered)
+        del_ts: float | None = _iso_to_epoch(delivered_at)
+    else:
+        delivered_at = None
+        del_ts = None
+
+    if not is_unfinished and (fin_ts is None or del_ts is None):
+        raise ValueError(
+            "Invalid Rust build timestamps: requested_at, finished_at, and delivered_at are required for completed builds"
+        )
+    if fin_ts is not None and req_ts > fin_ts:
+        raise ValueError(
+            "Invalid Rust build timestamps: requested_at <= finished_at <= delivered_at is required"
+        )
+    if del_ts is not None and fin_ts is not None and fin_ts > del_ts:
+        raise ValueError(
+            "Invalid Rust build timestamps: requested_at <= finished_at <= delivered_at is required"
+        )
+    if del_ts is not None and req_ts > del_ts:
         raise ValueError(
             "Invalid Rust build timestamps: requested_at <= finished_at <= delivered_at is required"
         )
 
-    compile_seconds = round(fin_ts - req_ts, 2)
-    delivery_seconds = round(del_ts - fin_ts, 2)
+    compile_seconds = round(fin_ts - req_ts, 2) if fin_ts is not None else 0.0
+    delivery_seconds = round(del_ts - fin_ts, 2) if (del_ts is not None and fin_ts is not None) else 0.0
     raw_total = record.get("total_duration_seconds")
-    if raw_total is not None and float(raw_total) < 0:
-        raise ValueError("total_duration_seconds must be non-negative")
-    total_duration_seconds = round(
-        float(raw_total) if raw_total is not None else (del_ts - req_ts), 2
-    )
+    if raw_total is not None:
+        total_duration_seconds = round(
+            _finite_float(raw_total, "total_duration_seconds", min_val=0.0), 2
+        )
+    elif del_ts is not None:
+        total_duration_seconds = round(del_ts - req_ts, 2)
+    else:
+        total_duration_seconds = compile_seconds
 
-    cache_hits = max(0, int(record.get("cache_hits", 0)))
+    cache_hits = _finite_int(record.get("cache_hits", 0), "cache_hits", min_val=0)
     if record.get("cache_misses") is not None:
-        cache_misses = max(0, int(record["cache_misses"]))
+        cache_misses = _finite_int(record["cache_misses"], "cache_misses", min_val=0)
     elif record.get("total_crates") is not None:
-        cache_misses = max(0, int(record["total_crates"]) - cache_hits)
+        cache_misses = max(0, _finite_int(record["total_crates"], "total_crates", min_val=0) - cache_hits)
     else:
         cache_misses = 0
     if record.get("total_crates") is not None:
-        total_crates = max(cache_hits + cache_misses, int(record["total_crates"]))
+        total_crates = max(
+            cache_hits + cache_misses,
+            _finite_int(record["total_crates"], "total_crates", min_val=0),
+        )
     else:
         total_crates = cache_hits + cache_misses
     cache_hit_rate = round((cache_hits / total_crates * 100.0) if total_crates > 0 else 0.0, 1)
@@ -346,18 +415,39 @@ def enrich_rust_build_record(
     zone = str(record.get("zone", "us-south1-a"))
     region = zone.rsplit("-", 1)[0] if "-" in zone else zone
     machine_type = str(record.get("machine_type", "c4d-highcpu-16"))
-    vcpu = int(record.get("vcpu", 16))
+    vcpu = _finite_int(record.get("vcpu", 16), "vcpu", min_val=1)
     cpu_platform = str(record.get("cpu_platform", "AMD Turin"))
-    benchmark_score = int(
-        record.get("instance_benchmark_score")
-        or compute_cpu_benchmark_score(cpu_platform, vcpu, machine_type)
+    raw_bench = record.get("instance_benchmark_score")
+    benchmark_score = (
+        _finite_int(raw_bench, "instance_benchmark_score", min_val=1)
+        if raw_bench is not None
+        else compute_cpu_benchmark_score(cpu_platform, vcpu, machine_type)
     )
 
-    cpu_time_seconds = round(float(record.get("cpu_time_seconds", compile_seconds * 8.5)), 2)
+    default_cpu_time = 0.0 if is_unfinished else (compile_seconds * 8.5)
+    cpu_time_seconds = round(
+        _finite_float(
+            record.get("cpu_time_seconds", default_cpu_time),
+            "cpu_time_seconds",
+            min_val=0.0,
+        ),
+        2,
+    )
     cpu_points = compute_cpu_points(cpu_time_seconds, benchmark_score)
 
-    peak_ram_gib = round(float(record.get("peak_ram_gib", 18.4)), 2)
-    container_ram_cap_gib = round(float(record.get("container_ram_cap_gib", 28.0)), 2)
+    default_peak_ram = 0.0 if is_unfinished else 18.4
+    peak_ram_gib = round(
+        _finite_float(record.get("peak_ram_gib", default_peak_ram), "peak_ram_gib", min_val=0.0),
+        2,
+    )
+    container_ram_cap_gib = round(
+        _finite_float(
+            record.get("container_ram_cap_gib", 28.0),
+            "container_ram_cap_gib",
+            min_val=0.1,
+        ),
+        2,
+    )
     ram_headroom_gib = round(max(0.0, container_ram_cap_gib - peak_ram_gib), 2)
 
     ip_intel = classify_ip_and_network(
@@ -371,7 +461,7 @@ def enrich_rust_build_record(
         "profile": str(record.get("profile", "release")),
         "target_triple": str(record.get("target_triple", "x86_64-unknown-linux-gnu")),
         "commit_sha": str(record.get("commit_sha", "af7c14f8cb2c")),
-        "status": str(record.get("status", "DELIVERED")),
+        "status": status_str,
         "requested_at": requested_at,
         "finished_at": finished_at,
         "delivered_at": delivered_at,

@@ -4,7 +4,7 @@ VM templates, and Cloud-Init parser/visualizer for the Web UI Dashboard.
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 import socket
 import time
@@ -21,7 +21,15 @@ HOURS_PER_MONTH = HOURS_PER_DAY * DAYS_PER_MONTH
 def _dec(value: Any, default: str = "0") -> Decimal:
     if value is None or value == "":
         return Decimal(default)
-    return Decimal(str(value))
+    if isinstance(value, bool):
+        raise ValueError(f"Expected numeric value, got boolean {value!r}")
+    try:
+        dec = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError(f"Invalid numeric value: {value!r}") from exc
+    if not dec.is_finite():
+        raise ValueError(f"Numeric value must be finite: {value!r}")
+    return dec
 
 
 def _money(value: Decimal, places: str = "0.01") -> float:
@@ -626,7 +634,7 @@ def normalize_budget(budget: dict[str, Any]) -> dict[str, Any]:
 
     max_hourly = _dec(budget.get("max_hourly_usd", "0.42"))
     max_daily = _dec(budget.get("max_daily_usd", "10.00"))
-    max_monthly = _dec(budget.get("max_monthly_usd", "300.00"))
+    max_monthly = _dec(budget.get("max_monthly_usd", "50.00"))
     if max_hourly < Decimal("0") or max_daily < Decimal("0") or max_monthly < Decimal("0"):
         raise ValueError("Budget limits (max_hourly_usd, max_daily_usd, max_monthly_usd) must be >= 0")
 
@@ -865,9 +873,15 @@ def qualify_instances(
                     pricing["compute_monthly_usd"] + pricing["disk_monthly_usd"], 2
                 )
             else:
-                eval_hourly = pricing["compute_hourly_usd"]
-                eval_daily = pricing["compute_daily_usd"]
-                eval_monthly = pricing["compute_monthly_usd"]
+                if include_taxes:
+                    tax_mult = Decimal("1") + (_dec(tax_rate) / Decimal("100"))
+                    eval_hourly = _money4(_dec(pricing["compute_hourly_usd"]) * tax_mult)
+                    eval_daily = _money(_dec(pricing["compute_daily_usd"]) * tax_mult)
+                    eval_monthly = _money(_dec(pricing["compute_monthly_usd"]) * tax_mult)
+                else:
+                    eval_hourly = pricing["compute_hourly_usd"]
+                    eval_daily = pricing["compute_daily_usd"]
+                    eval_monthly = pricing["compute_monthly_usd"]
 
             fleet_floor_hourly = round(eval_hourly * instances_for_floor, 4)
             fleet_floor_daily = round(eval_daily * instances_for_floor, 2)

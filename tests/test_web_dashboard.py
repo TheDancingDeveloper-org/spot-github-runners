@@ -540,6 +540,10 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         ctx.exception.close()
 
         # Scaling up in us-south1 (which supports c4d / AMD Turin / hyperdisk-balanced) honors the 32-vCPU template (8 runners)
+        self._post(
+            "/api/budget",
+            {"target": "cicd_runner", "max_hourly_usd": 5.0, "max_daily_usd": 25.0, "max_monthly_usd": 800.0},
+        )
         scale_res = self._post(
             "/api/instances/scale-region",
             {"region": "us-south1", "role": "cicd_runner", "target_instances": 2},
@@ -919,6 +923,116 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(after_telem["builds_ran_past_hour"], before_builds_hr + 1)
         self.assertGreaterEqual(after_telem["queued_builds"], 1)
         self.assertIn("builder_scaling_evaluation", rb_post)
+
+    def test_round5_codex_regressions(self):
+        # 1. Default monthly budget caps match the UI's $50.00 default
+        self.assertEqual(self.store.state["global_budget"]["max_monthly_usd"], 50.00)
+        self.assertEqual(self.store.state["profiles"]["cicd_runner"]["budget"]["max_monthly_usd"], 50.00)
+        self.assertEqual(self.store.state["scaling"]["cicd_runner"]["max_scale_up_monthly_usd"], 50.00)
+
+        # 2. Regional scale-up enforces scale-up budget caps
+        self._post(
+            "/api/budget",
+            {"target": "cicd_runner", "max_hourly_usd": 0.0, "max_daily_usd": 0.0, "max_monthly_usd": 0.0},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/instances/scale-region",
+                {"region": "us-south1", "role": "cicd_runner", "target_instances": 2},
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+
+        # 3. When templates are disabled and profile sizing increases, regional scale-up selects a qualifying regional shape
+        self._post(
+            "/api/profile/cicd_runner",
+            {
+                "use_vm_template": False,
+                "min_instance_vcpu": 32,
+                "min_instance_ram_gib": 100,
+                "disk_category": "any",
+                "budget": {
+                    "max_hourly_usd": 10.0,
+                    "max_daily_usd": 100.0,
+                    "max_monthly_usd": 1000.0,
+                    "include_disk_costs": True,
+                    "include_taxes": True,
+                },
+            },
+        )
+        za_scale = self._post(
+            "/api/instances/scale-region",
+            {"region": "africa-south1", "role": "cicd_runner", "target_instances": 2},
+        )
+        self.assertEqual(za_scale["current_count"], 2)
+        newest_za = next(i for i in za_scale["running_instances"] if i["name"] != "oxidex-runners-za-jnb-01")
+        self.assertGreaterEqual(newest_za["vcpu"], 32)
+        self.assertGreaterEqual(newest_za["ram_gib"], 100)
+
+        # 4. Compute tax is applied even when include_disk_costs is False
+        compute_tax_qual = qualify_instances(
+            {
+                **self.store.state["profiles"]["cicd_runner"],
+                "budget": {
+                    "max_hourly_usd": 10.0,
+                    "max_daily_usd": 100.0,
+                    "max_monthly_usd": 1000.0,
+                    "include_disk_costs": False,
+                    "include_taxes": True,
+                },
+            },
+            {"europe-west1": True},
+        )
+        eu_cand = next(c for c in compute_tax_qual["spot_price_qualifying"] if c["region"] == "europe-west1")
+        expected_taxed_compute = round(eu_cand["pricing"]["compute_hourly_usd"] * 1.21, 4)
+        self.assertEqual(eu_cand["evaluated_hourly_usd"], expected_taxed_compute)
+
+        # 5. Builder capacity_floor is clamped to max_instances when active_builds > max_instances
+        capped_builder = evaluate_builder_scaling_decision(
+            policy={"min_instances": 1, "max_instances": 4, "max_scale_up_hourly_usd": 50.0, "max_scale_up_daily_usd": 500.0, "max_scale_up_monthly_usd": 5000.0},
+            telemetry={
+                "current_builder_instances": 2,
+                "active_builds": 5,
+                "queued_builds": 0,
+                "builds_ran_past_hour": 5,
+                "builder_cpu_percentages": [30.0, 35.0],
+                "builder_journal_oom_events": [],
+            },
+            per_instance_hourly_usd=0.30,
+        )
+        self.assertEqual(capped_builder["desired_instances"], 4)
+
+        # 6. Partial QUEUED builds preserve null finished/delivered timestamps, do not fabricate completion stats, and are excluded from summary completion aggregates
+        summary_before = self._get("/api/rust-builds")
+        q_res = self._post(
+            "/api/rust-builds",
+            {"build_id": "rb-queued-partial-01", "status": "QUEUED"},
+        )
+        q_build = q_res["build"]
+        self.assertIsNone(q_build["finished_at"])
+        self.assertIsNone(q_build["delivered_at"])
+        self.assertEqual(q_build["total_duration_seconds"], 0.0)
+        self.assertEqual(q_build["total_crates"], 0)
+        self.assertEqual(q_build["cpu_time_seconds"], 0.0)
+        self.assertEqual(q_build["cpu_points"], 0.0)
+        self.assertEqual(q_build["peak_ram_gib"], 0.0)
+        summary_after = self._get("/api/rust-builds")
+        self.assertEqual(summary_after["total_builds"], summary_before["total_builds"] + 1)
+        self.assertEqual(summary_after["completed_builds"], summary_before["completed_builds"])
+        self.assertEqual(summary_after["total_cache_hits"], summary_before["total_cache_hits"])
+        self.assertEqual(summary_after["total_cpu_points"], summary_before["total_cpu_points"])
+        self.assertEqual(summary_after["average_duration_seconds"], summary_before["average_duration_seconds"])
+
+        # 7. Non-finite Rust telemetry values ("nan", "inf", "-inf") are rejected with HTTP 400
+        for bad_telemetry in (
+            {"peak_ram_gib": "nan"},
+            {"cpu_time_seconds": "inf"},
+            {"total_duration_seconds": "-inf"},
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._post("/api/rust-builds", bad_telemetry)
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
 
 
 if __name__ == "__main__":
