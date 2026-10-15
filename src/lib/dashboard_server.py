@@ -601,23 +601,49 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         ],
         "github_oom_runs": [
             {
-                "id": "gh-oom-38601924810",
+                "id": "gh-oom-37192272062",
                 "repository": "swack-tools/oxidex",
-                "workflow_name": "Rust 1.99 Qualification Matrix",
-                "run_id": 38601924810,
-                "job_id": 116012948102,
-                "job_name": "cargo-nextest-heavy",
-                "runner_name": "oxidex-za-jnb-01-3",
-                "step_number": 4,
-                "line_number": 118,
-                "failed_at": _iso_seconds_ago(540, ref_now),
-                "error_excerpt": "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
+                "workflow_name": "CI",
+                "run_id": 37192272062,
+                "job_id": 111407847874,
+                "job_name": "Verify Generated Tables / catalog join",
+                "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-2",
+                "step_number": 8,
+                "line_number": 106,
+                "failed_at": "2026-10-04T09:39:54Z",
+                "error_excerpt": (
+                    "line 14: 15780 Killed python3 tools/exiftool-tables — "
+                    "##[error]Process completed with exit code 137."
+                ),
                 "failure_classification": "OOM",
                 "is_oom": True,
                 "is_self_hosted_runner": True,
                 "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
                 "deep_link": build_github_oom_deep_link(
-                    "swack-tools/oxidex", 38601924810, 116012948102, 4, 118
+                    "swack-tools/oxidex", 37192272062, 111407847874, 8, 106
+                ),
+            },
+            {
+                "id": "gh-oom-37192994059",
+                "repository": "swack-tools/oxidex",
+                "workflow_name": "CI",
+                "run_id": 37192994059,
+                "job_id": 111409747367,
+                "job_name": "Verify Generated Tables / tools 5/8",
+                "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-5",
+                "step_number": 7,
+                "line_number": 77,
+                "failed_at": "2026-10-04T10:01:39Z",
+                "error_excerpt": (
+                    "test_committed_rules_and_ledger_equal_fresh_native_generation ... "
+                    "##[error]Process completed with exit code 137."
+                ),
+                "failure_classification": "OOM",
+                "is_oom": True,
+                "is_self_hosted_runner": True,
+                "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
+                "deep_link": build_github_oom_deep_link(
+                    "swack-tools/oxidex", 37192994059, 111409747367, 7, 77
                 ),
             },
             {
@@ -630,7 +656,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
                 "runner_name": "GitHub Actions 1000014245",
                 "step_number": 2,
                 "line_number": 50,
-                "failed_at": _iso_seconds_ago(1380, ref_now),
+                "failed_at": "2026-10-14T16:25:26Z",
                 "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
                 "failure_classification": "TIMEOUT",
                 "is_oom": False,
@@ -825,6 +851,24 @@ class DashboardStore:
     def _normalize_github_ci_runs(self) -> None:
         runs = self.state.get("scaling_telemetry", {}).get("github_oom_runs", [])
         for r in runs:
+            if int(r.get("run_id", 0)) == 38601924810:
+                r["id"] = "gh-oom-37192272062"
+                r["repository"] = "swack-tools/oxidex"
+                r["workflow_name"] = "CI"
+                r["run_id"] = 37192272062
+                r["job_id"] = 111407847874
+                r["job_name"] = "Verify Generated Tables / catalog join"
+                r["runner_name"] = "gha-oxidex-runners-asianortheast2-a-1791098074-2"
+                r["step_number"] = 8
+                r["line_number"] = 106
+                r["failed_at"] = "2026-10-04T09:39:54Z"
+                r["error_excerpt"] = (
+                    "line 14: 15780 Killed python3 tools/exiftool-tables — "
+                    "##[error]Process completed with exit code 137."
+                )
+                r["deep_link"] = build_github_oom_deep_link(
+                    "swack-tools/oxidex", 37192272062, 111407847874, 8, 106
+                )
             if int(r.get("run_id", 0)) == 38596411473 and int(r.get("job_id", 0)) == 115964282184:
                 if "nzbget-core" in str(r.get("error_excerpt", "")):
                     r["id"] = "gh-timeout-38596411473"
