@@ -1480,19 +1480,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById("top-budget-month").value = Number(gb.max_monthly_usd).toFixed(2);
       document.getElementById("top-budget-disk").checked = Boolean(gb.include_disk_costs);
 
-      // KPIs
+      // KPIs (fleet-wide running totals independent of table filters)
       const iv = APP_STATE.instances_view;
-      document.getElementById("kpi-burn-rate").textContent = `$${iv.active_hourly_burn_usd.toFixed(2)}/hr · $${iv.active_daily_burn_usd.toFixed(2)}/day`;
-      document.getElementById("kpi-burn-sub").textContent = `Projected monthly: $${iv.active_monthly_burn_usd.toFixed(2)}/mo · Window spend (${iv.window_hours}h): $${iv.total_window_spend_usd.toFixed(2)}`;
+      const fs = APP_STATE.fleet_summary || iv;
+      document.getElementById("kpi-burn-rate").textContent = `$${fs.active_hourly_burn_usd.toFixed(2)}/hr · $${fs.active_daily_burn_usd.toFixed(2)}/day`;
+      document.getElementById("kpi-burn-sub").textContent = `Projected monthly: $${fs.active_monthly_burn_usd.toFixed(2)}/mo · Window spend (${iv.window_hours}h): $${iv.total_window_spend_usd.toFixed(2)}`;
 
-      const runningRunners = APP_STATE.instances_view.instances.filter(i => i.status === "RUNNING" && i.role === "cicd_runner");
-      const totalRunnerSlots = runningRunners.reduce((acc, i) => acc + i.runners_count, 0);
-      document.getElementById("kpi-runners-online").textContent = `${totalRunnerSlots} Runners (${runningRunners.length} VMs)`;
+      const allRunning = APP_STATE.regions
+        ? APP_STATE.regions.flatMap(r => r.running_instances || [])
+        : APP_STATE.instances_view.instances.filter(i => i.status === "RUNNING");
+      const runningRunners = allRunning.filter(i => i.role === "cicd_runner");
+      const totalRunnerSlots = fs.running_runner_slots !== undefined
+        ? fs.running_runner_slots
+        : runningRunners.reduce((acc, i) => acc + i.runners_count, 0);
+      const runningRunnerVms = fs.running_runner_vms !== undefined ? fs.running_runner_vms : runningRunners.length;
+      document.getElementById("kpi-runners-online").textContent = `${totalRunnerSlots} Runners (${runningRunnerVms} VMs)`;
       const st = APP_STATE.scaling_telemetry;
       document.getElementById("kpi-runners-sub").textContent = `Min floor: ${APP_STATE.profiles.cicd_runner.min_runners} · ${st.queued_jobs} queued · ${st.jobs_ran_past_hour} runs in past 1h`;
 
-      const runningBuilders = APP_STATE.instances_view.instances.filter(i => i.status === "RUNNING" && i.role === "rust_builder");
-      document.getElementById("kpi-builders-online").textContent = `${runningBuilders.length} Builders Online`;
+      const runningBuilders = allRunning.filter(i => i.role === "rust_builder");
+      const runningBuilderVms = fs.running_builder_vms !== undefined ? fs.running_builder_vms : runningBuilders.length;
+      document.getElementById("kpi-builders-online").textContent = `${runningBuilderVms} Builders Online`;
       document.getElementById("kpi-builders-sub").textContent = `Min benchmark: ${APP_STATE.profiles.rust_builder.min_benchmark_score} · Peak RAM floor: ${APP_STATE.rust_builds.max_peak_ram_gib} GiB`;
 
       const cq = APP_STATE.qualifications.cicd_runner;
@@ -1919,6 +1927,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     function collectProfileForm(role) {
+      const curBudget = (APP_STATE && APP_STATE.profiles && APP_STATE.profiles[role] && APP_STATE.profiles[role].budget)
+        ? APP_STATE.profiles[role].budget
+        : {};
       if (role === "cicd_runner") {
         return {
           role: "cicd_runner",
@@ -1935,12 +1946,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           vm_template_id: document.getElementById("runner-vmtpl-select").value,
           cloud_init_template_id: document.getElementById("runner-cloudinit-select").value,
           budget: {
-            active_period: "day",
+            ...curBudget,
+            active_period: curBudget.active_period || "day",
             max_hourly_usd: parseFloat(document.getElementById("runner-max-hour").value || "5"),
             max_daily_usd: parseFloat(document.getElementById("runner-max-day").value || "10"),
             max_monthly_usd: parseFloat(document.getElementById("runner-max-month").value || "300"),
-            include_disk_costs: true,
-            include_taxes: false
+            include_disk_costs: curBudget.include_disk_costs !== undefined ? Boolean(curBudget.include_disk_costs) : true,
+            include_taxes: curBudget.include_taxes !== undefined ? Boolean(curBudget.include_taxes) : false,
+            tax_rate_percent: curBudget.tax_rate_percent !== undefined ? Number(curBudget.tax_rate_percent) : 8.25
           }
         };
       }
@@ -1960,12 +1973,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         vm_template_id: document.getElementById("builder-vmtpl-select").value,
         cloud_init_template_id: document.getElementById("builder-cloudinit-select").value,
         budget: {
-          active_period: "day",
+          ...curBudget,
+          active_period: curBudget.active_period || "day",
           max_hourly_usd: parseFloat(document.getElementById("builder-max-hour").value || "3.5"),
           max_daily_usd: parseFloat(document.getElementById("builder-max-day").value || "12"),
           max_monthly_usd: parseFloat(document.getElementById("builder-max-month").value || "80"),
-          include_disk_costs: true,
-          include_taxes: false
+          include_disk_costs: curBudget.include_disk_costs !== undefined ? Boolean(curBudget.include_disk_costs) : true,
+          include_taxes: curBudget.include_taxes !== undefined ? Boolean(curBudget.include_taxes) : false,
+          tax_rate_percent: curBudget.tax_rate_percent !== undefined ? Number(curBudget.tax_rate_percent) : 8.25
         }
       };
     }
@@ -1979,7 +1994,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
       });
-      LAST_QUAL_DATA[role] = await res.json();
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error previewing qualification: ${data.error || res.statusText}`);
+        return;
+      }
+      LAST_QUAL_DATA[role] = data;
       renderQualificationTable();
     }
 
@@ -2151,13 +2171,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         provisioned_jobs: parseInt(document.getElementById("sim-jobs-prov").value || "7", 10),
         queued_jobs: parseInt(document.getElementById("sim-jobs-queued").value || "3", 10)
       };
-      await fetch("/api/scaling", {
+      const res = await fetch("/api/scaling", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ role: "cicd_runner", policy, telemetry })
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error updating scaling policy: ${data.error || res.statusText}`);
+        return false;
+      }
       showToast("Updated scaling policy and evaluated live telemetry");
       await loadOverview();
+      return true;
     }
 
     async function simulateLowDemandScaleDown() {
@@ -2167,8 +2193,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById("sc-en-gh-oom").checked = false;
       document.getElementById("sc-en-journal-oom").checked = false;
       document.getElementById("sc-en-cpu").checked = false;
-      await saveAndEvaluateScaling();
-      showToast("Simulated <=5 CI/CD jobs in past hour -> scaled down target to minimum runner floor");
+      const ok = await saveAndEvaluateScaling();
+      if (ok) {
+        showToast("Simulated <=5 CI/CD jobs in past hour -> scaled down target to minimum runner floor");
+      }
     }
 
     async function addGithubOomRun() {
@@ -2177,7 +2205,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const job_id = parseInt(document.getElementById("new-oom-jobid").value || "115964282184", 10);
       const step_number = parseInt(document.getElementById("new-oom-step").value || "2", 10);
       const line_number = parseInt(document.getElementById("new-oom-line").value || "50", 10);
-      await fetch("/api/scaling", {
+      const res = await fetch("/api/scaling", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2193,6 +2221,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           }
         })
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error adding GitHub OOM deep-link: ${data.error || res.statusText}`);
+        return;
+      }
       showToast(`Added GitHub OOM deep-link for ${repo} run #${run_id}`);
       await loadOverview();
     }
@@ -2303,13 +2336,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         body: JSON.stringify({ id, mode, role, name, content, assign_to_profile: assign })
       });
       const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error saving Cloud-Init template: ${data.error || res.statusText}`);
+        return;
+      }
       if (data.template) {
         showToast(`${mode === 'save_as' ? 'Saved new Cloud-Init template' : 'Updated Cloud-Init template'}: "${data.template.name}"`);
         await loadOverview();
         document.getElementById("ci-editor-select").value = data.template.id;
         loadSelectedCloudInitIntoEditor();
-      } else if (data.error) {
-        showToast(`Error saving Cloud-Init template: ${data.error}`);
       }
     }
 
@@ -2382,11 +2417,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     async function toggleSingleRegion(region, enabled) {
-      await fetch("/api/regions", {
+      const res = await fetch("/api/regions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ regions_enabled: { [region]: enabled } })
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error updating region ${region}: ${data.error || res.statusText}`);
+        await loadOverview();
+        return;
+      }
       showToast(`${enabled ? 'Enabled' : 'Deselected'} region ${region}`);
       await loadOverview();
     }
@@ -2395,33 +2436,48 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const filtered = getFilteredRegions();
       const map = {};
       filtered.forEach(r => { map[r.region] = enabled; });
-      await fetch("/api/regions", {
+      const res = await fetch("/api/regions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ regions_enabled: map })
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error updating regions: ${data.error || res.statusText}`);
+        return;
+      }
       showToast(`${enabled ? 'Enabled' : 'Deselected'} ${filtered.length} matching region(s)`);
       await loadOverview();
     }
 
     async function deselectHighLatencyRegions() {
       const maxLat = parseFloat(document.getElementById("reg-max-latency").value || "150");
-      await fetch("/api/regions", {
+      const res = await fetch("/api/regions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ deselect_matching: { min_latency_ms_to_disable: maxLat } })
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error deselecting regions: ${data.error || res.statusText}`);
+        return;
+      }
       showToast(`Deselected all regions with latency > ${maxLat} ms`);
       await loadOverview();
     }
 
     async function probeRegionLatencies() {
       showToast("Probing live TCP latency from backend to GCP regions...");
-      await fetch("/api/regions", {
+      const res = await fetch("/api/regions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ measure_latency: true })
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error probing latencies: ${data.error || res.statusText}`);
+        return;
+      }
       await loadOverview();
       showToast("Updated live regional latencies");
     }
@@ -2546,6 +2602,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         body: JSON.stringify(payload)
       });
       const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error recording Rust build: ${data.error || res.statusText}`);
+        return;
+      }
       if (data.build) {
         showToast(`Recorded Rust build ${data.build.build_id}: ${data.build.network_security.badge_text} · ${data.build.cpu_points.toLocaleString()} CPU points`);
         await loadOverview();
@@ -2566,11 +2626,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         include_taxes: document.getElementById("top-budget-disk").checked,
         tax_rate_percent: 8.25
       };
-      await fetch("/api/budget", {
+      const res = await fetch("/api/budget", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error updating budget: ${data.error || res.statusText}`);
+        return;
+      }
       showToast(`Updated live billing budget: $${payload.max_hourly_usd.toFixed(2)}/hr · $${payload.max_daily_usd.toFixed(2)}/day · $${payload.max_monthly_usd.toFixed(2)}/mo`);
       await loadOverview();
     }

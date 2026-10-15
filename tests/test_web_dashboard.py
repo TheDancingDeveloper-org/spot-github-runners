@@ -21,6 +21,7 @@ from lib.dashboard_models import (
 from lib.dashboard_scaling import (
     build_github_oom_deep_link,
     classify_github_ci_failure,
+    evaluate_builder_scaling_decision,
     evaluate_cpu_scope,
     evaluate_scaling_decision,
     parse_github_oom_deep_link,
@@ -528,13 +529,22 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(tpl_res["vm_template"]["source_instance"], "oxidex-runners-hk-bulky-02")
         self.assertEqual(self.store.state["scaling"]["cicd_runner"]["runners_per_instance"], 8)
 
-        # Scaling up in africa-south1 honors the newly assigned 32-vCPU template (8 runners)
+        # Scaling up a c4d template in africa-south1 (only n2/e2/t2d) is rejected with 400
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/instances/scale-region",
+                {"region": "africa-south1", "role": "cicd_runner", "target_instances": 2},
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+
+        # Scaling up in us-south1 (which supports c4d / AMD Turin / hyperdisk-balanced) honors the 32-vCPU template (8 runners)
         scale_res = self._post(
             "/api/instances/scale-region",
-            {"region": "africa-south1", "role": "cicd_runner", "target_instances": 2},
+            {"region": "us-south1", "role": "cicd_runner", "target_instances": 2},
         )
         self.assertEqual(scale_res["current_count"], 2)
-        newest = next(i for i in scale_res["running_instances"] if i["name"] != "oxidex-runners-za-jnb-01")
+        newest = next(i for i in scale_res["running_instances"] if i["name"] != "oxidex-runners-us-south1-03")
         self.assertEqual(newest["machine_type"], "c4d-standard-32")
         self.assertEqual(newest["runners_count"], 8)
         self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 18)
@@ -723,6 +733,88 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             urllib.request.urlopen(text_req, timeout=10)
         self.assertEqual(ctx.exception.code, 415)
         ctx.exception.close()
+
+    def test_round3_codex_regressions(self):
+        # 1. Malformed YAML flow sequences and mappings are rejected
+        for bad_flow in (
+            "#cloud-config\npackages: [curl,,git]\n",
+            "#cloud-config\npackages: [,curl]\n",
+            "#cloud-config\npackages: [curl,]\n",
+            "#cloud-config\npackages: [curl] trailing\n",
+            "#cloud-config\nruncmd: [{a: 1,, b: 2}]\n",
+            "#cloud-config\nruncmd: [{bare_key}]\n",
+        ):
+            res = parse_cloud_init(bad_flow)
+            self.assertFalse(res["valid"], f"Expected invalid flow syntax for: {bad_flow!r}")
+
+        # 2. Zero or sub-unit budgets prohibit scaling from 0 -> 1 instance
+        zero_runner_eval = evaluate_scaling_decision(
+            policy={"min_runners": 0, "max_runners": 16, "runners_per_instance": 4, "max_scale_up_hourly_usd": 0.0, "max_scale_up_daily_usd": 0.0, "max_scale_up_monthly_usd": 0.0},
+            telemetry={"current_runners": 0, "current_instances": 0, "queued_jobs": 5},
+            per_instance_hourly_usd=0.35,
+        )
+        self.assertEqual(zero_runner_eval["desired_instances"], 0)
+        self.assertEqual(zero_runner_eval["desired_runners"], 0)
+        self.assertTrue(zero_runner_eval["budget_capped"])
+
+        zero_builder_eval = evaluate_builder_scaling_decision(
+            policy={"min_instances": 0, "max_instances": 4, "max_scale_up_hourly_usd": 0.0, "max_scale_up_daily_usd": 0.0, "max_scale_up_monthly_usd": 0.0},
+            telemetry={"current_builder_instances": 0, "queued_rust_builds": 3},
+            per_instance_hourly_usd=0.30,
+        )
+        self.assertEqual(zero_builder_eval["desired_instances"], 0)
+        self.assertTrue(zero_builder_eval["budget_capped"])
+
+        # 3. Unknown budget target is rejected with 400 instead of mutating global budget
+        prev_global_daily = self.store.state["global_budget"]["max_daily_usd"]
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post("/api/budget", {"target": "rust_bulder", "max_daily_usd": 999.0})
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+        self.assertEqual(self.store.state["global_budget"]["max_daily_usd"], prev_global_daily)
+
+        # 4. Invalid profile update does not poison persisted state and preserves existing budget inclusion flags
+        self._post(
+            "/api/budget",
+            {"target": "cicd_runner", "include_disk_costs": False, "include_taxes": True, "tax_rate_percent": 9.5},
+        )
+        prev_min_runners = self.store.state["profiles"]["cicd_runner"]["min_runners"]
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/profile/cicd_runner",
+                {"min_runners": 99, "runner_vcpu": "not-a-number"},
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+        self.assertEqual(self.store.state["profiles"]["cicd_runner"]["min_runners"], prev_min_runners)
+
+        # Partial budget update in profile preserves include_disk_costs / include_taxes / tax_rate_percent
+        self._post(
+            "/api/profile/cicd_runner",
+            {"min_runners": 6, "budget": {"max_daily_usd": 14.0}},
+        )
+        r_budget = self.store.state["profiles"]["cicd_runner"]["budget"]
+        self.assertFalse(r_budget["include_disk_costs"])
+        self.assertTrue(r_budget["include_taxes"])
+        self.assertEqual(r_budget["tax_rate_percent"], 9.5)
+
+        # 5. Excessive or negative regional scale targets are rejected before allocating records
+        for bad_target in (-1, 25, 100000):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._post(
+                    "/api/instances/scale-region",
+                    {"region": "us-south1", "role": "cicd_runner", "target_instances": bad_target},
+                )
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
+
+        # 6. Overview includes unfiltered fleet_summary even when instances_view is role-filtered
+        filtered_ov = self._get("/api/overview?role=rust_builder&include_deleted=false")
+        self.assertEqual(len(filtered_ov["instances_view"]["instances"]), 2)
+        self.assertTrue(all(i["role"] == "rust_builder" for i in filtered_ov["instances_view"]["instances"]))
+        self.assertEqual(filtered_ov["fleet_summary"]["running_runner_vms"], 3)
+        self.assertEqual(filtered_ov["fleet_summary"]["running_runner_slots"], 10)
+        self.assertEqual(filtered_ov["fleet_summary"]["running_builder_vms"], 2)
 
 
 if __name__ == "__main__":

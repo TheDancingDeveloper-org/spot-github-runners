@@ -503,22 +503,19 @@ def evaluate_scaling_decision(
         max_daily_cap / 24.0,
         max_monthly_cap / (24.0 * 365.0 / 12.0),
     )
-    max_affordable_instances = max(1, int(math.floor(effective_hourly_cap / unit_hourly)))
+    max_affordable_instances = max(0, int(math.floor(effective_hourly_cap / unit_hourly)))
     budget_capped = False
     budget_cap_note = ""
 
-    if scale_up_reasons and desired_instances > max_affordable_instances:
+    if (scale_up_reasons or desired_instances > current_instances_count) and (
+        desired_instances > max_affordable_instances
+    ):
         budget_capped = True
-        floor_runners = max(current_runners, min_runners)
-        floor_instances = max(
-            current_instances_count,
-            math.ceil(floor_runners / runners_per_vm) if floor_runners > 0 else 0,
-        )
-        desired_instances = max(floor_instances, max_affordable_instances)
-        if desired_instances == current_instances_count and current_runners >= min_runners:
+        desired_instances = max(current_instances_count, max_affordable_instances)
+        if desired_instances == current_instances_count:
             desired_runners = current_runners
         else:
-            desired_runners = max(floor_runners, desired_instances * runners_per_vm)
+            desired_runners = min(desired_runners, desired_instances * runners_per_vm)
         budget_cap_note = (
             f"Scale-up capped at {desired_instances} instance(s) ({desired_runners} runners) "
             f"by max scale-up budget (${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, "
@@ -691,14 +688,15 @@ def evaluate_builder_scaling_decision(
         max_daily_cap / 24.0,
         max_monthly_cap / (24.0 * 365.0 / 12.0),
     )
-    max_affordable_instances = max(1, int(math.floor(effective_hourly_cap / unit_hourly)))
+    max_affordable_instances = max(0, int(math.floor(effective_hourly_cap / unit_hourly)))
     budget_capped = False
     budget_cap_note = ""
 
-    if scale_up_reasons and desired_instances > max_affordable_instances:
+    if (scale_up_reasons or desired_instances > current_instances) and (
+        desired_instances > max_affordable_instances
+    ):
         budget_capped = True
-        floor_instances = max(current_instances, min_instances)
-        desired_instances = max(floor_instances, max_affordable_instances)
+        desired_instances = max(current_instances, max_affordable_instances)
         budget_cap_note = (
             f"Builder scale-up capped at {desired_instances} instance(s) "
             f"by max scale-up budget (${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, "

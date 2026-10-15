@@ -4,6 +4,7 @@ Rust Remote Builder Web UI Dashboard.
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1138,6 +1139,19 @@ class DashboardStore:
                 search_filter=search_filter,
                 role_filter=role_filter,
             )
+            fleet_summary = (
+                instances_view
+                if (not search_filter and not role_filter)
+                else self.query_instances(
+                    include_deleted=include_deleted,
+                    window_hours=window_hours,
+                    include_disk_and_tax=include_disk_and_tax,
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                    search_filter="",
+                    role_filter="",
+                )
+            )
             regions_list = []
             for reg in REGIONS_CATALOG:
                 r_code = reg["region"]
@@ -1180,6 +1194,7 @@ class DashboardStore:
                 "cloud_init_templates": enriched_templates,
                 "vm_templates": self.state["vm_templates"],
                 "instances_view": instances_view,
+                "fleet_summary": fleet_summary,
                 "rust_builds": self.get_rust_builds_summary(),
             }
 
@@ -1297,11 +1312,15 @@ class DashboardStore:
             except TypeError:
                 rows.sort(key=lambda x: str(x.get(sort_by, "")), reverse=reverse)
 
-            running_count = sum(1 for r in rows if r["status"] == "RUNNING")
+            running_rows = [r for r in rows if r["status"] == "RUNNING"]
+            running_count = len(running_rows)
             deleted_count = sum(1 for r in rows if r["status"] != "RUNNING")
+            running_runner_rows = [r for r in running_rows if r.get("role") == "cicd_runner"]
+            running_builder_rows = [r for r in running_rows if r.get("role") == "rust_builder"]
+            running_runner_slots = sum(int(r.get("runners_count", 0)) for r in running_runner_rows)
             total_window_spend = round(sum(r["total_cost_in_window_usd"] for r in rows), 2)
             active_hourly_burn = round(
-                sum(r["active_hourly_usd"] for r in rows if r["status"] == "RUNNING"), 4
+                sum(r["active_hourly_usd"] for r in running_rows), 4
             )
 
             return {
@@ -1312,6 +1331,9 @@ class DashboardStore:
                 "sort_dir": sort_dir,
                 "running_count": running_count,
                 "deleted_count": deleted_count,
+                "running_runner_vms": len(running_runner_rows),
+                "running_runner_slots": running_runner_slots,
+                "running_builder_vms": len(running_builder_rows),
                 "total_window_spend_usd": total_window_spend,
                 "active_hourly_burn_usd": active_hourly_burn,
                 "active_daily_burn_usd": round(active_hourly_burn * 24.0, 2),
@@ -1322,7 +1344,9 @@ class DashboardStore:
     def update_budget(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Update global or workload-specific billing budget on the fly."""
         with self._lock:
-            target = payload.get("target", "global")
+            target = str(payload.get("target", "global")).strip()
+            if target not in ("global", "cicd_runner", "rust_builder"):
+                raise ValueError(f"Unsupported budget target: {target}")
             normalized = normalize_budget(payload)
             if target in ("cicd_runner", "rust_builder"):
                 self.state["profiles"][target]["budget"] = normalized
@@ -1373,53 +1397,90 @@ class DashboardStore:
                         f"Cloud-init template '{payload['cloud_init_template_id']}' does not belong to role '{role}'"
                     )
             current = self.state["profiles"][role]
-            for key in (
+            candidate: dict[str, Any] = {
+                **current,
+                "budget": dict(current.get("budget", {})),
+            }
+            int_positive_keys = (
                 "min_runners",
                 "min_instances",
                 "max_instances",
                 "runner_vcpu",
-                "runner_ram_gib",
-                "host_overhead_gib",
                 "min_instance_vcpu",
-                "min_instance_ram_gib",
                 "min_benchmark_score",
-                "disk_category",
-                "disk_type",
                 "boot_disk_gb",
                 "data_disk_gb",
-                "use_vm_template",
-                "vm_template_id",
-                "cloud_init_template_id",
-            ):
+            )
+            float_positive_keys = (
+                "runner_ram_gib",
+                "min_instance_ram_gib",
+            )
+            for key in int_positive_keys:
                 if key in payload:
-                    current[key] = payload[key]
+                    val_int = int(payload[key])
+                    if val_int < 1:
+                        raise ValueError(f"{key} must be >= 1")
+                    candidate[key] = val_int
+            for key in float_positive_keys:
+                if key in payload:
+                    val_float = float(payload[key])
+                    if val_float <= 0:
+                        raise ValueError(f"{key} must be > 0")
+                    candidate[key] = val_float
+            if "host_overhead_gib" in payload:
+                overhead_val = float(payload["host_overhead_gib"])
+                if overhead_val < 0:
+                    raise ValueError("host_overhead_gib must be >= 0")
+                candidate["host_overhead_gib"] = overhead_val
+            if "disk_category" in payload:
+                d_cat = str(payload["disk_category"]).strip().lower()
+                if d_cat not in ("any", "hyperdrive", "normal"):
+                    raise ValueError(f"Unsupported disk_category: {payload['disk_category']}")
+                candidate["disk_category"] = d_cat
+            if "disk_type" in payload:
+                candidate["disk_type"] = str(payload["disk_type"]).strip()
+            if "use_vm_template" in payload:
+                candidate["use_vm_template"] = bool(payload["use_vm_template"])
+            if "vm_template_id" in payload:
+                candidate["vm_template_id"] = payload["vm_template_id"]
+            if "cloud_init_template_id" in payload:
+                candidate["cloud_init_template_id"] = payload["cloud_init_template_id"]
+            if int(candidate.get("max_instances", 8)) < int(candidate.get("min_instances", 1)):
+                raise ValueError("max_instances must be >= min_instances")
+
+            normalized_budget: dict[str, Any] | None = None
             if "budget" in payload and isinstance(payload["budget"], dict):
-                normalized_budget = normalize_budget(payload["budget"])
-                current["budget"] = normalized_budget
+                merged_budget_input = {**candidate.get("budget", {}), **payload["budget"]}
+                normalized_budget = normalize_budget(merged_budget_input)
+                candidate["budget"] = normalized_budget
+
+            qual = qualify_instances(
+                candidate,
+                self.state["regions_enabled"],
+                self.project,
+                region_latencies_ms=self.state.get("region_latencies_ms"),
+            )
+
+            self.state["profiles"][role] = candidate
+            if normalized_budget is not None:
                 self.state["scaling"][role]["max_scale_up_hourly_usd"] = normalized_budget["max_hourly_usd"]
                 self.state["scaling"][role]["max_scale_up_daily_usd"] = normalized_budget["max_daily_usd"]
                 self.state["scaling"][role]["max_scale_up_monthly_usd"] = normalized_budget["max_monthly_usd"]
                 self.state["scaling"][role]["include_disk_in_scale_budget"] = normalized_budget["include_disk_costs"]
             if role == "cicd_runner":
-                self.state["scaling"]["cicd_runner"]["min_runners"] = int(current["min_runners"])
-                self.state["scaling"]["cicd_runner"]["runner_vcpu"] = int(current["runner_vcpu"])
-                self.state["scaling"]["cicd_runner"]["runner_ram_gib"] = float(current["runner_ram_gib"])
+                self.state["scaling"]["cicd_runner"]["min_runners"] = int(candidate["min_runners"])
+                self.state["scaling"]["cicd_runner"]["runner_vcpu"] = int(candidate["runner_vcpu"])
+                self.state["scaling"]["cicd_runner"]["runner_ram_gib"] = float(candidate["runner_ram_gib"])
                 self._sync_template_density()
             elif role == "rust_builder":
-                self.state["scaling"]["rust_builder"]["min_instances"] = int(current["min_instances"])
-                self.state["scaling"]["rust_builder"]["max_instances"] = int(current["max_instances"])
-                self.state["scaling"]["rust_builder"]["container_vcpu"] = int(current["runner_vcpu"])
-                self.state["scaling"]["rust_builder"]["builder_vcpu"] = int(current["runner_vcpu"])
-                self.state["scaling"]["rust_builder"]["container_ram_gib"] = float(current["runner_ram_gib"])
-                self.state["scaling"]["rust_builder"]["builder_ram_gib"] = float(current["runner_ram_gib"])
+                self.state["scaling"]["rust_builder"]["min_instances"] = int(candidate["min_instances"])
+                self.state["scaling"]["rust_builder"]["max_instances"] = int(candidate["max_instances"])
+                self.state["scaling"]["rust_builder"]["container_vcpu"] = int(candidate["runner_vcpu"])
+                self.state["scaling"]["rust_builder"]["builder_vcpu"] = int(candidate["runner_vcpu"])
+                self.state["scaling"]["rust_builder"]["container_ram_gib"] = float(candidate["runner_ram_gib"])
+                self.state["scaling"]["rust_builder"]["builder_ram_gib"] = float(candidate["runner_ram_gib"])
             self._persist()
-            qual = qualify_instances(
-                current,
-                self.state["regions_enabled"],
-                self.project,
-                region_latencies_ms=self.state.get("region_latencies_ms"),
-            )
-            return {"status": "ok", "profile": current, "qualification": qual}
+            return {"status": "ok", "profile": candidate, "qualification": qual}
 
     def update_scaling(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Update scaling rules, triggers, hourly thresholds, CPU scope, and telemetry."""
@@ -1427,117 +1488,128 @@ class DashboardStore:
             role = str(payload.get("role", "cicd_runner")).strip()
             if role not in ("cicd_runner", "rust_builder"):
                 raise ValueError(f"Unsupported workload role: {role}")
-            if "policy" in payload and isinstance(payload["policy"], dict):
-                self.state["scaling"][role].update(payload["policy"])
-                pol_target = self.state["scaling"][role]
-                prof_budget = self.state["profiles"][role].setdefault("budget", {})
-                if "max_scale_up_hourly_usd" in payload["policy"]:
-                    prof_budget["max_hourly_usd"] = float(pol_target["max_scale_up_hourly_usd"])
-                if "max_scale_up_daily_usd" in payload["policy"]:
-                    prof_budget["max_daily_usd"] = float(pol_target["max_scale_up_daily_usd"])
-                if "max_scale_up_monthly_usd" in payload["policy"]:
-                    prof_budget["max_monthly_usd"] = float(pol_target["max_scale_up_monthly_usd"])
-                if "include_disk_in_scale_budget" in payload["policy"]:
-                    prof_budget["include_disk_costs"] = bool(pol_target["include_disk_in_scale_budget"])
-                if role == "cicd_runner":
-                    pol = self.state["scaling"]["cicd_runner"]
-                    self.state["profiles"]["cicd_runner"]["min_runners"] = int(pol.get("min_runners", 4))
-                    self.state["profiles"]["cicd_runner"]["runner_vcpu"] = int(pol.get("runner_vcpu", 4))
-                    self.state["profiles"]["cicd_runner"]["runner_ram_gib"] = float(pol.get("runner_ram_gib", 16))
-                    if "runners_per_instance" not in payload["policy"]:
-                        self._sync_template_density()
-                else:
-                    pol = self.state["scaling"]["rust_builder"]
-                    if "builder_vcpu" in payload["policy"] and "container_vcpu" not in payload["policy"]:
-                        pol["container_vcpu"] = int(pol["builder_vcpu"])
-                    elif "container_vcpu" in payload["policy"] and "builder_vcpu" not in payload["policy"]:
-                        pol["builder_vcpu"] = int(pol["container_vcpu"])
-                    if "builder_ram_gib" in payload["policy"] and "container_ram_gib" not in payload["policy"]:
-                        pol["container_ram_gib"] = float(pol["builder_ram_gib"])
-                    elif "container_ram_gib" in payload["policy"] and "builder_ram_gib" not in payload["policy"]:
-                        pol["builder_ram_gib"] = float(pol["container_ram_gib"])
-                    self.state["profiles"]["rust_builder"]["min_instances"] = int(pol.get("min_instances", 1))
-                    self.state["profiles"]["rust_builder"]["max_instances"] = int(pol.get("max_instances", 4))
-                    self.state["profiles"]["rust_builder"]["runner_vcpu"] = int(
-                        pol.get("container_vcpu", pol.get("builder_vcpu", 16))
-                    )
-                    self.state["profiles"]["rust_builder"]["runner_ram_gib"] = float(
-                        pol.get("container_ram_gib", pol.get("builder_ram_gib", 28))
-                    )
-            if "telemetry" in payload and isinstance(payload["telemetry"], dict):
-                if "current_runners" in payload["telemetry"] and "current_instances" not in payload["telemetry"]:
-                    self.state["scaling_telemetry"].pop("current_instances", None)
-                self.state["scaling_telemetry"].update(payload["telemetry"])
-                if (
-                    "journal_oom_events" in payload["telemetry"]
-                    and "builder_journal_oom_events" not in payload["telemetry"]
-                ):
-                    raw_journal_ooms = self.state["scaling_telemetry"].get("journal_oom_events", [])
-                    if isinstance(raw_journal_ooms, list):
-                        self.state["scaling_telemetry"]["builder_journal_oom_events"] = [
-                            evt
-                            for evt in raw_journal_ooms
-                            if isinstance(evt, dict)
-                            and (
-                                evt.get("role") == "rust_builder"
-                                or str(evt.get("instance_name", "")).startswith("builder-")
-                            )
-                        ]
-            if "add_github_oom_run" in payload and isinstance(payload["add_github_oom_run"], dict):
-                item = dict(payload["add_github_oom_run"])
-                if "deep_link" in item and not item.get("run_id"):
-                    parsed = parse_github_oom_deep_link(item["deep_link"])
-                    item = {**item, **parsed, "deep_link": parsed["url"]}
-                else:
-                    link = build_github_oom_deep_link(
-                        item.get("repository", "Appz4Fun/nzbget"),
-                        item.get("run_id", 38596411473),
-                        item.get("job_id", 115964282184),
-                        item.get("step_number", 2),
-                        item.get("line_number", 50),
-                    )
-                    item["deep_link"] = link
-                is_known_timeout_run = (
-                    int(item.get("run_id", 0)) == 38596411473
-                    and int(item.get("job_id", 0)) == 115964282184
-                )
-                if not item.get("error_excerpt"):
-                    if is_known_timeout_run:
-                        item["error_excerpt"] = (
-                            "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
-                        )
+            prev_scaling = copy.deepcopy(self.state["scaling"])
+            prev_profiles = copy.deepcopy(self.state["profiles"])
+            prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
+            try:
+                if "policy" in payload and isinstance(payload["policy"], dict):
+                    self.state["scaling"][role].update(payload["policy"])
+                    pol_target = self.state["scaling"][role]
+                    prof_budget = self.state["profiles"][role].setdefault("budget", {})
+                    if "max_scale_up_hourly_usd" in payload["policy"]:
+                        prof_budget["max_hourly_usd"] = float(pol_target["max_scale_up_hourly_usd"])
+                    if "max_scale_up_daily_usd" in payload["policy"]:
+                        prof_budget["max_daily_usd"] = float(pol_target["max_scale_up_daily_usd"])
+                    if "max_scale_up_monthly_usd" in payload["policy"]:
+                        prof_budget["max_monthly_usd"] = float(pol_target["max_scale_up_monthly_usd"])
+                    if "include_disk_in_scale_budget" in payload["policy"]:
+                        prof_budget["include_disk_costs"] = bool(pol_target["include_disk_in_scale_budget"])
+                    if role == "cicd_runner":
+                        pol = self.state["scaling"]["cicd_runner"]
+                        self.state["profiles"]["cicd_runner"]["min_runners"] = int(pol.get("min_runners", 4))
+                        self.state["profiles"]["cicd_runner"]["runner_vcpu"] = int(pol.get("runner_vcpu", 4))
+                        self.state["profiles"]["cicd_runner"]["runner_ram_gib"] = float(pol.get("runner_ram_gib", 16))
+                        if "runners_per_instance" not in payload["policy"]:
+                            self._sync_template_density()
                     else:
-                        item["error_excerpt"] = (
-                            "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
+                        pol = self.state["scaling"]["rust_builder"]
+                        if "builder_vcpu" in payload["policy"] and "container_vcpu" not in payload["policy"]:
+                            pol["container_vcpu"] = int(pol["builder_vcpu"])
+                        elif "container_vcpu" in payload["policy"] and "builder_vcpu" not in payload["policy"]:
+                            pol["builder_vcpu"] = int(pol["container_vcpu"])
+                        if "builder_ram_gib" in payload["policy"] and "container_ram_gib" not in payload["policy"]:
+                            pol["container_ram_gib"] = float(pol["builder_ram_gib"])
+                        elif "container_ram_gib" in payload["policy"] and "builder_ram_gib" not in payload["policy"]:
+                            pol["builder_ram_gib"] = float(pol["container_ram_gib"])
+                        self.state["profiles"]["rust_builder"]["min_instances"] = int(pol.get("min_instances", 1))
+                        self.state["profiles"]["rust_builder"]["max_instances"] = int(pol.get("max_instances", 4))
+                        self.state["profiles"]["rust_builder"]["runner_vcpu"] = int(
+                            pol.get("container_vcpu", pol.get("builder_vcpu", 16))
                         )
-                if "runner_name" not in item:
-                    item["runner_name"] = (
-                        "GitHub Actions 1000014245"
-                        if is_known_timeout_run
-                        else "gha-oxidex-runners-us-south1-a-01"
+                        self.state["profiles"]["rust_builder"]["runner_ram_gib"] = float(
+                            pol.get("container_ram_gib", pol.get("builder_ram_gib", 28))
+                        )
+                if "telemetry" in payload and isinstance(payload["telemetry"], dict):
+                    if "current_runners" in payload["telemetry"] and "current_instances" not in payload["telemetry"]:
+                        self.state["scaling_telemetry"].pop("current_instances", None)
+                    self.state["scaling_telemetry"].update(payload["telemetry"])
+                    if (
+                        "journal_oom_events" in payload["telemetry"]
+                        and "builder_journal_oom_events" not in payload["telemetry"]
+                    ):
+                        raw_journal_ooms = self.state["scaling_telemetry"].get("journal_oom_events", [])
+                        if isinstance(raw_journal_ooms, list):
+                            self.state["scaling_telemetry"]["builder_journal_oom_events"] = [
+                                evt
+                                for evt in raw_journal_ooms
+                                if isinstance(evt, dict)
+                                and (
+                                    evt.get("role") == "rust_builder"
+                                    or str(evt.get("instance_name", "")).startswith("builder-")
+                                )
+                            ]
+                if "add_github_oom_run" in payload and isinstance(payload["add_github_oom_run"], dict):
+                    item = dict(payload["add_github_oom_run"])
+                    if "deep_link" in item and not item.get("run_id"):
+                        parsed = parse_github_oom_deep_link(item["deep_link"])
+                        item = {**item, **parsed, "deep_link": parsed["url"]}
+                    else:
+                        link = build_github_oom_deep_link(
+                            item.get("repository", "Appz4Fun/nzbget"),
+                            item.get("run_id", 38596411473),
+                            item.get("job_id", 115964282184),
+                            item.get("step_number", 2),
+                            item.get("line_number", 50),
+                        )
+                        item["deep_link"] = link
+                    is_known_timeout_run = (
+                        int(item.get("run_id", 0)) == 38596411473
+                        and int(item.get("job_id", 0)) == 115964282184
                     )
-                cls_info = classify_github_ci_failure(
-                    str(item["error_excerpt"]),
-                    runner_name=item.get("runner_name"),
+                    if not item.get("error_excerpt"):
+                        if is_known_timeout_run:
+                            item["error_excerpt"] = (
+                                "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
+                            )
+                        else:
+                            item["error_excerpt"] = (
+                                "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
+                            )
+                    if "runner_name" not in item:
+                        item["runner_name"] = (
+                            "GitHub Actions 1000014245"
+                            if is_known_timeout_run
+                            else "gha-oxidex-runners-us-south1-a-01"
+                        )
+                    cls_info = classify_github_ci_failure(
+                        str(item["error_excerpt"]),
+                        runner_name=item.get("runner_name"),
+                    )
+                    item["failure_classification"] = cls_info["failure_classification"]
+                    item["is_oom"] = cls_info["is_oom"]
+                    item["is_self_hosted_runner"] = cls_info["is_self_hosted_runner"]
+                    item["badge_text"] = cls_info["badge_text"]
+                    item.setdefault("id", f"gh-ci-{uuid.uuid4().hex[:8]}")
+                    item.setdefault("failed_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                    self.state["scaling_telemetry"]["github_oom_runs"].insert(0, item)
+
+                cicd_eval = evaluate_scaling_decision(
+                    self.state["scaling"]["cicd_runner"],
+                    self.state["scaling_telemetry"],
+                    per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("cicd_runner"),
                 )
-                item["failure_classification"] = cls_info["failure_classification"]
-                item["is_oom"] = cls_info["is_oom"]
-                item["is_self_hosted_runner"] = cls_info["is_self_hosted_runner"]
-                item["badge_text"] = cls_info["badge_text"]
-                item.setdefault("id", f"gh-ci-{uuid.uuid4().hex[:8]}")
-                item.setdefault("failed_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-                self.state["scaling_telemetry"]["github_oom_runs"].insert(0, item)
+                builder_eval = evaluate_builder_scaling_decision(
+                    self.state["scaling"]["rust_builder"],
+                    self.state["scaling_telemetry"],
+                    per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
+                )
+            except Exception:
+                self.state["scaling"] = prev_scaling
+                self.state["profiles"] = prev_profiles
+                self.state["scaling_telemetry"] = prev_telemetry
+                raise
+
             self._persist()
-            cicd_eval = evaluate_scaling_decision(
-                self.state["scaling"]["cicd_runner"],
-                self.state["scaling_telemetry"],
-                per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("cicd_runner"),
-            )
-            builder_eval = evaluate_builder_scaling_decision(
-                self.state["scaling"]["rust_builder"],
-                self.state["scaling_telemetry"],
-                per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
-            )
             evaluation = builder_eval if role == "rust_builder" else cicd_eval
             return {
                 "status": "ok",
@@ -1719,19 +1791,28 @@ class DashboardStore:
         """Scale the number of instances in a specific region/location on demand."""
         with self._lock:
             region = str(payload.get("region", "africa-south1")).strip()
-            target_count = max(0, int(payload.get("target_instances", 1)))
+            raw_target = int(payload.get("target_instances", 1))
+            if raw_target < 0:
+                raise ValueError("target_instances must be >= 0")
+            target_count = raw_target
             role = str(payload.get("role", "cicd_runner")).strip()
             if role not in ("cicd_runner", "rust_builder"):
                 raise ValueError(f"Unsupported workload role: {role}")
             reg_info = next((r for r in REGIONS_CATALOG if r["region"] == region), None)
             if reg_info is None:
                 raise ValueError(f"Unknown region: {region}")
+            prof = self.state["profiles"].get(role, self.state["profiles"]["cicd_runner"])
+            max_allowed = min(20, max(1, int(prof.get("max_instances", 20))))
             running_in_region = [
                 i
                 for i in self.state["instances"]
                 if i["region"] == region and i["status"] == "RUNNING" and i["role"] == role
             ]
             current_count = len(running_in_region)
+            if target_count > 20 or (target_count > current_count and target_count > max_allowed):
+                raise ValueError(
+                    f"target_instances ({target_count}) exceeds maximum allowed instances ({max_allowed}) for role '{role}'"
+                )
             now_ts = time.time()
 
             if target_count < current_count:
@@ -1759,7 +1840,6 @@ class DashboardStore:
             elif target_count > current_count:
                 if not bool(self.state["regions_enabled"].get(region, True)):
                     raise ValueError(f"Cannot scale up in disabled region '{region}'")
-                prof = self.state["profiles"].get(role, self.state["profiles"]["cicd_runner"])
                 vm_tpl = None
                 if prof.get("use_vm_template") and prof.get("vm_template_id"):
                     vm_tpl = next(
@@ -1771,6 +1851,39 @@ class DashboardStore:
                         ),
                         None,
                     )
+                    if vm_tpl is None:
+                        raise ValueError(
+                            f"Assigned VM template '{prof.get('vm_template_id')}' not found for role '{role}'"
+                        )
+                    tpl_machine_type = str(vm_tpl.get("machine_type", ""))
+                    tpl_family = tpl_machine_type.split("-", 1)[0]
+                    if tpl_family not in reg_info.get("families", []):
+                        raise ValueError(
+                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' machine family '{tpl_family}' "
+                            f"({tpl_machine_type}) is not available in region '{region}' "
+                            f"(supported: {', '.join(reg_info.get('families', []))})"
+                        )
+                    tpl_cpu = str(vm_tpl.get("cpu_platform", ""))
+                    if tpl_cpu and tpl_cpu not in reg_info.get("cpu_platforms", []):
+                        raise ValueError(
+                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' CPU platform '{tpl_cpu}' "
+                            f"is not available in region '{region}' "
+                            f"(supported: {', '.join(reg_info.get('cpu_platforms', []))})"
+                        )
+                    tpl_boot_disk = str(vm_tpl.get("boot_disk_type", ""))
+                    if tpl_boot_disk and tpl_boot_disk not in reg_info.get("disk_types", []):
+                        raise ValueError(
+                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' boot disk type '{tpl_boot_disk}' "
+                            f"is not available in region '{region}' "
+                            f"(supported: {', '.join(reg_info.get('disk_types', []))})"
+                        )
+                    tpl_data_disk = str(vm_tpl.get("data_disk_type", ""))
+                    if tpl_data_disk and tpl_data_disk not in reg_info.get("disk_types", []):
+                        raise ValueError(
+                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' data disk type '{tpl_data_disk}' "
+                            f"is not available in region '{region}' "
+                            f"(supported: {', '.join(reg_info.get('disk_types', []))})"
+                        )
                 source_spec = vm_tpl or (running_in_region[0] if running_in_region else None)
                 for idx in range(current_count + 1, target_count + 1):
                     zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]

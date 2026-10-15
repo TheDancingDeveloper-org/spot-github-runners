@@ -935,6 +935,180 @@ def qualify_instances(
     }
 
 
+def _strip_yaml_inline_comment(line: str) -> str:
+    """Strip an unquoted YAML inline comment (# preceded by whitespace) from a line."""
+    in_single = False
+    in_double = False
+    escape = False
+    for i, ch in enumerate(line):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_double:
+            escape = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            if i == 0 or line[i - 1].isspace():
+                return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _split_yaml_flow_top_level(text: str, sep: str) -> list[str]:
+    """Split a YAML flow expression by a top-level separator outside quotes and nested brackets/braces."""
+    parts: list[str] = []
+    cur: list[str] = []
+    in_single = False
+    in_double = False
+    escape = False
+    bracket_depth = 0
+    brace_depth = 0
+    for ch in text:
+        if escape:
+            cur.append(ch)
+            escape = False
+            continue
+        if ch == "\\" and in_double:
+            cur.append(ch)
+            escape = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            cur.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            cur.append(ch)
+        elif not in_single and not in_double:
+            if ch == "[":
+                bracket_depth += 1
+                cur.append(ch)
+            elif ch == "]":
+                bracket_depth -= 1
+                cur.append(ch)
+            elif ch == "{":
+                brace_depth += 1
+                cur.append(ch)
+            elif ch == "}":
+                brace_depth -= 1
+                cur.append(ch)
+            elif ch == sep and bracket_depth == 0 and brace_depth == 0:
+                parts.append("".join(cur))
+                cur = []
+            else:
+                cur.append(ch)
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _validate_yaml_flow_value(expr: str, line_no: int, *, in_flow: bool = False) -> list[str]:
+    """Validate YAML flow sequences ([...]), flow mappings ({...}), and scalar values."""
+    val = expr.strip()
+    if not val:
+        return []
+    errors: list[str] = []
+    if val[0] in ("[", "{"):
+        expected_close = "]" if val[0] == "[" else "}"
+        # Verify the opening bracket/brace at index 0 closes at the final character
+        in_single = False
+        in_double = False
+        escape = False
+        depth = 0
+        closed_at = -1
+        for i, ch in enumerate(val):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_double:
+                escape = True
+                continue
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == val[0]:
+                    depth += 1
+                elif ch == expected_close:
+                    depth -= 1
+                    if depth == 0:
+                        closed_at = i
+                        break
+        if closed_at != len(val) - 1:
+            errors.append(
+                f"YAML syntax error on line {line_no}: trailing tokens after flow collection in '{val}'."
+            )
+            return errors
+        inner = val[1:-1].strip()
+        if not inner:
+            return []
+        items = _split_yaml_flow_top_level(inner, ",")
+        for raw_item in items:
+            item = raw_item.strip()
+            if not item:
+                errors.append(
+                    f"YAML syntax error on line {line_no}: empty element in flow collection '{val}'."
+                )
+                return errors
+            if val[0] == "{":
+                kv_parts = _split_yaml_flow_top_level(item, ":")
+                if len(kv_parts) != 2 or not kv_parts[0].strip() or not kv_parts[1].strip():
+                    errors.append(
+                        f"YAML syntax error on line {line_no}: invalid flow mapping entry '{item}' in '{val}'."
+                    )
+                    return errors
+                errors.extend(_validate_yaml_flow_value(kv_parts[0].strip(), line_no, in_flow=True))
+                errors.extend(_validate_yaml_flow_value(kv_parts[1].strip(), line_no, in_flow=True))
+            else:
+                kv_parts = _split_yaml_flow_top_level(item, ":")
+                if len(kv_parts) > 2:
+                    errors.append(
+                        f"YAML syntax error on line {line_no}: invalid nested colons in flow sequence item '{item}'."
+                    )
+                    return errors
+                if len(kv_parts) == 2 and not (item.startswith("'") or item.startswith('"')):
+                    if not kv_parts[0].strip() or not kv_parts[1].strip():
+                        errors.append(
+                            f"YAML syntax error on line {line_no}: incomplete mapping entry '{item}' in flow sequence."
+                        )
+                        return errors
+                    errors.extend(_validate_yaml_flow_value(kv_parts[1].strip(), line_no, in_flow=True))
+                else:
+                    errors.extend(_validate_yaml_flow_value(item, line_no, in_flow=True))
+        return errors
+
+    if val[0] in ("'", '"'):
+        quote_ch = val[0]
+        escape = False
+        closed_at = -1
+        for i in range(1, len(val)):
+            ch = val[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and quote_ch == '"':
+                escape = True
+                continue
+            if ch == quote_ch:
+                closed_at = i
+                break
+        if closed_at != len(val) - 1:
+            errors.append(
+                f"YAML syntax error on line {line_no}: unexpected trailing content after quoted scalar '{val}'."
+            )
+        return errors
+
+    if in_flow and any(ch in val for ch in ("[", "]", "{", "}")):
+        errors.append(
+            f"YAML syntax error on line {line_no}: unquoted flow brackets or braces in scalar '{val}'."
+        )
+    return errors
+
+
 def _validate_cloud_init_syntax(
     lines: list[str],
     *,
@@ -960,7 +1134,9 @@ def _validate_cloud_init_syntax(
                     continue
                 block_scalar_indent = None
 
-            stripped = raw.strip()
+            stripped = _strip_yaml_inline_comment(raw.strip())
+            if not stripped:
+                continue
             # Check balanced brackets, braces, and quotes on non-scalar YAML lines
             in_single = False
             in_double = False
@@ -987,8 +1163,6 @@ def _validate_cloud_init_syntax(
                         brace_depth += 1
                     elif ch == "}":
                         brace_depth -= 1
-                    elif ch == "#":
-                        break
                     if bracket_depth < 0 or brace_depth < 0:
                         break
             if in_single or in_double or bracket_depth != 0 or brace_depth != 0:
@@ -1067,12 +1241,15 @@ def _validate_cloud_init_syntax(
                             {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": True}
                         )
                     else:
+                        errors.extend(_validate_yaml_flow_value(v_str, idx))
                         scopes.append(
                             {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": False}
                         )
                 else:
                     if re.search(r"^[|>][-+]?\s*$", after_dash):
                         block_scalar_indent = indent
+                    else:
+                        errors.extend(_validate_yaml_flow_value(after_dash, idx))
                     scopes.append(
                         {"indent": indent, "kind": "list", "child_indent": None, "allow_children": False}
                     )
@@ -1089,6 +1266,7 @@ def _validate_cloud_init_syntax(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": True}
                     )
                 else:
+                    errors.extend(_validate_yaml_flow_value(v_str, idx))
                     scopes.append(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
                     )
