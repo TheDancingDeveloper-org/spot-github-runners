@@ -897,6 +897,87 @@ class DashboardStore:
         telem["template_runners_per_instance"] = tpl_runners
         self.state.get("scaling", {}).get("cicd_runner", {})["runners_per_instance"] = tpl_runners
 
+    def _sync_rust_build_telemetry(self, now_ts: float | None = None) -> None:
+        """Recompute Rust builder load counters (builds_ran_past_hour, active_builds, queued_builds) from build records."""
+        ref_ts = float(now_ts) if now_ts is not None else time.time()
+        builds = self.state.get("rust_builds", [])
+        builds_past_hour = 0
+        active_builds = 0
+        queued_builds = 0
+        for b in builds:
+            status = str(b.get("status", "DELIVERED")).strip().upper()
+            if status in ("QUEUED", "PENDING", "WAITING"):
+                queued_builds += 1
+            elif status in ("RUNNING", "COMPILING", "ACTIVE", "IN_PROGRESS", "BUILDING"):
+                active_builds += 1
+            ts_str = b.get("delivered_at") or b.get("finished_at") or b.get("requested_at")
+            if ts_str:
+                try:
+                    dt = datetime.fromisoformat(str(ts_str).strip().replace("Z", "+00:00"))
+                    age_sec = ref_ts - dt.timestamp()
+                    if 0.0 <= age_sec <= 3600.0:
+                        builds_past_hour += 1
+                except ValueError:
+                    # Safe to ignore unparseable timestamps in legacy or partial build records.
+                    continue
+        telem = self.state.setdefault("scaling_telemetry", {})
+        telem["builds_ran_past_hour"] = builds_past_hour
+        telem["active_builds"] = active_builds
+        telem["queued_builds"] = queued_builds
+
+    def _validate_vm_template_compatibility(
+        self,
+        vm_tpl: dict[str, Any] | None,
+        profile: dict[str, Any],
+        role: str,
+    ) -> int:
+        """Validate that a VM template satisfies the workload profile's role, vCPU, RAM, benchmark, disk, and unit density."""
+        if vm_tpl is None or vm_tpl.get("role", role) != role:
+            tpl_id = profile.get("vm_template_id") if vm_tpl is None else vm_tpl.get("id")
+            raise ValueError(f"VM template '{tpl_id}' does not belong to role '{role}'")
+        tpl_name = str(vm_tpl.get("name") or vm_tpl.get("id") or "template")
+        tpl_vcpu = int(vm_tpl.get("vcpu", 0))
+        tpl_ram = float(vm_tpl.get("ram_gib", 0.0))
+        unit_vcpu = max(1, int(profile.get("runner_vcpu", 4 if role == "cicd_runner" else 16)))
+        unit_ram = max(1.0, float(profile.get("runner_ram_gib", 16.0 if role == "cicd_runner" else 28.0)))
+        overhead = max(0.0, float(profile.get("host_overhead_gib", 0.0)))
+        min_inst_vcpu = max(unit_vcpu, int(profile.get("min_instance_vcpu", unit_vcpu)))
+        min_inst_ram = max(unit_ram + overhead, float(profile.get("min_instance_ram_gib", unit_ram + overhead)))
+        if tpl_vcpu < min_inst_vcpu or tpl_ram < min_inst_ram:
+            raise ValueError(
+                f"VM template '{tpl_name}' ({tpl_vcpu} vCPU / {tpl_ram} GiB) does not satisfy "
+                f"profile sizing requirements ({min_inst_vcpu} vCPU / {min_inst_ram} GiB)"
+            )
+        min_bench = max(0, int(profile.get("min_benchmark_score", 0)))
+        tpl_bench = int(vm_tpl.get("benchmark_score", 0))
+        if tpl_bench < min_bench:
+            raise ValueError(
+                f"VM template '{tpl_name}' benchmark ({tpl_bench}) is below profile minimum ({min_bench})"
+            )
+        disk_mode = str(profile.get("disk_category", "any")).lower()
+        tpl_disk_cat = str(
+            vm_tpl.get("disk_category") or disk_category(str(vm_tpl.get("data_disk_type", "pd-ssd")))
+        ).lower()
+        if disk_mode in ("hyperdrive", "normal") and tpl_disk_cat != disk_mode:
+            raise ValueError(
+                f"VM template '{tpl_name}' disk category '{tpl_disk_cat}' does not satisfy profile '{disk_mode}'"
+            )
+        req_disk_gb = int(profile.get("data_disk_gb", 0))
+        if int(vm_tpl.get("data_disk_gb", 0)) < req_disk_gb:
+            raise ValueError(
+                f"VM template '{tpl_name}' data disk ({vm_tpl.get('data_disk_gb')} GB) is smaller than profile minimum ({req_disk_gb} GB)"
+            )
+        if role == "cicd_runner":
+            units = min(tpl_vcpu // unit_vcpu, int(max(0.0, tpl_ram - overhead) // unit_ram))
+            min_runners = max(1, int(profile.get("min_runners", 4)))
+            max_instances = max(1, int(profile.get("max_instances", 12)))
+            if units < 1 or ((min_runners + units - 1) // units) > max_instances:
+                raise ValueError(
+                    f"VM template '{tpl_name}' ({units} runners/VM) cannot satisfy min_runners ({min_runners}) within max_instances ({max_instances})"
+                )
+            return units
+        return 1
+
     def _sync_fleet_telemetry(self) -> None:
         """Synchronize scaling telemetry counters and CPU percentages with active fleet instances."""
         running_runners = [
@@ -930,6 +1011,7 @@ class DashboardStore:
                     or str(evt.get("instance_name", "")).startswith("builder-")
                 )
             ]
+        self._sync_rust_build_telemetry()
         self._sync_template_density()
 
     def _resolve_scaling_unit_hourly_usd(
@@ -1454,6 +1536,19 @@ class DashboardStore:
                 normalized_budget = normalize_budget(merged_budget_input)
                 candidate["budget"] = normalized_budget
 
+            active_tpl: dict[str, Any] | None = None
+            validated_tpl_units: int | None = None
+            if candidate.get("use_vm_template") and candidate.get("vm_template_id"):
+                active_tpl = next(
+                    (
+                        t
+                        for t in self.state.get("vm_templates", [])
+                        if t.get("id") == candidate.get("vm_template_id")
+                    ),
+                    None,
+                )
+                validated_tpl_units = self._validate_vm_template_compatibility(active_tpl, candidate, role)
+
             qual = qualify_instances(
                 candidate,
                 self.state["regions_enabled"],
@@ -1462,6 +1557,10 @@ class DashboardStore:
             )
 
             self.state["profiles"][role] = candidate
+            if active_tpl is not None and validated_tpl_units is not None:
+                active_tpl["runner_vcpu"] = int(candidate["runner_vcpu"])
+                active_tpl["runner_ram_gib"] = float(candidate["runner_ram_gib"])
+                active_tpl["runners_count"] = validated_tpl_units
             if normalized_budget is not None:
                 self.state["scaling"][role]["max_scale_up_hourly_usd"] = normalized_budget["max_hourly_usd"]
                 self.state["scaling"][role]["max_scale_up_daily_usd"] = normalized_budget["max_daily_usd"]
@@ -1808,10 +1907,20 @@ class DashboardStore:
                 for i in self.state["instances"]
                 if i["region"] == region and i["status"] == "RUNNING" and i["role"] == role
             ]
+            running_other_regions = sum(
+                1
+                for i in self.state["instances"]
+                if i["region"] != region and i["status"] == "RUNNING" and i["role"] == role
+            )
             current_count = len(running_in_region)
-            if target_count > 20 or (target_count > current_count and target_count > max_allowed):
+            projected_total = running_other_regions + target_count
+            if target_count > 20 or (
+                target_count > current_count
+                and (target_count > max_allowed or projected_total > max_allowed)
+            ):
                 raise ValueError(
-                    f"target_instances ({target_count}) exceeds maximum allowed instances ({max_allowed}) for role '{role}'"
+                    f"target_instances ({target_count}) in {region} (total fleet: {projected_total}) "
+                    f"exceeds maximum allowed instances ({max_allowed}) for role '{role}'"
                 )
             now_ts = time.time()
 
@@ -1855,6 +1964,7 @@ class DashboardStore:
                         raise ValueError(
                             f"Assigned VM template '{prof.get('vm_template_id')}' not found for role '{role}'"
                         )
+                    self._validate_vm_template_compatibility(vm_tpl, prof, role)
                     tpl_machine_type = str(vm_tpl.get("machine_type", ""))
                     tpl_family = tpl_machine_type.split("-", 1)[0]
                     if tpl_family not in reg_info.get("families", []):
@@ -2093,8 +2203,19 @@ class DashboardStore:
                 self.state["rust_builds"][existing_idx] = enriched
             else:
                 self.state["rust_builds"].insert(0, enriched)
+            self._sync_rust_build_telemetry(now_ts)
             self._persist()
-            return {"status": "ok", "build": enriched}
+            builder_eval = evaluate_builder_scaling_decision(
+                self.state["scaling"]["rust_builder"],
+                self.state["scaling_telemetry"],
+                per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
+                now_epoch=now_ts,
+            )
+            return {
+                "status": "ok",
+                "build": enriched,
+                "builder_scaling_evaluation": builder_eval,
+            }
 
 
 def make_handler(store: DashboardStore) -> type[BaseHTTPRequestHandler]:

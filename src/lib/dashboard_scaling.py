@@ -171,7 +171,7 @@ def _is_recent_unhandled_oom(
     try:
         dt = datetime.fromisoformat(str(ts_raw).strip().replace("Z", "+00:00"))
         age_seconds = now_ts - dt.timestamp()
-        return age_seconds <= lookback_seconds
+        return 0.0 <= age_seconds <= lookback_seconds
     except ValueError:
         return False
 

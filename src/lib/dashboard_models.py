@@ -592,7 +592,10 @@ def calculate_spot_pricing(
     disk_hourly = disk_daily / HOURS_PER_DAY
 
     subtotal_hourly = compute_hourly + disk_hourly
-    tax_fraction = _dec(tax_rate_percent) / Decimal("100")
+    tax_dec = _dec(tax_rate_percent)
+    if tax_dec < Decimal("0") or tax_dec > Decimal("100"):
+        raise ValueError(f"tax_rate_percent must be between 0 and 100 (got {tax_rate_percent})")
+    tax_fraction = tax_dec / Decimal("100")
     tax_hourly = subtotal_hourly * tax_fraction
     total_hourly = subtotal_hourly + tax_hourly
     total_daily = total_hourly * HOURS_PER_DAY
@@ -624,6 +627,13 @@ def normalize_budget(budget: dict[str, Any]) -> dict[str, Any]:
     max_hourly = _dec(budget.get("max_hourly_usd", "0.42"))
     max_daily = _dec(budget.get("max_daily_usd", "10.00"))
     max_monthly = _dec(budget.get("max_monthly_usd", "300.00"))
+    if max_hourly < Decimal("0") or max_daily < Decimal("0") or max_monthly < Decimal("0"):
+        raise ValueError("Budget limits (max_hourly_usd, max_daily_usd, max_monthly_usd) must be >= 0")
+
+    raw_tax = budget.get("tax_rate_percent", 8.25)
+    tax_dec = _dec(8.25 if raw_tax is None else raw_tax)
+    if tax_dec < Decimal("0") or tax_dec > Decimal("100"):
+        raise ValueError(f"tax_rate_percent must be between 0 and 100 (got {raw_tax})")
 
     sync_periods = bool(budget.get("sync_periods", False))
     if sync_periods:
@@ -637,15 +647,18 @@ def normalize_budget(budget: dict[str, Any]) -> dict[str, Any]:
             max_daily = max_monthly / DAYS_PER_MONTH
             max_hourly = max_monthly / HOURS_PER_MONTH
 
-    return {
+    normalized: dict[str, Any] = {
         "active_period": active_period,
         "max_hourly_usd": _money4(max_hourly),
         "max_daily_usd": _money(max_daily),
         "max_monthly_usd": _money(max_monthly),
         "include_disk_costs": bool(budget.get("include_disk_costs", True)),
         "include_taxes": bool(budget.get("include_taxes", False)),
-        "tax_rate_percent": float(budget.get("tax_rate_percent", 8.25)),
+        "tax_rate_percent": float(tax_dec),
     }
+    if "override_regional_tax" in budget:
+        normalized["override_regional_tax"] = bool(budget.get("override_regional_tax"))
+    return normalized
 
 
 def filter_regions(
@@ -738,7 +751,7 @@ def qualify_instances(
     budget = normalize_budget(profile_config.get("budget", {}))
     include_disk = budget["include_disk_costs"]
     include_taxes = budget["include_taxes"]
-    tax_rate = budget["tax_rate_percent"] if include_taxes else 0.0
+    override_regional_tax = bool(budget.get("override_regional_tax", False))
 
     hardware_qualifying: list[dict[str, Any]] = []
     spot_price_qualifying: list[dict[str, Any]] = []
@@ -761,6 +774,12 @@ def qualify_instances(
             if region_latencies_ms
             else int(reg["latency_ms"])
         )
+        reg_tax_rate = (
+            float(budget["tax_rate_percent"])
+            if override_regional_tax
+            else float(reg.get("tax_rate_default", budget["tax_rate_percent"]))
+        )
+        tax_rate = reg_tax_rate if include_taxes else 0.0
 
         for shape in MACHINE_SHAPES_CATALOG:
             family = shape["family"]

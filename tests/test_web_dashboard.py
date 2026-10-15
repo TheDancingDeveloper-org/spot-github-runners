@@ -11,6 +11,7 @@ import urllib.request
 
 from lib.dashboard_models import (
     DEFAULT_RUNNER_CLOUD_INIT,
+    calculate_spot_pricing,
     compute_cpu_benchmark_score,
     disk_category,
     filter_regions,
@@ -656,6 +657,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                 "max_instances": 5,
                 "runner_vcpu": 24,
                 "runner_ram_gib": 48,
+                "use_vm_template": False,
                 "budget": {
                     "max_hourly_usd": 2.25,
                     "max_daily_usd": 18.00,
@@ -816,6 +818,109 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(filtered_ov["fleet_summary"]["running_runner_slots"], 10)
         self.assertEqual(filtered_ov["fleet_summary"]["running_builder_vms"], 2)
 
+    def test_round4_codex_regressions(self):
+        # 1. Active VM templates are validated against updated profile sizing requirements
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/profile/rust_builder",
+                {
+                    "use_vm_template": True,
+                    "vm_template_id": "tpl-builder-c4d-16",
+                    "min_instance_ram_gib": 64,
+                },
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+
+        # 2. Regional scale-up enforces max_instances across the entire workload fleet
+        # Default cicd_runner has max_instances=8 and 2 running in other regions (europe-west1, africa-south1)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(
+                "/api/instances/scale-region",
+                {"region": "us-south1", "role": "cicd_runner", "target_instances": 7},
+            )
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
+
+        # 3. Future-dated OOM events are rejected by _is_recent_unhandled_oom / evaluate_scaling_decision
+        future_eval = evaluate_scaling_decision(
+            policy={"min_runners": 4, "max_runners": 16, "runners_per_instance": 4},
+            telemetry={
+                "current_runners": 4,
+                "current_instances": 1,
+                "jobs_ran_past_hour": 10,
+                "queued_jobs": 0,
+                "journal_oom_events": [{"id": "oom-future-1", "observed_at": "2099-01-01T00:00:00Z"}],
+                "github_oom_runs": [{"id": "oom-future-2", "is_oom": True, "failed_at": "2099-01-01T00:00:00Z"}],
+            },
+            now_epoch=1792023000.0,
+        )
+        self.assertEqual(len(future_eval["scale_up_reasons"]), 0)
+        self.assertEqual(future_eval["direction"], "hold")
+
+        # 4. Negative or >100 tax rates and negative budget caps are rejected
+        with self.assertRaises(ValueError):
+            calculate_spot_pricing(
+                family="c4d",
+                vcpu=16,
+                ram_gib=32,
+                region="us-south1",
+                boot_disk_type="hyperdisk-balanced",
+                boot_disk_gb=40,
+                data_disk_type="hyperdisk-balanced",
+                data_disk_gb=200,
+                tax_rate_percent=-50.0,
+            )
+        for bad_budget in (
+            {"target": "global", "tax_rate_percent": -10.0},
+            {"target": "global", "tax_rate_percent": 150.0},
+            {"target": "global", "max_hourly_usd": -1.0},
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._post("/api/budget", bad_budget)
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
+
+        # 5. qualify_instances applies each candidate region's tax_rate_default when include_taxes=True
+        taxed_qual = qualify_instances(
+            {
+                **self.store.state["profiles"]["cicd_runner"],
+                "budget": {
+                    "max_hourly_usd": 10.0,
+                    "max_daily_usd": 100.0,
+                    "max_monthly_usd": 1000.0,
+                    "include_disk_costs": True,
+                    "include_taxes": True,
+                },
+            },
+            {"us-south1": True, "europe-west1": True},
+        )
+        eu_candidates = [c for c in taxed_qual["spot_price_qualifying"] if c["region"] == "europe-west1"]
+        us_candidates = [c for c in taxed_qual["spot_price_qualifying"] if c["region"] == "us-south1"]
+        self.assertTrue(eu_candidates)
+        self.assertTrue(us_candidates)
+        self.assertEqual(eu_candidates[0]["pricing"]["tax_rate_percent"], 21.0)
+        self.assertEqual(us_candidates[0]["pricing"]["tax_rate_percent"], 8.25)
+
+        # 6. Recording a Rust build refreshes scaling_telemetry (builds_ran_past_hour, active_builds, queued_builds)
+        before_builds_hr = self.store.state["scaling_telemetry"]["builds_ran_past_hour"]
+        rb_post = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-live-telemetry-01",
+                "project_name": "oxidex",
+                "status": "QUEUED",
+                "cache_hits": 20,
+                "cache_misses": 5,
+            },
+        )
+        self.assertEqual(rb_post["status"], "ok")
+        after_telem = self.store.state["scaling_telemetry"]
+        self.assertGreaterEqual(after_telem["builds_ran_past_hour"], before_builds_hr + 1)
+        self.assertGreaterEqual(after_telem["queued_builds"], 1)
+        self.assertIn("builder_scaling_evaluation", rb_post)
+
 
 if __name__ == "__main__":
     unittest.main()
+
