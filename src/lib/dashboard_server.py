@@ -614,7 +614,8 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
                 "error_excerpt": "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
                 "failure_classification": "OOM",
                 "is_oom": True,
-                "badge_text": "OOM Killed (Exit 137)",
+                "is_self_hosted_runner": True,
+                "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
                 "deep_link": build_github_oom_deep_link(
                     "swack-tools/oxidex", 38601924810, 116012948102, 4, 118
                 ),
@@ -633,7 +634,8 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
                 "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
                 "failure_classification": "TIMEOUT",
                 "is_oom": False,
-                "badge_text": "Timeout (Not OOM — Ignored)",
+                "is_self_hosted_runner": False,
+                "badge_text": "Timeout · GitHub-Hosted Runner (Not Ours — Ignored)",
                 "deep_link": build_github_oom_deep_link(
                     "Appz4Fun/nzbget", 38596411473, 115964282184, 2, 50
                 ),
@@ -833,13 +835,14 @@ class DashboardStore:
                         "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
                     )
                     r.pop("is_oom", None)
-            cls_info = classify_github_ci_failure(str(r.get("error_excerpt", "")))
-            r.setdefault("failure_classification", cls_info["failure_classification"])
-            if "is_oom" not in r:
-                r["is_oom"] = cls_info["is_oom"]
+            cls_info = classify_github_ci_failure(
+                str(r.get("error_excerpt", "")),
+                runner_name=r.get("runner_name"),
+            )
             r["badge_text"] = cls_info["badge_text"]
             r["failure_classification"] = cls_info["failure_classification"]
             r["is_oom"] = cls_info["is_oom"]
+            r["is_self_hosted_runner"] = cls_info["is_self_hosted_runner"]
 
     def _persist(self) -> None:
         self.state["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1152,9 +1155,13 @@ class DashboardStore:
                         item["error_excerpt"] = (
                             "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
                         )
-                cls_info = classify_github_ci_failure(str(item["error_excerpt"]))
+                cls_info = classify_github_ci_failure(
+                    str(item["error_excerpt"]),
+                    runner_name=item.get("runner_name"),
+                )
                 item["failure_classification"] = cls_info["failure_classification"]
                 item["is_oom"] = cls_info["is_oom"]
+                item["is_self_hosted_runner"] = cls_info["is_self_hosted_runner"]
                 item["badge_text"] = cls_info["badge_text"]
                 item.setdefault("id", f"gh-ci-{uuid.uuid4().hex[:8]}")
                 item.setdefault("failed_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))

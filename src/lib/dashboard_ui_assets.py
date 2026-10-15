@@ -2072,7 +2072,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="mono" style="font-size:11.5px; color:${textCol}; margin-bottom:6px;">${run.error_excerpt}</div>
           <div style="font-size:12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-            <span>Run <code class="mono">#${run.run_id}</code> · Job <code class="mono">${run.job_id}</code> · Step <code class="mono">${run.step_number}</code> · Line <code class="mono">${run.line_number}</code> · ${formatLocalTime(run.failed_at)}</span>
+            <span>Runner: <code class="mono">${run.runner_name || 'self-hosted'}</code> · Run <code class="mono">#${run.run_id}</code> · Job <code class="mono">${run.job_id}</code> · Step <code class="mono">${run.step_number}</code> · Line <code class="mono">${run.line_number}</code> · ${formatLocalTime(run.failed_at)}</span>
             <a href="${run.deep_link}" target="_blank" rel="noopener" class="btn btn-sm ${btnCls} mono" style="text-decoration:none;">
               🔗 ${run.deep_link}
             </a>

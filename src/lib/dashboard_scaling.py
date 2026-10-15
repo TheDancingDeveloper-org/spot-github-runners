@@ -57,12 +57,31 @@ def parse_github_oom_deep_link(url: str) -> dict[str, Any]:
     }
 
 
-def classify_github_ci_failure(error_excerpt: str) -> dict[str, Any]:
-    """Classify a GitHub Actions failure log line as OOM, TIMEOUT, or OTHER_FAILURE.
-
-    Prevents deployment/step timeouts (such as `##[error]Timeout reached, aborting!`)
-    from being misclassified as out-of-memory (OOM) events.
+def is_self_hosted_spot_runner(runner_name: str | None) -> bool:
+    """Return True if runner_name belongs to our self-hosted GCP Spot runner fleet,
+    or False if it is a default GitHub-hosted runner (e.g. 'GitHub Actions 1000014245').
     """
+    if not runner_name:
+        return True
+    norm = str(runner_name).strip().lower()
+    if norm.startswith(("github actions", "hosted agent", "azure pipelines", "ubuntu-latest")):
+        return False
+    return True
+
+
+def classify_github_ci_failure(
+    error_excerpt: str,
+    runner_name: str | None = None,
+) -> dict[str, Any]:
+    """Classify a GitHub Actions failure log line and runner ownership.
+
+    Prevents:
+    1. Default GitHub-hosted runners (e.g. 'GitHub Actions 1000014245') from triggering
+       self-hosted GCP Spot fleet scaling.
+    2. Deployment/step timeouts (such as `##[error]Timeout reached, aborting!`)
+       from being misclassified as out-of-memory (OOM) events.
+    """
+    our_runner = is_self_hosted_spot_runner(runner_name)
     text = (error_excerpt or "").strip()
     lower = text.lower()
     if any(
@@ -75,10 +94,16 @@ def classify_github_ci_failure(error_excerpt: str) -> dict[str, Any]:
             "etimedout",
         )
     ):
+        badge = (
+            "Timeout · GitHub-Hosted Runner (Not Ours — Ignored)"
+            if not our_runner
+            else "Timeout (Not OOM — Ignored)"
+        )
         return {
             "failure_classification": "TIMEOUT",
             "is_oom": False,
-            "badge_text": "Timeout (Not OOM — Ignored)",
+            "is_self_hosted_runner": our_runner,
+            "badge_text": badge,
         }
     if any(
         token in lower
@@ -98,15 +123,28 @@ def classify_github_ci_failure(error_excerpt: str) -> dict[str, Any]:
             "enomem",
         )
     ):
+        if not our_runner:
+            return {
+                "failure_classification": "EXTERNAL_RUNNER_OOM",
+                "is_oom": False,
+                "is_self_hosted_runner": False,
+                "badge_text": "OOM on GitHub-Hosted Runner (Not Ours — Ignored)",
+            }
         return {
             "failure_classification": "OOM",
             "is_oom": True,
-            "badge_text": "OOM Killed (Exit 137)",
+            "is_self_hosted_runner": True,
+            "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
         }
     return {
         "failure_classification": "OTHER_FAILURE",
         "is_oom": False,
-        "badge_text": "Non-OOM Failure (Ignored)",
+        "is_self_hosted_runner": our_runner,
+        "badge_text": (
+            "GitHub-Hosted Runner (Not Ours — Ignored)"
+            if not our_runner
+            else "Non-OOM Failure (Ignored)"
+        ),
     }
 
 
@@ -228,7 +266,9 @@ def evaluate_scaling_decision(
                 "error_excerpt",
                 "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)",
             )
-            classification = classify_github_ci_failure(excerpt)
+            classification = classify_github_ci_failure(excerpt, runner_name=run.get("runner_name"))
+            if not classification["is_self_hosted_runner"]:
+                continue
             is_oom = run.get("is_oom") if "is_oom" in run else classification["is_oom"]
             if not is_oom:
                 continue
