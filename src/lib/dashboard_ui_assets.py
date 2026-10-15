@@ -1500,7 +1500,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById("badge-map-count").textContent = `${totalRunning} live`;
       document.getElementById("badge-instances-count").textContent = `${iv.instances.length}`;
       document.getElementById("badge-qual-count").textContent = `${cq.spot_price_qualifying_count} offers`;
-      document.getElementById("badge-oom-count").textContent = `${st.github_oom_runs.length} OOM`;
+      const confirmedOoms = st.github_oom_runs.filter(r => r.is_oom !== false).length;
+      document.getElementById("badge-oom-count").textContent = `${confirmedOoms} OOM`;
       document.getElementById("badge-tpl-count").textContent = `${APP_STATE.cloud_init_templates.length}`;
       const enabledRegs = APP_STATE.regions.filter(r => r.enabled).length;
       document.getElementById("badge-reg-count").textContent = `${enabledRegs}/${APP_STATE.regions.length}`;
@@ -2054,22 +2055,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       `;
 
-      // Render GitHub OOM Runs with exact step/line clickable links
-      document.getElementById("github-oom-runs-list").innerHTML = st.github_oom_runs.map(run => `
-        <div style="background:var(--bg-card); border:1px solid rgba(244, 63, 94, 0.4); border-left:4px solid #f43f5e; border-radius:8px; padding:11px 13px;">
+      // Render GitHub CI Runs (distinguishes confirmed OOMs from Timeouts) with exact step/line clickable links
+      document.getElementById("github-oom-runs-list").innerHTML = st.github_oom_runs.map(run => {
+        const isOom = run.is_oom !== false;
+        const borderCol = isOom ? "rgba(244, 63, 94, 0.4)" : "rgba(245, 158, 11, 0.4)";
+        const leftCol = isOom ? "#f43f5e" : "#f59e0b";
+        const textCol = isOom ? "#fda4af" : "#fde68a";
+        const badgeCls = isOom ? "badge-deleted" : "badge-vpn";
+        const badgeLabel = run.badge_text || (isOom ? "OOM Killed (Exit 137)" : "Timeout (Not OOM — Ignored)");
+        const btnCls = isOom ? "btn-danger" : "btn-secondary";
+        return `
+        <div style="background:var(--bg-card); border:1px solid ${borderCol}; border-left:4px solid ${leftCol}; border-radius:8px; padding:11px 13px;">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:4px;">
             <div style="font-weight:700; color:#fff;">${run.repository} — ${run.workflow_name || 'CI Workflow'} (<span class="mono">${run.job_name || 'job'}</span>)</div>
-            <span class="badge badge-deleted">OOM Killed (Exit 137)</span>
+            <span class="badge ${badgeCls}">${badgeLabel}</span>
           </div>
-          <div class="mono" style="font-size:11.5px; color:#fda4af; margin-bottom:6px;">${run.error_excerpt}</div>
+          <div class="mono" style="font-size:11.5px; color:${textCol}; margin-bottom:6px;">${run.error_excerpt}</div>
           <div style="font-size:12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
             <span>Run <code class="mono">#${run.run_id}</code> · Job <code class="mono">${run.job_id}</code> · Step <code class="mono">${run.step_number}</code> · Line <code class="mono">${run.line_number}</code> · ${formatLocalTime(run.failed_at)}</span>
-            <a href="${run.deep_link}" target="_blank" rel="noopener" class="btn btn-sm btn-danger mono" style="text-decoration:none;">
+            <a href="${run.deep_link}" target="_blank" rel="noopener" class="btn btn-sm ${btnCls} mono" style="text-decoration:none;">
               🔗 ${run.deep_link}
             </a>
           </div>
         </div>
-      `).join("");
+        `;
+      }).join("");
 
       // Render VM Journal OOM events
       document.getElementById("journal-oom-events-list").innerHTML = st.journal_oom_events.map(evt => `

@@ -57,6 +57,59 @@ def parse_github_oom_deep_link(url: str) -> dict[str, Any]:
     }
 
 
+def classify_github_ci_failure(error_excerpt: str) -> dict[str, Any]:
+    """Classify a GitHub Actions failure log line as OOM, TIMEOUT, or OTHER_FAILURE.
+
+    Prevents deployment/step timeouts (such as `##[error]Timeout reached, aborting!`)
+    from being misclassified as out-of-memory (OOM) events.
+    """
+    text = (error_excerpt or "").strip()
+    lower = text.lower()
+    if any(
+        token in lower
+        for token in (
+            "timeout reached",
+            "timed out",
+            "the operation was canceled",
+            "canceling pages deployment",
+            "etimedout",
+        )
+    ):
+        return {
+            "failure_classification": "TIMEOUT",
+            "is_oom": False,
+            "badge_text": "Timeout (Not OOM — Ignored)",
+        }
+    if any(
+        token in lower
+        for token in (
+            "out of memory",
+            "oom-kill",
+            "oom_kill",
+            "memory.oom",
+            "memory.max",
+            "exit code 137",
+            "exit 137",
+            "signal: 9",
+            "signal 9",
+            "sigkill",
+            "killed process",
+            "cannot allocate memory",
+            "enomem",
+        )
+    ):
+        return {
+            "failure_classification": "OOM",
+            "is_oom": True,
+            "badge_text": "OOM Killed (Exit 137)",
+        }
+    return {
+        "failure_classification": "OTHER_FAILURE",
+        "is_oom": False,
+        "badge_text": "Non-OOM Failure (Ignored)",
+    }
+
+
 def default_scaling_config() -> dict[str, Any]:
     """Return the default scaling policy configuration for CI/CD runners and Rust builders."""
     return {
@@ -167,15 +220,25 @@ def evaluate_scaling_decision(
     scale_down_reasons: list[dict[str, Any]] = []
     desired_runners = current_runners
 
-    # 1. GitHub Actions CI Run OOM Trigger
+    # 1. GitHub Actions CI Run OOM Trigger (ignores TIMEOUT or non-OOM failures)
     if cfg.get("enable_github_ci_oom_trigger", True) and github_oom_runs:
+        any_confirmed_oom = False
         for run in github_oom_runs:
+            excerpt = run.get(
+                "error_excerpt",
+                "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)",
+            )
+            classification = classify_github_ci_failure(excerpt)
+            is_oom = run.get("is_oom") if "is_oom" in run else classification["is_oom"]
+            if not is_oom:
+                continue
+            any_confirmed_oom = True
             link = run.get("deep_link") or build_github_oom_deep_link(
-                run.get("repository", "Appz4Fun/nzbget"),
-                run.get("run_id", 38596411473),
-                run.get("job_id", 115964282184),
-                run.get("step_number", 2),
-                run.get("line_number", 50),
+                run.get("repository", "swack-tools/oxidex"),
+                run.get("run_id", 38601924810),
+                run.get("job_id", 116012948102),
+                run.get("step_number", 4),
+                run.get("line_number", 118),
             )
             scale_up_reasons.append(
                 {
@@ -190,13 +253,11 @@ def evaluate_scaling_decision(
                     "job_id": run.get("job_id"),
                     "step_number": run.get("step_number"),
                     "line_number": run.get("line_number"),
-                    "error_excerpt": run.get(
-                        "error_excerpt",
-                        "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)",
-                    ),
+                    "error_excerpt": excerpt,
                 }
             )
-        desired_runners = max(desired_runners, current_runners + step_runners)
+        if any_confirmed_oom:
+            desired_runners = max(desired_runners, current_runners + step_runners)
 
     # 2. VM Journal OOM Trigger
     if cfg.get("enable_journal_oom_trigger", True) and journal_oom_events:

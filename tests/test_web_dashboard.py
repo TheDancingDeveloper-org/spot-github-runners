@@ -20,6 +20,7 @@ from lib.dashboard_models import (
 )
 from lib.dashboard_scaling import (
     build_github_oom_deep_link,
+    classify_github_ci_failure,
     evaluate_cpu_scope,
     evaluate_scaling_decision,
     parse_github_oom_deep_link,
@@ -157,6 +158,16 @@ class DashboardScalingTests(unittest.TestCase):
         self.assertEqual(parsed["job_id"], 115964282184)
         self.assertEqual(parsed["step_number"], 2)
         self.assertEqual(parsed["line_number"], 50)
+        timeout_cls = classify_github_ci_failure(
+            "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
+        )
+        self.assertEqual(timeout_cls["failure_classification"], "TIMEOUT")
+        self.assertFalse(timeout_cls["is_oom"])
+        oom_cls = classify_github_ci_failure(
+            "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)"
+        )
+        self.assertEqual(oom_cls["failure_classification"], "OOM")
+        self.assertTrue(oom_cls["is_oom"])
 
     def test_cpu_scope_all_vs_majority(self):
         samples = [62.0, 58.0, 35.0]

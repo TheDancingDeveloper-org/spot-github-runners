@@ -31,6 +31,7 @@ from .dashboard_models import (
 )
 from .dashboard_scaling import (
     build_github_oom_deep_link,
+    classify_github_ci_failure,
     default_scaling_config,
     evaluate_scaling_decision,
     parse_github_oom_deep_link,
@@ -600,22 +601,6 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         ],
         "github_oom_runs": [
             {
-                "id": "gh-oom-38596411473",
-                "repository": "Appz4Fun/nzbget",
-                "workflow_name": "CI Build & Integration Suite",
-                "run_id": 38596411473,
-                "job_id": 115964282184,
-                "job_name": "linux-x64-release-build",
-                "runner_name": "oxidex-dallas-01-2",
-                "step_number": 2,
-                "line_number": 50,
-                "failed_at": _iso_seconds_ago(540, ref_now),
-                "error_excerpt": "error: could not compile `nzbget-core`: process didn't exit successfully (signal: 9, SIGKILL: kill) — container memory.max (16 GiB) exhausted",
-                "deep_link": build_github_oom_deep_link(
-                    "Appz4Fun/nzbget", 38596411473, 115964282184, 2, 50
-                ),
-            },
-            {
                 "id": "gh-oom-38601924810",
                 "repository": "swack-tools/oxidex",
                 "workflow_name": "Rust 1.99 Qualification Matrix",
@@ -625,10 +610,32 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
                 "runner_name": "oxidex-za-jnb-01-3",
                 "step_number": 4,
                 "line_number": 118,
-                "failed_at": _iso_seconds_ago(1380, ref_now),
+                "failed_at": _iso_seconds_ago(540, ref_now),
                 "error_excerpt": "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
+                "failure_classification": "OOM",
+                "is_oom": True,
+                "badge_text": "OOM Killed (Exit 137)",
                 "deep_link": build_github_oom_deep_link(
                     "swack-tools/oxidex", 38601924810, 116012948102, 4, 118
+                ),
+            },
+            {
+                "id": "gh-timeout-38596411473",
+                "repository": "Appz4Fun/nzbget",
+                "workflow_name": "docs",
+                "run_id": 38596411473,
+                "job_id": 115964282184,
+                "job_name": "deploy (Deploy to GitHub Pages)",
+                "runner_name": "GitHub Actions 1000014245",
+                "step_number": 2,
+                "line_number": 50,
+                "failed_at": _iso_seconds_ago(1380, ref_now),
+                "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
+                "failure_classification": "TIMEOUT",
+                "is_oom": False,
+                "badge_text": "Timeout (Not OOM — Ignored)",
+                "deep_link": build_github_oom_deep_link(
+                    "Appz4Fun/nzbget", 38596411473, 115964282184, 2, 50
                 ),
             },
         ],
@@ -805,11 +812,34 @@ class DashboardStore:
                 base = default_dashboard_state(project=project, org=org)
                 base.update(loaded)
                 self.state = base
+                self._normalize_github_ci_runs()
+                self._persist()
             except (OSError, json.JSONDecodeError):
                 self.state = default_dashboard_state(project=project, org=org)
         else:
             self.state = default_dashboard_state(project=project, org=org)
             self._persist()
+
+    def _normalize_github_ci_runs(self) -> None:
+        runs = self.state.get("scaling_telemetry", {}).get("github_oom_runs", [])
+        for r in runs:
+            if int(r.get("run_id", 0)) == 38596411473 and int(r.get("job_id", 0)) == 115964282184:
+                if "nzbget-core" in str(r.get("error_excerpt", "")):
+                    r["id"] = "gh-timeout-38596411473"
+                    r["workflow_name"] = "docs"
+                    r["job_name"] = "deploy (Deploy to GitHub Pages)"
+                    r["runner_name"] = "GitHub Actions 1000014245"
+                    r["error_excerpt"] = (
+                        "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
+                    )
+                    r.pop("is_oom", None)
+            cls_info = classify_github_ci_failure(str(r.get("error_excerpt", "")))
+            r.setdefault("failure_classification", cls_info["failure_classification"])
+            if "is_oom" not in r:
+                r["is_oom"] = cls_info["is_oom"]
+            r["badge_text"] = cls_info["badge_text"]
+            r["failure_classification"] = cls_info["failure_classification"]
+            r["is_oom"] = cls_info["is_oom"]
 
     def _persist(self) -> None:
         self.state["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1100,7 +1130,7 @@ class DashboardStore:
             if "telemetry" in payload and isinstance(payload["telemetry"], dict):
                 self.state["scaling_telemetry"].update(payload["telemetry"])
             if "add_github_oom_run" in payload and isinstance(payload["add_github_oom_run"], dict):
-                item = payload["add_github_oom_run"]
+                item = dict(payload["add_github_oom_run"])
                 if "deep_link" in item and not item.get("run_id"):
                     parsed = parse_github_oom_deep_link(item["deep_link"])
                     item = {**item, **parsed, "deep_link": parsed["url"]}
@@ -1113,7 +1143,20 @@ class DashboardStore:
                         item.get("line_number", 50),
                     )
                     item["deep_link"] = link
-                item.setdefault("id", f"gh-oom-{uuid.uuid4().hex[:8]}")
+                if not item.get("error_excerpt"):
+                    if int(item.get("run_id", 0)) == 38596411473 and int(item.get("job_id", 0)) == 115964282184:
+                        item["error_excerpt"] = (
+                            "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
+                        )
+                    else:
+                        item["error_excerpt"] = (
+                            "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
+                        )
+                cls_info = classify_github_ci_failure(str(item["error_excerpt"]))
+                item["failure_classification"] = cls_info["failure_classification"]
+                item["is_oom"] = cls_info["is_oom"]
+                item["badge_text"] = cls_info["badge_text"]
+                item.setdefault("id", f"gh-ci-{uuid.uuid4().hex[:8]}")
                 item.setdefault("failed_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
                 self.state["scaling_telemetry"]["github_oom_runs"].insert(0, item)
             self._persist()
