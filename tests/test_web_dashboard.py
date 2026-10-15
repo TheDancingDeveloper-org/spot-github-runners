@@ -1361,10 +1361,12 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             parsed_def = parse_cloud_init(tpl_str)
             self.assertTrue(parsed_def["valid"], parsed_def["warnings"])
             self.assertIn("/etc/apt/sources.list.d/docker.list", tpl_str)
-            self.assertIn("actions-runner-linux-x64", tpl_str)
             self.assertIn("./config.sh --unattended", tpl_str)
-            self.assertIn("./svc.sh install runner", tpl_str)
-            self.assertIn("./svc.sh start", tpl_str)
+        self.assertIn("actions-runner-linux-x64", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn("./svc.sh install runner", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn("./svc.sh start", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn("FROM ghcr.io/actions/actions-runner:2.337.0", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("oxidex-self-hosted-runner:2.337.0 ./run.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
 
         # 8. Saving an existing cloud-init template with an updated role persists the new role and assigns to that role
         created_ci = self._post(
@@ -1884,13 +1886,13 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         )
         from lib.dashboard_ui_assets import render_dashboard_html
 
-        # 1. DEFAULT_RUST_BUILDER_CLOUD_INIT allows canonical outer builder transaction flock + oxidex-remote-build in sudoers
+        # 1. DEFAULT_RUST_BUILDER_CLOUD_INIT allows canonical outer builder transaction wrapper + oxidex-remote-build in sudoers
         self.assertIn(
-            'sudo: ["ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/bin/flock --shared /run/oxidex-build.lock *"]',
+            'sudo: ["ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/local/bin/oxidex-remote-transaction"]',
             DEFAULT_RUST_BUILDER_CLOUD_INIT,
         )
         self.assertIn(
-            "%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/bin/flock --shared /run/oxidex-build.lock *",
+            "%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/local/bin/oxidex-remote-transaction",
             DEFAULT_RUST_BUILDER_CLOUD_INIT,
         )
 
@@ -1902,7 +1904,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertIn("just --version && cbindgen --version && cargo nextest --version", DEFAULT_RUST_BUILDER_CLOUD_INIT)
         self.assertIn(":/usr/local/cargo/bin:", DEFAULT_RUST_BUILDER_CLOUD_INIT)
 
-        # 3. DEFAULT_RUNNER_STRICT_CLOUD_INIT installs Rust 1.99.0 and enforces 8-vCPU / 32-GiB systemd drop-in limits before advertising rust-1.99 / heavy32 labels
+        # 3. DEFAULT_RUNNER_STRICT_CLOUD_INIT installs Rust 1.99.0 and enforces 8-vCPU / 32-GiB limits before advertising rust-1.99 / heavy32 labels
         self.assertIn("sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
         self.assertIn('rustc --version | grep "^rustc 1.99.0 "', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
         self.assertIn("heavy32-limits.conf", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
@@ -2030,9 +2032,129 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(expensive_fleet_eval["desired_instances"], 1)
         self.assertEqual(expensive_fleet_eval["projected_hourly_usd"], 0.42)
 
+    def test_round11_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+
+        # 1. Builder cloud-init does not grant wildcard sudo on /usr/bin/flock; uses dedicated oxidex-remote-transaction wrapper
+        self.assertNotIn("/usr/bin/flock --shared /run/oxidex-build.lock *", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("/usr/local/bin/oxidex-remote-transaction", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("if sys.argv[1:2] in (['transaction'], ['cleanup-export']):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        # 2. Strict runner cloud-init runs unprivileged containerized runners with no passwordless sudo or docker group
+        self.assertIn("sudo: false", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertNotIn("groups: docker", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("--cap-drop=ALL --security-opt=no-new-privileges:true", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("/opt/gha-runners/host_admission.py", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("/etc/gha-admission.json", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 3. Ruby Psych safe_load uses keyword arguments (aliases: true) so valid YAML with anchors/aliases parses cleanly
+        yaml_with_alias = (
+            "#cloud-config\n"
+            "users:\n"
+            "  - &base_user\n"
+            "    name: runner\n"
+            "    shell: /bin/bash\n"
+            "runcmd:\n"
+            "  - echo ok\n"
+        )
+        parsed_alias = parse_cloud_init(yaml_with_alias)
+        self.assertTrue(parsed_alias["valid"], f"Expected valid YAML with anchor: {parsed_alias}")
+
+        # 4. Global budget is enforced across both roles (cicd_runner + rust_builder combined)
+        # Set global budget to $0.50/hr; rust_builder alone is ~$0.22/hr (and scaling us-south1 to 2 is ~$0.33/hr < $0.50/hr),
+        # but combined with running cicd_runner VMs (~$0.33/hr) reaches ~$0.66/hr > $0.50/hr global cap
+        self._post(
+            "/api/budget",
+            {
+                "target": "global",
+                "max_hourly_usd": 0.50,
+                "max_daily_usd": 24.0,
+                "max_monthly_usd": 700.0,
+                "include_disk_costs": True,
+                "include_taxes": False,
+            },
+        )
+        ov_global = self._get("/api/overview")
+        self.assertTrue(ov_global["scaling"]["cicd_runner"]["shared_global_budget"])
+        self.assertTrue(ov_global["scaling"]["rust_builder"]["shared_global_budget"])
+        with self.assertRaises(urllib.error.HTTPError) as ctx_global_cap:
+            self._post(
+                "/api/instances/scale-region",
+                {
+                    "region": "us-south1",
+                    "role": "rust_builder",
+                    "target_instances": 2,
+                },
+            )
+        self.assertEqual(ctx_global_cap.exception.code, 400)
+        ctx_global_cap.exception.close()
+
+        # Restore generous global budget for subsequent checks
+        self._post(
+            "/api/budget",
+            {
+                "target": "global",
+                "max_hourly_usd": 20.0,
+                "max_daily_usd": 200.0,
+                "max_monthly_usd": 2000.0,
+                "include_disk_costs": True,
+                "include_taxes": False,
+            },
+        )
+
+        # 5. Inverted min_instances > max_instances (or min_runners > max_runners) is rejected in /api/scaling
+        with self.assertRaises(urllib.error.HTTPError) as ctx_inv_builder:
+            self._post(
+                "/api/scaling",
+                {
+                    "role": "rust_builder",
+                    "policy": {"min_instances": 5, "max_instances": 2},
+                },
+            )
+        self.assertEqual(ctx_inv_builder.exception.code, 400)
+        ctx_inv_builder.exception.close()
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx_inv_runner:
+            self._post(
+                "/api/scaling",
+                {
+                    "role": "cicd_runner",
+                    "policy": {"min_runners": 16, "max_runners": 8},
+                },
+            )
+        self.assertEqual(ctx_inv_runner.exception.code, 400)
+        ctx_inv_runner.exception.close()
+
+        # 6. create_vm_template_from_instance preserves the source instance's cloud_init_template_id even after profile cloud-init changes
+        saved_ci = self._post(
+            "/api/cloud-init/save",
+            {
+                "mode": "save_as",
+                "name": "Custom Profile CI",
+                "role": "cicd_runner",
+                "assign_to_profile": True,
+                "content": "#cloud-config\nruncmd:\n  - echo custom-profile\n",
+            },
+        )["template"]
+        self.assertNotEqual(saved_ci["id"], "ci-runner-default")
+        # Create VM template from an existing instance (oxidex-runners-dallas-01) that ran with ci-runner-default
+        created_vm_tpl = self._post(
+            "/api/vm-templates/from-instance",
+            {
+                "instance_id": "90481726351002",
+                "template_name": "Preserved Source CI Template",
+                "assign_to_profile": True,
+            },
+        )["vm_template"]
+        self.assertEqual(created_vm_tpl["cloud_init_template_id"], "ci-runner-default")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

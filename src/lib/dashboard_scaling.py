@@ -302,6 +302,7 @@ def evaluate_scaling_decision(
     now_epoch: float | None = None,
     max_instances: int | None = None,
     running_instance_hourly_rates: list[float] | None = None,
+    other_role_hourly_usd: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate live telemetry against scaling triggers and max scale-up budgets.
 
@@ -597,6 +598,16 @@ def evaluate_scaling_decision(
         max_daily_cap / 24.0,
         max_monthly_cap / (24.0 * 365.0 / 12.0),
     )
+    other_burn = 0.0
+    if other_role_hourly_usd is not None:
+        other_burn = max(0.0, _finite_float_val(other_role_hourly_usd, "other_role_hourly_usd"))
+    elif cfg.get("shared_global_budget") or telemetry.get("shared_global_budget"):
+        raw_other = telemetry.get("builder_instance_hourly_rates")
+        if isinstance(raw_other, (list, tuple)):
+            other_burn = sum(max(0.0, _finite_float_val(r, "builder_instance_hourly_rates")) for r in raw_other)
+    if other_burn > 0.0:
+        effective_hourly_cap = max(0.0, effective_hourly_cap - other_burn)
+
     raw_fleet_rates = (
         running_instance_hourly_rates
         if running_instance_hourly_rates is not None
@@ -686,6 +697,7 @@ def evaluate_builder_scaling_decision(
     per_instance_hourly_usd: float = 0.25,
     now_epoch: float | None = None,
     running_instance_hourly_rates: list[float] | None = None,
+    other_role_hourly_usd: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate dedicated Rust builder telemetry against builder scaling triggers and budgets."""
     _assert_finite_json_tree(policy, "policy")
@@ -841,6 +853,16 @@ def evaluate_builder_scaling_decision(
         max_daily_cap / 24.0,
         max_monthly_cap / (24.0 * 365.0 / 12.0),
     )
+    other_burn = 0.0
+    if other_role_hourly_usd is not None:
+        other_burn = max(0.0, _finite_float_val(other_role_hourly_usd, "other_role_hourly_usd"))
+    elif cfg.get("shared_global_budget") or telemetry.get("shared_global_budget"):
+        raw_other = telemetry.get("running_instance_hourly_rates")
+        if isinstance(raw_other, (list, tuple)):
+            other_burn = sum(max(0.0, _finite_float_val(r, "running_instance_hourly_rates")) for r in raw_other)
+    if other_burn > 0.0:
+        effective_hourly_cap = max(0.0, effective_hourly_cap - other_burn)
+
     raw_builder_rates = (
         running_instance_hourly_rates
         if running_instance_hourly_rates is not None

@@ -115,15 +115,12 @@ DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
 package_update: true
 package_upgrade: true
 
-groups:
-  - docker
-
 users:
   - default
   - name: runner
     gecos: Heavy Pool GitHub Actions Runner (Rust 1.99)
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    groups: users, admin, docker
+    sudo: false
+    groups: users
     shell: /bin/bash
     lock_passwd: true
 
@@ -133,6 +130,7 @@ packages:
   - gnupg
   - jq
   - git
+  - python3
   - xfsprogs
   - util-linux
   - rsync
@@ -153,8 +151,98 @@ write_files:
       RUNNERS_COUNT="4"
       RUNNER_CPU_LIMIT="8"
       RUNNER_MEMORY_GB="32"
+      ADMISSION_WORK_GIB="64"
+      STRICT_HEAVY_POOL="1"
       DISK_DEVICE="/dev/disk/by-id/google-runner-data"
       DISK_MOUNT="/mnt/runner-data"
+  - path: /opt/gha-runners/host_admission.py
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env python3
+      import json, os, socket, sys
+      from pathlib import Path
+
+      CONFIG_PATH = Path('/etc/gha-admission.json')
+      LEASES_PATH = Path('/var/lib/gha-admission/leases.json')
+      SOCKET_PATH = Path('/run/gha-admission/socket')
+
+      def serve():
+          SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+          LEASES_PATH.parent.mkdir(parents=True, exist_ok=True)
+          if not LEASES_PATH.exists():
+              LEASES_PATH.write_text('{}\\n')
+          if SOCKET_PATH.exists():
+              SOCKET_PATH.unlink()
+          srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          srv.bind(str(SOCKET_PATH))
+          os.chmod(SOCKET_PATH, 0o666)
+          srv.listen(16)
+          while True:
+              conn, _ = srv.accept()
+              with conn:
+                  raw = conn.recv(4096).decode('utf-8', errors='replace').strip()
+                  cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+                  leases = json.loads(LEASES_PATH.read_text()) if LEASES_PATH.exists() else {}
+                  req = json.loads(raw) if raw.startswith('{') else {'op': raw, 'owner': 'default'}
+                  op = req.get('op', 'acquire')
+                  owner = str(req.get('owner', 'default'))
+                  runner_gib = int(cfg.get('runner_gib', 32))
+                  work_gib = int(cfg.get('work_gib', 64))
+                  if op == 'release':
+                      leases.pop(owner, None)
+                      LEASES_PATH.write_text(json.dumps(leases, sort_keys=True) + '\\n')
+                      conn.sendall(b'{"ok": true}\\n')
+                  elif sum(leases.values()) + runner_gib <= work_gib or owner in leases:
+                      leases[owner] = runner_gib
+                      LEASES_PATH.write_text(json.dumps(leases, sort_keys=True) + '\\n')
+                      conn.sendall(b'{"ok": true}\\n')
+                  else:
+                      conn.sendall(b'{"ok": false, "reason": "admission budget exhausted"}\\n')
+
+      def write_config(runners_count, work_gib, runner_gib):
+          host = socket.gethostname().split('.')[0]
+          names = [f'{host}-runner-{i}' for i in range(1, int(runners_count) + 1)]
+          CONFIG_PATH.write_text(
+              json.dumps(
+                  {
+                      'role': 'runner',
+                      'work_gib': int(work_gib),
+                      'runner_gib': int(runner_gib),
+                      'runner_names': names,
+                      'heavy_runners': names,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + '\\n'
+          )
+          os.chmod(CONFIG_PATH, 0o644)
+
+      if __name__ == '__main__':
+          if sys.argv[1:] == ['serve']:
+              serve()
+          elif sys.argv[1:2] == ['write-config']:
+              write_config(sys.argv[2], sys.argv[3], sys.argv[4])
+  - path: /opt/gha-runners/build/Dockerfile
+    permissions: '0644'
+    owner: root:root
+    content: |
+      FROM ghcr.io/actions/actions-runner:2.337.0
+      ARG DEBIAN_FRONTEND=noninteractive
+      USER root
+      RUN apt-get update && apt-get install -y --no-install-recommends build-essential clang cmake curl git jq libssl-dev make pkg-config python3 ca-certificates unzip zip xz-utils zstd && rm -rf /var/lib/apt/lists/* && rm -f /etc/sudoers /etc/sudoers.d/* && install -d -o runner -g runner /runner-state /work /opt/runner-rust/cargo /opt/runner-rust/rustup
+      USER runner
+      ENV CARGO_HOME=/opt/runner-rust/cargo
+      ENV RUSTUP_HOME=/opt/runner-rust/rustup
+      ENV PATH=/opt/runner-rust/cargo/bin:${PATH}
+      RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && rustup component add rustfmt clippy --toolchain 1.99.0 && rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "
+      USER root
+      RUN chown -R root:root /opt/runner-rust && chmod -R a-w /opt/runner-rust
+      USER 1001:1001
+      ENV CARGO_HOME=/work/.cargo
+      ENV PATH=/opt/runner-rust/cargo/bin:/work/.cargo/bin:${PATH}
+      WORKDIR /work
 
 runcmd:
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && dev="${DISK_DEVICE:-/dev/disk/by-id/google-runner-data}" && mp="${DISK_MOUNT:-/mnt/runner-data}" && if [[ ! -b "$dev" ]]; then echo "Missing persistent runner disk $dev" >&2; exit 1; fi && (blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -F "$dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp") && mountpoint -q "$mp" && mkdir -p "$mp/docker" "$mp/containerd" "$mp/instances" "$mp/work"'''
@@ -164,9 +252,9 @@ runcmd:
   - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker"'''
-  - 'bash -lc ''set -euo pipefail && install -d -m 0755 -o runner -g runner /opt/runner-rust/cargo /opt/runner-rust/rustup && curl --proto "=https" --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup runuser -u runner -- sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup component add rustfmt clippy --toolchain 1.99.0 && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && ln -sfn /opt/runner-rust/cargo/bin/* /usr/local/bin/ && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "'''
-  - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --work "${work_dir}" && ./svc.sh install runner && unit_name="$(basename "$(cat .service)")" && install -d -m 0755 "/etc/systemd/system/${unit_name}.d" && printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nEnvironment=RUSTUP_HOME=/opt/runner-rust/rustup\\nEnvironment=PATH=/opt/runner-rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/${unit_name}.d/heavy32-limits.conf" && systemctl daemon-reload && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - 'bash -lc ''set -euo pipefail && install -d -m 0755 -o runner -g runner /opt/runner-rust/cargo /opt/runner-rust/rustup && curl --proto "=https" --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup runuser -u runner -- sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup component add rustfmt clippy --toolchain 1.99.0 && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && chown -R root:root /opt/runner-rust && chmod -R a-w /opt/runner-rust && ln -sfn /opt/runner-rust/cargo/bin/* /usr/local/bin/ && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "'''
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-64}" "${RUNNER_MEMORY_GB:-32}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -v "${state_dir}:/runner-state" -v "${work_dir}:${work_dir}" oxidex-self-hosted-runner:2.337.0 ./config.sh --unattended --replace --name "${name}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --work "${work_dir}"; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e GHA_ADMISSION_REQUIRED=1 -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:${work_dir}" oxidex-self-hosted-runner:2.337.0 ./run.sh; done'
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -181,7 +269,7 @@ users:
   - default
   - name: oxidex-uploader
     gecos: Dedicated Rust 1.99 Remote Builder Uploader
-    sudo: ["ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/bin/flock --shared /run/oxidex-build.lock *"]
+    sudo: ["ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/local/bin/oxidex-remote-transaction"]
     groups: oxidex-build
     shell: /bin/bash
     lock_passwd: true
@@ -208,7 +296,7 @@ write_files:
     permissions: '0440'
     owner: root:root
     content: |
-      %oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/bin/flock --shared /run/oxidex-build.lock *
+      %oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/local/bin/oxidex-remote-transaction
   - path: /etc/oxidex-remote-build.json
     permissions: '0644'
     owner: root:root
@@ -270,6 +358,141 @@ write_files:
       ENV CARGO_TARGET_DIR=/target
       WORKDIR /src
       ENTRYPOINT ["/usr/bin/python3", "/usr/local/bin/oxidex-build-entrypoint"]
+  - path: /usr/local/bin/oxidex-remote-transaction
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env python3
+      # Root-owned remote builder transaction wrapper; validates operations without allowing shell commands.
+      import argparse, fcntl, hashlib, json, os, pwd, re, shutil, stat, subprocess, sys, tarfile
+      from pathlib import Path
+
+      def validate_identity(project, run, upload):
+          if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}', project):
+              raise ValueError('Invalid project identifier')
+          if not re.fullmatch(r'run-[0-9a-f]{32}', run):
+              raise ValueError('Invalid run identifier')
+          expected_name = f'oxidex-remote-source-{run}.tar.gz'
+          if Path(upload).name != expected_name:
+              raise ValueError('Invalid upload archive name')
+          caller_uid = int(os.environ.get('SUDO_UID', '0'))
+          caller_home = Path(pwd.getpwuid(caller_uid).pw_dir).resolve()
+          upload_path = (caller_home / expected_name) if not Path(upload).is_absolute() else Path(upload)
+          if upload_path.is_symlink() or upload_path.parent.resolve() != caller_home:
+              raise ValueError('Upload archive must reside directly in caller home directory')
+          return upload_path
+
+      def verify_instance_id(instance_id):
+          if not instance_id:
+              return
+          if not re.fullmatch(r'[0-9]+', str(instance_id)):
+              raise ValueError('Invalid VM instance_id')
+          actual = subprocess.check_output(
+              ['curl', '--fail', '--silent', '--show-error', '--max-time', '10',
+               '-H', 'Metadata-Flavor:Google', 'http://metadata.google.internal/computeMetadata/v1/instance/id'],
+              text=True,
+          ).strip()
+          if actual != str(instance_id):
+              raise SystemExit(75)
+
+      def run_cleanup(root, project, run, upload_path, instance_id):
+          verify_instance_id(instance_id)
+          upload_path.unlink(missing_ok=True)
+          export = root / 'exports' / run
+          for path in (export, *export.parents):
+              if path.is_symlink():
+                  raise RuntimeError('Symlinked export path')
+              if not path.exists():
+                  continue
+              info = path.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                  raise RuntimeError('Export cleanup requires root-owned private directories')
+          if export.exists():
+              if export.resolve() != export:
+                  raise RuntimeError('Noncanonical export path')
+              shutil.rmtree(export)
+
+      def run_build(root, project, run, upload_path, digest, profile, instance_id):
+          if not re.fullmatch(r'[0-9a-f]{64}', digest):
+              raise ValueError('Invalid archive sha256 digest')
+          if profile not in ('debug', 'release'):
+              raise ValueError('Invalid build profile')
+          try:
+              verify_instance_id(instance_id)
+              if Path('/run/oxidex-build-draining').exists():
+                  raise SystemExit(75)
+              source = root / 'sources' / project
+              target = root / 'targets' / project
+              with open(f'/run/oxidex-cache-active-{project}.lock', 'a') as cache_lock:
+                  try:
+                      fcntl.flock(cache_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                  except BlockingIOError:
+                      raise SystemExit(75)
+                  subprocess.run(['/usr/local/bin/oxidex-remote-build', project, 'prepare'], check=True)
+                  actual_digest = hashlib.sha256(upload_path.read_bytes()).hexdigest()
+                  if actual_digest != digest:
+                      raise RuntimeError('Upload archive sha256 mismatch')
+                  for child in source.iterdir():
+                      if child.is_dir() and not child.is_symlink():
+                          shutil.rmtree(child)
+                      else:
+                          child.unlink()
+                  with tarfile.open(upload_path, 'r:gz') as tar:
+                      for member in tar.getmembers():
+                          member_path = (source / member.name).resolve()
+                          if not member_path.is_relative_to(source.resolve()) or member.issym() or member.islnk():
+                              raise RuntimeError('Unsafe archive member in source snapshot')
+                      tar.extractall(source)
+              stages = [['cargo', 'fetch', '--locked', '--target', 'x86_64-unknown-linux-gnu']]
+              if profile == 'release':
+                  stages.append(['just', 'cbindgen-check'])
+              build_cmd = ['cargo', 'build'] + (['--release'] if profile == 'release' else []) + ['--locked', '--bin', 'oxidex']
+              run_cmd = ['cargo', 'run'] + (['--release'] if profile == 'release' else []) + ['--locked', '--bin', 'oxidex', '--', '--readonly', '--version']
+              stages.extend([build_cmd, run_cmd])
+              for stage in stages:
+                  rc = subprocess.run(['/usr/local/bin/oxidex-remote-build', project, *stage]).returncode
+                  if rc != 0:
+                      raise SystemExit(rc)
+              binary = target / profile / 'oxidex'
+              if not binary.is_file() or binary.is_symlink() or binary.resolve() != binary:
+                  raise RuntimeError('Verified build binary is missing or a symlink')
+              export = root / 'exports' / run / 'oxidex'
+              export.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+              shutil.copy2(binary, export)
+              os.chmod(export, 0o755)
+              out_digest = hashlib.sha256(export.read_bytes()).hexdigest()
+              print(f'{out_digest}  {export}')
+          finally:
+              upload_path.unlink(missing_ok=True)
+
+      def main():
+          if os.geteuid() != 0:
+              raise RuntimeError('Invoke this root-owned transaction wrapper with sudo')
+          parser = argparse.ArgumentParser()
+          parser.add_argument('operation', choices=['build', 'cleanup'])
+          parser.add_argument('--project', required=True)
+          parser.add_argument('--run', required=True)
+          parser.add_argument('--upload', required=True)
+          parser.add_argument('--digest', default='')
+          parser.add_argument('--profile', default='release')
+          parser.add_argument('--instance-id', default='')
+          args = parser.parse_args()
+          config = json.loads(Path('/etc/oxidex-remote-build.json').read_text())
+          root = Path(config.get('cache_mount', '/mnt/runner-data/remote-build'))
+          mount_root = root.parent if root.name == 'remote-build' else root
+          if not os.path.ismount(mount_root):
+              raise RuntimeError(f'Builder cache mount point is not mounted: {mount_root}')
+          upload_path = validate_identity(args.project, args.run, args.upload)
+          with open('/run/oxidex-build.lock', 'a') as build_lock, open(f'/run/oxidex-project-{args.project}.lock', 'a') as proj_lock:
+              fcntl.flock(build_lock, fcntl.LOCK_SH)
+              fcntl.flock(proj_lock, fcntl.LOCK_EX)
+              if args.operation == 'cleanup':
+                  run_cleanup(root, args.project, args.run, upload_path, args.instance_id)
+              else:
+                  run_build(root, args.project, args.run, upload_path, args.digest, args.profile, args.instance_id)
+
+      if __name__ == '__main__':
+          main()
   - path: /usr/local/bin/oxidex-remote-build
     permissions: '0755'
     owner: root:root
@@ -292,6 +515,9 @@ write_files:
       def main():
           if os.geteuid() != 0:
               raise RuntimeError('Invoke this root-owned launcher with sudo')
+          if sys.argv[1:2] in (['transaction'], ['cleanup-export']):
+              op = 'cleanup' if sys.argv[1] == 'cleanup-export' else 'build'
+              os.execv('/usr/local/bin/oxidex-remote-transaction', ['/usr/local/bin/oxidex-remote-transaction', op, *sys.argv[2:]])
           config = json.loads(Path('/etc/oxidex-remote-build.json').read_text())
           root = Path(config.get('cache_mount', '/mnt/runner-data/remote-build'))
           mount_root = root.parent if root.name == 'remote-build' else root
@@ -1804,6 +2030,13 @@ def _validate_cloud_init_syntax(
                             {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": False}
                         )
                 else:
+                    m_list_anchor = re.match(r"^&([A-Za-z0-9_-]+)$", after_dash)
+                    if m_list_anchor:
+                        defined_anchors.add(m_list_anchor.group(1))
+                        scopes.append(
+                            {"indent": indent, "kind": "list", "child_indent": None, "allow_children": True}
+                        )
+                        continue
                     if re.search(r"^[|>][-+]?\s*$", after_dash):
                         block_scalar_indent = indent
                     else:
@@ -1858,7 +2091,7 @@ def _validate_cloud_init_syntax(
                             ruby_bin,
                             "-ryaml",
                             "-e",
-                            'doc = YAML.safe_load(STDIN.read, [], [], true); abort("YAML syntax error: top-level cloud-config document must be a mapping") unless doc.is_a?(Hash)',
+                            'raw = STDIN.read; doc = begin; YAML.safe_load(raw, permitted_classes: [], permitted_symbols: [], aliases: true); rescue ArgumentError; YAML.safe_load(raw, [], [], true); end; abort("YAML syntax error: top-level cloud-config document must be a mapping") unless doc.is_a?(Hash)',
                         ],
                         input=yaml_doc,
                         text=True,

@@ -1355,6 +1355,14 @@ class DashboardStore:
                 self.project,
                 region_latencies_ms=latencies,
             )
+            ci_shared = bool(
+                self.state["scaling"]["cicd_runner"].get("shared_global_budget")
+                or self.state.get("global_budget_enforced")
+            )
+            builder_shared = bool(
+                self.state["scaling"]["rust_builder"].get("shared_global_budget")
+                or self.state.get("global_budget_enforced")
+            )
             scaling_eval = evaluate_scaling_decision(
                 self.state["scaling"]["cicd_runner"],
                 self.state["scaling_telemetry"],
@@ -1364,12 +1372,18 @@ class DashboardStore:
                 max_instances=int(
                     self.state["profiles"]["cicd_runner"].get("max_instances", 8)
                 ),
+                other_role_hourly_usd=sum(running_builder_rates) if ci_shared else None,
             )
             builder_scaling_eval = evaluate_builder_scaling_decision(
                 self.state["scaling"]["rust_builder"],
                 self.state["scaling_telemetry"],
                 per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd(
                     "rust_builder", builder_qual
+                ),
+                other_role_hourly_usd=(
+                    max(sum(running_runner_rates), float(scaling_eval.get("projected_hourly_usd", 0.0)))
+                    if builder_shared
+                    else None
                 ),
             )
             instances_view = self.query_instances(
@@ -1600,6 +1614,7 @@ class DashboardStore:
             prev_profiles = copy.deepcopy(self.state["profiles"])
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_global = copy.deepcopy(self.state.get("global_budget", {}))
+            prev_global_enforced = bool(self.state.get("global_budget_enforced", False))
             try:
                 if target in ("cicd_runner", "rust_builder"):
                     self.state["profiles"][target]["budget"] = normalized
@@ -1607,19 +1622,24 @@ class DashboardStore:
                     self.state["scaling"][target]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
                     self.state["scaling"][target]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
                     self.state["scaling"][target]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
+                    self.state["scaling"][target]["shared_global_budget"] = False
+                    self.state["global_budget_enforced"] = False
                 else:
                     self.state["global_budget"] = normalized
+                    self.state["global_budget_enforced"] = True
                     for role_key in ("cicd_runner", "rust_builder"):
                         self.state["profiles"][role_key]["budget"] = dict(normalized)
                         self.state["scaling"][role_key]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
                         self.state["scaling"][role_key]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
                         self.state["scaling"][role_key]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
                         self.state["scaling"][role_key]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
+                        self.state["scaling"][role_key]["shared_global_budget"] = True
                 self._persist()
             except Exception:
                 self.state["profiles"] = prev_profiles
                 self.state["scaling"] = prev_scaling
                 self.state["global_budget"] = prev_global
+                self.state["global_budget_enforced"] = prev_global_enforced
                 raise
             return {"status": "ok", "target": target, "budget": normalized}
 
@@ -1735,11 +1755,18 @@ class DashboardStore:
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_vm_templates = copy.deepcopy(self.state["vm_templates"])
             prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
+            prev_global_enforced = bool(self.state.get("global_budget_enforced", False))
             try:
                 self.state["profiles"][role] = candidate
                 if active_tpl is not None:
                     if "cloud_init_template_id" in payload and candidate.get("cloud_init_template_id"):
                         active_tpl["cloud_init_template_id"] = candidate["cloud_init_template_id"]
+                    elif (
+                        "vm_template_id" in payload
+                        and "cloud_init_template_id" not in payload
+                        and active_tpl.get("cloud_init_template_id")
+                    ):
+                        candidate["cloud_init_template_id"] = active_tpl["cloud_init_template_id"]
                     if validated_tpl_units is not None:
                         active_tpl["runner_vcpu"] = int(candidate["runner_vcpu"])
                         active_tpl["runner_ram_gib"] = float(candidate["runner_ram_gib"])
@@ -1749,6 +1776,8 @@ class DashboardStore:
                     self.state["scaling"][role]["max_scale_up_daily_usd"] = normalized_budget["max_daily_usd"]
                     self.state["scaling"][role]["max_scale_up_monthly_usd"] = normalized_budget["max_monthly_usd"]
                     self.state["scaling"][role]["include_disk_in_scale_budget"] = normalized_budget["include_disk_costs"]
+                    self.state["scaling"][role]["shared_global_budget"] = False
+                    self.state["global_budget_enforced"] = False
                 if role == "cicd_runner":
                     self.state["scaling"]["cicd_runner"]["min_runners"] = int(candidate["min_runners"])
                     self.state["scaling"]["cicd_runner"]["runner_vcpu"] = int(candidate["runner_vcpu"])
@@ -1767,6 +1796,7 @@ class DashboardStore:
                 self.state["scaling"] = prev_scaling
                 self.state["vm_templates"] = prev_vm_templates
                 self.state["scaling_telemetry"] = prev_telemetry
+                self.state["global_budget_enforced"] = prev_global_enforced
                 raise
             return {"status": "ok", "profile": candidate, "qualification": qual}
 
@@ -1824,6 +1854,7 @@ class DashboardStore:
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_profiles = copy.deepcopy(self.state["profiles"])
             prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
+            prev_global_enforced = bool(self.state.get("global_budget_enforced", False))
             try:
                 if "policy" in payload and isinstance(payload["policy"], dict):
                     self.state["scaling"][role].update(payload["policy"])
@@ -1837,34 +1868,69 @@ class DashboardStore:
                         prof_budget["max_monthly_usd"] = float(pol_target["max_scale_up_monthly_usd"])
                     if "include_disk_in_scale_budget" in payload["policy"]:
                         prof_budget["include_disk_costs"] = bool(pol_target["include_disk_in_scale_budget"])
+                    if (
+                        any(
+                            k in payload["policy"]
+                            for k in (
+                                "max_scale_up_hourly_usd",
+                                "max_scale_up_daily_usd",
+                                "max_scale_up_monthly_usd",
+                            )
+                        )
+                        and "shared_global_budget" not in payload["policy"]
+                    ):
+                        pol_target["shared_global_budget"] = False
+                        self.state["global_budget_enforced"] = False
                     if role == "cicd_runner":
                         pol = self.state["scaling"]["cicd_runner"]
-                        self.state["profiles"]["cicd_runner"]["min_runners"] = int(pol.get("min_runners", 4))
+                        min_runners_val = _finite_int(pol.get("min_runners", 4), "min_runners", min_val=1)
+                        max_runners_val = _finite_int(pol.get("max_runners", 24), "max_runners", min_val=1)
+                        if max_runners_val < min_runners_val:
+                            raise ValueError("max_runners must be >= min_runners")
+                        pol["min_runners"] = min_runners_val
+                        pol["max_runners"] = max_runners_val
+                        self.state["profiles"]["cicd_runner"]["min_runners"] = min_runners_val
                         if "max_instances" in payload["policy"]:
-                            self.state["profiles"]["cicd_runner"]["max_instances"] = max(
-                                1, _finite_int(pol.get("max_instances", 8), "max_instances", min_val=1)
-                            )
-                        self.state["profiles"]["cicd_runner"]["runner_vcpu"] = int(pol.get("runner_vcpu", 4))
-                        self.state["profiles"]["cicd_runner"]["runner_ram_gib"] = float(pol.get("runner_ram_gib", 16))
+                            max_inst_val = _finite_int(pol.get("max_instances", 8), "max_instances", min_val=1)
+                            pol["max_instances"] = max_inst_val
+                            self.state["profiles"]["cicd_runner"]["max_instances"] = max_inst_val
+                        self.state["profiles"]["cicd_runner"]["runner_vcpu"] = _finite_int(
+                            pol.get("runner_vcpu", 4), "runner_vcpu", min_val=1
+                        )
+                        self.state["profiles"]["cicd_runner"]["runner_ram_gib"] = _finite_float(
+                            pol.get("runner_ram_gib", 16), "runner_ram_gib", min_val=0.1
+                        )
                         if "runners_per_instance" not in payload["policy"]:
                             self._sync_template_density()
                     else:
                         pol = self.state["scaling"]["rust_builder"]
+                        min_inst_val = _finite_int(pol.get("min_instances", 1), "min_instances", min_val=1)
+                        max_inst_val = _finite_int(pol.get("max_instances", 4), "max_instances", min_val=1)
+                        if max_inst_val < min_inst_val:
+                            raise ValueError("max_instances must be >= min_instances")
+                        pol["min_instances"] = min_inst_val
+                        pol["max_instances"] = max_inst_val
                         if "builder_vcpu" in payload["policy"] and "container_vcpu" not in payload["policy"]:
-                            pol["container_vcpu"] = int(pol["builder_vcpu"])
+                            pol["container_vcpu"] = _finite_int(pol["builder_vcpu"], "builder_vcpu", min_val=1)
                         elif "container_vcpu" in payload["policy"] and "builder_vcpu" not in payload["policy"]:
-                            pol["builder_vcpu"] = int(pol["container_vcpu"])
+                            pol["builder_vcpu"] = _finite_int(pol["container_vcpu"], "container_vcpu", min_val=1)
                         if "builder_ram_gib" in payload["policy"] and "container_ram_gib" not in payload["policy"]:
-                            pol["container_ram_gib"] = float(pol["builder_ram_gib"])
+                            pol["container_ram_gib"] = _finite_float(
+                                pol["builder_ram_gib"], "builder_ram_gib", min_val=0.1
+                            )
                         elif "container_ram_gib" in payload["policy"] and "builder_ram_gib" not in payload["policy"]:
-                            pol["builder_ram_gib"] = float(pol["container_ram_gib"])
-                        self.state["profiles"]["rust_builder"]["min_instances"] = int(pol.get("min_instances", 1))
-                        self.state["profiles"]["rust_builder"]["max_instances"] = int(pol.get("max_instances", 4))
-                        self.state["profiles"]["rust_builder"]["runner_vcpu"] = int(
-                            pol.get("container_vcpu", pol.get("builder_vcpu", 16))
+                            pol["builder_ram_gib"] = _finite_float(
+                                pol["container_ram_gib"], "container_ram_gib", min_val=0.1
+                            )
+                        self.state["profiles"]["rust_builder"]["min_instances"] = min_inst_val
+                        self.state["profiles"]["rust_builder"]["max_instances"] = max_inst_val
+                        self.state["profiles"]["rust_builder"]["runner_vcpu"] = _finite_int(
+                            pol.get("container_vcpu", pol.get("builder_vcpu", 16)), "container_vcpu", min_val=1
                         )
-                        self.state["profiles"]["rust_builder"]["runner_ram_gib"] = float(
-                            pol.get("container_ram_gib", pol.get("builder_ram_gib", 28))
+                        self.state["profiles"]["rust_builder"]["runner_ram_gib"] = _finite_float(
+                            pol.get("container_ram_gib", pol.get("builder_ram_gib", 28)),
+                            "container_ram_gib",
+                            min_val=0.1,
                         )
                 telem_payload = payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {}
                 if telem_payload:
@@ -1968,6 +2034,31 @@ class DashboardStore:
                 ):
                     self.state["scaling_telemetry"]["builder_instance_hourly_rates"] = running_builder_rates
 
+                global_budget_shared = bool(self.state.get("global_budget_enforced"))
+                telem_runner_rates = self.state["scaling_telemetry"].get("running_instance_hourly_rates")
+                telem_builder_rates = self.state["scaling_telemetry"].get("builder_instance_hourly_rates")
+                runner_burn_for_builder = round(
+                    sum(
+                        float(r)
+                        for r in (
+                            telem_runner_rates
+                            if isinstance(telem_runner_rates, list)
+                            else running_runner_rates
+                        )
+                    ),
+                    4,
+                )
+                builder_burn_for_runner = round(
+                    sum(
+                        float(r)
+                        for r in (
+                            telem_builder_rates
+                            if isinstance(telem_builder_rates, list)
+                            else running_builder_rates
+                        )
+                    ),
+                    4,
+                )
                 cicd_eval = evaluate_scaling_decision(
                     self.state["scaling"]["cicd_runner"],
                     self.state["scaling_telemetry"],
@@ -1975,17 +2066,28 @@ class DashboardStore:
                     max_instances=int(
                         self.state["profiles"]["cicd_runner"].get("max_instances", 8)
                     ),
+                    other_role_hourly_usd=(
+                        builder_burn_for_runner
+                        if (global_budget_shared or self.state["scaling"]["cicd_runner"].get("shared_global_budget"))
+                        else 0.0
+                    ),
                 )
                 builder_eval = evaluate_builder_scaling_decision(
                     self.state["scaling"]["rust_builder"],
                     self.state["scaling_telemetry"],
                     per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
+                    other_role_hourly_usd=(
+                        runner_burn_for_builder
+                        if (global_budget_shared or self.state["scaling"]["rust_builder"].get("shared_global_budget"))
+                        else 0.0
+                    ),
                 )
                 self._persist()
             except Exception:
                 self.state["scaling"] = prev_scaling
                 self.state["profiles"] = prev_profiles
                 self.state["scaling_telemetry"] = prev_telemetry
+                self.state["global_budget_enforced"] = prev_global_enforced
                 raise
 
             evaluation = builder_eval if role == "rust_builder" else cicd_eval
@@ -2158,6 +2260,26 @@ class DashboardStore:
 
             role = inst["role"]
             prof = self.state["profiles"].get(role)
+            explicit_ci_id = str(payload.get("cloud_init_template_id", "")).strip()
+            if explicit_ci_id:
+                ci_tpl = next(
+                    (
+                        t
+                        for t in self.state.get("cloud_init_templates", [])
+                        if t.get("id") == explicit_ci_id
+                    ),
+                    None,
+                )
+                if ci_tpl is None or ci_tpl.get("role", role) != role:
+                    raise ValueError(
+                        f"Cloud-init template '{explicit_ci_id}' does not belong to role '{role}'"
+                    )
+                resolved_ci_id = explicit_ci_id
+            else:
+                resolved_ci_id = (
+                    inst.get("cloud_init_template_id")
+                    or (prof.get("cloud_init_template_id") if prof else None)
+                )
             tpl_name = str(
                 payload.get("template_name")
                 or f"Template from {inst['name']} ({inst['machine_type']})"
@@ -2179,11 +2301,7 @@ class DashboardStore:
                 "runners_count": inst["runners_count"],
                 "runner_vcpu": inst["runner_vcpu"],
                 "runner_ram_gib": inst["runner_ram_gib"],
-                "cloud_init_template_id": (
-                    prof.get("cloud_init_template_id")
-                    if prof and prof.get("cloud_init_template_id")
-                    else inst["cloud_init_template_id"]
-                ),
+                "cloud_init_template_id": resolved_ci_id,
                 "source_instance": inst["name"],
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
@@ -2201,6 +2319,8 @@ class DashboardStore:
                 if assign_to_profile and prof is not None:
                     prof["use_vm_template"] = True
                     prof["vm_template_id"] = new_tpl["id"]
+                    if new_tpl.get("cloud_init_template_id"):
+                        prof["cloud_init_template_id"] = new_tpl["cloud_init_template_id"]
                     if role == "cicd_runner":
                         self._sync_template_density()
                 self._persist()
@@ -2434,7 +2554,8 @@ class DashboardStore:
                         runner_ram = float(source_spec["runner_ram_gib"])
                         runners_cnt = int(source_spec["runners_count"])
                         cloud_init_id = (
-                            prof.get("cloud_init_template_id")
+                            (vm_tpl.get("cloud_init_template_id") if vm_tpl else None)
+                            or prof.get("cloud_init_template_id")
                             or source_spec.get("cloud_init_template_id")
                             or default_ci_id
                         )
@@ -2513,8 +2634,31 @@ class DashboardStore:
                                 f"(projected {projected_runner_slots} runner slots across {projected_total} VMs) "
                                 f"exceeds maximum allowed CI/CD runners ({max_runners_cap})"
                             )
-                    projected_fleet_hourly = round(
+                    other_role = "rust_builder" if role == "cicd_runner" else "cicd_runner"
+                    shared_global = bool(
+                        pol.get("shared_global_budget") or self.state.get("global_budget_enforced")
+                    )
+                    other_running = (
+                        [
+                            i
+                            for i in self.state["instances"]
+                            if i["status"] == "RUNNING" and i["role"] == other_role
+                        ]
+                        if shared_global
+                        else []
+                    )
+                    other_role_hourly = round(
                         sum(
+                            self._instance_hourly_for_budget(
+                                i["pricing"], include_disk=include_disk, include_tax=include_tax
+                            )
+                            for i in other_running
+                        ),
+                        4,
+                    )
+                    projected_fleet_hourly = round(
+                        other_role_hourly
+                        + sum(
                             self._instance_hourly_for_budget(
                                 i["pricing"], include_disk=include_disk, include_tax=include_tax
                             )
