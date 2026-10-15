@@ -259,6 +259,18 @@ def _finite_int_val(val: Any, name: str = "value") -> int:
     return int(val)
 
 
+def _assert_finite_json_tree(val: Any, path: str = "value") -> None:
+    """Recursively reject NaN or Infinity anywhere in a nested policy or telemetry payload."""
+    if isinstance(val, float) and not math.isfinite(val):
+        raise ValueError(f"{path} must be a finite number (got {val!r})")
+    if isinstance(val, dict):
+        for k, v in val.items():
+            _assert_finite_json_tree(v, f"{path}.{k}")
+    elif isinstance(val, (list, tuple)):
+        for idx, item in enumerate(val):
+            _assert_finite_json_tree(item, f"{path}[{idx}]")
+
+
 def evaluate_cpu_scope(
     cpu_percentages: list[float],
     threshold_percent: float,
@@ -288,12 +300,15 @@ def evaluate_scaling_decision(
     telemetry: dict[str, Any],
     per_instance_hourly_usd: float = 0.14,
     now_epoch: float | None = None,
+    max_instances: int | None = None,
 ) -> dict[str, Any]:
     """Evaluate live telemetry against scaling triggers and max scale-up budgets.
 
     Returns the recommended runner count, instance count, active triggers, OOM links,
     and budget compliance details.
     """
+    _assert_finite_json_tree(policy, "policy")
+    _assert_finite_json_tree(telemetry, "telemetry")
     cfg = {**default_scaling_config()["cicd_runner"], **(policy or {})}
     now_ts = _finite_float_val(now_epoch, "now_epoch") if now_epoch is not None else time.time()
     lookback_seconds = max(
@@ -349,21 +364,20 @@ def evaluate_scaling_decision(
         for run in github_oom_runs:
             if not _is_recent_unhandled_oom(run, now_ts, lookback_seconds):
                 continue
-            excerpt = run.get(
-                "error_excerpt",
-                "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)",
-            )
-            runner_name = run.get("runner_name")
-            classification = classify_github_ci_failure(excerpt, runner_name=runner_name)
-            if not classification["is_self_hosted_runner"]:
-                continue
-            if (
+            if "error_excerpt" in run and run.get("error_excerpt") is not None:
+                excerpt = str(run.get("error_excerpt"))
+            elif (
                 run.get("is_oom") is False
                 or str(run.get("failure_classification", "")).strip().upper() == "TIMEOUT"
             ):
-                continue
-            is_oom = bool(classification["is_oom"])
-            if not is_oom:
+                excerpt = "##[error]Timeout reached, aborting!"
+            else:
+                excerpt = (
+                    "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
+                )
+            runner_name = run.get("runner_name")
+            classification = classify_github_ci_failure(excerpt, runner_name=runner_name)
+            if not classification["is_self_hosted_runner"] or not classification["is_oom"]:
                 continue
             any_confirmed_oom = True
             link = run.get("deep_link") or build_github_oom_deep_link(
@@ -535,6 +549,24 @@ def evaluate_scaling_decision(
     else:
         desired_instances = math.ceil(desired_runners / runners_per_vm) if desired_runners > 0 else 0
 
+    raw_max_instances = (
+        max_instances
+        if max_instances is not None
+        else (
+            (policy or {}).get("max_instances")
+            if (policy or {}).get("max_instances") is not None
+            else telemetry.get("max_instances")
+        )
+    )
+    if raw_max_instances is not None:
+        max_instances_cap = max(1, _finite_int_val(raw_max_instances, "max_instances"))
+        if desired_instances > max_instances_cap:
+            desired_instances = max(current_instances_count, max_instances_cap)
+            if desired_instances == current_instances_count:
+                desired_runners = current_runners
+            else:
+                desired_runners = min(desired_runners, desired_instances * runners_per_vm)
+
     # Enforce max scale-up budget caps (hourly, daily, monthly) without turning a blocked scale-up into a scale-down
     unit_hourly = max(0.0001, _finite_float_val(per_instance_hourly_usd, "per_instance_hourly_usd"))
     max_hourly_cap = _finite_float_val(cfg.get("max_scale_up_hourly_usd", 5.00), "max_scale_up_hourly_usd")
@@ -606,6 +638,8 @@ def evaluate_builder_scaling_decision(
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate dedicated Rust builder telemetry against builder scaling triggers and budgets."""
+    _assert_finite_json_tree(policy, "policy")
+    _assert_finite_json_tree(telemetry, "telemetry")
     raw_policy = policy or {}
     cfg = {**default_scaling_config()["rust_builder"], **raw_policy}
     now_ts = _finite_float_val(now_epoch, "now_epoch") if now_epoch is not None else time.time()

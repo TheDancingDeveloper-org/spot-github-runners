@@ -385,11 +385,38 @@ def enrich_rust_build_record(
 
     compile_seconds = round(fin_ts - req_ts, 2) if fin_ts is not None else 0.0
     delivery_seconds = round(del_ts - fin_ts, 2) if (del_ts is not None and fin_ts is not None) else 0.0
+    raw_compile = record.get("compile_duration_seconds")
+    if raw_compile is not None and fin_ts is not None:
+        explicit_compile = round(
+            _finite_float(raw_compile, "compile_duration_seconds", min_val=0.0), 2
+        )
+        if abs(explicit_compile - compile_seconds) > 0.05:
+            raise ValueError(
+                f"Inconsistent compile_duration_seconds ({explicit_compile}s) vs finished_at - requested_at ({compile_seconds}s)"
+            )
+    raw_delivery = record.get("delivery_duration_seconds")
+    if raw_delivery is not None and del_ts is not None and fin_ts is not None:
+        explicit_delivery = round(
+            _finite_float(raw_delivery, "delivery_duration_seconds", min_val=0.0), 2
+        )
+        if abs(explicit_delivery - delivery_seconds) > 0.05:
+            raise ValueError(
+                f"Inconsistent delivery_duration_seconds ({explicit_delivery}s) vs delivered_at - finished_at ({delivery_seconds}s)"
+            )
     raw_total = record.get("total_duration_seconds")
     if raw_total is not None:
-        total_duration_seconds = round(
+        explicit_total = round(
             _finite_float(raw_total, "total_duration_seconds", min_val=0.0), 2
         )
+        if del_ts is not None:
+            derived_total = round(del_ts - req_ts, 2)
+            if abs(explicit_total - derived_total) > 0.05:
+                raise ValueError(
+                    f"Inconsistent total_duration_seconds ({explicit_total}s) vs delivered_at - requested_at ({derived_total}s)"
+                )
+            total_duration_seconds = derived_total
+        else:
+            total_duration_seconds = explicit_total
     elif del_ts is not None:
         total_duration_seconds = round(del_ts - req_ts, 2)
     else:

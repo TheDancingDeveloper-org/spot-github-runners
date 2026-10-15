@@ -574,6 +574,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           Incl. Disk &amp; Tax
         </label>
         <button class="btn btn-sm btn-emerald" onclick="applyTopBudget()">Apply Budget On-the-Fly</button>
+        <button class="btn btn-sm btn-secondary" id="top-auth-btn" onclick="configureDashboardAuthToken()" title="Configure Bearer / Session Authentication Token">🔒 Auth Token</button>
       </div>
     </div>
 
@@ -1087,7 +1088,70 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
           </div>
 
-          <div id="scaling-decision-box" style="background:#0c1424; border:1px solid var(--border); border-radius:9px; padding:12px;"></div>
+          <div id="scaling-decision-box" style="background:#0c1424; border:1px solid var(--border); border-radius:9px; padding:12px; margin-bottom:14px;"></div>
+
+          <!-- Rust Remote Builders Autoscaling & Idle Scale-Down Policy -->
+          <div style="border-top:1px solid var(--border); padding-top:14px; margin-top:6px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <div>
+                <div style="font-weight:700; font-size:14px; color:#c4b5fd;">🦀 Rust Remote Builders Autoscaling &amp; Idle Scale-Down</div>
+                <div style="font-size:12px; color:var(--text-muted);">Configure dedicated Rust builder VM floor/ceiling, queue depth, CPU utilization, OOM triggers, and idle build scale-down.</div>
+              </div>
+              <span class="badge badge-builder">rust_builder</span>
+            </div>
+            <div class="form-grid">
+              <div class="field">
+                <label>Min Builder Instances</label>
+                <input type="number" id="sc-builder-min-inst" min="1" max="32" value="1" />
+              </div>
+              <div class="field">
+                <label>Max Builder Instances</label>
+                <input type="number" id="sc-builder-max-inst" min="1" max="64" value="6" />
+              </div>
+              <div class="field">
+                <label>Scale-Up Queued Builds (&gt;=)</label>
+                <input type="number" id="sc-builder-queued-thresh" min="1" max="50" value="2" />
+              </div>
+              <div class="field">
+                <label>CPU Scale-Up Threshold (%)</label>
+                <input type="number" id="sc-builder-cpu-thresh" min="10" max="99" value="60" />
+              </div>
+              <div class="field">
+                <label>Scale-Down If Builds/1h (&lt;=)</label>
+                <input type="number" id="sc-builder-down-max" min="0" max="100" value="2" />
+              </div>
+              <div class="field">
+                <label>Scale-Down Target Builders</label>
+                <input type="number" id="sc-builder-down-target" min="1" max="32" value="1" />
+              </div>
+              <div class="field">
+                <label>Max Builder Scale-Up Budget ($/hr · $/day · $/mo)</label>
+                <div style="display:flex; gap:4px;">
+                  <input type="number" id="sc-builder-budget-hr" step="0.25" value="3.50" style="width:33%;" />
+                  <input type="number" id="sc-builder-budget-day" step="0.50" value="12.00" style="width:33%;" />
+                  <input type="number" id="sc-builder-budget-mo" step="5.00" value="80.00" style="width:34%;" />
+                </div>
+              </div>
+              <div class="field">
+                <label>Live Builds (Past 1h / Active / Queued)</label>
+                <div style="display:flex; gap:4px;">
+                  <input type="number" id="sim-builds-hour" min="0" max="500" value="6" title="Builds ran in past hour" style="width:33%;" />
+                  <input type="number" id="sim-builds-active" min="0" max="100" value="1" title="Active builds" style="width:33%;" />
+                  <input type="number" id="sim-builds-queued" min="0" max="100" value="0" title="Queued builds" style="width:34%;" />
+                </div>
+              </div>
+            </div>
+            <div style="display:flex; gap:14px; flex-wrap:wrap; margin: 10px 0;">
+              <label class="toggle-label"><input type="checkbox" id="sc-builder-en-queue" checked /> Queued Builds Trigger</label>
+              <label class="toggle-label"><input type="checkbox" id="sc-builder-en-cpu" checked /> Builder CPU Trigger</label>
+              <label class="toggle-label"><input type="checkbox" id="sc-builder-en-oom" checked /> Builder Journal OOM Trigger</label>
+              <label class="toggle-label"><input type="checkbox" id="sc-builder-en-down" checked /> Idle Builds Scale-Down</label>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+              <button class="btn btn-sm btn-purple" onclick="saveAndEvaluateBuilderScaling()">Save &amp; Evaluate Rust Builder Scaling</button>
+            </div>
+            <div id="builder-scaling-decision-box" style="background:#0c1424; border:1px solid var(--border); border-radius:9px; padding:12px;"></div>
+          </div>
         </div>
 
         <!-- Right: GitHub Actions CI OOM Deep-Links & VM Journal OOM Feed -->
@@ -1406,6 +1470,121 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     let INST_SORT_DIR = "desc";
     let QUAL_ACTIVE_ROLE = "cicd_runner";
     let LAST_QUAL_DATA = { cicd_runner: null, rust_builder: null };
+    const AUTH_STORAGE_KEY = "dashboard_auth_token";
+    const NATIVE_FETCH = window.fetch.bind(window);
+
+    function getDashboardAuthToken() {
+      try {
+        return sessionStorage.getItem(AUTH_STORAGE_KEY) || localStorage.getItem(AUTH_STORAGE_KEY) || "";
+      } catch (_err) {
+        return "";
+      }
+    }
+
+    function storeDashboardAuthToken(token) {
+      const clean = String(token || "").trim();
+      try {
+        if (clean) {
+          sessionStorage.setItem(AUTH_STORAGE_KEY, clean);
+        } else {
+          sessionStorage.removeItem(AUTH_STORAGE_KEY);
+          localStorage.removeItem(AUTH_STORAGE_KEY);
+        }
+      } catch (_err) {
+        // Storage unavailable in restricted browsing contexts.
+      }
+      const btn = document.getElementById("top-auth-btn");
+      if (btn) {
+        btn.textContent = clean ? "🔒 Auth: Active" : "🔒 Auth Token";
+      }
+      return clean;
+    }
+
+    async function authenticateDashboardToken(token) {
+      const clean = storeDashboardAuthToken(token);
+      if (!clean) return false;
+      const res = await NATIVE_FETCH("/api/auth/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${clean}`,
+          "X-Dashboard-Token": clean
+        },
+        body: JSON.stringify({ token: clean })
+      });
+      return res.ok;
+    }
+
+    async function configureDashboardAuthToken() {
+      const current = getDashboardAuthToken();
+      const entered = window.prompt(
+        "Enter Dashboard Bearer / Session Token (leave blank to clear):",
+        current
+      );
+      if (entered === null) return;
+      const clean = storeDashboardAuthToken(entered);
+      if (!clean) {
+        showToast("Cleared saved dashboard auth token");
+        return;
+      }
+      const ok = await authenticateDashboardToken(clean);
+      if (ok) {
+        showToast("Authenticated dashboard session");
+        await loadOverview();
+      } else {
+        showToast("Authentication failed: invalid dashboard token");
+      }
+    }
+
+    (function bootstrapUrlAuthToken() {
+      try {
+        const url = new URL(window.location.href);
+        const queryToken = url.searchParams.get("token");
+        const hashParams = new URLSearchParams((url.hash || "").replace(/^#/, ""));
+        const hashToken = hashParams.get("token");
+        const initialToken = queryToken || hashToken;
+        if (initialToken) {
+          storeDashboardAuthToken(initialToken);
+          url.searchParams.delete("token");
+          if (hashToken) {
+            hashParams.delete("token");
+            url.hash = hashParams.toString() ? `#${hashParams.toString()}` : "";
+          }
+          window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
+        }
+      } catch (_err) {
+        // Ignore URL parsing errors in non-standard environments.
+      }
+    })();
+
+    window.fetch = async function dashboardAuthorizedFetch(input, init = {}) {
+      const reqInit = { ...init, credentials: init.credentials || "same-origin" };
+      const headers = new Headers(init.headers || {});
+      const token = getDashboardAuthToken();
+      if (token && !headers.has("Authorization")) {
+        headers.set("Authorization", `Bearer ${token}`);
+      }
+      if (token && !headers.has("X-Dashboard-Token")) {
+        headers.set("X-Dashboard-Token", token);
+      }
+      reqInit.headers = headers;
+      let res = await NATIVE_FETCH(input, reqInit);
+      if (res.status === 401 && typeof window.prompt === "function") {
+        const prompted = window.prompt("Dashboard authentication required. Enter your dashboard token:");
+        if (prompted && prompted.trim()) {
+          const ok = await authenticateDashboardToken(prompted.trim());
+          if (ok) {
+            const retryHeaders = new Headers(init.headers || {});
+            const fresh = getDashboardAuthToken();
+            retryHeaders.set("Authorization", `Bearer ${fresh}`);
+            retryHeaders.set("X-Dashboard-Token", fresh);
+            res = await NATIVE_FETCH(input, { ...reqInit, headers: retryHeaders });
+          }
+        }
+      }
+      return res;
+    };
 
     function showToast(msg) {
       const box = document.getElementById("toast-container");
@@ -1627,7 +1806,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         instancesHtml = `
           <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:9px; padding:14px; margin-bottom:12px;">
             <div style="color:var(--text-muted); margin-bottom:10px;">No running instances currently in <strong>${reg.display_name} (${reg.region})</strong>.</div>
-            <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${reg.region}', 'cicd_runner', 1)">+ Launch 1 CI/CD Runner Host Here</button>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${reg.region}', 'cicd_runner', 1)">+ Launch 1 CI/CD Runner Host Here</button>
+              <button class="btn btn-sm btn-purple" onclick="scaleRegion('${reg.region}', 'rust_builder', 1)">+ Launch 1 Rust Builder Host Here</button>
+            </div>
           </div>
         `;
       } else {
@@ -1688,6 +1870,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
 
       const runnerCountInReg = running.filter(i => i.role === "cicd_runner").length;
+      const builderCountInReg = running.filter(i => i.role === "rust_builder").length;
       panel.innerHTML = `
         <div class="panel-header">
           <div>
@@ -1696,13 +1879,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
 
-        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; background:var(--bg-card); border:1px solid var(--border); padding:10px 12px; border-radius:9px; margin-bottom:12px;">
-          <div style="font-size:12.5px; font-weight:600;">On-Demand Regional Instance Scaling (<span class="mono">${esc(reg.region)}</span>):</div>
-          <div style="display:flex; align-items:center; gap:6px;">
-            <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', Math.max(0, ${runnerCountInReg} - 1))">−1</button>
-            <input type="number" id="map-scale-input-${esc(reg.region)}" value="${runnerCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
-            <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', ${runnerCountInReg} + 1)">+1</button>
-            <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', parseInt(document.getElementById('map-scale-input-${esc(reg.region)}').value || '0', 10))">Apply Scale</button>
+        <div style="display:flex; flex-direction:column; gap:8px; background:var(--bg-card); border:1px solid var(--border); padding:10px 12px; border-radius:9px; margin-bottom:12px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+            <div style="font-size:12.5px; font-weight:600;">CI/CD Runner Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', Math.max(0, ${runnerCountInReg} - 1))">−1</button>
+              <input type="number" id="map-scale-input-${esc(reg.region)}" value="${runnerCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
+              <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', ${runnerCountInReg} + 1)">+1</button>
+              <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', parseInt(document.getElementById('map-scale-input-${esc(reg.region)}').value || '0', 10))">Apply Runner Scale</button>
+            </div>
+          </div>
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; border-top:1px solid var(--border); padding-top:8px;">
+            <div style="font-size:12.5px; font-weight:600; color:#c4b5fd;">🦀 Rust Builder Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', Math.max(0, ${builderCountInReg} - 1))">−1</button>
+              <input type="number" id="map-scale-builder-input-${esc(reg.region)}" value="${builderCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
+              <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', ${builderCountInReg} + 1)">+1</button>
+              <button class="btn btn-sm btn-purple" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', parseInt(document.getElementById('map-scale-builder-input-${esc(reg.region)}').value || '0', 10))">Apply Builder Scale</button>
+            </div>
           </div>
         </div>
 
@@ -1964,9 +2158,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           budget: {
             ...curBudget,
             active_period: curBudget.active_period || "day",
-            max_hourly_usd: parseFloat(document.getElementById("runner-max-hour").value || "5"),
-            max_daily_usd: parseFloat(document.getElementById("runner-max-day").value || "10"),
-            max_monthly_usd: parseFloat(document.getElementById("runner-max-month").value || "300"),
+            max_hourly_usd: parseFloat(document.getElementById("runner-max-hour").value || String(curBudget.max_hourly_usd ?? 5)),
+            max_daily_usd: parseFloat(document.getElementById("runner-max-day").value || String(curBudget.max_daily_usd ?? 10)),
+            max_monthly_usd: parseFloat(document.getElementById("runner-max-month").value || String(curBudget.max_monthly_usd ?? 50)),
             include_disk_costs: curBudget.include_disk_costs !== undefined ? Boolean(curBudget.include_disk_costs) : true,
             include_taxes: curBudget.include_taxes !== undefined ? Boolean(curBudget.include_taxes) : false,
             tax_rate_percent: curBudget.tax_rate_percent !== undefined ? Number(curBudget.tax_rate_percent) : 8.25
@@ -1991,9 +2185,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         budget: {
           ...curBudget,
           active_period: curBudget.active_period || "day",
-          max_hourly_usd: parseFloat(document.getElementById("builder-max-hour").value || "3.5"),
-          max_daily_usd: parseFloat(document.getElementById("builder-max-day").value || "12"),
-          max_monthly_usd: parseFloat(document.getElementById("builder-max-month").value || "80"),
+          max_hourly_usd: parseFloat(document.getElementById("builder-max-hour").value || String(curBudget.max_hourly_usd ?? 3.5)),
+          max_daily_usd: parseFloat(document.getElementById("builder-max-day").value || String(curBudget.max_daily_usd ?? 12)),
+          max_monthly_usd: parseFloat(document.getElementById("builder-max-month").value || String(curBudget.max_monthly_usd ?? 80)),
           include_disk_costs: curBudget.include_disk_costs !== undefined ? Boolean(curBudget.include_disk_costs) : true,
           include_taxes: curBudget.include_taxes !== undefined ? Boolean(curBudget.include_taxes) : false,
           tax_rate_percent: curBudget.tax_rate_percent !== undefined ? Number(curBudget.tax_rate_percent) : 8.25
@@ -2122,6 +2316,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       `;
 
+      // Populate Rust Builder scaling policy & evaluation
+      const bsc = APP_STATE.scaling.rust_builder || {};
+      document.getElementById("sc-builder-min-inst").value = bsc.min_instances ?? 1;
+      document.getElementById("sc-builder-max-inst").value = bsc.max_instances ?? 6;
+      document.getElementById("sc-builder-queued-thresh").value = bsc.queued_builds_threshold ?? 2;
+      document.getElementById("sc-builder-cpu-thresh").value = bsc.cpu_threshold_percent ?? 60;
+      document.getElementById("sc-builder-down-max").value = bsc.scale_down_max_builds_past_hour ?? 2;
+      document.getElementById("sc-builder-down-target").value = bsc.scale_down_target_instances ?? 1;
+      document.getElementById("sc-builder-budget-hr").value = bsc.max_scale_up_hourly_usd ?? 3.5;
+      document.getElementById("sc-builder-budget-day").value = bsc.max_scale_up_daily_usd ?? 12.0;
+      document.getElementById("sc-builder-budget-mo").value = bsc.max_scale_up_monthly_usd ?? 80.0;
+      document.getElementById("sc-builder-en-queue").checked = bsc.enable_queue_trigger !== false;
+      document.getElementById("sc-builder-en-cpu").checked = bsc.enable_cpu_utilization_trigger !== false;
+      document.getElementById("sc-builder-en-oom").checked = bsc.enable_journal_oom_trigger !== false;
+      document.getElementById("sc-builder-en-down").checked = bsc.enable_low_builds_scale_down !== false;
+      document.getElementById("sim-builds-hour").value = st.builds_ran_past_hour ?? 6;
+      document.getElementById("sim-builds-active").value = st.active_builds ?? 1;
+      document.getElementById("sim-builds-queued").value = st.queued_builds ?? 0;
+
+      const bev = APP_STATE.builder_scaling_evaluation;
+      if (bev) {
+        const breasons = [...(bev.scale_up_reasons || []), ...(bev.scale_down_reasons || [])];
+        document.getElementById("builder-scaling-decision-box").innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <div style="font-weight:700; font-size:13.5px;">Rust Builder Evaluation: <span style="color:#c4b5fd;">${esc(bev.direction.toUpperCase())}</span> (${bev.current_instances} → ${bev.desired_instances} Builder VMs)</div>
+            <span class="mono" style="font-size:12px; color:#34d399;">Projected: $${bev.projected_hourly_usd}/hr · $${bev.projected_daily_usd}/day · $${bev.projected_monthly_usd}/mo</span>
+          </div>
+          ${bev.budget_capped ? `<div style="color:#fbbf24; font-size:12px; margin-bottom:6px;">⚠️ ${esc(bev.budget_cap_note)}</div>` : ""}
+          <div style="display:flex; flex-direction:column; gap:5px;">
+            ${breasons.map(r => `<div style="font-size:12px; color:#e2e8f0;">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)}</div>`).join("") || '<div style="font-size:12px; color:var(--text-muted);">No builder scale change required.</div>'}
+          </div>
+        `;
+      }
+
       // Render GitHub CI Runs (distinguishes confirmed OOMs from Timeouts) with exact step/line clickable links
       document.getElementById("github-oom-runs-list").innerHTML = st.github_oom_runs.map(run => {
         const isOom = run.is_oom !== false;
@@ -2161,6 +2389,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     async function saveAndEvaluateScaling() {
+      const curSc = APP_STATE?.scaling?.cicd_runner || {};
       const policy = {
         min_runners: parseInt(document.getElementById("sc-min-runners").value || "4", 10),
         max_runners: parseInt(document.getElementById("sc-max-runners").value || "24", 10),
@@ -2171,9 +2400,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         cpu_scope: document.getElementById("sc-cpu-scope").value,
         scale_down_max_jobs_past_hour: parseInt(document.getElementById("sc-hourly-down-max").value || "5", 10),
         scale_down_target_runners: parseInt(document.getElementById("sc-hourly-down-target").value || "4", 10),
-        max_scale_up_hourly_usd: parseFloat(document.getElementById("sc-budget-hr").value || "5"),
-        max_scale_up_daily_usd: parseFloat(document.getElementById("sc-budget-day").value || "10"),
-        max_scale_up_monthly_usd: parseFloat(document.getElementById("sc-budget-mo").value || "300"),
+        max_scale_up_hourly_usd: parseFloat(document.getElementById("sc-budget-hr").value || String(curSc.max_scale_up_hourly_usd ?? 5)),
+        max_scale_up_daily_usd: parseFloat(document.getElementById("sc-budget-day").value || String(curSc.max_scale_up_daily_usd ?? 10)),
+        max_scale_up_monthly_usd: parseFloat(document.getElementById("sc-budget-mo").value || String(curSc.max_scale_up_monthly_usd ?? 50)),
         enable_queued_jobs_trigger: document.getElementById("sc-en-queued").checked,
         enable_provisioned_jobs_trigger: document.getElementById("sc-en-prov").checked,
         enable_hourly_runs_scale_up: document.getElementById("sc-en-hourly-up").checked,
@@ -2198,6 +2427,44 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return false;
       }
       showToast("Updated scaling policy and evaluated live telemetry");
+      await loadOverview();
+      return true;
+    }
+
+    async function saveAndEvaluateBuilderScaling() {
+      const curBsc = APP_STATE?.scaling?.rust_builder || {};
+      const policy = {
+        min_instances: parseInt(document.getElementById("sc-builder-min-inst").value || "1", 10),
+        max_instances: parseInt(document.getElementById("sc-builder-max-inst").value || "6", 10),
+        queued_builds_threshold: parseInt(document.getElementById("sc-builder-queued-thresh").value || "2", 10),
+        cpu_threshold_percent: parseFloat(document.getElementById("sc-builder-cpu-thresh").value || "60"),
+        cpu_scope: curBsc.cpu_scope || "majority",
+        scale_down_max_builds_past_hour: parseInt(document.getElementById("sc-builder-down-max").value || "2", 10),
+        scale_down_target_instances: parseInt(document.getElementById("sc-builder-down-target").value || "1", 10),
+        max_scale_up_hourly_usd: parseFloat(document.getElementById("sc-builder-budget-hr").value || String(curBsc.max_scale_up_hourly_usd ?? 3.5)),
+        max_scale_up_daily_usd: parseFloat(document.getElementById("sc-builder-budget-day").value || String(curBsc.max_scale_up_daily_usd ?? 12)),
+        max_scale_up_monthly_usd: parseFloat(document.getElementById("sc-builder-budget-mo").value || String(curBsc.max_scale_up_monthly_usd ?? 80)),
+        enable_queue_trigger: document.getElementById("sc-builder-en-queue").checked,
+        enable_cpu_utilization_trigger: document.getElementById("sc-builder-en-cpu").checked,
+        enable_journal_oom_trigger: document.getElementById("sc-builder-en-oom").checked,
+        enable_low_builds_scale_down: document.getElementById("sc-builder-en-down").checked
+      };
+      const telemetry = {
+        builds_ran_past_hour: parseInt(document.getElementById("sim-builds-hour").value || "6", 10),
+        active_builds: parseInt(document.getElementById("sim-builds-active").value || "1", 10),
+        queued_builds: parseInt(document.getElementById("sim-builds-queued").value || "0", 10)
+      };
+      const res = await fetch("/api/scaling", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: "rust_builder", policy, telemetry })
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(`Error updating Rust builder scaling policy: ${data.error || res.statusText}`);
+        return false;
+      }
+      showToast("Updated Rust builder scaling policy and evaluated live telemetry");
       await loadOverview();
       return true;
     }

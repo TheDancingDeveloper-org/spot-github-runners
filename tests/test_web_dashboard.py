@@ -1425,9 +1425,289 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         for cand in hd_tp_qual["hardware_qualifying"]:
             self.assertNotEqual(cand["boot_disk_type"], "hyperdisk-throughput")
 
+    def test_round8_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+            set_live_spot_pricing_override,
+        )
+        from lib.dashboard_ui_assets import render_dashboard_html
+
+        # 1 & 3. Default runner cloud-init templates preserve env vars for inner shell and provision all 4 runner slots
+        for tpl_str in (DEFAULT_RUNNER_CLOUD_INIT, DEFAULT_RUNNER_STRICT_CLOUD_INIT):
+            parsed_runner = parse_cloud_init(tpl_str)
+            self.assertTrue(parsed_runner["valid"], parsed_runner["warnings"])
+            self.assertIn('RUNNERS_COUNT="4"', tpl_str)
+            runcmds = parsed_runner["runcmd"]
+            self.assertGreaterEqual(len(runcmds), 1)
+            self.assertTrue(runcmds[-1].startswith("bash -lc '"))
+            self.assertIn('for slot in $(seq 1 "${RUNNERS_COUNT:-4}")', runcmds[-1])
+            self.assertIn('dir="/opt/actions-runner-${slot}"', runcmds[-1])
+
+        # 2. Default Rust builder cloud-init writes Dockerfile + oxidex-remote-build and builds image before readiness check
+        parsed_builder = parse_cloud_init(DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertTrue(parsed_builder["valid"], parsed_builder["warnings"])
+        builder_paths = [wf["path"] for wf in parsed_builder["write_files"]]
+        self.assertIn("/opt/oxidex-builder/image/Dockerfile", builder_paths)
+        self.assertIn("/usr/local/bin/oxidex-remote-build", builder_paths)
+        self.assertTrue(
+            any("docker build" in cmd and "oxidex-remote-builder:1.99.0" in cmd for cmd in parsed_builder["runcmd"])
+        )
+
+        # 4. Stale is_oom=False on an actual OOM error_excerpt is reclassified in both evaluate_scaling_decision and update_scaling
+        now_iso = self._get("/api/overview")["updated_at"]
+        reclassified_eval = evaluate_scaling_decision(
+            policy={
+                "min_runners": 4,
+                "max_runners": 16,
+                "runners_per_instance": 4,
+                "max_scale_up_monthly_usd": 300.0,
+                "enable_github_ci_oom_trigger": True,
+                "enable_journal_oom_trigger": False,
+                "enable_cpu_utilization_trigger": False,
+                "enable_hourly_runs_scale_down": False,
+            },
+            telemetry={
+                "current_runners": 4,
+                "current_instances": 1,
+                "jobs_ran_past_hour": 6,
+                "provisioned_jobs": 1,
+                "queued_jobs": 0,
+                "instance_cpu_percentages": [20.0],
+                "github_oom_runs": [
+                    {
+                        "id": "stale-false-on-real-oom",
+                        "repository": "swack-tools/oxidex",
+                        "run_id": 38596411473,
+                        "job_id": 115964282184,
+                        "step_number": 5,
+                        "line_number": 108,
+                        "runner_name": "gha-oxidex-runners-us-south1-a-01",
+                        "failed_at": now_iso,
+                        "is_oom": False,
+                        "failure_classification": "TIMEOUT",
+                        "error_excerpt": "##[error]Process completed with exit code 137 (SIGKILL / Out of memory)",
+                    }
+                ],
+                "journal_oom_events": [],
+            },
+        )
+        self.assertEqual(reclassified_eval["direction"], "scale_up")
+        self.assertTrue(
+            any(r["trigger"] == "github_ci_oom" for r in reclassified_eval["scale_up_reasons"])
+        )
+
+        scaling_resp = self._post(
+            "/api/scaling",
+            {
+                "role": "cicd_runner",
+                "telemetry": {
+                    "github_oom_runs": [
+                        {
+                            "id": "bulk-oom-reclassify",
+                            "repository": "swack-tools/oxidex",
+                            "run_id": 38596411473,
+                            "job_id": 115964282184,
+                            "step_number": 3,
+                            "line_number": 42,
+                            "runner_name": "oxidex-runners-dallas-01",
+                            "failed_at": now_iso,
+                            "is_oom": False,
+                            "failure_classification": "TIMEOUT",
+                            "error_excerpt": "fatal runtime error: out of memory (exit code 137)",
+                        }
+                    ]
+                },
+            },
+        )
+        norm_runs = scaling_resp["scaling_telemetry"]["github_oom_runs"]
+        self.assertTrue(norm_runs[0]["is_oom"])
+        self.assertEqual(norm_runs[0]["failure_classification"], "OOM")
+
+        # 5. Browser authentication flow on protected dashboards: GET / loads shell, POST /api/auth/login issues session cookie
+        auth_srv, _ = create_dashboard_server(
+            host="127.0.0.1",
+            port=0,
+            state_path=self.state_file,
+            auth_token="browser-flow-secret-888",
+        )
+        auth_port = auth_srv.server_address[1]
+        auth_thread = threading.Thread(target=auth_srv.serve_forever, daemon=True)
+        auth_thread.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{auth_port}/", timeout=5) as shell_resp:
+                shell_html = shell_resp.read().decode("utf-8")
+                self.assertEqual(shell_resp.status, 200)
+                self.assertIn("/api/auth/login", shell_html)
+
+            login_req = urllib.request.Request(
+                f"http://127.0.0.1:{auth_port}/api/auth/login",
+                data=json.dumps({"token": "browser-flow-secret-888"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(login_req, timeout=5) as login_resp:
+                set_cookie = login_resp.headers.get("Set-Cookie", "")
+                self.assertIn("dashboard_session=", set_cookie)
+                self.assertIn("HttpOnly", set_cookie)
+                cookie_pair = set_cookie.split(";", 1)[0]
+
+            cookie_req = urllib.request.Request(
+                f"http://127.0.0.1:{auth_port}/api/overview",
+                headers={"Cookie": cookie_pair},
+            )
+            with urllib.request.urlopen(cookie_req, timeout=5) as ov_resp:
+                ov_payload = json.loads(ov_resp.read().decode("utf-8"))
+                self.assertEqual(ov_resp.status, 200)
+                self.assertIn("profiles", ov_payload)
+        finally:
+            auth_srv.shutdown()
+            auth_srv.server_close()
+            auth_thread.join(timeout=5)
+
+        # 6. Instance records and scaling unit hourly rates use machine-level live pricing overrides, and static fallback reports catalog_baseline
+        baseline_price = calculate_spot_pricing(
+            region="us-south1",
+            family="c4d",
+            vcpu=16,
+            ram_gib=64,
+            boot_disk_type="hyperdisk-balanced",
+            boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced",
+            data_disk_gb=100,
+            machine_type="c4d-standard-16",
+        )
+        self.assertEqual(baseline_price["pricing_source"], "catalog_baseline")
+        try:
+            set_live_spot_pricing_override(
+                {
+                    "source": "gcp_capacity_history",
+                    "machine_hourly": {
+                        ("africa-south1", "n2-standard-16"): 0.0420,
+                        ("africa-south1", "c4d-standard-16"): 0.0420,
+                        ("us-south1", "c4d-standard-16"): 0.0350,
+                        ("europe-west1", "n2d-standard-8"): 0.0210,
+                    },
+                    "component_rates": {},
+                    "disk_monthly_gib": {},
+                }
+            )
+            ov_live = self.store.get_overview()
+            za_reg = next(r for r in ov_live["regions"] if r["region"] == "africa-south1")
+            za_inst = za_reg["running_instances"][0]
+            self.assertEqual(za_inst["pricing"]["pricing_source"], "gcp_capacity_history")
+            self.assertEqual(za_inst["pricing"]["compute_hourly_usd"], 0.0420)
+        finally:
+            set_live_spot_pricing_override(None)
+
+        # 7 & 12. UI assets keep empty monthly budget fallback at $50 and expose Rust Builder regional & tab scaling controls
+        rendered_ui = render_dashboard_html()
+        self.assertIn("curBudget.max_monthly_usd ?? 50", rendered_ui)
+        self.assertIn("curSc.max_scale_up_monthly_usd ?? 50", rendered_ui)
+        self.assertNotIn('document.getElementById("runner-max-month").value || "300"', rendered_ui)
+        self.assertNotIn('document.getElementById("sc-budget-mo").value || "300"', rendered_ui)
+        self.assertIn("scaleRegion('${reg.region}', 'rust_builder', 1)", rendered_ui)
+        self.assertIn("map-scale-builder-input-", rendered_ui)
+        self.assertIn("saveAndEvaluateBuilderScaling()", rendered_ui)
+
+        # 8. Non-finite nested telemetry is rejected and persistence failures roll back in-memory scaling state
+        before_jobs = self.store.state["scaling_telemetry"]["jobs_ran_past_hour"]
+        with self.assertRaises(ValueError):
+            self.store.update_scaling(
+                {
+                    "role": "cicd_runner",
+                    "telemetry": {
+                        "jobs_ran_past_hour": 99,
+                        "github_oom_runs": [
+                            {
+                                "id": "bad-nan-nested",
+                                "run_id": 1,
+                                "job_id": 2,
+                                "extra_metric": float("nan"),
+                            }
+                        ],
+                    },
+                }
+            )
+        self.assertEqual(self.store.state["scaling_telemetry"]["jobs_ran_past_hour"], before_jobs)
+
+        # 9. CI scaling recommendations clamp desired_instances and desired_runners to profile max_instances
+        capped_eval = evaluate_scaling_decision(
+            policy={
+                "min_runners": 4,
+                "max_runners": 64,
+                "runners_per_instance": 4,
+                "queued_jobs_threshold": 1,
+                "max_scale_up_hourly_usd": 50.0,
+                "max_scale_up_daily_usd": 500.0,
+                "max_scale_up_monthly_usd": 5000.0,
+                "enable_queued_jobs_trigger": True,
+            },
+            telemetry={
+                "current_runners": 8,
+                "current_instances": 2,
+                "jobs_ran_past_hour": 25,
+                "provisioned_jobs": 8,
+                "queued_jobs": 20,
+                "instance_cpu_percentages": [85.0, 90.0],
+                "github_oom_runs": [],
+                "journal_oom_events": [],
+            },
+            max_instances=3,
+        )
+        self.assertLessEqual(capped_eval["desired_instances"], 3)
+        self.assertLessEqual(capped_eval["desired_runners"], 12)
+
+        # 10. Rust build totals must match explicit timestamps, and omitted delivered_at anchors forward from requested_at
+        with self.assertRaises(urllib.error.HTTPError) as ctx_mismatch:
+            self._post(
+                "/api/rust-builds",
+                {
+                    "build_id": "rb-mismatch-timestamps",
+                    "status": "DELIVERED",
+                    "requested_at": "2026-10-15T12:00:00Z",
+                    "finished_at": "2026-10-15T12:01:00Z",
+                    "delivered_at": "2026-10-15T12:01:10Z",
+                    "total_duration_seconds": 5.0,
+                },
+            )
+        self.assertEqual(ctx_mismatch.exception.code, 400)
+        ctx_mismatch.exception.close()
+
+        forward_anchored = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-forward-anchor",
+                "status": "DELIVERED",
+                "requested_at": "2026-10-15T12:00:00Z",
+                "finished_at": "2026-10-15T12:01:00Z",
+                "total_duration_seconds": 75.0,
+            },
+        )["build"]
+        self.assertEqual(forward_anchored["requested_at"], "2026-10-15T12:00:00Z")
+        self.assertEqual(forward_anchored["finished_at"], "2026-10-15T12:01:00Z")
+        self.assertEqual(forward_anchored["delivered_at"], "2026-10-15T12:01:15Z")
+        self.assertEqual(forward_anchored["compile_duration_seconds"], 60.0)
+        self.assertEqual(forward_anchored["delivery_duration_seconds"], 15.0)
+        self.assertEqual(forward_anchored["total_duration_seconds"], 75.0)
+
+        # 11. _persist refuses symlinked .tmp or state_path without clobbering target file
+        victim_file = self.state_file.parent / "victim_target.txt"
+        victim_file.write_text("DO_NOT_OVERWRITE", encoding="utf-8")
+        tmp_symlink = self.state_file.with_suffix(".tmp")
+        tmp_symlink.symlink_to(victim_file)
+        try:
+            with self.assertRaises( OSError ):
+                self.store._persist()
+            self.assertEqual(victim_file.read_text(encoding="utf-8"), "DO_NOT_OVERWRITE")
+        finally:
+            if tmp_symlink.is_symlink():
+                tmp_symlink.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

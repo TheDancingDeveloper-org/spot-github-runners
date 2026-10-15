@@ -81,6 +81,7 @@ write_files:
       GITHUB_RUNNER_TOKEN="YOUR_REGISTRATION_TOKEN"
       RUNNER_GROUP="Default"
       RUNNER_LABELS="self-hosted,Linux,X64,gcp-dallas,n2,rust,docker"
+      RUNNERS_COUNT="4"
 
 runcmd:
   # 1. Install Official Docker Engine & Buildx
@@ -90,12 +91,9 @@ runcmd:
   - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now docker
-  # 2. Download, Configure & Start GitHub Actions Runner Service
-  - install -d -m 0755 -o runner -g runner /opt/actions-runner
+  # 2. Download, Configure & Start Isolated GitHub Actions Runner Slots
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner && chown -R runner:runner /opt/actions-runner && rm -f /tmp/actions-runner.tar.gz
-  - 'bash -lc "set -a && . /etc/runner-setup.env && set +a && su - runner -c \"cd /opt/actions-runner && ./config.sh --unattended --replace --url ${GITHUB_ORG_URL} --token ${GITHUB_RUNNER_TOKEN} --runnergroup ${RUNNER_GROUP} --labels ${RUNNER_LABELS} --ephemeral\""'
-  - cd /opt/actions-runner && ./svc.sh install runner && ./svc.sh start
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${dir}"; chown -R runner:runner "${dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --ephemeral && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -137,6 +135,7 @@ write_files:
       GITHUB_RUNNER_TOKEN="YOUR_REGISTRATION_TOKEN"
       RUNNER_GROUP="oxidex-strict"
       RUNNER_LABELS="self-hosted,Linux,X64,spot-heavy32,rust-1.99"
+      RUNNERS_COUNT="4"
       DISK_MOUNT="/mnt/runner-data"
 
 runcmd:
@@ -147,11 +146,8 @@ runcmd:
   - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now containerd docker
-  - install -d -m 0755 -o runner -g runner /opt/actions-runner
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner && chown -R runner:runner /opt/actions-runner && rm -f /tmp/actions-runner.tar.gz
-  - 'bash -lc "set -a && . /etc/runner-setup.env && set +a && su - runner -c \"cd /opt/actions-runner && ./config.sh --unattended --replace --url ${GITHUB_ORG_URL} --token ${GITHUB_RUNNER_TOKEN} --runnergroup ${RUNNER_GROUP} --labels ${RUNNER_LABELS} --ephemeral\""'
-  - cd /opt/actions-runner && ./svc.sh install runner && ./svc.sh start
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${dir}"; chown -R runner:runner "${dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --ephemeral && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -198,6 +194,31 @@ write_files:
         "image": "oxidex-remote-builder:1.99.0",
         "cache_mount": "/mnt/runner-data/remote-build"
       }
+  - path: /opt/oxidex-builder/image/Dockerfile
+    permissions: '0644'
+    owner: root:root
+    content: |
+      FROM rust:1-bookworm
+      RUN apt-get update && apt-get install -y --no-install-recommends clang lld cmake pkg-config libssl-dev zstd git ca-certificates && rm -rf /var/lib/apt/lists/*
+  - path: /usr/local/bin/oxidex-remote-build
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      CONFIG_FILE="/etc/oxidex-remote-build.json"
+      test -f "${CONFIG_FILE}"
+      IMAGE="$(jq -r '.image // "oxidex-remote-builder:1.99.0"' "${CONFIG_FILE}")"
+      CPUS="$(jq -r '.cpus // 16' "${CONFIG_FILE}")"
+      MEM_GIB="$(jq -r '.memory_gib // 28' "${CONFIG_FILE}")"
+      CACHE_MOUNT="$(jq -r '.cache_mount // "/mnt/runner-data/remote-build"' "${CONFIG_FILE}")"
+      if [[ "${1:-}" == "--verify-readiness" ]]; then
+        docker image inspect "${IMAGE}" >/dev/null
+        test -d "${CACHE_MOUNT}/cargo"
+        test -d "${CACHE_MOUNT}/targets"
+        exit 0
+      fi
+      exec docker run --rm --cpus="${CPUS}" --memory="${MEM_GIB}g" --memory-swap="${MEM_GIB}g" -v "${CACHE_MOUNT}:/cache" "${IMAGE}" "$@"
 
 runcmd:
   # 1. Mount persistent NVMe Hyperdisk cache and configure unprivileged build container
@@ -205,7 +226,10 @@ runcmd:
   - install -m 0755 -d /etc/apt/keyrings
   - curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
   - chmod a+r /etc/apt/keyrings/docker.asc
+  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
+  - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now containerd docker
+  - DOCKER_BUILDKIT=0 docker build --memory=28g --memory-swap=28g --cpu-period=100000 --cpu-quota=1600000 -t oxidex-remote-builder:1.99.0 /opt/oxidex-builder/image
   - /usr/local/bin/oxidex-remote-build --verify-readiness
 """
 
@@ -743,7 +767,7 @@ def calculate_spot_pricing(
             family, (Decimal("0.0040"), Decimal("0.00045"))
         )
         compute_hourly = (cpu_rate * _dec(vcpu) + ram_rate * _dec(ram_gib)) * mult
-        pricing_source = str((resolved_live or {}).get("source") or "catalog_baseline")
+        pricing_source = "catalog_baseline"
 
     compute_daily = compute_hourly * HOURS_PER_DAY
     compute_monthly = compute_hourly * HOURS_PER_MONTH

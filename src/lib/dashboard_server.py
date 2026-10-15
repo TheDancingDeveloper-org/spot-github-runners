@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import hashlib
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
 import ipaddress
 import json
 import math
@@ -35,6 +37,7 @@ from .dashboard_models import (
     qualify_instances,
 )
 from .dashboard_scaling import (
+    _assert_finite_json_tree,
     build_github_oom_deep_link,
     classify_github_ci_failure,
     default_scaling_config,
@@ -110,6 +113,8 @@ def _build_instance_record(
         data_disk_type=data_disk_type,
         data_disk_gb=data_disk_gb,
         tax_rate_percent=tax_rate,
+        machine_type=machine_type,
+        project=project,
     )
     benchmark = compute_cpu_benchmark_score(cpu_platform, vcpu, machine_type)
     started_epoch = ref_now - started_hours_ago * 3600.0
@@ -1136,6 +1141,8 @@ class DashboardStore:
                         data_disk_type=str(vm_tpl.get("data_disk_type", "hyperdisk-balanced")),
                         data_disk_gb=int(vm_tpl.get("data_disk_gb", 100)),
                         tax_rate_percent=float(reg_info.get("tax_rate_default", 8.25)),
+                        machine_type=str(tpl_machine or "n2-standard-16"),
+                        project=self.project,
                     )
                     tpl_rates.append(_offer_hourly({"pricing": pricing}))
                 if tpl_rates:
@@ -1206,8 +1213,19 @@ class DashboardStore:
         serialized = json.dumps(candidate_state, indent=2, allow_nan=False)
         if self.state_path:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.state_path.with_suffix(".tmp")
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            if self.state_path.is_symlink():
+                raise OSError(f"Refusing symlinked state file path: {self.state_path}")
+            legacy_tmp = self.state_path.with_suffix(".tmp")
+            if legacy_tmp.is_symlink():
+                raise OSError(f"Refusing symlinked temporary state path: {legacy_tmp}")
+            tmp = self.state_path.parent / f".{self.state_path.name}.{uuid.uuid4().hex}.tmp"
+            open_flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            fd = os.open(str(tmp), open_flags, 0o600)
             try:
                 try:
                     os.fchmod(fd, 0o600)
@@ -1216,6 +1234,7 @@ class DashboardStore:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(serialized)
                     fh.flush()
+                    os.fsync(fh.fileno())
             except Exception:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -1224,12 +1243,27 @@ class DashboardStore:
                     pass
                 raise
             tmp.replace(self.state_path)
-            try:
-                os.chmod(self.state_path, 0o600)
-            except OSError:
-                # Filesystems that do not support POSIX chmod keep the mode set at creation.
-                pass
         self.state["updated_at"] = new_updated_at
+
+    def _refresh_instances_pricing(self) -> None:
+        """Recompute instance pricing using current live/catalog machine rates."""
+        for inst in self.state.get("instances", []):
+            if not isinstance(inst, dict) or not inst.get("region") or not inst.get("machine_type"):
+                continue
+            cur_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else {}
+            inst["pricing"] = calculate_spot_pricing(
+                family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
+                vcpu=int(inst.get("vcpu", 16)),
+                ram_gib=float(inst.get("ram_gib", 64)),
+                region=str(inst["region"]),
+                boot_disk_type=str(inst.get("boot_disk_type", "hyperdisk-balanced")),
+                boot_disk_gb=int(inst.get("boot_disk_gb", 40)),
+                data_disk_type=str(inst.get("data_disk_type", "hyperdisk-balanced")),
+                data_disk_gb=int(inst.get("data_disk_gb", 100)),
+                tax_rate_percent=cur_pricing.get("tax_rate_percent"),
+                machine_type=str(inst["machine_type"]),
+                project=self.project,
+            )
 
     def get_overview(
         self,
@@ -1243,6 +1277,7 @@ class DashboardStore:
         role_filter: str = "",
     ) -> dict[str, Any]:
         with self._lock:
+            self._refresh_instances_pricing()
             latencies = self.state.get("region_latencies_ms")
             cicd_qual = qualify_instances(
                 self.state["profiles"]["cicd_runner"],
@@ -1261,6 +1296,9 @@ class DashboardStore:
                 self.state["scaling_telemetry"],
                 per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd(
                     "cicd_runner", cicd_qual
+                ),
+                max_instances=int(
+                    self.state["profiles"]["cicd_runner"].get("max_instances", 8)
                 ),
             )
             builder_scaling_eval = evaluate_builder_scaling_decision(
@@ -1669,6 +1707,7 @@ class DashboardStore:
     def update_scaling(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Update scaling rules, triggers, hourly thresholds, CPU scope, and telemetry."""
         with self._lock:
+            _assert_finite_json_tree(payload, "payload")
             role = str(payload.get("role", "cicd_runner")).strip()
             if role not in ("cicd_runner", "rust_builder"):
                 raise ValueError(f"Unsupported workload role: {role}")
@@ -1691,6 +1730,10 @@ class DashboardStore:
                     if role == "cicd_runner":
                         pol = self.state["scaling"]["cicd_runner"]
                         self.state["profiles"]["cicd_runner"]["min_runners"] = int(pol.get("min_runners", 4))
+                        if "max_instances" in payload["policy"]:
+                            self.state["profiles"]["cicd_runner"]["max_instances"] = max(
+                                1, _finite_int(pol.get("max_instances", 8), "max_instances", min_val=1)
+                            )
                         self.state["profiles"]["cicd_runner"]["runner_vcpu"] = int(pol.get("runner_vcpu", 4))
                         self.state["profiles"]["cicd_runner"]["runner_ram_gib"] = float(pol.get("runner_ram_gib", 16))
                         if "runners_per_instance" not in payload["policy"]:
@@ -1717,6 +1760,10 @@ class DashboardStore:
                     if "current_runners" in payload["telemetry"] and "current_instances" not in payload["telemetry"]:
                         self.state["scaling_telemetry"].pop("current_instances", None)
                     self.state["scaling_telemetry"].update(payload["telemetry"])
+                    if "github_oom_runs" in payload["telemetry"] and isinstance(
+                        self.state["scaling_telemetry"].get("github_oom_runs"), list
+                    ):
+                        self._normalize_github_ci_runs()
                     if (
                         "journal_oom_events" in payload["telemetry"]
                         and "builder_journal_oom_events" not in payload["telemetry"]
@@ -1781,19 +1828,22 @@ class DashboardStore:
                     self.state["scaling"]["cicd_runner"],
                     self.state["scaling_telemetry"],
                     per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("cicd_runner"),
+                    max_instances=int(
+                        self.state["profiles"]["cicd_runner"].get("max_instances", 8)
+                    ),
                 )
                 builder_eval = evaluate_builder_scaling_decision(
                     self.state["scaling"]["rust_builder"],
                     self.state["scaling_telemetry"],
                     per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
                 )
+                self._persist()
             except Exception:
                 self.state["scaling"] = prev_scaling
                 self.state["profiles"] = prev_profiles
                 self.state["scaling_telemetry"] = prev_telemetry
                 raise
 
-            self._persist()
             evaluation = builder_eval if role == "rust_builder" else cicd_eval
             return {
                 "status": "ok",
@@ -2506,8 +2556,8 @@ class DashboardStore:
                     if "delivered_at" in payload
                     else existing_build.get("delivered_at")
                 )
-            elif existing_build.get("requested_at") and not payload.get("requested_at"):
-                req_at = str(existing_build["requested_at"])
+            elif (payload.get("requested_at") or existing_build.get("requested_at")) and not payload.get("delivered_at"):
+                req_at = str(payload.get("requested_at") or existing_build["requested_at"])
                 req_epoch = _iso_to_epoch(req_at)
                 if payload.get("finished_at"):
                     fin_at = str(payload["finished_at"])
@@ -2522,16 +2572,19 @@ class DashboardStore:
                 else:
                     fin_epoch = req_epoch + max(0.0, duration - delivery_sec)
                     fin_at = _iso_seconds_ago(0, fin_epoch)
-                if payload.get("delivered_at"):
-                    del_at = str(payload["delivered_at"])
-                elif (
+                if (
                     existing_build.get("delivered_at")
+                    and not payload.get("requested_at")
                     and "total_duration_seconds" not in payload
                     and "delivery_duration_seconds" not in payload
                 ):
                     del_at = str(existing_build["delivered_at"])
                 else:
-                    del_epoch = fin_epoch + delivery_sec
+                    del_epoch = (
+                        (req_epoch + duration)
+                        if explicit_total is not None
+                        else (fin_epoch + delivery_sec)
+                    )
                     del_at = _iso_seconds_ago(0, del_epoch)
             else:
                 del_at = payload.get("delivered_at") or _iso_seconds_ago(0, now_ts)
@@ -2573,6 +2626,18 @@ class DashboardStore:
                 "finished_at": fin_at,
                 "delivered_at": del_at,
                 "total_duration_seconds": raw_duration,
+                "compile_duration_seconds": raw_compile,
+                "delivery_duration_seconds": (
+                    delivery_sec
+                    if (
+                        not is_unfinished
+                        and explicit_total is not None
+                        and explicit_delivery is not None
+                        and not payload.get("finished_at")
+                        and not payload.get("delivered_at")
+                    )
+                    else raw_delivery
+                ),
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
                 "total_crates": total_crates,
@@ -2615,13 +2680,21 @@ class DashboardStore:
                     min_val=0.0,
                 ),
             }
+            _assert_finite_json_tree(payload, "payload")
             enriched = enrich_rust_build_record(raw, project=self.project)
-            if existing_idx is not None:
-                self.state["rust_builds"][existing_idx] = enriched
-            else:
-                self.state["rust_builds"].insert(0, enriched)
-            self._sync_rust_build_telemetry(now_ts)
-            self._persist()
+            prev_builds = copy.deepcopy(self.state["rust_builds"])
+            prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
+            try:
+                if existing_idx is not None:
+                    self.state["rust_builds"][existing_idx] = enriched
+                else:
+                    self.state["rust_builds"].insert(0, enriched)
+                self._sync_rust_build_telemetry(now_ts)
+                self._persist()
+            except Exception:
+                self.state["rust_builds"] = prev_builds
+                self.state["scaling_telemetry"] = prev_telemetry
+                raise
             builder_eval = evaluate_builder_scaling_decision(
                 self.state["scaling"]["rust_builder"],
                 self.state["scaling_telemetry"],
@@ -2659,6 +2732,15 @@ def make_handler(
     from .dashboard_ui_assets import render_dashboard_html
 
     expected_token = str(auth_token).strip() if auth_token else ""
+    expected_session_cookie = (
+        hmac.new(
+            expected_token.encode("utf-8"),
+            b"spot-dashboard-session-v1",
+            hashlib.sha256,
+        ).hexdigest()
+        if expected_token
+        else ""
+    )
 
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -2681,27 +2763,73 @@ def make_handler(
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_html(self, html_text: str, status: int = HTTPStatus.OK) -> None:
+        def _send_html(
+            self,
+            html_text: str,
+            status: int = HTTPStatus.OK,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             body = html_text.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
-        def _check_auth(self) -> bool:
-            """Verify Bearer token or X-Dashboard-Token when authentication is configured."""
+        def _check_auth(self, *, allow_html_shell: bool = False) -> bool:
+            """Verify Bearer token, X-Dashboard-Token, or session cookie when authentication is configured."""
             if not expected_token:
                 return True
             auth_hdr = (self.headers.get("Authorization") or "").strip()
+            hdr_token = (self.headers.get("X-Dashboard-Token") or "").strip()
             candidate = ""
             if auth_hdr.lower().startswith("bearer "):
                 candidate = auth_hdr[7:].strip()
-            if not candidate:
-                candidate = (self.headers.get("X-Dashboard-Token") or "").strip()
-            if candidate and hmac.compare_digest(candidate, expected_token):
+            elif auth_hdr:
+                candidate = auth_hdr
+            if not candidate and hdr_token:
+                candidate = hdr_token
+            if candidate:
+                if hmac.compare_digest(candidate, expected_token):
+                    return True
+                self._send_json(
+                    {"error": "Unauthorized: valid Bearer token or X-Dashboard-Token required"},
+                    status=HTTPStatus.UNAUTHORIZED,
+                    extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
+                )
+                return False
+
+            raw_cookie = self.headers.get("Cookie") or ""
+            if raw_cookie:
+                cookie = SimpleCookie()
+                try:
+                    cookie.load(raw_cookie)
+                except Exception:  # noqa: BLE001
+                    cookie = SimpleCookie()
+                if "dashboard_session" in cookie:
+                    sess_val = cookie["dashboard_session"].value.strip()
+                    if sess_val and hmac.compare_digest(sess_val, expected_session_cookie):
+                        return True
+
+            qs = parse_qs(urlparse(self.path).query)
+            if "token" in qs:
+                q_token = (qs["token"][0] or "").strip()
+                if q_token and hmac.compare_digest(q_token, expected_token):
+                    return True
+                self._send_json(
+                    {"error": "Unauthorized: valid Bearer token or X-Dashboard-Token required"},
+                    status=HTTPStatus.UNAUTHORIZED,
+                    extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
+                )
+                return False
+
+            if allow_html_shell:
                 return True
+
             self._send_json(
                 {"error": "Unauthorized: valid Bearer token or X-Dashboard-Token required"},
                 status=HTTPStatus.UNAUTHORIZED,
@@ -2751,17 +2879,45 @@ def make_handler(
             if length <= 0:
                 return {}
             raw = self.rfile.read(length).decode("utf-8")
-            return json.loads(raw) if raw.strip() else {}
+            if not raw.strip():
+                return {}
+
+            def _reject_non_finite_constant(val: str) -> Any:
+                raise ValueError(f"Non-finite JSON constant '{val}' is not allowed")
+
+            parsed = json.loads(raw, parse_constant=_reject_non_finite_constant)
+            _assert_finite_json_tree(parsed, "payload")
+            return parsed
 
         def do_GET(self) -> None:  # noqa: N802
-            if not self._check_auth():
-                return
             parsed = urlparse(self.path)
             path = parsed.path
             qs = parse_qs(parsed.query)
 
             if path in ("/", "/index.html"):
-                self._send_html(render_dashboard_html(project=store.project, org=store.org))
+                if not self._check_auth(allow_html_shell=True):
+                    return
+                extra_hdrs: dict[str, str] | None = None
+                if expected_token:
+                    q_token = (qs.get("token", [""])[0] or "").strip()
+                    auth_hdr = (self.headers.get("Authorization") or "").strip()
+                    hdr_token = (self.headers.get("X-Dashboard-Token") or "").strip()
+                    supplied = (
+                        auth_hdr[7:].strip()
+                        if auth_hdr.lower().startswith("bearer ")
+                        else (hdr_token or q_token)
+                    )
+                    if supplied and hmac.compare_digest(supplied, expected_token):
+                        extra_hdrs = {
+                            "Set-Cookie": f"dashboard_session={expected_session_cookie}; HttpOnly; SameSite=Strict; Path=/"
+                        }
+                self._send_html(
+                    render_dashboard_html(project=store.project, org=store.org),
+                    extra_headers=extra_hdrs,
+                )
+                return
+
+            if not self._check_auth():
                 return
 
             if path == "/api/health":
@@ -2817,13 +2973,37 @@ def make_handler(
             self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:  # noqa: N802
-            if not self._check_auth():
-                return
             parsed = urlparse(self.path)
             path = parsed.path
             ok_req, err_status, err_msg = self._validate_same_origin_json_post()
             if not ok_req:
                 self._send_json({"error": err_msg}, status=err_status)
+                return
+            if path == "/api/auth/login":
+                try:
+                    payload = self._read_json()
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                token_candidate = str(payload.get("token", "")).strip()
+                if not expected_token:
+                    self._send_json({"status": "ok", "authenticated": True})
+                    return
+                if token_candidate and hmac.compare_digest(token_candidate, expected_token):
+                    self._send_json(
+                        {"status": "ok", "authenticated": True},
+                        extra_headers={
+                            "Set-Cookie": f"dashboard_session={expected_session_cookie}; HttpOnly; SameSite=Strict; Path=/"
+                        },
+                    )
+                    return
+                self._send_json(
+                    {"error": "Unauthorized: invalid dashboard authentication token"},
+                    status=HTTPStatus.UNAUTHORIZED,
+                    extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
+                )
+                return
+            if not self._check_auth():
                 return
             try:
                 payload = self._read_json()
