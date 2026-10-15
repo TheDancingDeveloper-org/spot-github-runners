@@ -1704,6 +1704,177 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             if tmp_symlink.is_symlink():
                 tmp_symlink.unlink()
 
+    def test_round9_codex_regressions(self) -> None:
+        import copy
+        import os
+        from unittest.mock import AsyncMock, patch
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_CLOUD_INIT,
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+            fetch_live_spot_pricing,
+            set_live_spot_pricing_override,
+        )
+
+        # 1. Persistent systemd runner cloud-init templates do not use one-shot --ephemeral registration
+        self.assertNotIn("--ephemeral", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertNotIn("--ephemeral", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 2. Rust builder cloud-init implements oxidex-remote-build launcher protocol (<project> prepare & <project> <cmd...>)
+        self.assertIn("/opt/oxidex-builder/image/entrypoint.py", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("/opt/oxidex-builder/image/Dockerfile", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("--label=oxidex.remote-build=true", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("f'{root}/sources/{project}:/src'", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("f'{root}/targets/{project}:/target'", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("--entrypoint=/usr/bin/time", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("if sys.argv[2:] == ['prepare']:", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        # 3. fetch_live_spot_pricing honors GOOGLE_CLOUD_API_KEY and falls back to Billing Catalog SKU rates via gcloud auth
+        set_live_spot_pricing_override(None)
+        with (
+            patch.dict(os.environ, {"GOOGLE_CLOUD_API_KEY": "test-gke-billing-key"}, clear=False),
+            patch(
+                "lib.spot_pricing.load_catalog_rates",
+                new=AsyncMock(return_value={("us-south1", "n2", "CPU", "SPOT"): 0.0085}),
+            ) as mock_load_rates,
+        ):
+            live_api_key = fetch_live_spot_pricing(project="homelab-424523", force_refresh=True)
+            self.assertEqual(live_api_key["source"], "gcp_billing_catalog")
+            self.assertEqual(live_api_key["component_rates"][("us-south1", "n2", "CPU", "SPOT")], 0.0085)
+            mock_load_rates.assert_awaited_once_with("test-gke-billing-key")
+
+        with (
+            patch("lib.compute_api.get_auth") as mock_auth,
+            patch("lib.billing_catalog.catalog_skus", return_value=({"skuId": "test-sku"},)) as mock_skus,
+            patch(
+                "lib.dashboard_models.parse_component_rates",
+                return_value={("us-south1", "n2", "CPU", "SPOT"): 0.0079},
+            ),
+            patch(
+                "lib.spot_pricing.spot_price",
+                new=AsyncMock(return_value=("us-south1", "n2-standard-16", None)),
+            ),
+        ):
+            mock_auth.return_value = type("AuthStub", (), {"token": "gcloud-oauth-token", "project": "homelab-424523"})()
+            live_catalog = fetch_live_spot_pricing(project="homelab-424523", force_refresh=True)
+            self.assertEqual(live_catalog["source"], "gcp_billing_catalog")
+            self.assertEqual(live_catalog["component_rates"][("us-south1", "n2", "CPU", "SPOT")], 0.0079)
+            mock_skus.assert_called_once()
+        set_live_spot_pricing_override(None)
+
+        # 4. scale_region_instances rolls back in-memory mutations when _persist fails
+        before_count = len(self.store.state["instances"])
+        with patch.object(self.store, "_persist", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.store.scale_region_instances(
+                    {"region": "us-south1", "role": "cicd_runner", "delta": 2}
+                )
+        self.assertEqual(len(self.store.state["instances"]), before_count)
+
+        # 5. /api/auth/login caps request body at MAX_LOGIN_BODY_BYTES (4096) with HTTP 413 before reading
+        auth_srv, _ = create_dashboard_server(
+            host="127.0.0.1",
+            port=0,
+            state_path=self.state_file,
+            auth_token="round9-secret",
+        )
+        auth_port = auth_srv.server_address[1]
+        auth_thread = threading.Thread(target=auth_srv.serve_forever, daemon=True)
+        auth_thread.start()
+        try:
+            oversized_body = json.dumps({"token": "x" * 6000}).encode("utf-8")
+            req_413 = urllib.request.Request(
+                f"http://127.0.0.1:{auth_port}/api/auth/login",
+                data=oversized_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_413:
+                urllib.request.urlopen(req_413, timeout=5)
+            self.assertEqual(ctx_413.exception.code, 413)
+            ctx_413.exception.close()
+        finally:
+            auth_srv.shutdown()
+            auth_srv.server_close()
+            auth_thread.join(timeout=5)
+
+        # 6. _refresh_instances_pricing preserves historical prices on DELETED instances when live rates change
+        deleted_before = [
+            copy.deepcopy(inst)
+            for inst in self.store.state["instances"]
+            if inst.get("status") != "RUNNING"
+        ]
+        self.assertTrue(len(deleted_before) > 0)
+        try:
+            set_live_spot_pricing_override(
+                {
+                    "source": "gcp_capacity_history",
+                    "machine_hourly": {
+                        ("us-south1", "c4d-standard-16"): 0.1999,
+                        ("europe-west4", "c4d-standard-16"): 0.1999,
+                        ("africa-south1", "n2-standard-16"): 0.1999,
+                    },
+                    "component_rates": {},
+                    "disk_monthly_gib": {},
+                }
+            )
+            self.store.get_overview()
+            deleted_after = [
+                inst
+                for inst in self.store.state["instances"]
+                if inst.get("status") != "RUNNING"
+            ]
+            for before_inst, after_inst in zip(deleted_before, deleted_after):
+                self.assertEqual(
+                    before_inst["pricing"]["total_hourly_usd"],
+                    after_inst["pricing"]["total_hourly_usd"],
+                )
+        finally:
+            set_live_spot_pricing_override(None)
+
+        # 7. All 3 cloud-init templates dynamically detect guest distro from /etc/os-release for Docker APT repo
+        for tpl in (
+            DEFAULT_RUNNER_CLOUD_INIT,
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        ):
+            self.assertNotIn("https://download.docker.com/linux/ubuntu", tpl)
+            self.assertIn("https://download.docker.com/linux/$(. /etc/os-release && echo", tpl)
+
+        # 8. Strict runner cloud-init mounts /dev/disk/by-id/google-runner-data at /mnt/runner-data and places Docker/runner work dirs there
+        self.assertIn("/dev/disk/by-id/google-runner-data", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('"$mp/docker"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('"$mp/containerd"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('work_dir="${mp}/work/runner-${slot}"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('--work "${work_dir}"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 9. Failed Rust builds do not fabricate successful metrics or count toward completed_builds
+        failed_resp = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-failed-no-fabricated-metrics",
+                "status": "FAILED",
+                "crate_workspace": "oxidex-engine",
+            },
+        )["build"]
+        self.assertEqual(failed_resp["status"], "FAILED")
+        self.assertEqual(failed_resp["compile_duration_seconds"], 0.0)
+        self.assertEqual(failed_resp["delivery_duration_seconds"], 0.0)
+        self.assertEqual(failed_resp["cache_hits"], 0)
+        self.assertEqual(failed_resp["peak_ram_gib"], 0.0)
+        self.assertIsNone(failed_resp["delivered_at"])
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx_bad_status:
+            self._post(
+                "/api/rust-builds",
+                {
+                    "build_id": "rb-invalid-status",
+                    "status": "BOGUS_STATUS",
+                },
+            )
+        self.assertEqual(ctx_bad_status.exception.code, 400)
+        ctx_bad_status.exception.close()
+
 
 if __name__ == "__main__":
     unittest.main()

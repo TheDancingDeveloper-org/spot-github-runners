@@ -46,13 +46,24 @@ from .dashboard_scaling import (
     parse_github_oom_deep_link,
 )
 from .rust_build_telemetry import (
+    ALLOWED_BUILD_STATUSES,
+    SUCCESSFUL_BUILD_STATUSES,
     UNFINISHED_BUILD_STATUSES,
+    UNSUCCESSFUL_BUILD_STATUSES,
     _finite_float,
     _finite_int,
     _iso_to_epoch,
     classify_ip_and_network,
     enrich_rust_build_record,
 )
+
+MAX_JSON_BODY_BYTES = 262_144
+MAX_LOGIN_BODY_BYTES = 4_096
+
+
+class _PayloadTooLargeError(ValueError):
+    """Raised when an incoming HTTP JSON request body exceeds the configured byte limit."""
+
 
 
 def _iso_hours_ago(hours_ago: float, base_epoch: float | None = None) -> str:
@@ -1246,9 +1257,14 @@ class DashboardStore:
         self.state["updated_at"] = new_updated_at
 
     def _refresh_instances_pricing(self) -> None:
-        """Recompute instance pricing using current live/catalog machine rates."""
+        """Recompute active instance pricing using current live/catalog machine rates while preserving historical rates on deleted instances."""
         for inst in self.state.get("instances", []):
-            if not isinstance(inst, dict) or not inst.get("region") or not inst.get("machine_type"):
+            if (
+                not isinstance(inst, dict)
+                or inst.get("status") != "RUNNING"
+                or not inst.get("region")
+                or not inst.get("machine_type")
+            ):
                 continue
             cur_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else {}
             inst["pricing"] = calculate_spot_pricing(
@@ -1389,6 +1405,7 @@ class DashboardStore:
     ) -> dict[str, Any]:
         """Filter, compute window-scoped costs, and sort running & deleted instances."""
         with self._lock:
+            self._refresh_instances_pricing()
             now_ts = time.time()
             window_hours = max(0.5, _finite_float(window_hours, "window_hours", min_val=0.0))
             window_start_ts = now_ts - window_hours * 3600.0
@@ -1911,20 +1928,71 @@ class DashboardStore:
             template_id = str(payload.get("id", "")).strip()
             now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            if mode == "save_as" or not template_id:
-                new_id = f"ci-{role.split('_')[0]}-{uuid.uuid4().hex[:6]}"
-                record = {
-                    "id": new_id,
-                    "name": name,
-                    "role": role,
-                    "description": description,
-                    "updated_at": now_iso,
-                    "content": content,
-                }
-                self.state["cloud_init_templates"].append(record)
-                if payload.get("assign_to_profile", True) and role in self.state["profiles"]:
-                    prof = self.state["profiles"][role]
-                    prof["cloud_init_template_id"] = new_id
+            prev_ci_templates = copy.deepcopy(self.state["cloud_init_templates"])
+            prev_profiles = copy.deepcopy(self.state["profiles"])
+            prev_vm_templates = copy.deepcopy(self.state.get("vm_templates", []))
+            try:
+                if mode == "save_as" or not template_id:
+                    new_id = f"ci-{role.split('_')[0]}-{uuid.uuid4().hex[:6]}"
+                    record = {
+                        "id": new_id,
+                        "name": name,
+                        "role": role,
+                        "description": description,
+                        "updated_at": now_iso,
+                        "content": content,
+                    }
+                    self.state["cloud_init_templates"].append(record)
+                    if payload.get("assign_to_profile", True) and role in self.state["profiles"]:
+                        prof = self.state["profiles"][role]
+                        prof["cloud_init_template_id"] = new_id
+                        if prof.get("vm_template_id"):
+                            assigned_vm_tpl = next(
+                                (
+                                    t
+                                    for t in self.state.get("vm_templates", [])
+                                    if t.get("id") == prof.get("vm_template_id")
+                                ),
+                                None,
+                            )
+                            if assigned_vm_tpl is not None:
+                                assigned_vm_tpl["cloud_init_template_id"] = new_id
+                    self._persist()
+                    return {"status": "ok", "template": {**record, "parsed": parsed}}
+
+                existing = next(
+                    (t for t in self.state["cloud_init_templates"] if t["id"] == template_id),
+                    None,
+                )
+                if existing is None:
+                    raise ValueError(f"Cloud-init template '{template_id}' not found")
+                old_role = str(existing.get("role", "cicd_runner")).strip()
+                target_role = role if "role" in payload else old_role
+                existing["role"] = target_role
+                existing["content"] = content
+                if name:
+                    existing["name"] = name
+                if description:
+                    existing["description"] = description
+                existing["updated_at"] = now_iso
+                if old_role != target_role and old_role in self.state["profiles"]:
+                    fallback_tpl = next(
+                        (
+                            t["id"]
+                            for t in self.state["cloud_init_templates"]
+                            if t.get("role") == old_role and t.get("id") != existing["id"]
+                        ),
+                        None,
+                    )
+                    old_prof = self.state["profiles"][old_role]
+                    if old_prof.get("cloud_init_template_id") == existing["id"]:
+                        old_prof["cloud_init_template_id"] = fallback_tpl
+                    for vm_t in self.state.get("vm_templates", []):
+                        if vm_t.get("role") == old_role and vm_t.get("cloud_init_template_id") == existing["id"]:
+                            vm_t["cloud_init_template_id"] = fallback_tpl
+                if payload.get("assign_to_profile", False) and existing["role"] in self.state["profiles"]:
+                    prof = self.state["profiles"][existing["role"]]
+                    prof["cloud_init_template_id"] = existing["id"]
                     if prof.get("vm_template_id"):
                         assigned_vm_tpl = next(
                             (
@@ -1935,56 +2003,14 @@ class DashboardStore:
                             None,
                         )
                         if assigned_vm_tpl is not None:
-                            assigned_vm_tpl["cloud_init_template_id"] = new_id
+                            assigned_vm_tpl["cloud_init_template_id"] = existing["id"]
                 self._persist()
-                return {"status": "ok", "template": {**record, "parsed": parsed}}
-
-            existing = next(
-                (t for t in self.state["cloud_init_templates"] if t["id"] == template_id),
-                None,
-            )
-            if existing is None:
-                raise ValueError(f"Cloud-init template '{template_id}' not found")
-            old_role = str(existing.get("role", "cicd_runner")).strip()
-            target_role = role if "role" in payload else old_role
-            existing["role"] = target_role
-            existing["content"] = content
-            if name:
-                existing["name"] = name
-            if description:
-                existing["description"] = description
-            existing["updated_at"] = now_iso
-            if old_role != target_role and old_role in self.state["profiles"]:
-                fallback_tpl = next(
-                    (
-                        t["id"]
-                        for t in self.state["cloud_init_templates"]
-                        if t.get("role") == old_role and t.get("id") != existing["id"]
-                    ),
-                    None,
-                )
-                old_prof = self.state["profiles"][old_role]
-                if old_prof.get("cloud_init_template_id") == existing["id"]:
-                    old_prof["cloud_init_template_id"] = fallback_tpl
-                for vm_t in self.state.get("vm_templates", []):
-                    if vm_t.get("role") == old_role and vm_t.get("cloud_init_template_id") == existing["id"]:
-                        vm_t["cloud_init_template_id"] = fallback_tpl
-            if payload.get("assign_to_profile", False) and existing["role"] in self.state["profiles"]:
-                prof = self.state["profiles"][existing["role"]]
-                prof["cloud_init_template_id"] = existing["id"]
-                if prof.get("vm_template_id"):
-                    assigned_vm_tpl = next(
-                        (
-                            t
-                            for t in self.state.get("vm_templates", [])
-                            if t.get("id") == prof.get("vm_template_id")
-                        ),
-                        None,
-                    )
-                    if assigned_vm_tpl is not None:
-                        assigned_vm_tpl["cloud_init_template_id"] = existing["id"]
-            self._persist()
-            return {"status": "ok", "template": {**existing, "parsed": parsed}}
+                return {"status": "ok", "template": {**existing, "parsed": parsed}}
+            except Exception:
+                self.state["cloud_init_templates"] = prev_ci_templates
+                self.state["profiles"] = prev_profiles
+                self.state["vm_templates"] = prev_vm_templates
+                raise
 
     def create_vm_template_from_instance(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Create a reusable VM template out of a current or historical instance."""
@@ -2040,13 +2066,22 @@ class DashboardStore:
                 new_tpl["runner_vcpu"] = int(prof["runner_vcpu"])
                 new_tpl["runner_ram_gib"] = float(prof["runner_ram_gib"])
                 new_tpl["runners_count"] = validated_units
-            self.state["vm_templates"].append(new_tpl)
-            if assign_to_profile and prof is not None:
-                prof["use_vm_template"] = True
-                prof["vm_template_id"] = new_tpl["id"]
-                if role == "cicd_runner":
-                    self._sync_template_density()
-            self._persist()
+            prev_vm_templates = copy.deepcopy(self.state["vm_templates"])
+            prev_profiles = copy.deepcopy(self.state["profiles"])
+            prev_scaling = copy.deepcopy(self.state["scaling"])
+            try:
+                self.state["vm_templates"].append(new_tpl)
+                if assign_to_profile and prof is not None:
+                    prof["use_vm_template"] = True
+                    prof["vm_template_id"] = new_tpl["id"]
+                    if role == "cicd_runner":
+                        self._sync_template_density()
+                self._persist()
+            except Exception:
+                self.state["vm_templates"] = prev_vm_templates
+                self.state["profiles"] = prev_profiles
+                self.state["scaling"] = prev_scaling
+                raise
             return {"status": "ok", "vm_template": new_tpl}
 
     def delete_instance(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2071,20 +2106,27 @@ class DashboardStore:
                 raise ValueError("Instance not found")
             if inst.get("status") != "RUNNING":
                 return {"status": "already_deleted", "instance": inst}
-            now_ts = time.time()
-            inst["status"] = "DELETED"
-            inst["deleted_epoch"] = now_ts
-            inst["deleted_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            inst["runtime_hours"] = round(max(0.1, (now_ts - float(inst["started_epoch"])) / 3600.0), 2)
-            inst["total_cost_usd"] = round(inst["runtime_hours"] * inst["pricing"]["total_hourly_usd"], 2)
-            inst["total_cost_compute_only_usd"] = round(
-                inst["runtime_hours"] * inst["pricing"]["compute_hourly_usd"], 2
-            )
-            inst["deletion_trigger"] = reason
-            inst["cpu_utilization_percent"] = 0.0
-            inst["ram_utilization_percent"] = 0.0
-            self._sync_fleet_telemetry()
-            self._persist()
+            prev_instances = copy.deepcopy(self.state["instances"])
+            prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
+            try:
+                now_ts = time.time()
+                inst["status"] = "DELETED"
+                inst["deleted_epoch"] = now_ts
+                inst["deleted_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                inst["runtime_hours"] = round(max(0.1, (now_ts - float(inst["started_epoch"])) / 3600.0), 2)
+                inst["total_cost_usd"] = round(inst["runtime_hours"] * inst["pricing"]["total_hourly_usd"], 2)
+                inst["total_cost_compute_only_usd"] = round(
+                    inst["runtime_hours"] * inst["pricing"]["compute_hourly_usd"], 2
+                )
+                inst["deletion_trigger"] = reason
+                inst["cpu_utilization_percent"] = 0.0
+                inst["ram_utilization_percent"] = 0.0
+                self._sync_fleet_telemetry()
+                self._persist()
+            except Exception:
+                self.state["instances"] = prev_instances
+                self.state["scaling_telemetry"] = prev_telemetry
+                raise
             return {"status": "ok", "instance": inst}
 
     def scale_region_instances(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2126,251 +2168,257 @@ class DashboardStore:
                     f"exceeds maximum allowed instances ({max_allowed}) for role '{role}'"
                 )
             now_ts = time.time()
-
-            if target_count < current_count:
-                to_remove = running_in_region[target_count:]
-                for inst in to_remove:
-                    inst["status"] = "DELETED"
-                    inst["deleted_epoch"] = now_ts
-                    inst["deleted_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"
-                    )
-                    inst["runtime_hours"] = round(
-                        max(0.1, (now_ts - float(inst["started_epoch"])) / 3600.0), 2
-                    )
-                    inst["total_cost_usd"] = round(
-                        inst["runtime_hours"] * inst["pricing"]["total_hourly_usd"], 2
-                    )
-                    inst["total_cost_compute_only_usd"] = round(
-                        inst["runtime_hours"] * inst["pricing"]["compute_hourly_usd"], 2
-                    )
-                    inst["deletion_trigger"] = (
-                        f"On-demand regional scale-down in {region} ({current_count} -> {target_count} instances)"
-                    )
-                    inst["cpu_utilization_percent"] = 0.0
-                    inst["ram_utilization_percent"] = 0.0
-            elif target_count > current_count:
-                if not bool(self.state["regions_enabled"].get(region, True)):
-                    raise ValueError(f"Cannot scale up in disabled region '{region}'")
-                vm_tpl = None
-                if prof.get("use_vm_template") and prof.get("vm_template_id"):
-                    vm_tpl = next(
-                        (
-                            t
-                            for t in self.state.get("vm_templates", [])
-                            if t.get("id") == prof.get("vm_template_id")
-                            and t.get("role", role) == role
-                        ),
-                        None,
-                    )
-                    if vm_tpl is None:
-                        raise ValueError(
-                            f"Assigned VM template '{prof.get('vm_template_id')}' not found for role '{role}'"
+            prev_instances = copy.deepcopy(self.state["instances"])
+            prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
+            try:
+                if target_count < current_count:
+                    to_remove = running_in_region[target_count:]
+                    for inst in to_remove:
+                        inst["status"] = "DELETED"
+                        inst["deleted_epoch"] = now_ts
+                        inst["deleted_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
                         )
-                    self._validate_vm_template_compatibility(vm_tpl, prof, role)
-                    tpl_machine_type = str(vm_tpl.get("machine_type", ""))
-                    tpl_family = tpl_machine_type.split("-", 1)[0]
-                    if tpl_family not in reg_info.get("families", []):
-                        raise ValueError(
-                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' machine family '{tpl_family}' "
-                            f"({tpl_machine_type}) is not available in region '{region}' "
-                            f"(supported: {', '.join(reg_info.get('families', []))})"
+                        inst["runtime_hours"] = round(
+                            max(0.1, (now_ts - float(inst["started_epoch"])) / 3600.0), 2
                         )
-                    tpl_cpu = str(vm_tpl.get("cpu_platform", ""))
-                    if tpl_cpu and tpl_cpu not in reg_info.get("cpu_platforms", []):
-                        raise ValueError(
-                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' CPU platform '{tpl_cpu}' "
-                            f"is not available in region '{region}' "
-                            f"(supported: {', '.join(reg_info.get('cpu_platforms', []))})"
+                        inst["total_cost_usd"] = round(
+                            inst["runtime_hours"] * inst["pricing"]["total_hourly_usd"], 2
                         )
-                    tpl_boot_disk = str(vm_tpl.get("boot_disk_type", ""))
-                    if tpl_boot_disk and tpl_boot_disk not in reg_info.get("disk_types", []):
-                        raise ValueError(
-                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' boot disk type '{tpl_boot_disk}' "
-                            f"is not available in region '{region}' "
-                            f"(supported: {', '.join(reg_info.get('disk_types', []))})"
+                        inst["total_cost_compute_only_usd"] = round(
+                            inst["runtime_hours"] * inst["pricing"]["compute_hourly_usd"], 2
                         )
-                    tpl_data_disk = str(vm_tpl.get("data_disk_type", ""))
-                    if tpl_data_disk and tpl_data_disk not in reg_info.get("disk_types", []):
-                        raise ValueError(
-                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' data disk type '{tpl_data_disk}' "
-                            f"is not available in region '{region}' "
-                            f"(supported: {', '.join(reg_info.get('disk_types', []))})"
+                        inst["deletion_trigger"] = (
+                            f"On-demand regional scale-down in {region} ({current_count} -> {target_count} instances)"
                         )
-                source_spec: dict[str, Any] | None = vm_tpl
-                if source_spec is None:
-                    existing_cand = running_in_region[0] if running_in_region else None
-                    if existing_cand is not None:
-                        try:
-                            self._validate_vm_template_compatibility(existing_cand, prof, role)
-                            if (
-                                int(existing_cand.get("runner_vcpu", 0)) == int(prof["runner_vcpu"])
-                                and float(existing_cand.get("runner_ram_gib", 0.0))
-                                == float(prof["runner_ram_gib"])
-                            ):
-                                source_spec = existing_cand
-                        except ValueError:
-                            # Existing instance no longer matches updated profile requirements; select a qualifying offer below.
-                            source_spec = None
-                    if source_spec is None:
-                        reg_qual = qualify_instances(
-                            prof,
-                            {r["region"]: (r["region"] == region) for r in REGIONS_CATALOG},
-                            self.project,
-                            region_latencies_ms=self.state.get("region_latencies_ms"),
-                        )
-                        best_offer = (
-                            reg_qual["spot_price_qualifying"]
-                            or reg_qual["hardware_qualifying"]
-                            or [None]
-                        )[0]
-                        if best_offer is None:
-                            raise ValueError(
-                                f"No machine shape in region '{region}' satisfies the sizing and hardware "
-                                f"requirements for role '{role}'"
-                            )
-                        source_spec = {
-                            "machine_type": best_offer["machine_type"],
-                            "vcpu": best_offer["vcpu"],
-                            "ram_gib": best_offer["ram_gib"],
-                            "cpu_platform": best_offer["cpu_platform"],
-                            "boot_disk_type": best_offer["boot_disk_type"],
-                            "boot_disk_gb": best_offer["boot_disk_gb"],
-                            "data_disk_type": best_offer["data_disk_type"],
-                            "data_disk_gb": best_offer["data_disk_gb"],
-                            "runner_vcpu": best_offer["unit_vcpu"],
-                            "runner_ram_gib": best_offer["unit_ram_gib"],
-                            "runners_count": best_offer["units_per_instance"],
-                            "cloud_init_template_id": prof.get(
-                                "cloud_init_template_id", "ci-runner-default"
+                        inst["cpu_utilization_percent"] = 0.0
+                        inst["ram_utilization_percent"] = 0.0
+                elif target_count > current_count:
+                    if not bool(self.state["regions_enabled"].get(region, True)):
+                        raise ValueError(f"Cannot scale up in disabled region '{region}'")
+                    vm_tpl = None
+                    if prof.get("use_vm_template") and prof.get("vm_template_id"):
+                        vm_tpl = next(
+                            (
+                                t
+                                for t in self.state.get("vm_templates", [])
+                                if t.get("id") == prof.get("vm_template_id")
+                                and t.get("role", role) == role
                             ),
-                            "vm_template_id": None,
-                        }
+                            None,
+                        )
+                        if vm_tpl is None:
+                            raise ValueError(
+                                f"Assigned VM template '{prof.get('vm_template_id')}' not found for role '{role}'"
+                            )
+                        self._validate_vm_template_compatibility(vm_tpl, prof, role)
+                        tpl_machine_type = str(vm_tpl.get("machine_type", ""))
+                        tpl_family = tpl_machine_type.split("-", 1)[0]
+                        if tpl_family not in reg_info.get("families", []):
+                            raise ValueError(
+                                f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' machine family '{tpl_family}' "
+                                f"({tpl_machine_type}) is not available in region '{region}' "
+                                f"(supported: {', '.join(reg_info.get('families', []))})"
+                            )
+                        tpl_cpu = str(vm_tpl.get("cpu_platform", ""))
+                        if tpl_cpu and tpl_cpu not in reg_info.get("cpu_platforms", []):
+                            raise ValueError(
+                                f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' CPU platform '{tpl_cpu}' "
+                                f"is not available in region '{region}' "
+                                f"(supported: {', '.join(reg_info.get('cpu_platforms', []))})"
+                            )
+                        tpl_boot_disk = str(vm_tpl.get("boot_disk_type", ""))
+                        if tpl_boot_disk and tpl_boot_disk not in reg_info.get("disk_types", []):
+                            raise ValueError(
+                                f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' boot disk type '{tpl_boot_disk}' "
+                                f"is not available in region '{region}' "
+                                f"(supported: {', '.join(reg_info.get('disk_types', []))})"
+                            )
+                        tpl_data_disk = str(vm_tpl.get("data_disk_type", ""))
+                        if tpl_data_disk and tpl_data_disk not in reg_info.get("disk_types", []):
+                            raise ValueError(
+                                f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' data disk type '{tpl_data_disk}' "
+                                f"is not available in region '{region}' "
+                                f"(supported: {', '.join(reg_info.get('disk_types', []))})"
+                            )
+                    source_spec: dict[str, Any] | None = vm_tpl
+                    if source_spec is None:
+                        existing_cand = running_in_region[0] if running_in_region else None
+                        if existing_cand is not None:
+                            try:
+                                self._validate_vm_template_compatibility(existing_cand, prof, role)
+                                if (
+                                    int(existing_cand.get("runner_vcpu", 0)) == int(prof["runner_vcpu"])
+                                    and float(existing_cand.get("runner_ram_gib", 0.0))
+                                    == float(prof["runner_ram_gib"])
+                                ):
+                                    source_spec = existing_cand
+                            except ValueError:
+                                # Existing instance no longer matches updated profile requirements; select a qualifying offer below.
+                                source_spec = None
+                        if source_spec is None:
+                            reg_qual = qualify_instances(
+                                prof,
+                                {r["region"]: (r["region"] == region) for r in REGIONS_CATALOG},
+                                self.project,
+                                region_latencies_ms=self.state.get("region_latencies_ms"),
+                            )
+                            best_offer = (
+                                reg_qual["spot_price_qualifying"]
+                                or reg_qual["hardware_qualifying"]
+                                or [None]
+                            )[0]
+                            if best_offer is None:
+                                raise ValueError(
+                                    f"No machine shape in region '{region}' satisfies the sizing and hardware "
+                                    f"requirements for role '{role}'"
+                                )
+                            source_spec = {
+                                "machine_type": best_offer["machine_type"],
+                                "vcpu": best_offer["vcpu"],
+                                "ram_gib": best_offer["ram_gib"],
+                                "cpu_platform": best_offer["cpu_platform"],
+                                "boot_disk_type": best_offer["boot_disk_type"],
+                                "boot_disk_gb": best_offer["boot_disk_gb"],
+                                "data_disk_type": best_offer["data_disk_type"],
+                                "data_disk_gb": best_offer["data_disk_gb"],
+                                "runner_vcpu": best_offer["unit_vcpu"],
+                                "runner_ram_gib": best_offer["unit_ram_gib"],
+                                "runners_count": best_offer["units_per_instance"],
+                                "cloud_init_template_id": prof.get(
+                                    "cloud_init_template_id", "ci-runner-default"
+                                ),
+                                "vm_template_id": None,
+                            }
 
-                default_ci_id = "ci-runner-default" if role == "cicd_runner" else "ci-rust-builder-199"
-                new_records: list[dict[str, Any]] = []
-                for idx in range(current_count + 1, target_count + 1):
-                    zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]
-                    machine_type = source_spec["machine_type"]
-                    vcpu = int(source_spec["vcpu"])
-                    ram_gib = float(source_spec["ram_gib"])
-                    cpu_platform = source_spec["cpu_platform"]
-                    boot_disk_type = source_spec["boot_disk_type"]
-                    boot_disk_gb = int(source_spec.get("boot_disk_gb", prof.get("boot_disk_gb", 40)))
-                    data_disk_type = source_spec["data_disk_type"]
-                    data_disk_gb = int(source_spec.get("data_disk_gb", prof.get("data_disk_gb", 100)))
-                    runner_vcpu = int(source_spec["runner_vcpu"])
-                    runner_ram = float(source_spec["runner_ram_gib"])
-                    runners_cnt = int(source_spec["runners_count"])
-                    cloud_init_id = (
-                        prof.get("cloud_init_template_id")
-                        or source_spec.get("cloud_init_template_id")
-                        or default_ci_id
-                    )
-                    vm_tpl_id = (
-                        vm_tpl["id"]
-                        if vm_tpl
-                        else source_spec.get("vm_template_id")
-                    )
-                    prefix = "oxidex-runners" if role == "cicd_runner" else "builder-oxidex"
-                    new_name = f"{prefix}-{region}-{uuid.uuid4().hex[:4]}"
-                    created = _build_instance_record(
-                        instance_id=str(int(now_ts * 1000) + idx),
-                        name=new_name,
-                        role=role,
-                        status="RUNNING",
-                        region=region,
-                        zone=zone,
-                        machine_type=machine_type,
-                        vcpu=vcpu,
-                        ram_gib=ram_gib,
-                        cpu_platform=cpu_platform,
-                        boot_disk_type=boot_disk_type,
-                        boot_disk_gb=boot_disk_gb,
-                        data_disk_type=data_disk_type,
-                        data_disk_gb=data_disk_gb,
-                        runners_count=runners_cnt,
-                        runner_vcpu=runner_vcpu,
-                        runner_ram_gib=runner_ram,
-                        started_hours_ago=0.05,
-                        deleted_hours_ago=None,
-                        deletion_trigger=f"Active — Scaled up on demand in {region}",
-                        cloud_init_template_id=cloud_init_id,
-                        vm_template_id=vm_tpl_id,
-                        cpu_utilization_percent=35.0,
-                        ram_utilization_percent=40.0,
-                        project=self.project,
-                        now_epoch=now_ts,
-                    )
-                    new_records.append(created)
+                    default_ci_id = "ci-runner-default" if role == "cicd_runner" else "ci-rust-builder-199"
+                    new_records: list[dict[str, Any]] = []
+                    for idx in range(current_count + 1, target_count + 1):
+                        zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]
+                        machine_type = source_spec["machine_type"]
+                        vcpu = int(source_spec["vcpu"])
+                        ram_gib = float(source_spec["ram_gib"])
+                        cpu_platform = source_spec["cpu_platform"]
+                        boot_disk_type = source_spec["boot_disk_type"]
+                        boot_disk_gb = int(source_spec.get("boot_disk_gb", prof.get("boot_disk_gb", 40)))
+                        data_disk_type = source_spec["data_disk_type"]
+                        data_disk_gb = int(source_spec.get("data_disk_gb", prof.get("data_disk_gb", 100)))
+                        runner_vcpu = int(source_spec["runner_vcpu"])
+                        runner_ram = float(source_spec["runner_ram_gib"])
+                        runners_cnt = int(source_spec["runners_count"])
+                        cloud_init_id = (
+                            prof.get("cloud_init_template_id")
+                            or source_spec.get("cloud_init_template_id")
+                            or default_ci_id
+                        )
+                        vm_tpl_id = (
+                            vm_tpl["id"]
+                            if vm_tpl
+                            else source_spec.get("vm_template_id")
+                        )
+                        prefix = "oxidex-runners" if role == "cicd_runner" else "builder-oxidex"
+                        new_name = f"{prefix}-{region}-{uuid.uuid4().hex[:4]}"
+                        created = _build_instance_record(
+                            instance_id=str(int(now_ts * 1000) + idx),
+                            name=new_name,
+                            role=role,
+                            status="RUNNING",
+                            region=region,
+                            zone=zone,
+                            machine_type=machine_type,
+                            vcpu=vcpu,
+                            ram_gib=ram_gib,
+                            cpu_platform=cpu_platform,
+                            boot_disk_type=boot_disk_type,
+                            boot_disk_gb=boot_disk_gb,
+                            data_disk_type=data_disk_type,
+                            data_disk_gb=data_disk_gb,
+                            runners_count=runners_cnt,
+                            runner_vcpu=runner_vcpu,
+                            runner_ram_gib=runner_ram,
+                            started_hours_ago=0.05,
+                            deleted_hours_ago=None,
+                            deletion_trigger=f"Active — Scaled up on demand in {region}",
+                            cloud_init_template_id=cloud_init_id,
+                            vm_template_id=vm_tpl_id,
+                            cpu_utilization_percent=35.0,
+                            ram_utilization_percent=40.0,
+                            project=self.project,
+                            now_epoch=now_ts,
+                        )
+                        new_records.append(created)
 
-                budget = prof.get("budget", {})
-                max_hourly_cap = float(
-                    pol.get("max_scale_up_hourly_usd", budget.get("max_hourly_usd", 5.0))
-                )
-                max_daily_cap = float(
-                    pol.get("max_scale_up_daily_usd", budget.get("max_daily_usd", 10.0))
-                )
-                max_monthly_cap = float(
-                    pol.get("max_scale_up_monthly_usd", budget.get("max_monthly_usd", 50.0))
-                )
-                include_disk = bool(
-                    pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
-                )
-                include_tax = bool(budget.get("include_taxes", False))
-                effective_hourly_cap = min(
-                    max_hourly_cap,
-                    max_daily_cap / 24.0,
-                    max_monthly_cap / (24.0 * 365.0 / 12.0),
-                )
-                existing_running_role = [
-                    i
-                    for i in self.state["instances"]
-                    if i["status"] == "RUNNING" and i["role"] == role
-                ]
-                if role == "cicd_runner":
-                    projected_runner_slots = sum(
-                        int(i.get("runners_count", 1)) for i in existing_running_role + new_records
+                    budget = prof.get("budget", {})
+                    max_hourly_cap = float(
+                        pol.get("max_scale_up_hourly_usd", budget.get("max_hourly_usd", 5.0))
                     )
-                    max_runners_cap = max(
-                        int(prof.get("min_runners", 1)),
-                        int(pol.get("max_runners", 24)),
+                    max_daily_cap = float(
+                        pol.get("max_scale_up_daily_usd", budget.get("max_daily_usd", 10.0))
                     )
-                    if projected_runner_slots > max_runners_cap:
+                    max_monthly_cap = float(
+                        pol.get("max_scale_up_monthly_usd", budget.get("max_monthly_usd", 50.0))
+                    )
+                    include_disk = bool(
+                        pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
+                    )
+                    include_tax = bool(budget.get("include_taxes", False))
+                    effective_hourly_cap = min(
+                        max_hourly_cap,
+                        max_daily_cap / 24.0,
+                        max_monthly_cap / (24.0 * 365.0 / 12.0),
+                    )
+                    existing_running_role = [
+                        i
+                        for i in self.state["instances"]
+                        if i["status"] == "RUNNING" and i["role"] == role
+                    ]
+                    if role == "cicd_runner":
+                        projected_runner_slots = sum(
+                            int(i.get("runners_count", 1)) for i in existing_running_role + new_records
+                        )
+                        max_runners_cap = max(
+                            int(prof.get("min_runners", 1)),
+                            int(pol.get("max_runners", 24)),
+                        )
+                        if projected_runner_slots > max_runners_cap:
+                            raise ValueError(
+                                f"Scaling up in {region} to {target_count} instance(s) "
+                                f"(projected {projected_runner_slots} runner slots across {projected_total} VMs) "
+                                f"exceeds maximum allowed CI/CD runners ({max_runners_cap})"
+                            )
+                    projected_fleet_hourly = round(
+                        sum(
+                            self._instance_hourly_for_budget(
+                                i["pricing"], include_disk=include_disk, include_tax=include_tax
+                            )
+                            for i in existing_running_role + new_records
+                        ),
+                        4,
+                    )
+                    evaluator_unit_hourly = max(
+                        0.0001, float(self._resolve_scaling_unit_hourly_usd(role))
+                    )
+                    max_affordable_instances = max(
+                        0, int(math.floor(effective_hourly_cap / evaluator_unit_hourly))
+                    )
+                    if (
+                        projected_fleet_hourly > effective_hourly_cap
+                        or projected_total > max_affordable_instances
+                    ):
                         raise ValueError(
-                            f"Scaling up in {region} to {target_count} instance(s) "
-                            f"(projected {projected_runner_slots} runner slots across {projected_total} VMs) "
-                            f"exceeds maximum allowed CI/CD runners ({max_runners_cap})"
+                            f"Scaling up in {region} to {target_count} instance(s) (total fleet: {projected_total}, "
+                            f"projected ${projected_fleet_hourly:.4f}/hr) exceeds scale-up budget cap "
+                            f"(${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, ${max_monthly_cap:.2f}/mo) for role '{role}'"
                         )
-                projected_fleet_hourly = round(
-                    sum(
-                        self._instance_hourly_for_budget(
-                            i["pricing"], include_disk=include_disk, include_tax=include_tax
-                        )
-                        for i in existing_running_role + new_records
-                    ),
-                    4,
-                )
-                evaluator_unit_hourly = max(
-                    0.0001, float(self._resolve_scaling_unit_hourly_usd(role))
-                )
-                max_affordable_instances = max(
-                    0, int(math.floor(effective_hourly_cap / evaluator_unit_hourly))
-                )
-                if (
-                    projected_fleet_hourly > effective_hourly_cap
-                    or projected_total > max_affordable_instances
-                ):
-                    raise ValueError(
-                        f"Scaling up in {region} to {target_count} instance(s) (total fleet: {projected_total}, "
-                        f"projected ${projected_fleet_hourly:.4f}/hr) exceeds scale-up budget cap "
-                        f"(${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, ${max_monthly_cap:.2f}/mo) for role '{role}'"
-                    )
-                for created in new_records:
-                    self.state["instances"].insert(0, created)
+                    for created in new_records:
+                        self.state["instances"].insert(0, created)
 
-            self._sync_fleet_telemetry()
-            self._persist()
+                self._sync_fleet_telemetry()
+                self._persist()
+            except Exception:
+                self.state["instances"] = prev_instances
+                self.state["scaling_telemetry"] = prev_telemetry
+                raise
             updated_running = [
                 i
                 for i in self.state["instances"]
@@ -2393,7 +2441,7 @@ class DashboardStore:
             completed_builds = [
                 b
                 for b in builds
-                if str(b.get("status", "DELIVERED")).strip().upper() not in UNFINISHED_BUILD_STATUSES
+                if str(b.get("status", "DELIVERED")).strip().upper() in SUCCESSFUL_BUILD_STATUSES
             ]
             completed_count = len(completed_builds)
             avg_duration = (
@@ -2450,9 +2498,15 @@ class DashboardStore:
             )
 
             status_str = str(payload.get("status", existing_build.get("status", "DELIVERED")))
-            is_unfinished = status_str.strip().upper() in UNFINISHED_BUILD_STATUSES
-            was_unfinished = (
-                str(existing_build.get("status", "QUEUED")).strip().upper() in UNFINISHED_BUILD_STATUSES
+            norm_status = status_str.strip().upper()
+            if norm_status not in ALLOWED_BUILD_STATUSES:
+                raise ValueError(f"Unsupported Rust build status: {status_str!r}")
+            is_unfinished = norm_status in UNFINISHED_BUILD_STATUSES
+            is_unsuccessful = norm_status in UNSUCCESSFUL_BUILD_STATUSES
+            is_non_delivered = is_unfinished or is_unsuccessful
+            prev_status_norm = str(existing_build.get("status", "QUEUED")).strip().upper()
+            was_non_delivered = (
+                prev_status_norm not in SUCCESSFUL_BUILD_STATUSES
                 if existing_build
                 else True
             )
@@ -2460,17 +2514,17 @@ class DashboardStore:
             raw_duration = (
                 payload.get("total_duration_seconds")
                 if "total_duration_seconds" in payload
-                else (existing_build.get("total_duration_seconds") if not was_unfinished else None)
+                else (existing_build.get("total_duration_seconds") if not was_non_delivered else None)
             )
             raw_delivery = (
                 payload.get("delivery_duration_seconds")
                 if "delivery_duration_seconds" in payload
-                else (existing_build.get("delivery_duration_seconds") if not was_unfinished else None)
+                else (existing_build.get("delivery_duration_seconds") if not was_non_delivered else None)
             )
             raw_compile = (
                 payload.get("compile_duration_seconds")
                 if "compile_duration_seconds" in payload
-                else (existing_build.get("compile_duration_seconds") if not was_unfinished else None)
+                else (existing_build.get("compile_duration_seconds") if not was_non_delivered else None)
             )
             explicit_total = (
                 _finite_float(raw_duration, "total_duration_seconds", min_val=0.0)
@@ -2488,8 +2542,12 @@ class DashboardStore:
                 else None
             )
 
-            if is_unfinished:
-                duration = explicit_total if explicit_total is not None else 0.0
+            if is_non_delivered:
+                duration = (
+                    explicit_total
+                    if explicit_total is not None
+                    else (explicit_compile if explicit_compile is not None else 0.0)
+                )
                 delivery_sec = explicit_delivery if explicit_delivery is not None else 0.0
             else:
                 if explicit_total is not None:
@@ -2520,7 +2578,7 @@ class DashboardStore:
             elif has_existing_crates:
                 cache_hits = _finite_int(existing_build.get("cache_hits", 0), "cache_hits", min_val=0)
             else:
-                cache_hits = 0 if is_unfinished else 380
+                cache_hits = 0 if is_non_delivered else 380
 
             if has_misses:
                 cache_misses = _finite_int(payload["cache_misses"], "cache_misses", min_val=0)
@@ -2531,7 +2589,7 @@ class DashboardStore:
             elif has_existing_crates:
                 cache_misses = _finite_int(existing_build.get("cache_misses", 0), "cache_misses", min_val=0)
             else:
-                cache_misses = 0 if is_unfinished else 25
+                cache_misses = 0 if is_non_delivered else 25
 
             if has_total:
                 total_crates = _finite_int(payload["total_crates"], "total_crates", min_val=0)
@@ -2540,17 +2598,21 @@ class DashboardStore:
             else:
                 total_crates = cache_hits + cache_misses
 
-            if is_unfinished:
+            if is_non_delivered:
                 req_at = (
                     payload.get("requested_at")
                     or existing_build.get("requested_at")
-                    or _iso_seconds_ago(0, now_ts)
+                    or _iso_seconds_ago(duration if is_unsuccessful else 0, now_ts)
                 )
-                fin_at = (
-                    payload.get("finished_at")
-                    if "finished_at" in payload
-                    else existing_build.get("finished_at")
-                )
+                req_epoch = _iso_to_epoch(str(req_at))
+                if "finished_at" in payload:
+                    fin_at = payload.get("finished_at")
+                elif existing_build.get("finished_at"):
+                    fin_at = existing_build.get("finished_at")
+                elif is_unsuccessful and duration > 0:
+                    fin_at = _iso_seconds_ago(0, req_epoch + max(0.0, duration - delivery_sec))
+                else:
+                    fin_at = None
                 del_at = (
                     payload.get("delivered_at")
                     if "delivered_at" in payload
@@ -2599,13 +2661,13 @@ class DashboardStore:
             default_peak_ram = (
                 existing_peak_ram
                 if (existing_peak_ram is not None and float(existing_peak_ram) > 0.0)
-                else (0.0 if is_unfinished else 20.5)
+                else (0.0 if is_non_delivered else 20.5)
             )
             existing_cpu_time = existing_build.get("cpu_time_seconds")
             default_cpu_time = (
                 existing_cpu_time
                 if (existing_cpu_time is not None and float(existing_cpu_time) > 0.0)
-                else (0.0 if is_unfinished else 1120.0)
+                else (0.0 if is_non_delivered else 1120.0)
             )
 
             raw = {
@@ -2630,7 +2692,7 @@ class DashboardStore:
                 "delivery_duration_seconds": (
                     delivery_sec
                     if (
-                        not is_unfinished
+                        not is_non_delivered
                         and explicit_total is not None
                         and explicit_delivery is not None
                         and not payload.get("finished_at")
@@ -2874,11 +2936,31 @@ def make_handler(
                 )
             return True, HTTPStatus.OK, ""
 
-        def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            if length <= 0:
+        def _read_json(self, *, max_bytes: int = MAX_JSON_BODY_BYTES) -> dict[str, Any]:
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                raise ValueError("Transfer-Encoding is not supported; provide a bounded Content-Length header")
+            raw_len = (self.headers.get("Content-Length") or "0").strip()
+            try:
+                length = int(raw_len)
+            except ValueError as exc:
+                self.close_connection = True
+                raise ValueError("Invalid Content-Length header") from exc
+            if length < 0:
+                self.close_connection = True
+                raise ValueError("Content-Length cannot be negative")
+            if length > max_bytes:
+                self.close_connection = True
+                raise _PayloadTooLargeError(
+                    f"Request body of {length} bytes exceeds maximum allowed size of {max_bytes} bytes"
+                )
+            if length == 0:
                 return {}
-            raw = self.rfile.read(length).decode("utf-8")
+            raw_bytes = self.rfile.read(length)
+            if len(raw_bytes) != length:
+                self.close_connection = True
+                raise ValueError("Truncated request body")
+            raw = raw_bytes.decode("utf-8")
             if not raw.strip():
                 return {}
 
@@ -2887,6 +2969,8 @@ def make_handler(
 
             parsed = json.loads(raw, parse_constant=_reject_non_finite_constant)
             _assert_finite_json_tree(parsed, "payload")
+            if not isinstance(parsed, dict):
+                raise ValueError("JSON request body must be an object")
             return parsed
 
         def do_GET(self) -> None:  # noqa: N802
@@ -2981,7 +3065,10 @@ def make_handler(
                 return
             if path == "/api/auth/login":
                 try:
-                    payload = self._read_json()
+                    payload = self._read_json(max_bytes=MAX_LOGIN_BODY_BYTES)
+                except _PayloadTooLargeError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
                 except Exception as exc:  # noqa: BLE001
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                     return
@@ -3006,7 +3093,7 @@ def make_handler(
             if not self._check_auth():
                 return
             try:
-                payload = self._read_json()
+                payload = self._read_json(max_bytes=MAX_JSON_BODY_BYTES)
                 if path == "/api/budget":
                     self._send_json(store.update_budget(payload))
                     return
@@ -3063,6 +3150,8 @@ def make_handler(
                     )
                     return
                 self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
+            except _PayloadTooLargeError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 

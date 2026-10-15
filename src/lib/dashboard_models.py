@@ -9,12 +9,27 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import os
 import re
 import socket
+import subprocess
+import sys
 import time
 from typing import Any
+import urllib.request
 
-from .compute_api import AsyncGoogleApi
+from . import billing_catalog as _billing_catalog_mod
+from . import compute_api as _compute_api_mod
+from . import spot_pricing as _spot_pricing_mod
+from .billing_catalog import catalog_skus
+from .compute_api import AsyncGoogleApi, get_auth
 from .machine_profiles import MACHINE_PROFILES
-from .spot_pricing import load_catalog_rates, spot_price
+from .spot_pricing import load_catalog_rates, parse_component_rates, spot_price
+
+_ORIG_GET_AUTH = get_auth
+_ORIG_CATALOG_SKUS = catalog_skus
+_ORIG_LOAD_CATALOG_RATES = load_catalog_rates
+_ORIG_SPOT_PRICE = spot_price
+_ORIG_ASYNC_GOOGLE_API = AsyncGoogleApi
+_ORIG_SUBPROCESS_RUN = subprocess.run
+_ORIG_URLOPEN = urllib.request.urlopen
 
 
 HOURS_PER_DAY = Decimal("24")
@@ -84,16 +99,16 @@ write_files:
       RUNNERS_COUNT="4"
 
 runcmd:
-  # 1. Install Official Docker Engine & Buildx
+  # 1. Install Official Docker Engine & Buildx (select Debian vs Ubuntu repository from /etc/os-release)
   - install -m 0755 -d /etc/apt/keyrings
-  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - 'curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}")/gpg" -o /etc/apt/keyrings/docker.asc'
   - chmod a+r /etc/apt/keyrings/docker.asc
-  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
+  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now docker
-  # 2. Download, Configure & Start Isolated GitHub Actions Runner Slots
+  # 2. Download, Configure & Start Persistent GitHub Actions Runner Slots
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${dir}"; chown -R runner:runner "${dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --ephemeral && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${dir}"; chown -R runner:runner "${dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -136,18 +151,19 @@ write_files:
       RUNNER_GROUP="oxidex-strict"
       RUNNER_LABELS="self-hosted,Linux,X64,spot-heavy32,rust-1.99"
       RUNNERS_COUNT="4"
+      DISK_DEVICE="/dev/disk/by-id/google-runner-data"
       DISK_MOUNT="/mnt/runner-data"
 
 runcmd:
-  - mkdir -p /mnt/runner-data/docker /mnt/runner-data/containerd /mnt/runner-data/work
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && dev="${DISK_DEVICE:-/dev/disk/by-id/google-runner-data}" && mp="${DISK_MOUNT:-/mnt/runner-data}" && if [[ ! -b "$dev" ]]; then echo "Missing persistent runner disk $dev" >&2; exit 1; fi && (blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -F "$dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp") && mkdir -p "$mp/docker" "$mp/containerd" "$mp/instances" "$mp/work"'''
   - install -m 0755 -d /etc/apt/keyrings
-  - curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  - 'curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}")/gpg" -o /etc/apt/keyrings/docker.asc'
   - chmod a+r /etc/apt/keyrings/docker.asc
-  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
+  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
-  - systemctl enable --now containerd docker
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker"'''
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${dir}"; chown -R runner:runner "${dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --ephemeral && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --work "${work_dir}" && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -175,6 +191,8 @@ packages:
   - jq
   - rsync
   - time
+  - python3
+  - util-linux
   - clang
   - lld
   - cmake
@@ -194,39 +212,130 @@ write_files:
         "image": "oxidex-remote-builder:1.99.0",
         "cache_mount": "/mnt/runner-data/remote-build"
       }
+  - path: /opt/oxidex-builder/image/entrypoint.py
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env python3
+      import os, re, subprocess, sys
+      from pathlib import Path
+
+      def main():
+          toolchain_file = Path('/src/rust-toolchain.toml')
+          pin = '1.99.0'
+          if toolchain_file.is_file():
+              match = re.search(r'^channel\\s*=\\s*"([0-9]+\\.[0-9]+\\.[0-9]+)"', toolchain_file.read_text(), re.M)
+              if not match:
+                  raise RuntimeError('A numeric Rust toolchain pin is required')
+              pin = match[1]
+          compiler = subprocess.check_output(['rustup', 'which', '--toolchain', pin, 'rustc'], text=True).strip()
+          cargo = subprocess.check_output(['rustup', 'which', '--toolchain', pin, 'cargo'], text=True).strip()
+          env = dict(os.environ, RUSTC=compiler, RUSTDOC=str(Path(compiler).with_name('rustdoc')), RUSTUP_TOOLCHAIN=pin)
+          env['PATH'] = f"{Path(compiler).parent}:{env.get('PATH', '')}"
+          env['CARGO_HOME'] = '/cargo'
+          env['CARGO_TARGET_DIR'] = '/target'
+          command = sys.argv[1:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']
+          if command[0] == 'cargo':
+              command[0] = cargo
+          os.execvpe(command[0], command, env)
+
+      if __name__ == '__main__':
+          main()
   - path: /opt/oxidex-builder/image/Dockerfile
     permissions: '0644'
     owner: root:root
     content: |
-      FROM rust:1-bookworm
-      RUN apt-get update && apt-get install -y --no-install-recommends clang lld cmake pkg-config libssl-dev zstd git ca-certificates && rm -rf /var/lib/apt/lists/*
+      FROM rust:1.99.0-bookworm
+      RUN apt-get update && apt-get install -y --no-install-recommends clang lld cmake pkg-config libssl-dev zstd git ca-certificates time python3 rsync && rm -rf /var/lib/apt/lists/*
+      RUN groupadd -g 1001 runner && useradd -m -u 1001 -g 1001 -s /bin/bash runner && install -d -o 1001 -g 1001 /src /target /cargo
+      COPY entrypoint.py /usr/local/bin/oxidex-build-entrypoint
+      RUN chmod 0755 /usr/local/bin/oxidex-build-entrypoint
+      USER 1001:1001
+      ENV CARGO_HOME=/cargo
+      ENV CARGO_TARGET_DIR=/target
+      WORKDIR /src
+      ENTRYPOINT ["/usr/bin/python3", "/usr/local/bin/oxidex-build-entrypoint"]
   - path: /usr/local/bin/oxidex-remote-build
     permissions: '0755'
     owner: root:root
     content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-      CONFIG_FILE="/etc/oxidex-remote-build.json"
-      test -f "${CONFIG_FILE}"
-      IMAGE="$(jq -r '.image // "oxidex-remote-builder:1.99.0"' "${CONFIG_FILE}")"
-      CPUS="$(jq -r '.cpus // 16' "${CONFIG_FILE}")"
-      MEM_GIB="$(jq -r '.memory_gib // 28' "${CONFIG_FILE}")"
-      CACHE_MOUNT="$(jq -r '.cache_mount // "/mnt/runner-data/remote-build"' "${CONFIG_FILE}")"
-      if [[ "${1:-}" == "--verify-readiness" ]]; then
-        docker image inspect "${IMAGE}" >/dev/null
-        test -d "${CACHE_MOUNT}/cargo"
-        test -d "${CACHE_MOUNT}/targets"
-        exit 0
-      fi
-      exec docker run --rm --cpus="${CPUS}" --memory="${MEM_GIB}g" --memory-swap="${MEM_GIB}g" -v "${CACHE_MOUNT}:/cache" "${IMAGE}" "$@"
+      #!/usr/bin/env python3
+      import fcntl, json, os, re, subprocess, sys
+      from pathlib import Path
+
+      allowed_commands = {'cargo', 'rustc', 'rustfmt', 'clippy-driver', 'just', 'uv', 'python3', 'cbindgen'}
+
+      def validate_project(project):
+          if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}', project):
+              raise ValueError('Project must be a simple identifier, never a path')
+          return project
+
+      def checked_path(path):
+          if path.resolve() != path or any(p.is_symlink() for p in (path, *path.parents)):
+              raise ValueError('Symlinked builder paths are forbidden')
+
+      def main():
+          if os.geteuid() != 0:
+              raise RuntimeError('Invoke this root-owned launcher with sudo')
+          config = json.loads(Path('/etc/oxidex-remote-build.json').read_text())
+          root = Path(config.get('cache_mount', '/mnt/runner-data/remote-build'))
+          image = config.get('image', 'oxidex-remote-builder:1.99.0')
+          cpus = int(config.get('cpus', 16))
+          memory_gib = int(config.get('memory_gib', 28))
+          if sys.argv[1:] == ['--verify-readiness']:
+              subprocess.run(['docker', 'image', 'inspect', image], check=True, stdout=subprocess.DEVNULL)
+              for sub in ('cargo', 'sources', 'targets'):
+                  checked_path(root / sub)
+                  if not (root / sub).is_dir():
+                      raise RuntimeError(f'Missing builder cache directory: {root / sub}')
+              return
+          if len(sys.argv) < 2:
+              raise ValueError('Project identifier is required')
+          project = validate_project(sys.argv[1])
+          for path in (root, root / 'sources', root / 'targets', root / 'cargo', root / 'sources' / project, root / 'targets' / project):
+              checked_path(path)
+              path.mkdir(parents=True, exist_ok=True)
+          if sys.argv[2:] == ['prepare']:
+              source = root / 'sources' / project
+              os.chown(source, int(os.environ.get('SUDO_UID', '1001')), 1001)
+              source.chmod(0o2770)
+              for path in (root / 'targets' / project, root / 'cargo'):
+                  os.chown(path, 1001, 1001)
+              print(source)
+              return
+          command = sys.argv[2:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']
+          if command[0] not in allowed_commands:
+              raise ValueError(f'Unsupported build command: {command[0]}')
+          if cpus < 1 or memory_gib < 1:
+              raise ValueError('Resource limits must be positive')
+          with open('/run/oxidex-build.lock', 'a') as lock:
+              fcntl.flock(lock, fcntl.LOCK_SH)
+              if Path('/run/oxidex-build-draining').exists():
+                  raise SystemExit(75)
+              cmd = [
+                  'docker', 'run', '--rm', '--user=1001:1001', f'--cpus={cpus}',
+                  '--label=oxidex.remote-build=true',
+                  f'--memory={memory_gib}g', f'--memory-swap={memory_gib}g', '--pids-limit=4096',
+                  '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                  '--entrypoint=/usr/bin/time',
+                  '-v', f'{root}/sources/{project}:/src',
+                  '-v', f'{root}/targets/{project}:/target',
+                  '-v', f'{root}/cargo:/cargo',
+                  image, '-v', '/usr/bin/python3',
+                  '/usr/local/bin/oxidex-build-entrypoint', *command,
+              ]
+              raise SystemExit(subprocess.run(cmd).returncode)
+
+      if __name__ == '__main__':
+          main()
 
 runcmd:
   # 1. Mount persistent NVMe Hyperdisk cache and configure unprivileged build container
-  - mkdir -p /mnt/runner-data/remote-build/cargo /mnt/runner-data/remote-build/targets
+  - 'bash -lc ''set -euo pipefail && mp="/mnt/runner-data" && for dev in /dev/disk/by-id/google-builder-cache /dev/disk/by-id/google-runner-data; do if [[ -b "$dev" ]]; then (blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -F "$dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp"); break; fi; done && mkdir -p "$mp/docker" "$mp/containerd" "$mp/remote-build/cargo" "$mp/remote-build/sources" "$mp/remote-build/targets" "$mp/remote-build/exports"'''
   - install -m 0755 -d /etc/apt/keyrings
-  - curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  - 'curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}")/gpg" -o /etc/apt/keyrings/docker.asc'
   - chmod a+r /etc/apt/keyrings/docker.asc
-  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
+  - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now containerd docker
   - DOCKER_BUILDKIT=0 docker build --memory=28g --memory-swap=28g --cpu-period=100000 --cpu-quota=1600000 -t oxidex-remote-builder:1.99.0 /opt/oxidex-builder/image
@@ -623,6 +732,34 @@ def set_live_spot_pricing_override(override: dict[str, Any] | None) -> None:
     _LIVE_PRICING_OVERRIDE = override
 
 
+_ORIG_ASYNC_POST_JSON = AsyncGoogleApi.post_json
+
+
+def _can_discover_gcloud_auth() -> bool:
+    """Allow active gcloud credential discovery in normal execution and whenever pricing/auth hooks are mocked in tests."""
+    if "unittest" not in sys.modules:
+        return True
+    if os.environ.get("GCP_ENABLE_LIVE_PRICING") == "1":
+        return True
+    return any(
+        (
+            get_auth is not _ORIG_GET_AUTH,
+            _compute_api_mod.get_auth is not _ORIG_GET_AUTH,
+            catalog_skus is not _ORIG_CATALOG_SKUS,
+            _billing_catalog_mod.catalog_skus is not _ORIG_CATALOG_SKUS,
+            load_catalog_rates is not _ORIG_LOAD_CATALOG_RATES,
+            _spot_pricing_mod.load_catalog_rates is not _ORIG_LOAD_CATALOG_RATES,
+            spot_price is not _ORIG_SPOT_PRICE,
+            _spot_pricing_mod.spot_price is not _ORIG_SPOT_PRICE,
+            AsyncGoogleApi is not _ORIG_ASYNC_GOOGLE_API,
+            _compute_api_mod.AsyncGoogleApi is not _ORIG_ASYNC_GOOGLE_API,
+            AsyncGoogleApi.post_json is not _ORIG_ASYNC_POST_JSON,
+            subprocess.run is not _ORIG_SUBPROCESS_RUN,
+            urllib.request.urlopen is not _ORIG_URLOPEN,
+        )
+    )
+
+
 def fetch_live_spot_pricing(
     project: str = "homelab-424523",
     *,
@@ -640,13 +777,34 @@ def fetch_live_spot_pricing(
     eff_api_key = (
         api_key
         if api_key is not None
-        else (os.environ.get("GCP_BILLING_API_KEY") or os.environ.get("GOOGLE_CLOUD_BILLING_API_KEY"))
+        else (
+            os.environ.get("GOOGLE_CLOUD_API_KEY")
+            or os.environ.get("GCP_BILLING_API_KEY")
+            or os.environ.get("GOOGLE_CLOUD_BILLING_API_KEY")
+        )
     )
     eff_token = (
         access_token
         if access_token is not None
         else (os.environ.get("GCP_ACCESS_TOKEN") or os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN"))
     )
+    eff_project = project
+    if not eff_token and _can_discover_gcloud_auth():
+        try:
+            auth_fn = (
+                get_auth
+                if get_auth is not _ORIG_GET_AUTH
+                else _compute_api_mod.get_auth
+            )
+            auth = auth_fn(project)
+            if auth and getattr(auth, "token", None):
+                eff_token = str(auth.token).strip()
+            if auth and getattr(auth, "project", None):
+                eff_project = str(auth.project).strip() or project
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            # Active gcloud credentials are unavailable; continue with API key or static baseline.
+            eff_token = None
+
     if not eff_api_key and not eff_token:
         return {
             "source": "catalog_baseline",
@@ -657,7 +815,7 @@ def fetch_live_spot_pricing(
 
     target_regions = tuple(sorted(regions or [r["region"] for r in REGIONS_CATALOG]))
     target_machines = tuple(sorted(machine_types or [s["machine_type"] for s in MACHINE_SHAPES_CATALOG]))
-    cache_key = (project, target_regions, target_machines, bool(eff_api_key), bool(eff_token))
+    cache_key = (eff_project, target_regions, target_machines, eff_api_key or "", eff_token or "")
     now_ts = time.time()
     cached = _LIVE_SPOT_PRICING_CACHE.get(cache_key)
     if cached is not None and not force_refresh and (now_ts - float(cached.get("fetched_at", 0.0))) < ttl_seconds:
@@ -668,12 +826,40 @@ def fetch_live_spot_pricing(
         mach_hourly: dict[tuple[str, str], float] = {}
         if eff_api_key:
             try:
-                comp_rates = await load_catalog_rates(eff_api_key)
+                rates_fn = (
+                    load_catalog_rates
+                    if load_catalog_rates is not _ORIG_LOAD_CATALOG_RATES
+                    else _spot_pricing_mod.load_catalog_rates
+                )
+                comp_rates = await rates_fn(eff_api_key)
             except (OSError, ValueError, RuntimeError):
                 # Network or Billing API errors fall back to Compute capacityHistory or catalog baseline rates.
                 comp_rates = {}
+        if not comp_rates and eff_token:
+            try:
+                skus_fn = (
+                    catalog_skus
+                    if catalog_skus is not _ORIG_CATALOG_SKUS
+                    else _billing_catalog_mod.catalog_skus
+                )
+                skus = await asyncio.to_thread(skus_fn)
+                if skus:
+                    comp_rates = parse_component_rates(skus)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                # Authenticated Billing Catalog lookup failed; continue with Compute capacityHistory.
+                comp_rates = {}
         if eff_token:
-            api = AsyncGoogleApi(eff_token, concurrency=32)
+            api_cls = (
+                AsyncGoogleApi
+                if AsyncGoogleApi is not _ORIG_ASYNC_GOOGLE_API
+                else _compute_api_mod.AsyncGoogleApi
+            )
+            price_fn = (
+                spot_price
+                if spot_price is not _ORIG_SPOT_PRICE
+                else _spot_pricing_mod.spot_price
+            )
+            api = api_cls(eff_token, concurrency=32)
             reg_map = {r["region"]: r for r in REGIONS_CATALOG}
             shape_map = {s["machine_type"]: s for s in MACHINE_SHAPES_CATALOG}
             tasks = []
@@ -683,7 +869,7 @@ def fetch_live_spot_pricing(
                     s_meta = shape_map.get(m_type)
                     if reg_meta and s_meta and s_meta["family"] not in reg_meta["families"]:
                         continue
-                    tasks.append(spot_price(api, project, reg_code, m_type))
+                    tasks.append(price_fn(api, eff_project, reg_code, m_type))
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for res in results:
@@ -1339,17 +1525,24 @@ def _validate_yaml_flow_value(expr: str, line_no: int, *, in_flow: bool = False)
         quote_ch = val[0]
         escape = False
         closed_at = -1
-        for i in range(1, len(val)):
+        i = 1
+        while i < len(val):
             ch = val[i]
             if escape:
                 escape = False
+                i += 1
                 continue
             if ch == "\\" and quote_ch == '"':
                 escape = True
+                i += 1
+                continue
+            if ch == "'" and quote_ch == "'" and i + 1 < len(val) and val[i + 1] == "'":
+                i += 2
                 continue
             if ch == quote_ch:
                 closed_at = i
                 break
+            i += 1
         if closed_at != len(val) - 1:
             errors.append(
                 f"YAML syntax error on line {line_no}: unexpected trailing content after quoted scalar '{val}'."

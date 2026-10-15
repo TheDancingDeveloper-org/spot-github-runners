@@ -14,6 +14,15 @@ from typing import Any
 from .dashboard_models import compute_cpu_benchmark_score, format_gcloud_ssh_command
 
 
+SUCCESSFUL_BUILD_STATUSES: frozenset[str] = frozenset(
+    {
+        "DELIVERED",
+        "COMPLETED",
+        "SUCCEEDED",
+        "SUCCESS",
+    }
+)
+
 UNFINISHED_BUILD_STATUSES: frozenset[str] = frozenset(
     {
         "QUEUED",
@@ -25,6 +34,24 @@ UNFINISHED_BUILD_STATUSES: frozenset[str] = frozenset(
         "IN_PROGRESS",
         "BUILDING",
     }
+)
+
+UNSUCCESSFUL_BUILD_STATUSES: frozenset[str] = frozenset(
+    {
+        "FAILED",
+        "FAILURE",
+        "ERROR",
+        "CANCELLED",
+        "CANCELED",
+        "ABORTED",
+        "TIMED_OUT",
+        "TIMEOUT",
+        "OOM_KILLED",
+    }
+)
+
+ALLOWED_BUILD_STATUSES: frozenset[str] = (
+    SUCCESSFUL_BUILD_STATUSES | UNFINISHED_BUILD_STATUSES | UNSUCCESSFUL_BUILD_STATUSES
 )
 
 
@@ -345,7 +372,12 @@ def enrich_rust_build_record(
     cache hit rate, IP geolocation, VPN/Tor lookup, active RAM OOM floor, and CPU points.
     """
     status_str = str(record.get("status", "DELIVERED"))
-    is_unfinished = status_str.strip().upper() in UNFINISHED_BUILD_STATUSES
+    norm_status = status_str.strip().upper()
+    if norm_status not in ALLOWED_BUILD_STATUSES:
+        raise ValueError(f"Unsupported Rust build status: {status_str!r}")
+    is_unfinished = norm_status in UNFINISHED_BUILD_STATUSES
+    is_unsuccessful = norm_status in UNSUCCESSFUL_BUILD_STATUSES
+    is_successful = norm_status in SUCCESSFUL_BUILD_STATUSES
 
     requested_at = str(record["requested_at"])
     req_ts = _iso_to_epoch(requested_at)
@@ -366,7 +398,7 @@ def enrich_rust_build_record(
         delivered_at = None
         del_ts = None
 
-    if not is_unfinished and (fin_ts is None or del_ts is None):
+    if is_successful and (fin_ts is None or del_ts is None):
         raise ValueError(
             "Invalid Rust build timestamps: requested_at, finished_at, and delivered_at are required for completed builds"
         )
@@ -451,7 +483,7 @@ def enrich_rust_build_record(
         else compute_cpu_benchmark_score(cpu_platform, vcpu, machine_type)
     )
 
-    default_cpu_time = 0.0 if is_unfinished else (compile_seconds * 8.5)
+    default_cpu_time = 0.0 if (is_unfinished or is_unsuccessful) else (compile_seconds * 8.5)
     cpu_time_seconds = round(
         _finite_float(
             record.get("cpu_time_seconds", default_cpu_time),
@@ -462,7 +494,7 @@ def enrich_rust_build_record(
     )
     cpu_points = compute_cpu_points(cpu_time_seconds, benchmark_score)
 
-    default_peak_ram = 0.0 if is_unfinished else 18.4
+    default_peak_ram = 0.0 if (is_unfinished or is_unsuccessful) else 18.4
     peak_ram_gib = round(
         _finite_float(record.get("peak_ram_gib", default_peak_ram), "peak_ram_gib", min_val=0.0),
         2,
