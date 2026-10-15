@@ -1,0 +1,413 @@
+"""Unit and HTTP integration tests for the Spot Fleet & Rust Builder Web UI Dashboard."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import tempfile
+import threading
+import unittest
+import urllib.request
+
+from lib.dashboard_models import (
+    DEFAULT_RUNNER_CLOUD_INIT,
+    calculate_spot_pricing,
+    compute_cpu_benchmark_score,
+    disk_category,
+    filter_regions,
+    format_gcloud_ssh_command,
+    normalize_budget,
+    parse_cloud_init,
+    qualify_instances,
+)
+from lib.dashboard_scaling import (
+    build_github_oom_deep_link,
+    evaluate_cpu_scope,
+    evaluate_scaling_decision,
+    parse_github_oom_deep_link,
+)
+from lib.dashboard_server import DashboardStore, create_dashboard_server, main as dashboard_main
+from lib.rust_build_telemetry import (
+    classify_ip_and_network,
+    compute_cpu_points,
+    enrich_rust_build_record,
+)
+
+
+class DashboardModelsTests(unittest.TestCase):
+    def test_cpu_benchmark_scores_order_generations(self):
+        turin_16 = compute_cpu_benchmark_score("AMD Turin", 16, "c4d-standard-16")
+        emerald_16 = compute_cpu_benchmark_score("Intel Emerald Rapids", 16, "n4-standard-16")
+        icelake_8 = compute_cpu_benchmark_score("Intel Ice Lake", 8, "n2-standard-8")
+        cascade_8 = compute_cpu_benchmark_score("Intel Cascade Lake", 8, "n2-standard-8")
+        self.assertGreater(turin_16, emerald_16)
+        self.assertGreaterEqual(icelake_8, 1000)
+        self.assertLess(cascade_8, 1000)
+
+    def test_qualify_instances_runner_sizing_and_benchmark_floor(self):
+        # 4 GitHub runners each with 4 vCPU and 16 GiB RAM, benchmark >= 1000
+        profile = {
+            "role": "cicd_runner",
+            "min_runners": 4,
+            "min_instances": 1,
+            "max_instances": 8,
+            "runner_vcpu": 4,
+            "runner_ram_gib": 16,
+            "host_overhead_gib": 0,
+            "min_instance_vcpu": 8,
+            "min_instance_ram_gib": 32,
+            "min_benchmark_score": 1000,
+            "disk_category": "any",
+            "disk_type": "hyperdisk-balanced",
+            "boot_disk_gb": 40,
+            "data_disk_gb": 100,
+            "budget": {
+                "active_period": "day",
+                "max_hourly_usd": 5.00,
+                "max_daily_usd": 10.00,
+                "max_monthly_usd": 300.00,
+                "include_disk_costs": True,
+                "include_taxes": False,
+            },
+        }
+        regions = {"us-south1": True, "africa-south1": True, "europe-west1": True}
+        result = qualify_instances(profile, regions)
+        self.assertGreater(result["hardware_qualifying_count"], 0)
+        self.assertGreater(result["spot_price_qualifying_count"], 0)
+
+        for candidate in result["hardware_qualifying"]:
+            self.assertGreaterEqual(candidate["benchmark_score"], 1000)
+            self.assertGreaterEqual(candidate["vcpu"], 8)
+            self.assertGreaterEqual(candidate["ram_gib"], 32)
+            # An 8 vCPU / 32 GiB instance holds 2 runners; a 16 vCPU / 64 GiB holds 4
+            if candidate["vcpu"] == 8 and candidate["ram_gib"] == 32:
+                self.assertEqual(candidate["units_per_instance"], 2)
+                self.assertEqual(candidate["instances_needed_for_floor"], 2)
+            elif candidate["vcpu"] == 16 and candidate["ram_gib"] == 64:
+                self.assertEqual(candidate["units_per_instance"], 4)
+                self.assertEqual(candidate["instances_needed_for_floor"], 1)
+
+    def test_hyperdrive_vs_normal_drive_filtering(self):
+        self.assertEqual(disk_category("hyperdisk-balanced"), "hyperdrive")
+        self.assertEqual(disk_category("hyperdisk-throughput"), "hyperdrive")
+        self.assertEqual(disk_category("pd-ssd"), "normal")
+        self.assertEqual(disk_category("pd-balanced"), "normal")
+
+        profile = {
+            "role": "rust_builder",
+            "min_runners": 1,
+            "runner_vcpu": 16,
+            "runner_ram_gib": 28,
+            "min_instance_vcpu": 16,
+            "min_instance_ram_gib": 32,
+            "min_benchmark_score": 1400,
+            "disk_category": "hyperdrive",
+            "disk_type": "hyperdisk-balanced",
+            "budget": {
+                "max_hourly_usd": 5.0,
+                "max_daily_usd": 20.0,
+                "max_monthly_usd": 500.0,
+                "include_disk_costs": True,
+            },
+        }
+        res = qualify_instances(profile, {"us-south1": True})
+        self.assertTrue(all(c["disk_category"] == "hyperdrive" for c in res["hardware_qualifying"]))
+
+    def test_cloud_init_parser_and_incomplete_chmod_warning(self):
+        broken_yaml = DEFAULT_RUNNER_CLOUD_INIT + "\n  - chmod\n"
+        parsed = parse_cloud_init(broken_yaml)
+        self.assertEqual(parsed["format"], "cloud-config")
+        self.assertTrue(parsed["package_update"])
+        self.assertTrue(parsed["package_upgrade"])
+        self.assertIn("docker", parsed["groups"])
+        self.assertIn("build-essential", parsed["packages"])
+        self.assertEqual(len(parsed["stages"]), 5)
+        self.assertFalse(parsed["valid"])
+        self.assertTrue(any("chmod" in w for w in parsed["warnings"]))
+
+    def test_region_filtering_by_latency_and_capabilities(self):
+        state = {"us-south1": True, "africa-south1": True, "europe-west1": False}
+        low_lat = filter_regions(state, max_latency_ms=50)
+        self.assertTrue(all(r["latency_ms"] <= 50 for r in low_lat))
+        turin_only = filter_regions(state, required_cpu_platform="AMD Turin")
+        self.assertTrue(all("AMD Turin" in r["cpu_platforms"] for r in turin_only))
+
+    def test_ssh_command_formatting(self):
+        cmd = format_gcloud_ssh_command("oxidex-runners-za-jnb-01", "africa-south1-a", "homelab-424523")
+        self.assertEqual(
+            cmd,
+            "gcloud compute ssh oxidex-runners-za-jnb-01 --zone=africa-south1-a --project=homelab-424523",
+        )
+
+
+class DashboardScalingTests(unittest.TestCase):
+    def test_github_oom_deep_link_build_and_parse(self):
+        url = build_github_oom_deep_link(
+            "Appz4Fun/nzbget",
+            38596411473,
+            115964282184,
+            2,
+            50,
+        )
+        self.assertEqual(
+            url,
+            "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50",
+        )
+        parsed = parse_github_oom_deep_link(url)
+        self.assertEqual(parsed["repository"], "Appz4Fun/nzbget")
+        self.assertEqual(parsed["run_id"], 38596411473)
+        self.assertEqual(parsed["job_id"], 115964282184)
+        self.assertEqual(parsed["step_number"], 2)
+        self.assertEqual(parsed["line_number"], 50)
+
+    def test_cpu_scope_all_vs_majority(self):
+        samples = [62.0, 58.0, 35.0]
+        maj_ok, _ = evaluate_cpu_scope(samples, 50.0, "majority")
+        all_ok, _ = evaluate_cpu_scope(samples, 50.0, "all")
+        self.assertTrue(maj_ok)
+        self.assertFalse(all_ok)
+        all_hot, _ = evaluate_cpu_scope([55.0, 71.0, 64.0], 50.0, "all")
+        self.assertTrue(all_hot)
+
+    def test_scale_down_when_only_5_jobs_ran_in_past_hour(self):
+        policy = {
+            "min_runners": 4,
+            "max_runners": 20,
+            "runners_per_instance": 2,
+            "enable_hourly_runs_scale_down": True,
+            "scale_down_max_jobs_past_hour": 5,
+            "scale_down_target_runners": 2,
+            "enable_github_ci_oom_trigger": False,
+            "enable_journal_oom_trigger": False,
+            "enable_cpu_utilization_trigger": False,
+        }
+        telemetry = {
+            "current_runners": 8,
+            "jobs_ran_past_hour": 5,
+            "provisioned_jobs": 1,
+            "queued_jobs": 0,
+            "instance_cpu_percentages": [20.0, 18.0],
+            "journal_oom_events": [],
+            "github_oom_runs": [],
+        }
+        decision = evaluate_scaling_decision(policy, telemetry)
+        self.assertEqual(decision["direction"], "scale_down")
+        self.assertEqual(decision["desired_runners"], 2)
+        self.assertEqual(decision["desired_instances"], 1)
+        self.assertEqual(decision["scale_down_reasons"][0]["trigger"], "hourly_runs_low")
+
+    def test_scale_up_on_oom_and_budget_cap_enforcement(self):
+        policy = {
+            "min_runners": 4,
+            "max_runners": 24,
+            "runners_per_instance": 2,
+            "scale_up_step_runners": 6,
+            "max_scale_up_hourly_usd": 5.00,
+            "max_scale_up_daily_usd": 10.00,
+            "max_scale_up_monthly_usd": 12.00,  # Strict monthly cap (~$0.0164/hr)
+        }
+        telemetry = {
+            "current_runners": 4,
+            "jobs_ran_past_hour": 25,
+            "provisioned_jobs": 8,
+            "queued_jobs": 4,
+            "instance_cpu_percentages": [75.0, 82.0],
+            "github_oom_runs": [
+                {
+                    "repository": "Appz4Fun/nzbget",
+                    "run_id": 38596411473,
+                    "job_id": 115964282184,
+                    "step_number": 2,
+                    "line_number": 50,
+                }
+            ],
+        }
+        decision = evaluate_scaling_decision(policy, telemetry, per_instance_hourly_usd=0.20)
+        self.assertTrue(decision["budget_capped"])
+        self.assertEqual(decision["desired_instances"], 1)
+
+
+class RustBuildTelemetryTests(unittest.TestCase):
+    def test_ip_geolocation_and_protonvpn_tor_classification(self):
+        proton = classify_ip_and_network("185.159.157.42")
+        self.assertEqual(proton["provider_label"], "ProtonVPN")
+        self.assertTrue(proton["is_vpn"])
+        self.assertFalse(proton["is_tor"])
+        self.assertEqual(proton["geolocation"]["country_code"], "CH")
+
+        tor = classify_ip_and_network("185.220.101.99")
+        self.assertEqual(tor["provider_label"], "Tor")
+        self.assertTrue(tor["is_tor"])
+        self.assertIn("Tor", tor["badge_text"])
+
+        direct = classify_ip_and_network("73.162.44.19", "m4air-workstation.local")
+        self.assertEqual(direct["provider_label"], "Direct")
+        self.assertFalse(direct["is_vpn"])
+        self.assertFalse(direct["is_tor"])
+        self.assertEqual(direct["hostname"], "m4air-workstation.local")
+
+    def test_cpu_points_and_rust_build_enrichment(self):
+        pts = compute_cpu_points(1000.0, 2485)
+        self.assertEqual(pts, 2485000.0)
+
+        enriched = enrich_rust_build_record(
+            {
+                "build_id": "rb-test-1",
+                "project_name": "oxidex",
+                "requested_at": "2026-10-15T00:00:00Z",
+                "finished_at": "2026-10-15T00:01:40Z",
+                "delivered_at": "2026-10-15T00:01:50Z",
+                "cache_hits": 400,
+                "total_crates": 420,
+                "instance_name": "builder-oxidex-turin-01",
+                "zone": "us-south1-b",
+                "machine_type": "c4d-highcpu-16",
+                "vcpu": 16,
+                "cpu_platform": "AMD Turin",
+                "instance_benchmark_score": 2500,
+                "origin_ip": "185.159.157.12",
+                "peak_ram_gib": 22.5,
+                "container_ram_cap_gib": 28.0,
+                "cpu_time_seconds": 800.0,
+            }
+        )
+        self.assertEqual(enriched["total_duration_seconds"], 110.0)
+        self.assertEqual(enriched["compile_duration_seconds"], 100.0)
+        self.assertEqual(enriched["delivery_duration_seconds"], 10.0)
+        self.assertEqual(enriched["network_security"]["provider_label"], "ProtonVPN")
+        self.assertEqual(enriched["peak_ram_gib"], 22.5)
+        self.assertEqual(enriched["cpu_points"], 2000000.0)
+
+
+class DashboardServerIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_file = Path(self.tmp.name) / "dashboard-state.json"
+        self.server, self.store = create_dashboard_server(
+            host="127.0.0.1",
+            port=0,
+            state_path=self.state_file,
+        )
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop_server)
+
+    def _stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _get(self, path: str) -> dict:
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _post(self, path: str, payload: dict) -> dict:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def test_index_html_and_overview_endpoints(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=10) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn("Spot GitHub Runners &amp; Rust Remote Builders Control Plane", html)
+        self.assertIn("africa-south1", html)
+
+        overview = self._get("/api/overview?include_deleted=true&window_hours=24")
+        self.assertEqual(overview["project"], "homelab-424523")
+        self.assertGreaterEqual(len(overview["instances_view"]["instances"]), 5)
+        # Verify South Africa instance is present with 4 runners of 4vCPU / 8GB RAM
+        za = next(
+            i for i in overview["instances_view"]["instances"] if i["region"] == "africa-south1"
+        )
+        self.assertEqual(za["runners_count"], 4)
+        self.assertEqual(za["runner_vcpu"], 4)
+        self.assertEqual(za["runner_ram_gib"], 8)
+
+    def test_edit_budget_and_save_as_cloud_init_template(self):
+        budget_res = self._post(
+            "/api/budget",
+            {
+                "target": "global",
+                "active_period": "day",
+                "max_hourly_usd": 4.50,
+                "max_daily_usd": 12.00,
+                "max_monthly_usd": 60.00,
+                "include_disk_costs": True,
+            },
+        )
+        self.assertEqual(budget_res["budget"]["max_daily_usd"], 12.00)
+
+        custom_yaml = DEFAULT_RUNNER_CLOUD_INIT + "\n  - wget -qO /tmp/setup.sh https://example.com/setup.sh\n"
+        ci_res = self._post(
+            "/api/cloud-init/save",
+            {
+                "mode": "save_as",
+                "role": "cicd_runner",
+                "name": "Wget Custom Runner Cloud-Init",
+                "content": custom_yaml,
+                "assign_to_profile": True,
+            },
+        )
+        new_id = ci_res["template"]["id"]
+        self.assertEqual(self.store.state["profiles"]["cicd_runner"]["cloud_init_template_id"], new_id)
+
+    def test_create_vm_template_scale_region_and_delete_instance(self):
+        tpl_res = self._post(
+            "/api/vm-templates/from-instance",
+            {
+                "instance_name": "oxidex-runners-za-jnb-01",
+                "template_name": "ZA Production Snapshot Template",
+            },
+        )
+        self.assertEqual(tpl_res["vm_template"]["source_instance"], "oxidex-runners-za-jnb-01")
+
+        scale_res = self._post(
+            "/api/instances/scale-region",
+            {"region": "africa-south1", "role": "cicd_runner", "target_instances": 2},
+        )
+        self.assertEqual(scale_res["current_count"], 2)
+
+        del_res = self._post(
+            "/api/instances/delete",
+            {
+                "instance_name": "oxidex-runners-za-jnb-01",
+                "reason": "Scheduled scale-down: lack of GitHub runner demand",
+            },
+        )
+        self.assertEqual(del_res["instance"]["status"], "DELETED")
+
+    def test_record_rust_build_and_cli_dump_overview(self):
+        import contextlib
+        import io
+
+        rb_res = self._post(
+            "/api/rust-builds",
+            {
+                "project_name": "oxidex",
+                "origin_ip": "185.220.101.44",
+                "instance_name": "builder-oxidex-turin-01",
+                "cache_hits": 410,
+                "total_crates": 430,
+                "peak_ram_gib": 23.1,
+                "cpu_time_seconds": 900.0,
+            },
+        )
+        self.assertEqual(rb_res["build"]["network_security"]["provider_label"], "Tor")
+        self.assertGreater(rb_res["build"]["cpu_points"], 0)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = dashboard_main(["--dump-overview", "--state-file", str(self.state_file)])
+        self.assertEqual(rc, 0)
+        dumped = json.loads(buf.getvalue())
+        self.assertEqual(dumped["project"], "homelab-424523")
+
+
+if __name__ == "__main__":
+    unittest.main()
