@@ -2337,7 +2337,72 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(suppressed_up["desired_instances"], 1)
         self.assertEqual(suppressed_up["desired_runners"], 4)
 
+    def test_round13_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+            parse_cloud_init,
+        )
+
+        # 1. Strict runner admission service authenticates peer credentials via SO_PEERCRED and Runner.Worker ancestry
+        self.assertIn("socket.SO_PEERCRED", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("def peer_owner(pid, uid, cfg):", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("def worker_owner(pid, container_id, container_started):", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("def runner_reservation(owner, cfg):", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("os.chmod(SOCKET_PATH, 0o660)", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertNotIn("os.chmod(SOCKET_PATH, 0o666)", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertNotIn("owner = str(req.get('owner'", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 2. Builder transaction wrapper cleans and extracts archives using dir_fd + O_NOFOLLOW on root-owned directories
+        self.assertIn("def cleanup_source_fd(source_fd):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("def open_nofollow_subdir(parent_fd, name, device):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("dir_fd=cur_fd", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertNotIn("os.chown(source, int(os.environ.get('SUDO_UID'", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertNotIn("member_path = (source_root / member.name).resolve()", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        # 3. Switching from global budget to a role-specific budget clears shared_global_budget for BOTH roles
+        self._post(
+            "/api/budget",
+            {
+                "target": "global",
+                "max_hourly_usd": 10.0,
+                "max_daily_usd": 100.0,
+                "max_monthly_usd": 1000.0,
+                "include_disk_costs": True,
+                "include_taxes": False,
+            },
+        )
+        ov_before = self._get("/api/overview")
+        self.assertTrue(ov_before["scaling"]["cicd_runner"]["shared_global_budget"])
+        self.assertTrue(ov_before["scaling"]["rust_builder"]["shared_global_budget"])
+
+        self._post(
+            "/api/budget",
+            {
+                "target": "cicd_runner",
+                "max_hourly_usd": 12.0,
+                "max_daily_usd": 120.0,
+                "max_monthly_usd": 1200.0,
+                "include_disk_costs": True,
+                "include_taxes": False,
+            },
+        )
+        ov_after = self._get("/api/overview")
+        self.assertFalse(ov_after["scaling"]["cicd_runner"]["shared_global_budget"])
+        self.assertFalse(ov_after["scaling"]["rust_builder"]["shared_global_budget"])
+
+        # 4. parse_cloud_init accepts valid 1-space and 3-space YAML indentation while rejecting inconsistent sibling indentation
+        valid_odd_indent_yaml = (
+            "#cloud-config\n"
+            "users:\n"
+            " - default\n"
+            "packages:\n"
+            "   - git\n"
+            "   - curl\n"
+        )
+        parsed_odd = parse_cloud_init(valid_odd_indent_yaml)
+        self.assertTrue(parsed_odd["valid"], f"Expected valid odd-indented YAML: {parsed_odd}")
+
 
 if __name__ == "__main__":
     unittest.main()
-

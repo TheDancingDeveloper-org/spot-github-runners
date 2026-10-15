@@ -1631,7 +1631,8 @@ class DashboardStore:
                     self.state["scaling"][target]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
                     self.state["scaling"][target]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
                     self.state["scaling"][target]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
-                    self.state["scaling"][target]["shared_global_budget"] = False
+                    for role_key in ("cicd_runner", "rust_builder"):
+                        self.state["scaling"][role_key]["shared_global_budget"] = False
                     self.state["global_budget_enforced"] = False
                 else:
                     self.state["global_budget"] = normalized
@@ -1785,7 +1786,8 @@ class DashboardStore:
                     self.state["scaling"][role]["max_scale_up_daily_usd"] = normalized_budget["max_daily_usd"]
                     self.state["scaling"][role]["max_scale_up_monthly_usd"] = normalized_budget["max_monthly_usd"]
                     self.state["scaling"][role]["include_disk_in_scale_budget"] = normalized_budget["include_disk_costs"]
-                    self.state["scaling"][role]["shared_global_budget"] = False
+                    for role_key in ("cicd_runner", "rust_builder"):
+                        self.state["scaling"][role_key]["shared_global_budget"] = False
                     self.state["global_budget_enforced"] = False
                 if role == "cicd_runner":
                     self.state["scaling"]["cicd_runner"]["min_runners"] = int(candidate["min_runners"])
@@ -1878,17 +1880,21 @@ class DashboardStore:
                     if "include_disk_in_scale_budget" in payload["policy"]:
                         prof_budget["include_disk_costs"] = bool(pol_target["include_disk_in_scale_budget"])
                     if (
-                        any(
-                            k in payload["policy"]
-                            for k in (
-                                "max_scale_up_hourly_usd",
-                                "max_scale_up_daily_usd",
-                                "max_scale_up_monthly_usd",
+                        payload["policy"].get("shared_global_budget") is False
+                        or (
+                            any(
+                                k in payload["policy"]
+                                for k in (
+                                    "max_scale_up_hourly_usd",
+                                    "max_scale_up_daily_usd",
+                                    "max_scale_up_monthly_usd",
+                                )
                             )
+                            and "shared_global_budget" not in payload["policy"]
                         )
-                        and "shared_global_budget" not in payload["policy"]
                     ):
-                        pol_target["shared_global_budget"] = False
+                        for role_key in ("cicd_runner", "rust_builder"):
+                            self.state["scaling"][role_key]["shared_global_budget"] = False
                         self.state["global_budget_enforced"] = False
                     if role == "cicd_runner":
                         pol = self.state["scaling"]["cicd_runner"]

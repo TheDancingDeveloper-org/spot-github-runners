@@ -160,57 +160,180 @@ write_files:
     owner: root:root
     content: |
       #!/usr/bin/env python3
-      import json, os, socket, sys, time
+      import fcntl, json, os, re, socket, struct, subprocess, sys, time
       from pathlib import Path
 
       CONFIG_PATH = Path('/etc/gha-admission.json')
       LEASES_PATH = Path('/var/lib/gha-admission/leases.json')
       SOCKET_PATH = Path('/run/gha-admission/socket')
 
+      class OrphanRunnerHook(ValueError):
+          # The requesting hook has outlived its GitHub-assigned Worker.
+          pass
+
+      def process_record(pid):
+          root = Path(f'/proc/{pid}')
+          stat = (root / 'stat').read_text().rsplit(')', 1)[1].split()
+          return int(stat[1]), stat[19], (root / 'comm').read_text().strip(), (root / 'cgroup').read_text()
+
+      def runner_cgroup(cgroup):
+          ids = re.findall(r'(?:docker[-/])([a-f0-9]{64})(?:\\.scope)?', cgroup)
+          return next(iter(set(ids))) if len(set(ids)) == 1 else None
+
+      def docker_identity(container):
+          row = json.loads(
+              subprocess.run(
+                  ['/usr/bin/docker', 'inspect', container],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              ).stdout
+          )[0]
+          if not row['State']['Running']:
+              raise ValueError('Container is not running')
+          return f"container:{row['Id']}:{row['State']['StartedAt']}", row
+
+      def worker_owner(pid, container_id, container_started):
+          seen = set()
+          for _ in range(32):
+              if pid <= 1 or pid in seen:
+                  break
+              seen.add(pid)
+              try:
+                  parent, start, comm, cgroup = process_record(pid)
+              except FileNotFoundError as exc:
+                  raise OrphanRunnerHook('Runner hook lost its Worker ancestry') from exc
+              if runner_cgroup(cgroup) != container_id:
+                  raise OrphanRunnerHook('Runner hook left its container')
+              if comm == 'Runner.Worker':
+                  return f'runner:{container_id}:{container_started}:{pid}:{start}'
+              pid = parent
+          raise OrphanRunnerHook('Runner hook has no live Worker ancestor')
+
+      def peer_owner(pid, uid, cfg):
+          if uid != 1001:
+              raise ValueError('Unauthorized admission peer')
+          cgroup = Path(f'/proc/{pid}/cgroup').read_text()
+          cid = runner_cgroup(cgroup)
+          if cid is None:
+              raise ValueError('Runner must belong to a Docker cgroup')
+          _, row = docker_identity(cid)
+          if row['Name'].lstrip('/') not in cfg.get('runner_names', []):
+              raise ValueError('Container is outside this runner deployment')
+          return worker_owner(pid, cid, row['State']['StartedAt'])
+
+      def owner_alive(owner):
+          try:
+              match = re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)', owner)
+              if match is None:
+                  return False
+              cid, started, pid, start = match.groups()
+              try:
+                  _, actual_start, comm, cgroup = process_record(int(pid))
+              except FileNotFoundError:
+                  return False
+              if comm != 'Runner.Worker' or actual_start != start or runner_cgroup(cgroup) != cid:
+                  return False
+              actual, _ = docker_identity(cid)
+              return actual == f'container:{cid}:{started}'
+          except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+              return True
+
+      def runner_reservation(owner, cfg):
+          match = re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)', owner)
+          if match is None:
+              raise ValueError('Invalid Worker lease identity')
+          cid, started, _, _ = match.groups()
+          actual, row = docker_identity(cid)
+          if actual != f'container:{cid}:{started}' or row['Id'] != cid:
+              raise ValueError('Runner identity changed before admission')
+          if row['Name'].lstrip('/') not in cfg.get('runner_names', []):
+              raise ValueError('Runner left this deployment')
+          if not owner_alive(owner):
+              raise OrphanRunnerHook('Runner Worker exited before grant')
+          runner_gib = int(cfg.get('runner_gib', 32))
+          caps = row.get('HostConfig') or {}
+          expected = runner_gib * (1024 ** 3)
+          if caps.get('Memory') != expected or caps.get('MemorySwap') != expected:
+              raise ValueError('Runner memory cap differs from reservation')
+          return runner_gib
+
       def serve():
-          SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
-          LEASES_PATH.parent.mkdir(parents=True, exist_ok=True)
+          if os.geteuid() != 0:
+              raise RuntimeError('Admission service must run as root')
+          SOCKET_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+          LEASES_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
           if not LEASES_PATH.exists():
               LEASES_PATH.write_text('{}\\n')
-          if SOCKET_PATH.exists():
-              SOCKET_PATH.unlink()
-          srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-          srv.bind(str(SOCKET_PATH))
-          os.chmod(SOCKET_PATH, 0o666)
-          srv.listen(16)
-          while True:
-              conn, _ = srv.accept()
-              with conn:
-                  raw = conn.recv(4096).decode('utf-8', errors='replace').strip()
-                  cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
-                  leases = json.loads(LEASES_PATH.read_text()) if LEASES_PATH.exists() else {}
-                  req = json.loads(raw) if raw.startswith('{') else {'op': raw, 'owner': 'default'}
-                  op = req.get('op', 'acquire')
-                  owner = str(req.get('owner', 'default'))
-                  runner_gib = int(cfg.get('runner_gib', 32))
-                  work_gib = int(cfg.get('work_gib', 64))
-                  if op == 'release':
-                      leases.pop(owner, None)
-                      LEASES_PATH.write_text(json.dumps(leases, sort_keys=True) + '\\n')
-                      conn.sendall(b'{"ok": true, "accepted": true}\\n')
-                  elif sum(leases.values()) + runner_gib <= work_gib or owner in leases:
-                      leases[owner] = runner_gib
-                      LEASES_PATH.write_text(json.dumps(leases, sort_keys=True) + '\\n')
-                      conn.sendall(b'{"ok": true, "accepted": true}\\n')
-                  else:
-                      conn.sendall(b'{"ok": false, "accepted": false, "reason": "admission budget exhausted"}\\n')
+          SOCKET_PATH.unlink(missing_ok=True)
+          with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+              srv.bind(str(SOCKET_PATH))
+              os.chown(SOCKET_PATH, 0, 1001)
+              os.chmod(SOCKET_PATH, 0o660)
+              srv.listen(128)
+              while True:
+                  conn, _ = srv.accept()
+                  with conn:
+                      try:
+                          conn.settimeout(5.0)
+                          pid, uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                          cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+                          owner = peer_owner(pid, uid, cfg)
+                          raw = conn.recv(4096).decode('utf-8', errors='replace').strip()
+                          req = json.loads(raw)
+                          if req.get('kind', 'runner') != 'runner':
+                              raise ValueError('Admission kind does not match peer identity')
+                          action = req.get('action') or req.get('op')
+                          work_gib = int(cfg.get('work_gib', 64))
+                          lock_fd = os.open(str(LEASES_PATH) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                          with os.fdopen(lock_fd, 'r+') as lock_f:
+                              fcntl.flock(lock_f, fcntl.LOCK_EX)
+                              rows = json.loads(LEASES_PATH.read_text()) if LEASES_PATH.exists() else {}
+                              leases = {k: v for k, v in rows.items() if owner_alive(k)}
+                              if action == 'release':
+                                  leases.pop(owner, None)
+                                  accepted = True
+                              elif action == 'acquire':
+                                  runner_gib = runner_reservation(owner, cfg)
+                                  if owner in leases or sum(leases.values()) + runner_gib <= work_gib:
+                                      leases[owner] = runner_gib
+                                      accepted = True
+                                      if not owner_alive(owner):
+                                          leases.pop(owner, None)
+                                          accepted = False
+                                  else:
+                                      accepted = False
+                              else:
+                                  raise ValueError('Unknown admission action')
+                              tmp_path = LEASES_PATH.with_suffix('.tmp')
+                              tmp_fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                              with os.fdopen(tmp_fd, 'w') as out_f:
+                                  json.dump(leases, out_f, sort_keys=True)
+                                  out_f.flush()
+                                  os.fsync(out_f.fileno())
+                              tmp_path.replace(LEASES_PATH)
+                          answer = {'ok': accepted, 'accepted': accepted}
+                      except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+                          answer = {'ok': False, 'accepted': False, 'error': str(exc)[:200]}
+                          if isinstance(exc, OrphanRunnerHook):
+                              answer['code'] = 'orphaned-runner-hook'
+                              answer['error'] = 'ORPHAN_RUNNER_HOOK: ' + str(exc)[:180]
+                      conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))
 
-      def request(op='acquire', owner=None):
-          resolved_owner = str(owner or os.environ.get('RUNNER_NAME') or socket.gethostname())
+      def request(action='acquire'):
           with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
               sock.settimeout(30.0)
               sock.connect(str(SOCKET_PATH))
-              sock.sendall((json.dumps({'op': op, 'owner': resolved_owner}) + '\\n').encode('utf-8'))
+              sock.sendall((json.dumps({'action': action, 'kind': 'runner'}) + '\\n').encode('utf-8'))
+              sock.shutdown(socket.SHUT_WR)
               raw = sock.recv(4096).decode('utf-8', errors='replace').strip()
-          resp = json.loads(raw) if raw.startswith('{') else {'ok': False, 'reason': raw}
-          if not resp.get('ok'):
-              raise RuntimeError(resp.get('reason', 'admission denied'))
-          return True
+          resp = json.loads(raw)
+          if isinstance(resp, dict) and resp.get('code') == 'orphaned-runner-hook':
+              raise OrphanRunnerHook(resp.get('error', 'Runner hook lost its Worker ancestry'))
+          if 'error' in resp:
+              raise RuntimeError(resp['error'])
+          return bool(resp.get('accepted'))
 
       def write_config(runners_count, work_gib, runner_gib):
           host = socket.gethostname().split('.')[0]
@@ -236,16 +359,26 @@ write_files:
               serve()
           elif sys.argv[1:2] == ['write-config']:
               write_config(sys.argv[2], sys.argv[3], sys.argv[4])
-          elif sys.argv[1:2] in (['acquire'], ['release']):
-              op_name = sys.argv[1]
-              owner_arg = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else os.environ.get('RUNNER_NAME', 'default')
+          elif sys.argv[1:] == ['acquire']:
               while True:
                   try:
-                      if request(op_name, owner_arg):
+                      if request('acquire'):
                           break
+                  except OSError:
+                      # Retry when the root admission service restarts during an assigned job.
+                      time.sleep(5)
+                  else:
+                      time.sleep(5)
+          elif sys.argv[1:] == ['release']:
+              while True:
+                  try:
+                      if request('release'):
+                          break
+                  except OrphanRunnerHook:
+                      raise SystemExit(75)
                   except (OSError, RuntimeError, ValueError):
-                      # Retry until admission budget is available or release is acknowledged.
-                      time.sleep(2)
+                      # Retry until the root daemon acknowledges release or reports an orphaned hook.
+                      time.sleep(5)
   - path: /opt/gha-runners/build/entrypoint.sh
     permissions: '0755'
     owner: root:root
@@ -283,7 +416,7 @@ write_files:
       #!/usr/bin/env bash
       set -Eeuo pipefail
       if [[ "${GHA_ADMISSION_REQUIRED:-0}" == 1 ]]; then
-        exec python3 /usr/local/bin/gha-host-admission.py acquire "${RUNNER_NAME:-}"
+        exec python3 /usr/local/bin/gha-host-admission.py acquire
       fi
   - path: /opt/gha-runners/build/job-completed.sh
     permissions: '0755'
@@ -292,7 +425,7 @@ write_files:
       #!/usr/bin/env bash
       set -Eeuo pipefail
       if [[ "${GHA_ADMISSION_REQUIRED:-0}" == 1 ]]; then
-        python3 /usr/local/bin/gha-host-admission.py release "${RUNNER_NAME:-}"
+        python3 /usr/local/bin/gha-host-admission.py release
       fi
   - path: /opt/gha-runners/build/Dockerfile
     permissions: '0644'
@@ -474,38 +607,131 @@ write_files:
           if actual != str(instance_id):
               raise SystemExit(75)
 
-      def extract_safe_source_archive(upload_path, source, caller_uid):
-          source_root = source.resolve()
-          with tarfile.open(upload_path, 'r:gz') as tar:
-              for member in tar.getmembers():
-                  rel_parts = Path(member.name).parts
-                  if not rel_parts or '..' in rel_parts or Path(member.name).is_absolute():
-                      raise RuntimeError('Unsafe archive member path in source snapshot')
-                  member_path = (source_root / member.name).resolve()
-                  if not member_path.is_relative_to(source_root):
-                      raise RuntimeError('Unsafe archive member in source snapshot')
-                  if member.isdir():
-                      member_path.mkdir(parents=True, exist_ok=True, mode=0o750)
-                      os.chown(member_path, caller_uid, 1001)
-                      os.chmod(member_path, 0o2770)
-                  elif member.isfile():
-                      member_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
-                      for parent in (member_path.parent, *member_path.parent.parents):
-                          if parent == source_root or not parent.is_relative_to(source_root):
-                              break
-                          os.chown(parent, caller_uid, 1001)
-                          os.chmod(parent, 0o2770)
-                      stream = tar.extractfile(member)
-                      if stream is None:
-                          raise RuntimeError('Unable to read archive file member')
-                      file_mode = 0o750 if (member.mode & 0o100) else 0o640
-                      fd = os.open(member_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, file_mode)
-                      with os.fdopen(fd, 'wb') as out_f:
-                          shutil.copyfileobj(stream, out_f)
-                          os.fchown(out_f.fileno(), caller_uid, 1001)
-                          os.fchmod(out_f.fileno(), file_mode)
+      def cleanup_source_fd(source_fd):
+          device = os.fstat(source_fd).st_dev
+          count = [0]
+
+          def _empty(dir_fd, depth):
+              if depth > 64:
+                  raise RuntimeError('Source cleanup depth bound exceeded')
+              for name in os.listdir(dir_fd):
+                  count[0] += 1
+                  if count[0] > 100000:
+                      raise RuntimeError('Source cleanup entry bound exceeded')
+                  info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                  if info.st_dev != device:
+                      raise RuntimeError('Foreign filesystem inside source')
+                  if stat.S_ISDIR(info.st_mode):
+                      child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                      try:
+                          _empty(child_fd, depth + 1)
+                      finally:
+                          os.close(child_fd)
+                      os.rmdir(name, dir_fd=dir_fd)
                   else:
-                      raise RuntimeError('Unsupported non-regular archive member in source snapshot')
+                      os.unlink(name, dir_fd=dir_fd)
+
+          _empty(source_fd, 0)
+          os.fsync(source_fd)
+
+      def open_nofollow_subdir(parent_fd, name, device):
+          if name not in os.listdir(parent_fd):
+              os.mkdir(name, 0o700, dir_fd=parent_fd)
+          child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+          info = os.fstat(child_fd)
+          if (
+              not stat.S_ISDIR(info.st_mode)
+              or info.st_dev != device
+              or info.st_uid != 0
+              or (info.st_mode & 0o077) != 0
+          ):
+              os.close(child_fd)
+              raise RuntimeError('Untrusted intermediate directory in source tree')
+          return child_fd
+
+      def finalize_source_tree(dir_fd, device, depth=0):
+          if depth > 64:
+              raise RuntimeError('Source tree depth bound exceeded')
+          for name in os.listdir(dir_fd):
+              info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+              if info.st_dev != device:
+                  raise RuntimeError('Foreign filesystem inside source')
+              if stat.S_ISDIR(info.st_mode):
+                  child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                  try:
+                      finalize_source_tree(child_fd, device, depth + 1)
+                      os.fchown(child_fd, 1001, 1001)
+                      os.fchmod(child_fd, 0o2750)
+                  finally:
+                      os.close(child_fd)
+
+      def extract_safe_source_archive(upload_path, source, expected_digest=None):
+          source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+          try:
+              root_info = os.fstat(source_fd)
+              if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0:
+                  raise RuntimeError('Source root must be a root-owned directory')
+              os.fchown(source_fd, 0, 0)
+              os.fchmod(source_fd, 0o700)
+              cleanup_source_fd(source_fd)
+              upload_fd = os.open(upload_path, os.O_RDONLY | os.O_NOFOLLOW)
+              with os.fdopen(upload_fd, 'rb') as upload_f:
+                  if expected_digest is not None:
+                      actual_digest = hashlib.sha256(upload_f.read()).hexdigest()
+                      if actual_digest != expected_digest:
+                          raise RuntimeError('Upload archive sha256 mismatch')
+                      upload_f.seek(0)
+                  with tarfile.open(fileobj=upload_f, mode='r:gz') as tar:
+                      for member in tar.getmembers():
+                          rel_parts = Path(member.name).parts
+                          if (
+                              not rel_parts
+                              or Path(member.name).is_absolute()
+                              or any(p in ('', '.', '..') for p in rel_parts)
+                          ):
+                              raise RuntimeError('Unsafe archive member path in source snapshot')
+                          if member.isdir():
+                              cur_fd = source_fd
+                              opened_fds = []
+                              try:
+                                  for part in rel_parts:
+                                      cur_fd = open_nofollow_subdir(cur_fd, part, root_info.st_dev)
+                                      opened_fds.append(cur_fd)
+                              finally:
+                                  for fd_item in reversed(opened_fds):
+                                      os.close(fd_item)
+                          elif member.isfile():
+                              cur_fd = source_fd
+                              opened_fds = []
+                              try:
+                                  for part in rel_parts[:-1]:
+                                      cur_fd = open_nofollow_subdir(cur_fd, part, root_info.st_dev)
+                                      opened_fds.append(cur_fd)
+                                  stream = tar.extractfile(member)
+                                  if stream is None:
+                                      raise RuntimeError('Unable to read archive file member')
+                                  file_mode = 0o750 if (member.mode & 0o100) else 0o640
+                                  fd = os.open(
+                                      rel_parts[-1],
+                                      os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                      0o600,
+                                      dir_fd=cur_fd,
+                                  )
+                                  with os.fdopen(fd, 'wb') as out_f:
+                                      shutil.copyfileobj(stream, out_f)
+                                      os.fchown(out_f.fileno(), 1001, 1001)
+                                      os.fchmod(out_f.fileno(), file_mode)
+                              finally:
+                                  for fd_item in reversed(opened_fds):
+                                      os.close(fd_item)
+                          else:
+                              raise RuntimeError('Unsupported non-regular archive member in source snapshot')
+              finalize_source_tree(source_fd, root_info.st_dev)
+              os.fchown(source_fd, 0, 1001)
+              os.fchmod(source_fd, 0o750)
+              os.fsync(source_fd)
+          finally:
+              os.close(source_fd)
 
       def run_cleanup(root, project, run, upload_path, instance_id):
           verify_instance_id(instance_id)
@@ -529,7 +755,6 @@ write_files:
               raise ValueError('Invalid archive sha256 digest')
           if profile not in ('debug', 'release'):
               raise ValueError('Invalid build profile')
-          caller_uid = int(os.environ.get('SUDO_UID', '1001'))
           try:
               verify_instance_id(instance_id)
               if Path('/run/oxidex-build-draining').exists():
@@ -553,15 +778,7 @@ write_files:
                       if mounts == str(target):
                           raise SystemExit(75)
                   subprocess.run(['/usr/local/bin/oxidex-remote-build', project, 'prepare'], check=True)
-                  actual_digest = hashlib.sha256(upload_path.read_bytes()).hexdigest()
-                  if actual_digest != digest:
-                      raise RuntimeError('Upload archive sha256 mismatch')
-                  for child in source.iterdir():
-                      if child.is_dir() and not child.is_symlink():
-                          shutil.rmtree(child)
-                      else:
-                          child.unlink()
-                  extract_safe_source_archive(upload_path, source, caller_uid)
+                  extract_safe_source_archive(upload_path, source, digest)
               stages = [['cargo', 'fetch', '--locked', '--target', 'x86_64-unknown-linux-gnu']]
               if profile == 'release':
                   stages.append(['just', 'cbindgen-check'])
@@ -665,8 +882,9 @@ write_files:
               path.mkdir(parents=True, exist_ok=True)
           if sys.argv[2:] == ['prepare']:
               source = root / 'sources' / project
-              os.chown(source, int(os.environ.get('SUDO_UID', '1001')), 1001)
-              source.chmod(0o2770)
+              for anc in (root, root / 'sources', source):
+                  os.chown(anc, 0, 1001)
+                  anc.chmod(0o750)
               for path in (root / 'targets' / project, root / 'cargo'):
                   os.chown(path, 1001, 1001)
               print(source)
@@ -2082,12 +2300,6 @@ def _validate_cloud_init_syntax(
             if not (is_mapping or is_list_item):
                 errors.append(
                     f"YAML syntax error on line {idx}: expected mapping 'key: value' or list item '- value'."
-                )
-                continue
-
-            if indent % 2 != 0:
-                errors.append(
-                    f"YAML syntax error on line {idx}: inconsistent indentation ({indent} spaces)."
                 )
                 continue
 
