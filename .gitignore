@@ -10,6 +10,8 @@
 !.env.example
 !.gitignore
 !.dockerignore
+!AGENTS.md
+!CLAUDE.md
 !README.md
 !builder/standalone/website-package.json
 !builder/standalone/website-package-lock.json
