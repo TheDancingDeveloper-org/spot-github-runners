@@ -1366,7 +1366,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertIn("./svc.sh install runner", DEFAULT_RUNNER_CLOUD_INIT)
         self.assertIn("./svc.sh start", DEFAULT_RUNNER_CLOUD_INIT)
         self.assertIn("FROM ghcr.io/actions/actions-runner:2.337.0", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
-        self.assertIn("oxidex-self-hosted-runner:2.337.0 ./run.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('ENTRYPOINT ["/usr/local/bin/gha-runner-entrypoint"]', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("exec ./run.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
 
         # 8. Saving an existing cloud-init template with an updated role persists the new role and assigns to that role
         created_ci = self._post(
@@ -1849,7 +1850,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertIn('"$mp/docker"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
         self.assertIn('"$mp/containerd"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
         self.assertIn('work_dir="${mp}/work/runner-${slot}"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
-        self.assertIn('--work "${work_dir}"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("--work /work", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('-v "${work_dir}:/work"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
 
         # 9. Failed Rust builds do not fabricate successful metrics or count toward completed_builds
         failed_resp = self._post(
@@ -2151,11 +2153,191 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         )["vm_template"]
         self.assertEqual(created_vm_tpl["cloud_init_template_id"], "ci-runner-default")
 
+    def test_round12_codex_regressions(self):
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+            parse_cloud_init,
+        )
+        from lib.remote_build import cleanup_script, transaction_script
+
+        # 1 & 2. Strict runner cloud-init uses state-copying entrypoint and wires job admission hooks to gha-host-admission.py
+        strict_parsed = parse_cloud_init(DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertTrue(strict_parsed["valid"], strict_parsed["warnings"])
+        self.assertIn("path: /opt/gha-runners/build/entrypoint.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('cp -a /home/runner/. "$state/"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("path: /opt/gha-runners/build/job-started.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("path: /opt/gha-runners/build/job-completed.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("COPY entrypoint.sh /usr/local/bin/gha-runner-entrypoint", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("COPY job-started.sh /usr/local/bin/gha-runner-job-started.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("COPY job-completed.sh /usr/local/bin/gha-runner-job-completed.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("COPY host_admission.py /usr/local/bin/gha-host-admission.py", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("-e RUNNER_CONFIGURE_ONLY=1", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 3 & 4. remote_build.py routes through oxidex-remote-transaction when present, and oxidex-remote-transaction sanitizes archive extraction
+        tx_cmd, _ = transaction_script(
+            "checkout",
+            "oxidex-remote-source-run-" + "a" * 32 + ".tar.gz",
+            "b" * 64,
+            "release",
+            "run-" + "a" * 32,
+            "12345",
+        )
+        self.assertIn(
+            "if test -x /usr/local/bin/oxidex-remote-transaction; then exec sudo /usr/local/bin/oxidex-remote-transaction build",
+            tx_cmd,
+        )
+        cl_cmd = cleanup_script(
+            "checkout",
+            "oxidex-remote-source-run-" + "a" * 32 + ".tar.gz",
+            "run-" + "a" * 32,
+            "12345",
+        )
+        self.assertIn(
+            "if test -x /usr/local/bin/oxidex-remote-transaction; then exec sudo /usr/local/bin/oxidex-remote-transaction cleanup",
+            cl_cmd,
+        )
+        builder_parsed = parse_cloud_init(DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertTrue(builder_parsed["valid"], builder_parsed["warnings"])
+        self.assertNotIn("tar.extractall(", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("def extract_safe_source_archive(", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("file_mode = 0o750 if (member.mode & 0o100) else 0o640", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("Unsupported non-regular archive member in source snapshot", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        # 5. DashboardStore.__init__ preserves loaded state when startup persistence fails
+        from lib.dashboard_server import DashboardStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "custom_state.json"
+            custom_store = DashboardStore(state_path=state_file, project="custom-proj-99", org="custom-org")
+            custom_store.update_budget({"max_monthly_usd": 777.0})
+            with unittest.mock.patch.object(
+                DashboardStore, "_persist", side_effect=OSError("read-only disk")
+            ):
+                reloaded_store = DashboardStore(
+                    state_path=state_file, project="custom-proj-99", org="custom-org"
+                )
+            self.assertEqual(
+                reloaded_store.state["profiles"]["cicd_runner"]["budget"]["max_monthly_usd"],
+                777.0,
+            )
+
+        # 6. DashboardRequestHandler enforces a socket timeout on stalled unauthenticated request body reads
+        self.assertEqual(self.server.RequestHandlerClass.timeout, 10.0)
+        import socket as _socket
+
+        orig_timeout = self.server.RequestHandlerClass.timeout
+        self.server.RequestHandlerClass.timeout = 0.15
+        try:
+            with _socket.create_connection(("127.0.0.1", self.port), timeout=2.0) as sock:
+                sock.sendall(
+                    b"POST /api/auth/session HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 64\r\n\r\n"
+                )
+                resp_bytes = sock.recv(4096)
+            self.assertIn(b"400", resp_bytes)
+            self.assertIn(b"Request body read timed out", resp_bytes)
+        finally:
+            self.server.RequestHandlerClass.timeout = orig_timeout
+
+        # 7. Active work (provisioned_jobs / active_builds) stays above the scale-down floor even when max_runners / max_instances is smaller
+        busy_runner_eval = evaluate_scaling_decision(
+            policy={
+                "min_runners": 2,
+                "max_runners": 4,
+                "runners_per_instance": 2,
+                "enable_hourly_runs_scale_down": True,
+                "scale_down_max_jobs_past_hour": 5,
+                "scale_down_target_runners": 2,
+                "enable_cpu_utilization_trigger": False,
+            },
+            telemetry={
+                "current_runners": 6,
+                "current_instances": 3,
+                "provisioned_jobs": 6,
+                "queued_jobs": 0,
+                "jobs_ran_past_hour": 1,
+                "instance_cpu_percentages": [10.0, 10.0, 10.0],
+            },
+        )
+        self.assertEqual(busy_runner_eval["direction"], "hold")
+        self.assertEqual(busy_runner_eval["desired_runners"], 6)
+        self.assertEqual(busy_runner_eval["desired_instances"], 3)
+
+        busy_builder_eval = evaluate_builder_scaling_decision(
+            policy={
+                "min_instances": 1,
+                "max_instances": 2,
+                "enable_low_builds_scale_down": True,
+                "scale_down_max_builds_past_hour": 5,
+                "scale_down_target_instances": 1,
+                "enable_cpu_utilization_trigger": False,
+            },
+            telemetry={
+                "current_builder_instances": 3,
+                "active_builds": 3,
+                "queued_builds": 0,
+                "builds_ran_past_hour": 1,
+                "instance_cpu_percentages": [10.0, 10.0, 10.0],
+            },
+        )
+        self.assertEqual(busy_builder_eval["direction"], "hold")
+        self.assertEqual(busy_builder_eval["desired_instances"], 3)
+
+        # 8. Scale-up runner recommendations quantize desired_runners to whole-VM capacity and suppress scale-up when another whole VM exceeds max_runners
+        quantized_up = evaluate_scaling_decision(
+            policy={
+                "min_runners": 4,
+                "max_runners": 12,
+                "runners_per_instance": 4,
+                "scale_up_step_runners": 2,
+                "queued_jobs_threshold": 1,
+                "max_scale_up_hourly_usd": 10.0,
+                "max_scale_up_daily_usd": 100.0,
+                "max_scale_up_monthly_usd": 1000.0,
+            },
+            telemetry={
+                "current_runners": 4,
+                "current_instances": 1,
+                "queued_jobs": 2,
+                "provisioned_jobs": 4,
+                "jobs_ran_past_hour": 10,
+                "instance_cpu_percentages": [40.0],
+            },
+        )
+        self.assertEqual(quantized_up["direction"], "scale_up")
+        self.assertEqual(quantized_up["desired_instances"], 2)
+        self.assertEqual(quantized_up["desired_runners"], 8)
+
+        suppressed_up = evaluate_scaling_decision(
+            policy={
+                "min_runners": 4,
+                "max_runners": 6,
+                "runners_per_instance": 4,
+                "scale_up_step_runners": 2,
+                "queued_jobs_threshold": 1,
+                "max_scale_up_hourly_usd": 10.0,
+                "max_scale_up_daily_usd": 100.0,
+                "max_scale_up_monthly_usd": 1000.0,
+            },
+            telemetry={
+                "current_runners": 4,
+                "current_instances": 1,
+                "queued_jobs": 2,
+                "provisioned_jobs": 4,
+                "jobs_ran_past_hour": 10,
+                "instance_cpu_percentages": [40.0],
+            },
+        )
+        self.assertEqual(suppressed_up["direction"], "hold")
+        self.assertEqual(suppressed_up["desired_instances"], 1)
+        self.assertEqual(suppressed_up["desired_runners"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
 

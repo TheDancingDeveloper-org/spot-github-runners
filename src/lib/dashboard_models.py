@@ -160,7 +160,7 @@ write_files:
     owner: root:root
     content: |
       #!/usr/bin/env python3
-      import json, os, socket, sys
+      import json, os, socket, sys, time
       from pathlib import Path
 
       CONFIG_PATH = Path('/etc/gha-admission.json')
@@ -192,13 +192,25 @@ write_files:
                   if op == 'release':
                       leases.pop(owner, None)
                       LEASES_PATH.write_text(json.dumps(leases, sort_keys=True) + '\\n')
-                      conn.sendall(b'{"ok": true}\\n')
+                      conn.sendall(b'{"ok": true, "accepted": true}\\n')
                   elif sum(leases.values()) + runner_gib <= work_gib or owner in leases:
                       leases[owner] = runner_gib
                       LEASES_PATH.write_text(json.dumps(leases, sort_keys=True) + '\\n')
-                      conn.sendall(b'{"ok": true}\\n')
+                      conn.sendall(b'{"ok": true, "accepted": true}\\n')
                   else:
-                      conn.sendall(b'{"ok": false, "reason": "admission budget exhausted"}\\n')
+                      conn.sendall(b'{"ok": false, "accepted": false, "reason": "admission budget exhausted"}\\n')
+
+      def request(op='acquire', owner=None):
+          resolved_owner = str(owner or os.environ.get('RUNNER_NAME') or socket.gethostname())
+          with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+              sock.settimeout(30.0)
+              sock.connect(str(SOCKET_PATH))
+              sock.sendall((json.dumps({'op': op, 'owner': resolved_owner}) + '\\n').encode('utf-8'))
+              raw = sock.recv(4096).decode('utf-8', errors='replace').strip()
+          resp = json.loads(raw) if raw.startswith('{') else {'ok': False, 'reason': raw}
+          if not resp.get('ok'):
+              raise RuntimeError(resp.get('reason', 'admission denied'))
+          return True
 
       def write_config(runners_count, work_gib, runner_gib):
           host = socket.gethostname().split('.')[0]
@@ -224,6 +236,64 @@ write_files:
               serve()
           elif sys.argv[1:2] == ['write-config']:
               write_config(sys.argv[2], sys.argv[3], sys.argv[4])
+          elif sys.argv[1:2] in (['acquire'], ['release']):
+              op_name = sys.argv[1]
+              owner_arg = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else os.environ.get('RUNNER_NAME', 'default')
+              while True:
+                  try:
+                      if request(op_name, owner_arg):
+                          break
+                  except (OSError, RuntimeError, ValueError):
+                      # Retry until admission budget is available or release is acknowledged.
+                      time.sleep(2)
+  - path: /opt/gha-runners/build/entrypoint.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      state="${RUNNER_STATE:-/runner-state}"
+      config="$state/.runner"
+      mkdir -p "$state"
+      if [[ ! -x "$state/run.sh" ]]; then
+        cp -a /home/runner/. "$state/"
+      fi
+      cd "$state"
+      if [[ "${RUNNER_CONFIGURE_ONLY:-0}" == 1 ]]; then
+        if [[ -f "$config" ]]; then
+          exit 0
+        fi
+        : "${GITHUB_RUNNER_URL:?GITHUB_RUNNER_URL is required}"
+        : "${GITHUB_RUNNER_TOKEN:?GITHUB_RUNNER_TOKEN is required for initial registration}"
+        ./config.sh --unattended --replace --url "$GITHUB_RUNNER_URL" \
+          --token "$GITHUB_RUNNER_TOKEN" --name "$RUNNER_NAME" \
+          --labels "$RUNNER_LABELS" --runnergroup "$RUNNER_GROUP_NAME" \
+          --work /work
+        exit 0
+      fi
+      if [[ ! -f "$config" ]]; then
+        echo "Runner state is not registered at $config" >&2
+        exit 1
+      fi
+      exec ./run.sh
+  - path: /opt/gha-runners/build/job-started.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      if [[ "${GHA_ADMISSION_REQUIRED:-0}" == 1 ]]; then
+        exec python3 /usr/local/bin/gha-host-admission.py acquire "${RUNNER_NAME:-}"
+      fi
+  - path: /opt/gha-runners/build/job-completed.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      if [[ "${GHA_ADMISSION_REQUIRED:-0}" == 1 ]]; then
+        python3 /usr/local/bin/gha-host-admission.py release "${RUNNER_NAME:-}"
+      fi
   - path: /opt/gha-runners/build/Dockerfile
     permissions: '0644'
     owner: root:root
@@ -232,6 +302,11 @@ write_files:
       ARG DEBIAN_FRONTEND=noninteractive
       USER root
       RUN apt-get update && apt-get install -y --no-install-recommends build-essential clang cmake curl git jq libssl-dev make pkg-config python3 ca-certificates unzip zip xz-utils zstd && rm -rf /var/lib/apt/lists/* && rm -f /etc/sudoers /etc/sudoers.d/* && install -d -o runner -g runner /runner-state /work /opt/runner-rust/cargo /opt/runner-rust/rustup
+      COPY entrypoint.sh /usr/local/bin/gha-runner-entrypoint
+      COPY job-started.sh /usr/local/bin/gha-runner-job-started.sh
+      COPY job-completed.sh /usr/local/bin/gha-runner-job-completed.sh
+      COPY host_admission.py /usr/local/bin/gha-host-admission.py
+      RUN chmod 0755 /usr/local/bin/gha-runner-entrypoint /usr/local/bin/gha-runner-job-started.sh /usr/local/bin/gha-runner-job-completed.sh /usr/local/bin/gha-host-admission.py
       USER runner
       ENV CARGO_HOME=/opt/runner-rust/cargo
       ENV RUSTUP_HOME=/opt/runner-rust/rustup
@@ -242,7 +317,11 @@ write_files:
       USER 1001:1001
       ENV CARGO_HOME=/work/.cargo
       ENV PATH=/opt/runner-rust/cargo/bin:/work/.cargo/bin:${PATH}
+      ENV RUNNER_STATE=/runner-state
+      ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh
+      ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh
       WORKDIR /work
+      ENTRYPOINT ["/usr/local/bin/gha-runner-entrypoint"]
 
 runcmd:
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && dev="${DISK_DEVICE:-/dev/disk/by-id/google-runner-data}" && mp="${DISK_MOUNT:-/mnt/runner-data}" && if [[ ! -b "$dev" ]]; then echo "Missing persistent runner disk $dev" >&2; exit 1; fi && (blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -F "$dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp") && mountpoint -q "$mp" && mkdir -p "$mp/docker" "$mp/containerd" "$mp/instances" "$mp/work"'''
@@ -253,8 +332,8 @@ runcmd:
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker"'''
   - 'bash -lc ''set -euo pipefail && install -d -m 0755 -o runner -g runner /opt/runner-rust/cargo /opt/runner-rust/rustup && curl --proto "=https" --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup runuser -u runner -- sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup component add rustfmt clippy --toolchain 1.99.0 && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && chown -R root:root /opt/runner-rust && chmod -R a-w /opt/runner-rust && ln -sfn /opt/runner-rust/cargo/bin/* /usr/local/bin/ && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "'''
-  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-64}" "${RUNNER_MEMORY_GB:-32}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -v "${state_dir}:/runner-state" -v "${work_dir}:${work_dir}" oxidex-self-hosted-runner:2.337.0 ./config.sh --unattended --replace --name "${name}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${RUNNER_LABELS}" --work "${work_dir}"; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e GHA_ADMISSION_REQUIRED=1 -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:${work_dir}" oxidex-self-hosted-runner:2.337.0 ./run.sh; done'
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && cp /opt/gha-runners/host_admission.py /opt/gha-runners/build/host_admission.py && chmod 0755 /opt/gha-runners/build/entrypoint.sh /opt/gha-runners/build/job-started.sh /opt/gha-runners/build/job-completed.sh /opt/gha-runners/build/host_admission.py && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-64}" "${RUNNER_MEMORY_GB:-32}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -e RUNNER_CONFIGURE_ONLY=1 -e RUNNER_NAME="${name}" -e RUNNER_LABELS="${RUNNER_LABELS}" -e RUNNER_GROUP_NAME="${RUNNER_GROUP}" -e GITHUB_RUNNER_URL="${GITHUB_ORG_URL}" -e RUNNER_STATE=/runner-state -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e RUNNER_NAME="${name}" -e RUNNER_STATE=/runner-state -e GHA_ADMISSION_REQUIRED=1 -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; done'
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -395,6 +474,39 @@ write_files:
           if actual != str(instance_id):
               raise SystemExit(75)
 
+      def extract_safe_source_archive(upload_path, source, caller_uid):
+          source_root = source.resolve()
+          with tarfile.open(upload_path, 'r:gz') as tar:
+              for member in tar.getmembers():
+                  rel_parts = Path(member.name).parts
+                  if not rel_parts or '..' in rel_parts or Path(member.name).is_absolute():
+                      raise RuntimeError('Unsafe archive member path in source snapshot')
+                  member_path = (source_root / member.name).resolve()
+                  if not member_path.is_relative_to(source_root):
+                      raise RuntimeError('Unsafe archive member in source snapshot')
+                  if member.isdir():
+                      member_path.mkdir(parents=True, exist_ok=True, mode=0o750)
+                      os.chown(member_path, caller_uid, 1001)
+                      os.chmod(member_path, 0o2770)
+                  elif member.isfile():
+                      member_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+                      for parent in (member_path.parent, *member_path.parent.parents):
+                          if parent == source_root or not parent.is_relative_to(source_root):
+                              break
+                          os.chown(parent, caller_uid, 1001)
+                          os.chmod(parent, 0o2770)
+                      stream = tar.extractfile(member)
+                      if stream is None:
+                          raise RuntimeError('Unable to read archive file member')
+                      file_mode = 0o750 if (member.mode & 0o100) else 0o640
+                      fd = os.open(member_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, file_mode)
+                      with os.fdopen(fd, 'wb') as out_f:
+                          shutil.copyfileobj(stream, out_f)
+                          os.fchown(out_f.fileno(), caller_uid, 1001)
+                          os.fchmod(out_f.fileno(), file_mode)
+                  else:
+                      raise RuntimeError('Unsupported non-regular archive member in source snapshot')
+
       def run_cleanup(root, project, run, upload_path, instance_id):
           verify_instance_id(instance_id)
           upload_path.unlink(missing_ok=True)
@@ -417,6 +529,7 @@ write_files:
               raise ValueError('Invalid archive sha256 digest')
           if profile not in ('debug', 'release'):
               raise ValueError('Invalid build profile')
+          caller_uid = int(os.environ.get('SUDO_UID', '1001'))
           try:
               verify_instance_id(instance_id)
               if Path('/run/oxidex-build-draining').exists():
@@ -428,6 +541,17 @@ write_files:
                       fcntl.flock(cache_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                   except BlockingIOError:
                       raise SystemExit(75)
+                  ids = subprocess.check_output(
+                      ['/usr/bin/docker', 'ps', '-aq', '--filter', 'label=oxidex.remote-build=true'],
+                      text=True,
+                  ).split()
+                  for cid in ids:
+                      mounts = subprocess.check_output(
+                          ['/usr/bin/docker', 'inspect', '--format', '{{range .Mounts}}{{if eq .Destination "/target"}}{{.Source}}{{end}}{{end}}', cid],
+                          text=True,
+                      ).strip()
+                      if mounts == str(target):
+                          raise SystemExit(75)
                   subprocess.run(['/usr/local/bin/oxidex-remote-build', project, 'prepare'], check=True)
                   actual_digest = hashlib.sha256(upload_path.read_bytes()).hexdigest()
                   if actual_digest != digest:
@@ -437,12 +561,7 @@ write_files:
                           shutil.rmtree(child)
                       else:
                           child.unlink()
-                  with tarfile.open(upload_path, 'r:gz') as tar:
-                      for member in tar.getmembers():
-                          member_path = (source / member.name).resolve()
-                          if not member_path.is_relative_to(source.resolve()) or member.issym() or member.islnk():
-                              raise RuntimeError('Unsafe archive member in source snapshot')
-                      tar.extractall(source)
+                  extract_safe_source_archive(upload_path, source, caller_uid)
               stages = [['cargo', 'fetch', '--locked', '--target', 'x86_64-unknown-linux-gnu']]
               if profile == 'release':
                   stages.append(['just', 'cbindgen-check'])
@@ -458,7 +577,12 @@ write_files:
                   raise RuntimeError('Verified build binary is missing or a symlink')
               export = root / 'exports' / run / 'oxidex'
               export.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+              os.chown(root / 'exports', 0, 0)
+              os.chmod(root / 'exports', 0o755)
+              os.chown(export.parent, 0, 0)
+              os.chmod(export.parent, 0o755)
               shutil.copy2(binary, export)
+              os.chown(export, 0, 0)
               os.chmod(export, 0o755)
               out_digest = hashlib.sha256(export.read_bytes()).hexdigest()
               print(f'{out_digest}  {export}')

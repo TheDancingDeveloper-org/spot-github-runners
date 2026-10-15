@@ -75,8 +75,21 @@ def transaction_script(project,upload,digest,profile,run,instance_id=None):
         f'install -m 0755 {shlex.quote(binary)} {shlex.quote(export)}',
         f'sha256sum {shlex.quote(export)}',
     ])
-    return ('sudo flock --shared /run/oxidex-build.lock flock --exclusive '
-            f'/run/oxidex-project-{project}.lock sh -c '+shlex.quote(body)),export
+    tx_args = [
+        'sudo', '/usr/local/bin/oxidex-remote-transaction', 'build',
+        '--project', project,
+        '--run', run,
+        '--upload', upload,
+        '--digest', digest,
+        '--profile', profile,
+        *(['--instance-id', str(instance_id)] if instance_id else []),
+    ]
+    return (
+        'if test -x /usr/local/bin/oxidex-remote-transaction; then exec '
+        + shlex.join(tx_args)
+        + '; fi; sudo flock --shared /run/oxidex-build.lock flock --exclusive '
+        f'/run/oxidex-project-{project}.lock sh -c ' + shlex.quote(body)
+    ), export
 
 
 def identity_guard(instance_id):
@@ -114,9 +127,20 @@ def cleanup_script(project,upload,run,instance_id):
         '    shutil.rmtree(export)',
     ])
     body='set -eu; '+identity_guard(instance_id)+'; rm -f -- '+shlex.quote(upload)+'; /usr/bin/python3 -I -c '+shlex.quote(code)
+    tx_args = [
+        'sudo', '/usr/local/bin/oxidex-remote-transaction', 'cleanup',
+        '--project', project,
+        '--run', run,
+        '--upload', upload,
+        '--instance-id', str(instance_id),
+    ]
     # Serialize with a transaction that may still be finishing after SSH loss.
-    return ('sudo flock --shared /run/oxidex-build.lock flock --exclusive '
-            f'/run/oxidex-project-{project}.lock sh -c '+shlex.quote(body))
+    return (
+        'if test -x /usr/local/bin/oxidex-remote-transaction; then exec '
+        + shlex.join(tx_args)
+        + '; fi; sudo flock --shared /run/oxidex-build.lock flock --exclusive '
+        f'/run/oxidex-project-{project}.lock sh -c ' + shlex.quote(body)
+    )
 
 
 def make_snapshot(source: Path, archive: Path) -> dict:

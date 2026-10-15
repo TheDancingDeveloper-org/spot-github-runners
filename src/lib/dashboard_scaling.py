@@ -512,14 +512,23 @@ def evaluate_scaling_decision(
 
     # Scale-down evaluation (only when no scale-up triggers fired, no jobs are queued,
     # and target preserves capacity for both min_runners and active provisioned_jobs)
-    capacity_floor = min(max_runners, max(min_runners, provisioned_jobs))
+    capacity_floor = max(
+        min(max_runners, max(min_runners, provisioned_jobs)),
+        min(current_runners, provisioned_jobs),
+    )
     if not scale_up_reasons:
         if (
             cfg.get("enable_hourly_runs_scale_down", True)
             and jobs_ran_past_hour <= _finite_int_val(cfg.get("scale_down_max_jobs_past_hour", 5), "scale_down_max_jobs_past_hour")
             and queued_jobs == 0
         ):
-            low_target = max(capacity_floor, _finite_int_val(cfg.get("scale_down_target_runners", min_runners), "scale_down_target_runners"))
+            low_target = max(
+                capacity_floor,
+                min(
+                    max_runners,
+                    _finite_int_val(cfg.get("scale_down_target_runners", min_runners), "scale_down_target_runners"),
+                ),
+            )
             if low_target < current_runners:
                 scale_down_reasons.append(
                     {
@@ -557,15 +566,27 @@ def evaluate_scaling_decision(
         else:
             desired_runners = max(capacity_floor, current_runners)
     else:
-        desired_runners = min(max_runners, max(capacity_floor, desired_runners))
+        desired_runners = max(capacity_floor, min(max_runners, desired_runners))
 
-    # Compute desired instances from fleet state and runner density
+    # Compute desired instances from fleet state and runner density, quantizing scale-up to whole VM capacity
     if desired_runners == current_runners and known_current_instances is not None:
         desired_instances = current_instances_count
-    elif desired_runners > current_runners and known_current_instances is not None:
-        desired_instances = current_instances_count + math.ceil(
-            (desired_runners - current_runners) / runners_per_vm
-        )
+    elif desired_runners > current_runners:
+        if known_current_instances is not None:
+            added_instances = math.ceil((desired_runners - current_runners) / runners_per_vm)
+            max_add_by_runners = max(0, (max_runners - current_runners) // runners_per_vm)
+            added_instances = min(added_instances, max_add_by_runners)
+            desired_instances = current_instances_count + added_instances
+            desired_runners = current_runners + added_instances * runners_per_vm
+        else:
+            desired_instances = math.ceil(desired_runners / runners_per_vm)
+            max_instances_by_runners = max(current_instances_count, max_runners // runners_per_vm)
+            if desired_instances > max_instances_by_runners:
+                desired_instances = max_instances_by_runners
+            if desired_instances == current_instances_count:
+                desired_runners = current_runners
+            else:
+                desired_runners = desired_instances * runners_per_vm
     else:
         desired_instances = math.ceil(desired_runners / runners_per_vm) if desired_runners > 0 else 0
 
@@ -584,8 +605,10 @@ def evaluate_scaling_decision(
             desired_instances = max(current_instances_count, max_instances_cap)
             if desired_instances == current_instances_count:
                 desired_runners = current_runners
+            elif known_current_instances is not None:
+                desired_runners = current_runners + (desired_instances - current_instances_count) * runners_per_vm
             else:
-                desired_runners = min(desired_runners, desired_instances * runners_per_vm)
+                desired_runners = desired_instances * runners_per_vm
 
     # Enforce max scale-up budget caps (hourly, daily, monthly) without turning a blocked scale-up into a scale-down
     unit_hourly = max(0.0001, _finite_float_val(per_instance_hourly_usd, "per_instance_hourly_usd"))
@@ -641,8 +664,10 @@ def evaluate_scaling_decision(
         desired_instances = max(current_instances_count, max_affordable_instances)
         if desired_instances == current_instances_count:
             desired_runners = current_runners
+        elif known_current_instances is not None:
+            desired_runners = current_runners + (desired_instances - current_instances_count) * runners_per_vm
         else:
-            desired_runners = min(desired_runners, desired_instances * runners_per_vm)
+            desired_runners = desired_instances * runners_per_vm
         budget_cap_note = (
             f"Scale-up capped at {desired_instances} instance(s) ({desired_runners} runners) "
             f"by max scale-up budget (${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, "
@@ -813,16 +838,22 @@ def evaluate_builder_scaling_decision(
             )
             desired_instances = max(desired_instances, current_instances + 1)
 
-    capacity_floor = min(max_instances, max(min_instances, active_builds))
+    capacity_floor = max(
+        min(max_instances, max(min_instances, active_builds)),
+        min(current_instances, active_builds),
+    )
     if not scale_up_reasons:
         if (
             cfg.get("enable_low_builds_scale_down", True)
             and builds_ran_past_hour <= _finite_int_val(cfg.get("scale_down_max_builds_past_hour", 2), "scale_down_max_builds_past_hour")
             and queued_builds == 0
         ):
-            low_target = min(
-                max_instances,
-                max(capacity_floor, _finite_int_val(cfg.get("scale_down_target_instances", min_instances), "scale_down_target_instances")),
+            low_target = max(
+                capacity_floor,
+                min(
+                    max_instances,
+                    _finite_int_val(cfg.get("scale_down_target_instances", min_instances), "scale_down_target_instances"),
+                ),
             )
             if low_target < current_instances:
                 scale_down_reasons.append(
@@ -837,11 +868,11 @@ def evaluate_builder_scaling_decision(
                 )
                 desired_instances = low_target
             else:
-                desired_instances = min(max_instances, max(capacity_floor, current_instances))
+                desired_instances = max(capacity_floor, min(max_instances, current_instances))
         else:
-            desired_instances = min(max_instances, max(capacity_floor, current_instances))
+            desired_instances = max(capacity_floor, min(max_instances, current_instances))
     else:
-        desired_instances = min(max_instances, max(capacity_floor, desired_instances))
+        desired_instances = max(capacity_floor, min(max_instances, desired_instances))
 
     unit_hourly = max(0.0001, _finite_float_val(per_instance_hourly_usd, "per_instance_hourly_usd"))
     max_hourly_cap = _finite_float_val(cfg.get("max_scale_up_hourly_usd", 3.50), "max_scale_up_hourly_usd")

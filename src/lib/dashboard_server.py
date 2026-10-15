@@ -887,14 +887,23 @@ class DashboardStore:
                 self._normalize_project_derived_fields()
                 self._normalize_github_ci_runs()
                 self._sync_fleet_telemetry()
-                self._persist()
             except (OSError, json.JSONDecodeError):
                 self.state = default_dashboard_state(project=project, org=org)
                 self._sync_fleet_telemetry()
+            else:
+                try:
+                    self._persist()
+                except OSError:
+                    # Preserve loaded and normalized in-memory state when startup write-back fails.
+                    pass
         else:
             self.state = default_dashboard_state(project=project, org=org)
             self._sync_fleet_telemetry()
-            self._persist()
+            try:
+                self._persist()
+            except OSError:
+                # Preserve default in-memory state when initial persistence fails on a read-only path.
+                pass
 
     def _normalize_project_derived_fields(self) -> None:
         """Ensure project/org metadata and gcloud SSH commands match the active store configuration."""
@@ -3072,6 +3081,8 @@ def make_handler(
     )
 
     class DashboardRequestHandler(BaseHTTPRequestHandler):
+        timeout = 10.0
+
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
 
@@ -3233,7 +3244,11 @@ def make_handler(
                 )
             if length == 0:
                 return {}
-            raw_bytes = self.rfile.read(length)
+            try:
+                raw_bytes = self.rfile.read(length)
+            except (TimeoutError, OSError) as exc:
+                self.close_connection = True
+                raise ValueError("Request body read timed out") from exc
             if len(raw_bytes) != length:
                 self.close_connection = True
                 raise ValueError("Truncated request body")
