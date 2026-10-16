@@ -97,18 +97,22 @@ write_files:
       RUNNER_GROUP="Default"
       RUNNER_LABELS="self-hosted,Linux,X64,spot-runner,rust,docker"
       RUNNERS_COUNT="4"
+      DISK_DEVICE="/dev/disk/by-id/google-runner-data"
+      DISK_MOUNT="/mnt/runner-data"
 
 runcmd:
-  # 1. Install Official Docker Engine & Buildx (select Debian vs Ubuntu repository from /etc/os-release)
+  # 1. Mount persistent runner data disk at /mnt/runner-data and relocate Docker/runner state
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && dev="${DISK_DEVICE:-/dev/disk/by-id/google-runner-data}" && mp="${DISK_MOUNT:-/mnt/runner-data}" && if [[ -b "$dev" ]]; then (blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -F "$dev") && mkdir -p "$mp" && uuid="$(blkid -s UUID -o value "$dev")" && (grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mp ext4 defaults,nofail 0 2" >> /etc/fstab) && (mountpoint -q "$mp" || mount "$mp") && mountpoint -q "$mp"; else mkdir -p "$mp"; fi && mkdir -p "$mp/docker" "$mp/containerd" "$mp/instances" "$mp/work"'''
+  # 2. Install Official Docker Engine & Buildx (select Debian vs Ubuntu repository from /etc/os-release)
   - install -m 0755 -d /etc/apt/keyrings
   - 'curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}")/gpg" -o /etc/apt/keyrings/docker.asc'
   - chmod a+r /etc/apt/keyrings/docker.asc
   - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
-  - systemctl enable --now docker
-  # 2. Download, Configure & Start Persistent GitHub Actions Runner Slots with live GCE region & machine-family labels
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker'''
+  # 3. Download, Configure & Start Persistent GitHub Actions Runner Slots with live GCE region & machine-family labels
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${dir}"; chown -R runner:runner "${dir}"; (cd "${dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}" && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -750,6 +754,38 @@ write_files:
                   raise RuntimeError('Noncanonical export path')
               shutil.rmtree(export)
 
+      def reconcile_project_containers(source, target):
+          ids = subprocess.check_output(
+              ['/usr/bin/docker', 'ps', '-aq', '--no-trunc', '--filter', 'label=oxidex.remote-build=true'],
+              text=True,
+          ).split()
+          for cid in ids:
+              rows = json.loads(
+                  subprocess.check_output(['/usr/bin/docker', 'inspect', cid], text=True)
+              )
+              if not rows or not isinstance(rows[0], dict):
+                  raise SystemExit(75)
+              record = rows[0]
+              mounts = record.get('Mounts') or []
+              matches_project = any(
+                  isinstance(m, dict) and m.get('Source') in (str(source), str(target))
+                  for m in mounts
+              )
+              if not matches_project:
+                  continue
+              state = record.get('State') or {}
+              is_stopped = (
+                  isinstance(state, dict)
+                  and state.get('Running') is False
+                  and state.get('Paused') is False
+                  and state.get('Restarting') is False
+                  and state.get('Pid') == 0
+                  and state.get('Status') in ('created', 'exited', 'dead')
+              )
+              if not is_stopped:
+                  raise SystemExit(75)
+              subprocess.run(['/usr/bin/docker', 'rm', cid], check=True, stdout=subprocess.DEVNULL)
+
       def run_build(root, project, run, upload_path, digest, profile, instance_id):
           if not re.fullmatch(r'[0-9a-f]{64}', digest):
               raise ValueError('Invalid archive sha256 digest')
@@ -761,23 +797,13 @@ write_files:
                   raise SystemExit(75)
               source = root / 'sources' / project
               target = root / 'targets' / project
+              subprocess.run(['/usr/local/bin/oxidex-remote-build', project, 'prepare'], check=True)
               with open(f'/run/oxidex-cache-active-{project}.lock', 'a') as cache_lock:
                   try:
                       fcntl.flock(cache_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                   except BlockingIOError:
                       raise SystemExit(75)
-                  ids = subprocess.check_output(
-                      ['/usr/bin/docker', 'ps', '-aq', '--filter', 'label=oxidex.remote-build=true'],
-                      text=True,
-                  ).split()
-                  for cid in ids:
-                      mounts = subprocess.check_output(
-                          ['/usr/bin/docker', 'inspect', '--format', '{{range .Mounts}}{{if eq .Destination "/target"}}{{.Source}}{{end}}{{end}}', cid],
-                          text=True,
-                      ).strip()
-                      if mounts == str(target):
-                          raise SystemExit(75)
-                  subprocess.run(['/usr/local/bin/oxidex-remote-build', project, 'prepare'], check=True)
+                  reconcile_project_containers(source, target)
                   extract_safe_source_archive(upload_path, source, digest)
               stages = [['cargo', 'fetch', '--locked', '--target', 'x86_64-unknown-linux-gnu']]
               if profile == 'release':
@@ -877,27 +903,31 @@ write_files:
           if len(sys.argv) < 2:
               raise ValueError('Project identifier is required')
           project = validate_project(sys.argv[1])
-          for path in (root, root / 'sources', root / 'targets', root / 'cargo', root / 'sources' / project, root / 'targets' / project):
-              checked_path(path)
-              path.mkdir(parents=True, exist_ok=True)
-          if sys.argv[2:] == ['prepare']:
-              source = root / 'sources' / project
-              for anc in (root, root / 'sources', source):
-                  os.chown(anc, 0, 1001)
-                  anc.chmod(0o750)
-              for path in (root / 'targets' / project, root / 'cargo'):
-                  os.chown(path, 1001, 1001)
-              print(source)
-              return
-          command = sys.argv[2:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']
-          if command[0] not in allowed_commands:
-              raise ValueError(f'Unsupported build command: {command[0]}')
-          if cpus < 1 or memory_gib < 1:
-              raise ValueError('Resource limits must be positive')
-          with open('/run/oxidex-build.lock', 'a') as lock:
+          with open('/run/oxidex-build.lock', 'a') as lock, open(f'/run/oxidex-cache-active-{project}.lock', 'a') as active_lock:
               fcntl.flock(lock, fcntl.LOCK_SH)
+              try:
+                  fcntl.flock(active_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+              except BlockingIOError:
+                  raise SystemExit(75)
               if Path('/run/oxidex-build-draining').exists():
                   raise SystemExit(75)
+              for path in (root, root / 'sources', root / 'targets', root / 'cargo', root / 'sources' / project, root / 'targets' / project):
+                  checked_path(path)
+                  path.mkdir(parents=True, exist_ok=True)
+              if sys.argv[2:] == ['prepare']:
+                  source = root / 'sources' / project
+                  for anc in (root, root / 'sources', source):
+                      os.chown(anc, 0, 1001)
+                      anc.chmod(0o750)
+                  for path in (root / 'targets' / project, root / 'cargo'):
+                      os.chown(path, 1001, 1001)
+                  print(source)
+                  return
+              command = sys.argv[2:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']
+              if command[0] not in allowed_commands:
+                  raise ValueError(f'Unsupported build command: {command[0]}')
+              if cpus < 1 or memory_gib < 1:
+                  raise ValueError('Resource limits must be positive')
               cmd = [
                   'docker', 'run', '--rm', '--user=1001:1001', f'--cpus={cpus}',
                   '--label=oxidex.remote-build=true',
@@ -2349,7 +2379,7 @@ def _validate_cloud_init_syntax(
                     )
                     _, _, v_part = after_dash.partition(":")
                     v_str = v_part.strip()
-                    if re.search(r":\s*[|>][-+]?\s*$", after_dash):
+                    if re.search(r":\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*$", after_dash):
                         block_scalar_indent = indent
                         scopes.append(
                             {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": False}
@@ -2373,7 +2403,7 @@ def _validate_cloud_init_syntax(
                             {"indent": indent, "kind": "list", "child_indent": None, "allow_children": True}
                         )
                         continue
-                    if re.search(r"^[|>][-+]?\s*$", after_dash):
+                    if re.search(r"^[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*$", after_dash):
                         block_scalar_indent = indent
                     else:
                         errors.extend(
@@ -2385,7 +2415,7 @@ def _validate_cloud_init_syntax(
             else:
                 _, _, v_part = stripped.partition(":")
                 v_str = v_part.strip()
-                if re.search(r":\s*[|>][-+]?\s*$", stripped):
+                if re.search(r":\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*$", stripped):
                     block_scalar_indent = indent
                     scopes.append(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
@@ -2395,7 +2425,10 @@ def _validate_cloud_init_syntax(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": True}
                     )
                 else:
-                    m_block_anchor = re.match(r"^&([A-Za-z0-9_-]+)\s+[|>][-+]?\s*$", v_str)
+                    m_block_anchor = re.match(
+                        r"^&([A-Za-z0-9_-]+)\s+[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*$",
+                        v_str,
+                    )
                     if m_block_anchor:
                         defined_anchors.add(m_block_anchor.group(1))
                         block_scalar_indent = indent

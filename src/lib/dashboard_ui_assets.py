@@ -2390,6 +2390,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     async function saveAndEvaluateScaling() {
       const curSc = APP_STATE?.scaling?.cicd_runner || {};
+      const nextHourlyUsd = parseFloat(document.getElementById("sc-budget-hr").value || String(curSc.max_scale_up_hourly_usd ?? 5));
+      const nextDailyUsd = parseFloat(document.getElementById("sc-budget-day").value || String(curSc.max_scale_up_daily_usd ?? 10));
+      const nextMonthlyUsd = parseFloat(document.getElementById("sc-budget-mo").value || String(curSc.max_scale_up_monthly_usd ?? 50));
+      const budgetCapsEdited = (
+        Math.abs(nextHourlyUsd - Number(curSc.max_scale_up_hourly_usd ?? 5)) > 1e-6 ||
+        Math.abs(nextDailyUsd - Number(curSc.max_scale_up_daily_usd ?? 10)) > 1e-6 ||
+        Math.abs(nextMonthlyUsd - Number(curSc.max_scale_up_monthly_usd ?? 50)) > 1e-6
+      );
       const policy = {
         min_runners: parseInt(document.getElementById("sc-min-runners").value || "4", 10),
         max_runners: parseInt(document.getElementById("sc-max-runners").value || "24", 10),
@@ -2400,9 +2408,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         cpu_scope: document.getElementById("sc-cpu-scope").value,
         scale_down_max_jobs_past_hour: parseInt(document.getElementById("sc-hourly-down-max").value || "5", 10),
         scale_down_target_runners: parseInt(document.getElementById("sc-hourly-down-target").value || "4", 10),
-        max_scale_up_hourly_usd: parseFloat(document.getElementById("sc-budget-hr").value || String(curSc.max_scale_up_hourly_usd ?? 5)),
-        max_scale_up_daily_usd: parseFloat(document.getElementById("sc-budget-day").value || String(curSc.max_scale_up_daily_usd ?? 10)),
-        max_scale_up_monthly_usd: parseFloat(document.getElementById("sc-budget-mo").value || String(curSc.max_scale_up_monthly_usd ?? 50)),
+        ...(budgetCapsEdited ? {
+          max_scale_up_hourly_usd: nextHourlyUsd,
+          max_scale_up_daily_usd: nextDailyUsd,
+          max_scale_up_monthly_usd: nextMonthlyUsd,
+          shared_global_budget: false
+        } : {}),
         enable_queued_jobs_trigger: document.getElementById("sc-en-queued").checked,
         enable_provisioned_jobs_trigger: document.getElementById("sc-en-prov").checked,
         enable_hourly_runs_scale_up: document.getElementById("sc-en-hourly-up").checked,
@@ -2433,6 +2444,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     async function saveAndEvaluateBuilderScaling() {
       const curBsc = APP_STATE?.scaling?.rust_builder || {};
+      const nextHourlyUsd = parseFloat(document.getElementById("sc-builder-budget-hr").value || String(curBsc.max_scale_up_hourly_usd ?? 3.5));
+      const nextDailyUsd = parseFloat(document.getElementById("sc-builder-budget-day").value || String(curBsc.max_scale_up_daily_usd ?? 12));
+      const nextMonthlyUsd = parseFloat(document.getElementById("sc-builder-budget-mo").value || String(curBsc.max_scale_up_monthly_usd ?? 80));
+      const budgetCapsEdited = (
+        Math.abs(nextHourlyUsd - Number(curBsc.max_scale_up_hourly_usd ?? 3.5)) > 1e-6 ||
+        Math.abs(nextDailyUsd - Number(curBsc.max_scale_up_daily_usd ?? 12)) > 1e-6 ||
+        Math.abs(nextMonthlyUsd - Number(curBsc.max_scale_up_monthly_usd ?? 80)) > 1e-6
+      );
       const policy = {
         min_instances: parseInt(document.getElementById("sc-builder-min-inst").value || "1", 10),
         max_instances: parseInt(document.getElementById("sc-builder-max-inst").value || "6", 10),
@@ -2441,9 +2460,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         cpu_scope: curBsc.cpu_scope || "majority",
         scale_down_max_builds_past_hour: parseInt(document.getElementById("sc-builder-down-max").value || "2", 10),
         scale_down_target_instances: parseInt(document.getElementById("sc-builder-down-target").value || "1", 10),
-        max_scale_up_hourly_usd: parseFloat(document.getElementById("sc-builder-budget-hr").value || String(curBsc.max_scale_up_hourly_usd ?? 3.5)),
-        max_scale_up_daily_usd: parseFloat(document.getElementById("sc-builder-budget-day").value || String(curBsc.max_scale_up_daily_usd ?? 12)),
-        max_scale_up_monthly_usd: parseFloat(document.getElementById("sc-builder-budget-mo").value || String(curBsc.max_scale_up_monthly_usd ?? 80)),
+        ...(budgetCapsEdited ? {
+          max_scale_up_hourly_usd: nextHourlyUsd,
+          max_scale_up_daily_usd: nextDailyUsd,
+          max_scale_up_monthly_usd: nextMonthlyUsd,
+          shared_global_budget: false
+        } : {}),
         enable_queue_trigger: document.getElementById("sc-builder-en-queue").checked,
         enable_cpu_utilization_trigger: document.getElementById("sc-builder-en-cpu").checked,
         enable_journal_oom_trigger: document.getElementById("sc-builder-en-oom").checked,

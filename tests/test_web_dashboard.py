@@ -2403,6 +2403,101 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         parsed_odd = parse_cloud_init(valid_odd_indent_yaml)
         self.assertTrue(parsed_odd["valid"], f"Expected valid odd-indented YAML: {parsed_odd}")
 
+    def test_round14_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+            parse_cloud_init,
+        )
+
+        # 1. Standard runner cloud-init mounts /dev/disk/by-id/google-runner-data at /mnt/runner-data
+        self.assertIn("/dev/disk/by-id/google-runner-data", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn('DISK_MOUNT="/mnt/runner-data"', DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn('mountpoint -q "$mp"', DEFAULT_RUNNER_CLOUD_INIT)
+
+        # 2 & 3. Rust builder cloud-init reconciles lingering containers and holds active lock across prepare + docker run
+        self.assertIn("def reconcile_project_containers(source, target):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("reconcile_project_containers(source, target)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("open(f'/run/oxidex-cache-active-{project}.lock', 'a') as active_lock:", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        # 4. parse_cloud_init accepts indicator-first YAML block-scalar headers like |-2 and >+4
+        block_scalar_yaml = (
+            "#cloud-config\n"
+            "write_files:\n"
+            "  - path: /etc/test.conf\n"
+            "    content: |-2\n"
+            "      hello\n"
+            "  - path: /etc/test2.conf\n"
+            "    content: >+4\n"
+            "        world\n"
+        )
+        parsed_block = parse_cloud_init(block_scalar_yaml)
+        self.assertTrue(parsed_block["valid"], f"Expected valid block-scalar YAML: {parsed_block}")
+
+        # 5. Ordinary /api/scaling updates preserve shared_global_budget when budget caps are unchanged
+        self._post(
+            "/api/budget",
+            {
+                "target": "global",
+                "max_hourly_usd": 15.0,
+                "max_daily_usd": 150.0,
+                "max_monthly_usd": 1500.0,
+                "include_disk_costs": True,
+                "include_taxes": True,
+            },
+        )
+        ov_global = self._get("/api/overview")
+        runner_scaling = dict(ov_global["scaling"]["cicd_runner"])
+        self.assertTrue(runner_scaling["shared_global_budget"])
+        runner_scaling.pop("shared_global_budget", None)
+        runner_scaling.pop("global_budget_enforced", None)
+        runner_scaling["max_instances"] = 9
+        self._post("/api/scaling", runner_scaling)
+        ov_after_scaling = self._get("/api/overview")
+        self.assertTrue(ov_after_scaling["scaling"]["cicd_runner"]["shared_global_budget"])
+        self.assertTrue(ov_after_scaling["scaling"]["rust_builder"]["shared_global_budget"])
+
+        # 6. Profile tax override (override_regional_tax + tax_rate_percent) applies to instances and budget calculations
+        for role_name in ("cicd_runner", "rust_builder"):
+            self._post(
+                f"/api/profile/{role_name}",
+                {
+                    "override_regional_tax": True,
+                    "tax_rate_percent": 0.0,
+                },
+            )
+        inst_zero_tax = self._get("/api/instances")
+        for inst in inst_zero_tax["instances"]:
+            if inst["status"] in ("RUNNING", "PROVISIONING", "STAGING"):
+                self.assertEqual(inst["pricing"]["tax_rate_percent"], 0.0)
+                self.assertEqual(inst["pricing"]["tax_hourly_usd"], 0.0)
+        self._post(
+            "/api/budget",
+            {
+                "target": "global",
+                "max_hourly_usd": 15.0,
+                "max_daily_usd": 150.0,
+                "max_monthly_usd": 1500.0,
+                "include_disk_costs": True,
+                "include_taxes": True,
+            },
+        )
+        burn_zero_tax = self._get("/api/overview")["scaling_evaluation"]["projected_hourly_usd"]
+        self._post(
+            "/api/budget",
+            {
+                "target": "global",
+                "max_hourly_usd": 15.0,
+                "max_daily_usd": 150.0,
+                "max_monthly_usd": 1500.0,
+                "include_disk_costs": True,
+                "include_taxes": False,
+            },
+        )
+        burn_no_tax = self._get("/api/overview")["scaling_evaluation"]["projected_hourly_usd"]
+        self.assertAlmostEqual(burn_zero_tax, burn_no_tax, places=5)
+
 
 if __name__ == "__main__":
     unittest.main()
+

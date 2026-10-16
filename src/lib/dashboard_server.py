@@ -110,11 +110,16 @@ def _build_instance_record(
     ram_utilization_percent: float = 54.0,
     project: str = "homelab-424523",
     now_epoch: float | None = None,
+    tax_rate_percent: float | None = None,
 ) -> dict[str, Any]:
     ref_now = now_epoch if now_epoch is not None else time.time()
     family = machine_type.split("-", 1)[0]
     reg_info = next((r for r in REGIONS_CATALOG if r["region"] == region), REGIONS_CATALOG[0])
-    tax_rate = float(reg_info.get("tax_rate_default", 8.25))
+    tax_rate = (
+        float(tax_rate_percent)
+        if tax_rate_percent is not None
+        else float(reg_info.get("tax_rate_default", 8.25))
+    )
     pricing = calculate_spot_pricing(
         family=family,
         vcpu=vcpu,
@@ -1192,6 +1197,11 @@ class DashboardStore:
                     and family in r.get("families", [])
                 ] or [REGIONS_CATALOG[0]]
                 tpl_rates: list[float] = []
+                override_tax_rate = (
+                    float(budget.get("tax_rate_percent", 0.0))
+                    if budget.get("override_regional_tax")
+                    else None
+                )
                 for reg_info in enabled_regs:
                     pricing = calculate_spot_pricing(
                         family=family,
@@ -1202,7 +1212,11 @@ class DashboardStore:
                         boot_disk_gb=int(vm_tpl.get("boot_disk_gb", 40)),
                         data_disk_type=str(vm_tpl.get("data_disk_type", "hyperdisk-balanced")),
                         data_disk_gb=int(vm_tpl.get("data_disk_gb", 100)),
-                        tax_rate_percent=float(reg_info.get("tax_rate_default", 8.25)),
+                        tax_rate_percent=(
+                            override_tax_rate
+                            if override_tax_rate is not None
+                            else float(reg_info.get("tax_rate_default", 8.25))
+                        ),
                         machine_type=str(tpl_machine or "n2-standard-16"),
                         project=self.project,
                     )
@@ -1318,6 +1332,26 @@ class DashboardStore:
             ):
                 continue
             cur_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else {}
+            inst_role = str(inst.get("role", "cicd_runner"))
+            prof_budget = (
+                self.state.get("profiles", {})
+                .get(inst_role, {})
+                .get("budget", {})
+            )
+            reg_info = next(
+                (r for r in REGIONS_CATALOG if r["region"] == str(inst["region"])),
+                REGIONS_CATALOG[0],
+            )
+            tax_rate_pct = (
+                float(prof_budget.get("tax_rate_percent", 0.0))
+                if isinstance(prof_budget, dict) and prof_budget.get("override_regional_tax")
+                else float(
+                    reg_info.get(
+                        "tax_rate_default",
+                        cur_pricing.get("tax_rate_percent", 8.25) or 8.25,
+                    )
+                )
+            )
             inst["pricing"] = calculate_spot_pricing(
                 family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
                 vcpu=int(inst.get("vcpu", 16)),
@@ -1327,7 +1361,7 @@ class DashboardStore:
                 boot_disk_gb=int(inst.get("boot_disk_gb", 40)),
                 data_disk_type=str(inst.get("data_disk_type", "hyperdisk-balanced")),
                 data_disk_gb=int(inst.get("data_disk_gb", 100)),
-                tax_rate_percent=cur_pricing.get("tax_rate_percent"),
+                tax_rate_percent=tax_rate_pct,
                 machine_type=str(inst["machine_type"]),
                 project=self.project,
             )
@@ -1638,18 +1672,30 @@ class DashboardStore:
                     self.state["global_budget"] = normalized
                     self.state["global_budget_enforced"] = True
                     for role_key in ("cicd_runner", "rust_builder"):
-                        self.state["profiles"][role_key]["budget"] = dict(normalized)
+                        prev_role_budget = (
+                            self.state["profiles"][role_key].get("budget", {})
+                            if isinstance(self.state["profiles"][role_key].get("budget"), dict)
+                            else {}
+                        )
+                        role_budget = dict(normalized)
+                        if "override_regional_tax" not in payload and "override_regional_tax" in prev_role_budget:
+                            role_budget["override_regional_tax"] = bool(prev_role_budget["override_regional_tax"])
+                        if "tax_rate_percent" not in payload and "tax_rate_percent" in prev_role_budget:
+                            role_budget["tax_rate_percent"] = float(prev_role_budget["tax_rate_percent"])
+                        self.state["profiles"][role_key]["budget"] = role_budget
                         self.state["scaling"][role_key]["max_scale_up_hourly_usd"] = normalized["max_hourly_usd"]
                         self.state["scaling"][role_key]["max_scale_up_daily_usd"] = normalized["max_daily_usd"]
                         self.state["scaling"][role_key]["max_scale_up_monthly_usd"] = normalized["max_monthly_usd"]
                         self.state["scaling"][role_key]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
                         self.state["scaling"][role_key]["shared_global_budget"] = True
+                self._refresh_instances_pricing()
                 self._persist()
             except Exception:
                 self.state["profiles"] = prev_profiles
                 self.state["scaling"] = prev_scaling
                 self.state["global_budget"] = prev_global
                 self.state["global_budget_enforced"] = prev_global_enforced
+                self._refresh_instances_pricing()
                 raise
             return {"status": "ok", "target": target, "budget": normalized}
 
@@ -1735,10 +1781,20 @@ class DashboardStore:
                 raise ValueError("max_instances must be >= min_instances")
 
             normalized_budget: dict[str, Any] | None = None
+            tax_override_updated = False
             if "budget" in payload and isinstance(payload["budget"], dict):
                 merged_budget_input = {**candidate.get("budget", {}), **payload["budget"]}
                 normalized_budget = normalize_budget(merged_budget_input)
                 candidate["budget"] = normalized_budget
+            elif "override_regional_tax" in payload or "tax_rate_percent" in payload:
+                tax_patch: dict[str, Any] = {}
+                if "override_regional_tax" in payload:
+                    tax_patch["override_regional_tax"] = payload["override_regional_tax"]
+                if "tax_rate_percent" in payload:
+                    tax_patch["tax_rate_percent"] = payload["tax_rate_percent"]
+                merged_budget_input = {**candidate.get("budget", {}), **tax_patch}
+                candidate["budget"] = normalize_budget(merged_budget_input)
+                tax_override_updated = True
 
             active_tpl: dict[str, Any] | None = None
             validated_tpl_units: int | None = None
@@ -1801,6 +1857,8 @@ class DashboardStore:
                     self.state["scaling"]["rust_builder"]["builder_vcpu"] = int(candidate["runner_vcpu"])
                     self.state["scaling"]["rust_builder"]["container_ram_gib"] = float(candidate["runner_ram_gib"])
                     self.state["scaling"]["rust_builder"]["builder_ram_gib"] = float(candidate["runner_ram_gib"])
+                if normalized_budget is not None or tax_override_updated:
+                    self._refresh_instances_pricing()
                 self._persist()
             except Exception:
                 self.state["profiles"] = prev_profiles
@@ -1808,6 +1866,7 @@ class DashboardStore:
                 self.state["vm_templates"] = prev_vm_templates
                 self.state["scaling_telemetry"] = prev_telemetry
                 self.state["global_budget_enforced"] = prev_global_enforced
+                self._refresh_instances_pricing()
                 raise
             return {"status": "ok", "profile": candidate, "qualification": qual}
 
@@ -1868,6 +1927,20 @@ class DashboardStore:
             prev_global_enforced = bool(self.state.get("global_budget_enforced", False))
             try:
                 if "policy" in payload and isinstance(payload["policy"], dict):
+                    prev_role_sc = prev_scaling.get(role, {})
+                    budget_cap_changed = any(
+                        k in payload["policy"]
+                        and abs(
+                            _finite_float(payload["policy"][k], k)
+                            - float(prev_role_sc.get(k, 0.0))
+                        )
+                        > 1e-6
+                        for k in (
+                            "max_scale_up_hourly_usd",
+                            "max_scale_up_daily_usd",
+                            "max_scale_up_monthly_usd",
+                        )
+                    )
                     self.state["scaling"][role].update(payload["policy"])
                     pol_target = self.state["scaling"][role]
                     prof_budget = self.state["profiles"][role].setdefault("budget", {})
@@ -1882,14 +1955,7 @@ class DashboardStore:
                     if (
                         payload["policy"].get("shared_global_budget") is False
                         or (
-                            any(
-                                k in payload["policy"]
-                                for k in (
-                                    "max_scale_up_hourly_usd",
-                                    "max_scale_up_daily_usd",
-                                    "max_scale_up_monthly_usd",
-                                )
-                            )
+                            budget_cap_changed
                             and "shared_global_budget" not in payload["policy"]
                         )
                     ):
@@ -2581,6 +2647,12 @@ class DashboardStore:
                         )
                         prefix = "oxidex-runners" if role == "cicd_runner" else "builder-oxidex"
                         new_name = f"{prefix}-{region}-{uuid.uuid4().hex[:4]}"
+                        prof_budget = prof.get("budget", {}) if isinstance(prof.get("budget"), dict) else {}
+                        override_tax = (
+                            float(prof_budget.get("tax_rate_percent", 0.0))
+                            if prof_budget.get("override_regional_tax")
+                            else None
+                        )
                         created = _build_instance_record(
                             instance_id=str(int(now_ts * 1000) + idx),
                             name=new_name,
@@ -2608,6 +2680,7 @@ class DashboardStore:
                             ram_utilization_percent=40.0,
                             project=self.project,
                             now_epoch=now_ts,
+                            tax_rate_percent=override_tax,
                         )
                         new_records.append(created)
 
