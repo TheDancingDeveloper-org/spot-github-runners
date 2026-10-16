@@ -2943,7 +2943,7 @@ class DashboardStore:
             has_hits = payload.get("cache_hits") is not None
             has_misses = payload.get("cache_misses") is not None
             has_total = payload.get("total_crates") is not None
-            has_existing_crates = bool(existing_build and int(existing_build.get("total_crates", 0)) > 0)
+            has_existing_crates = bool(existing_build)
             if has_hits:
                 cache_hits = _finite_int(payload["cache_hits"], "cache_hits", min_val=0)
             elif has_total and has_misses:
@@ -3056,14 +3056,14 @@ class DashboardStore:
             existing_peak_ram = existing_build.get("peak_ram_gib")
             default_peak_ram = (
                 existing_peak_ram
-                if (existing_peak_ram is not None and float(existing_peak_ram) > 0.0)
-                else (0.0 if is_non_delivered else 20.5)
+                if existing_peak_ram is not None
+                else 0.0
             )
             existing_cpu_time = existing_build.get("cpu_time_seconds")
             default_cpu_time = (
                 existing_cpu_time
-                if (existing_cpu_time is not None and float(existing_cpu_time) > 0.0)
-                else (0.0 if is_non_delivered else 1120.0)
+                if existing_cpu_time is not None
+                else 0.0
             )
 
             raw = {

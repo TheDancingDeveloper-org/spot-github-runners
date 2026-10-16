@@ -112,7 +112,7 @@ runcmd:
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker'''
   # 3. Download, Configure & Start Persistent GitHub Actions Runner Slots with live GCE region & machine-family labels
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}" && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && if [[ ! -f .runner ]]; then runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}"; fi && rm -f .service && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -362,7 +362,10 @@ write_files:
                           if isinstance(exc, OrphanRunnerHook):
                               answer['code'] = 'orphaned-runner-hook'
                               answer['error'] = 'ORPHAN_RUNNER_HOOK: ' + str(exc)[:180]
-                      conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))
+                      try:
+                          conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))
+                      except OSError:
+                          pass
 
       def request(action='acquire'):
           with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -2393,7 +2396,9 @@ def _validate_cloud_init_syntax(
                 )
                 continue
 
-            is_mapping = bool(re.match(r"^[A-Za-z0-9_.-]+\s*:(?:\s+.*|\s*)$", stripped))
+            mapping_key_re = r'^(?P<key>[A-Za-z0-9_.-]+|"(?:[^"\\]|\\.)*"|\'(?:[^\']|\'\')*\')\s*:(?P<val>\s+.*|\s*)$'
+            m_map_line = re.match(mapping_key_re, stripped)
+            is_mapping = bool(m_map_line)
             is_list_item = bool(re.match(r"^-(?:\s+.*|\s*)$", stripped))
             if not (is_mapping or is_list_item):
                 errors.append(
@@ -2436,18 +2441,24 @@ def _validate_cloud_init_syntax(
 
             if is_list_item:
                 after_dash = stripped[1:].lstrip(" ")
+                m_list_map = re.match(mapping_key_re, after_dash) if after_dash else None
                 if not after_dash:
                     scopes.append(
                         {"indent": indent, "kind": "list", "child_indent": None, "allow_children": True}
                     )
-                elif re.match(r"^[A-Za-z0-9_.-]+\s*:(?:\s+.*|\s*)$", after_dash):
+                elif m_list_map:
+                    list_key_str = m_list_map.group("key")
+                    if list_key_str.startswith(("'", '"')):
+                        errors.extend(
+                            _validate_yaml_flow_value(list_key_str, idx, defined_anchors=defined_anchors)
+                        )
                     key_indent = indent + (len(stripped) - len(after_dash))
                     scopes.append(
                         {"indent": indent, "kind": "list", "child_indent": key_indent, "allow_children": True}
                     )
-                    _, _, v_part = after_dash.partition(":")
+                    v_part = m_list_map.group("val")
                     v_str = v_part.strip()
-                    if re.search(r":\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*$", after_dash):
+                    if re.search(r"^[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*$", v_str):
                         block_scalar_indent = indent
                         scopes.append(
                             {"indent": key_indent, "kind": "map", "child_indent": None, "allow_children": False}
@@ -2481,9 +2492,15 @@ def _validate_cloud_init_syntax(
                         {"indent": indent, "kind": "list", "child_indent": None, "allow_children": False}
                     )
             else:
-                _, _, v_part = stripped.partition(":")
+                assert m_map_line is not None
+                map_key_str = m_map_line.group("key")
+                if map_key_str.startswith(("'", '"')):
+                    errors.extend(
+                        _validate_yaml_flow_value(map_key_str, idx, defined_anchors=defined_anchors)
+                    )
+                v_part = m_map_line.group("val")
                 v_str = v_part.strip()
-                if re.search(r":\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*$", stripped):
+                if re.search(r"^[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*$", v_str):
                     block_scalar_indent = indent
                     scopes.append(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
@@ -2580,8 +2597,8 @@ def parse_cloud_init(content: str) -> dict[str, Any]:
     is_cloud_config = bool(lines and lines[0].strip().startswith("#cloud-config"))
     is_shell_script = bool(lines and lines[0].strip().startswith("#!"))
 
-    package_update = bool(re.search(r"^\s*package_update:\s*true\b", text, re.M | re.I))
-    package_upgrade = bool(re.search(r"^\s*package_upgrade:\s*true\b", text, re.M | re.I))
+    package_update = bool(re.search(r'^\s*["\']?package_update["\']?\s*:\s*true\b', text, re.M | re.I))
+    package_upgrade = bool(re.search(r'^\s*["\']?package_upgrade["\']?\s*:\s*true\b', text, re.M | re.I))
 
     def _extract_top_list(section_name: str) -> list[str]:
         items: list[str] = []
@@ -2590,11 +2607,11 @@ def parse_cloud_init(content: str) -> dict[str, Any]:
             stripped = raw.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            if re.match(rf"^{re.escape(section_name)}:\s*$", raw):
+            if re.match(rf'^["\']?{re.escape(section_name)}["\']?\s*:\s*$', raw):
                 in_section = True
                 continue
             if in_section:
-                if re.match(r"^[A-Za-z0-9_-]+:\s*", raw):
+                if re.match(r'^["\']?[A-Za-z0-9_.-]+["\']?\s*:\s*', raw):
                     break
                 match = re.match(r"^\s*-\s+(.+)$", raw)
                 if match:
@@ -2613,11 +2630,11 @@ def parse_cloud_init(content: str) -> dict[str, Any]:
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if re.match(r"^users:\s*$", raw):
+        if re.match(r'^["\']?users["\']?\s*:\s*$', raw):
             in_users = True
             continue
         if in_users:
-            if re.match(r"^[A-Za-z0-9_-]+:\s*", raw):
+            if re.match(r'^["\']?[A-Za-z0-9_.-]+["\']?\s*:\s*', raw):
                 if current_user:
                     users.append(current_user)
                 current_user = None
@@ -2629,14 +2646,14 @@ def parse_cloud_init(content: str) -> dict[str, Any]:
                 val = item_match.group(1).strip()
                 if ":" in val:
                     k, v = val.split(":", 1)
-                    current_user = {k.strip(): v.strip()}
+                    current_user = {k.strip().strip("'\""): v.strip()}
                 else:
                     users.append({"name": val, "role": "system default"})
                     current_user = None
             elif current_user is not None:
-                kv = re.match(r"^\s+([A-Za-z0-9_-]+):\s*(.+)$", raw)
+                kv = re.match(r'^\s+(["\']?[A-Za-z0-9_.-]+["\']?)\s*:\s*(.+)$', raw)
                 if kv:
-                    current_user[kv.group(1).strip()] = kv.group(2).strip()
+                    current_user[kv.group(1).strip().strip("'\"")] = kv.group(2).strip()
     if current_user:
         users.append(current_user)
 

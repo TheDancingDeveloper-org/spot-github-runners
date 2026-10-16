@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.request
 
 from lib.dashboard_models import (
@@ -2595,6 +2596,70 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(completed_rec["total_duration_seconds"], 7100.0)
         after_builds_hr = self.store.state["scaling_telemetry"]["builds_ran_past_hour"]
         self.assertGreaterEqual(after_builds_hr, before_builds_hr + 1)
+
+    def test_round16_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_CLOUD_INIT,
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            parse_cloud_init,
+        )
+
+        # 1. unittest.mock is available at module import time for standalone test execution
+        self.assertIsNotNone(unittest.mock.patch)
+
+        # 2. parse_cloud_init accepts single- and double-quoted YAML mapping keys
+        quoted_key_yaml = (
+            "#cloud-config\n"
+            '"package_update": true\n'
+            "'package_upgrade': true\n"
+            '"packages":\n'
+            "  - git\n"
+            "  - curl\n"
+            "write_files:\n"
+            '  - "path": /etc/quoted.conf\n'
+            "    'permissions': '0644'\n"
+            '    "content": |\n'
+            "      hello\n"
+        )
+        parsed_quoted = parse_cloud_init(quoted_key_yaml)
+        self.assertTrue(parsed_quoted["valid"], f"Expected valid quoted-key YAML: {parsed_quoted}")
+        self.assertTrue(parsed_quoted["package_update"])
+        self.assertTrue(parsed_quoted["package_upgrade"])
+        self.assertEqual(parsed_quoted["packages"], ["git", "curl"])
+
+        # 3. Completing an existing RUNNING build without cpu_time_seconds or peak_ram_gib keeps them at 0.0
+        self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "bld-round16-nocpu",
+                "project_name": "oxidex",
+                "status": "RUNNING",
+            },
+        )
+        completed_nocpu = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "bld-round16-nocpu",
+                "status": "DELIVERED",
+            },
+        )["build"]
+        self.assertEqual(completed_nocpu["cpu_time_seconds"], 0.0)
+        self.assertEqual(completed_nocpu["cpu_points"], 0.0)
+        self.assertEqual(completed_nocpu["peak_ram_gib"], 0.0)
+
+        # 4. Standard runner cloud-init reuses existing .runner state on persistent disk without unconditional config.sh
+        self.assertIn('if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi', DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn("if [[ ! -f .runner ]]; then runuser -u runner -- ./config.sh", DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn("rm -f .service && ./svc.sh install runner && ./svc.sh start", DEFAULT_RUNNER_CLOUD_INIT)
+
+        # 5. Strict runner admission daemon catches socket write errors on conn.sendall
+        self.assertIn(
+            "                      try:\n"
+            "                          conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))\n"
+            "                      except OSError:\n"
+            "                          pass",
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+        )
 
 
 if __name__ == "__main__":
