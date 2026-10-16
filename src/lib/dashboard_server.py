@@ -36,6 +36,7 @@ from .dashboard_models import (
     normalize_budget,
     parse_cloud_init,
     qualify_instances,
+    render_cloud_init_for_profile,
 )
 from .dashboard_scaling import (
     _assert_finite_json_tree,
@@ -952,6 +953,59 @@ class DashboardStore:
         telem = self.state.setdefault("scaling_telemetry", {})
         telem["template_runners_per_instance"] = tpl_runners
         self.state.get("scaling", {}).get("cicd_runner", {})["runners_per_instance"] = tpl_runners
+        prof = self.state.get("profiles", {}).get("cicd_runner", {})
+        if prof:
+            r_vcpu = max(1, int(prof.get("runner_vcpu", 4)))
+            r_ram = max(0.5, float(prof.get("runner_ram_gib", 16)))
+            overhead = max(0.0, float(prof.get("host_overhead_gib", 0)))
+            inst_ram = float(prof.get("min_instance_ram_gib", 64))
+            active_ci_ids: set[str] = set()
+            if prof.get("cloud_init_template_id"):
+                active_ci_ids.add(str(prof["cloud_init_template_id"]))
+            if prof.get("use_vm_template") and prof.get("vm_template_id"):
+                vm_tpl = next(
+                    (
+                        t
+                        for t in self.state.get("vm_templates", [])
+                        if t.get("id") == prof.get("vm_template_id")
+                        and t.get("role", "cicd_runner") == "cicd_runner"
+                    ),
+                    None,
+                )
+                if vm_tpl:
+                    inst_ram = float(vm_tpl.get("ram_gib", inst_ram))
+                    if vm_tpl.get("cloud_init_template_id"):
+                        active_ci_ids.add(str(vm_tpl["cloud_init_template_id"]))
+            for ci_tpl in self.state.get("cloud_init_templates", []):
+                if (
+                    ci_tpl.get("role", "cicd_runner") == "cicd_runner"
+                    and ci_tpl.get("id") in active_ci_ids
+                ):
+                    ci_tpl["content"] = render_cloud_init_for_profile(
+                        str(ci_tpl.get("content", "")),
+                        role="cicd_runner",
+                        runners_count=tpl_runners,
+                        runner_vcpu=r_vcpu,
+                        runner_ram_gib=r_ram,
+                        instance_ram_gib=inst_ram,
+                        host_overhead_gib=overhead,
+                    )
+        b_prof = self.state.get("profiles", {}).get("rust_builder", {})
+        if b_prof and b_prof.get("cloud_init_template_id"):
+            b_vcpu = max(1, int(b_prof.get("runner_vcpu", 16)))
+            b_ram = max(1.0, float(b_prof.get("runner_ram_gib", 28)))
+            for ci_tpl in self.state.get("cloud_init_templates", []):
+                if (
+                    ci_tpl.get("role") == "rust_builder"
+                    and ci_tpl.get("id") == b_prof.get("cloud_init_template_id")
+                ):
+                    ci_tpl["content"] = render_cloud_init_for_profile(
+                        str(ci_tpl.get("content", "")),
+                        role="rust_builder",
+                        runners_count=1,
+                        runner_vcpu=b_vcpu,
+                        runner_ram_gib=b_ram,
+                    )
 
     def _sync_rust_build_telemetry(self, now_ts: float | None = None) -> None:
         """Recompute Rust builder load counters (builds_ran_past_hour, active_builds, queued_builds) from build records."""
@@ -1820,6 +1874,7 @@ class DashboardStore:
             prev_profiles = copy.deepcopy(self.state["profiles"])
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_vm_templates = copy.deepcopy(self.state["vm_templates"])
+            prev_ci_templates = copy.deepcopy(self.state["cloud_init_templates"])
             prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
             prev_global_enforced = bool(self.state.get("global_budget_enforced", False))
             try:
@@ -1857,6 +1912,7 @@ class DashboardStore:
                     self.state["scaling"]["rust_builder"]["builder_vcpu"] = int(candidate["runner_vcpu"])
                     self.state["scaling"]["rust_builder"]["container_ram_gib"] = float(candidate["runner_ram_gib"])
                     self.state["scaling"]["rust_builder"]["builder_ram_gib"] = float(candidate["runner_ram_gib"])
+                    self._sync_template_density()
                 if normalized_budget is not None or tax_override_updated:
                     self._refresh_instances_pricing()
                 self._persist()
@@ -1864,6 +1920,7 @@ class DashboardStore:
                 self.state["profiles"] = prev_profiles
                 self.state["scaling"] = prev_scaling
                 self.state["vm_templates"] = prev_vm_templates
+                self.state["cloud_init_templates"] = prev_ci_templates
                 self.state["scaling_telemetry"] = prev_telemetry
                 self.state["global_budget_enforced"] = prev_global_enforced
                 self._refresh_instances_pricing()
@@ -1875,15 +1932,36 @@ class DashboardStore:
         *,
         role: str | None = None,
         event_id: str | None = None,
+        previous_runners: int | None = None,
+        current_runners: int | None = None,
+        step_runners: int | None = None,
+        max_runners: int | None = None,
     ) -> None:
         """Mark active/unhandled OOM events as handled/acknowledged so a single OOM does not repeatedly trigger scale-ups."""
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         telem = self.state.setdefault("scaling_telemetry", {})
+
+        def _runner_oom_satisfied(record: dict[str, Any]) -> bool:
+            if event_id is not None or current_runners is None:
+                return True
+            baseline_default = int(previous_runners) if previous_runners is not None else 0
+            try:
+                baseline_val = int(record.setdefault("baseline_runners", baseline_default))
+            except (TypeError, ValueError):
+                baseline_val = baseline_default
+                record["baseline_runners"] = baseline_val
+            step_val = max(1, int(step_runners or 1))
+            max_val = int(max_runners) if max_runners is not None else (baseline_val + step_val)
+            required_target = min(max_val, baseline_val + step_val)
+            return int(current_runners) >= required_target and int(current_runners) > baseline_val
+
         if role in (None, "cicd_runner"):
             for run in telem.get("github_oom_runs", []):
                 if not isinstance(run, dict):
                     continue
                 if event_id and str(run.get("id", "")) != event_id and str(run.get("run_id", "")) != event_id:
+                    continue
+                if not _runner_oom_satisfied(run):
                     continue
                 run["handled"] = True
                 run["acknowledged"] = True
@@ -1900,6 +1978,8 @@ class DashboardStore:
             if role == "cicd_runner" and is_builder:
                 continue
             if role == "rust_builder" and not is_builder:
+                continue
+            if not is_builder and not _runner_oom_satisfied(evt):
                 continue
             evt["handled"] = True
             evt["acknowledged"] = True
@@ -1923,6 +2003,7 @@ class DashboardStore:
                 raise ValueError(f"Unsupported workload role: {role}")
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_profiles = copy.deepcopy(self.state["profiles"])
+            prev_ci_templates = copy.deepcopy(self.state["cloud_init_templates"])
             prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
             prev_global_enforced = bool(self.state.get("global_budget_enforced", False))
             try:
@@ -2013,6 +2094,7 @@ class DashboardStore:
                             "container_ram_gib",
                             min_val=0.1,
                         )
+                        self._sync_template_density()
                 telem_payload = payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {}
                 if telem_payload:
                     if "current_runners" in telem_payload and "current_instances" not in telem_payload:
@@ -2167,6 +2249,7 @@ class DashboardStore:
             except Exception:
                 self.state["scaling"] = prev_scaling
                 self.state["profiles"] = prev_profiles
+                self.state["cloud_init_templates"] = prev_ci_templates
                 self.state["scaling_telemetry"] = prev_telemetry
                 self.state["global_budget_enforced"] = prev_global_enforced
                 raise
@@ -2395,6 +2478,7 @@ class DashboardStore:
             prev_vm_templates = copy.deepcopy(self.state["vm_templates"])
             prev_profiles = copy.deepcopy(self.state["profiles"])
             prev_scaling = copy.deepcopy(self.state["scaling"])
+            prev_ci_templates = copy.deepcopy(self.state["cloud_init_templates"])
             try:
                 self.state["vm_templates"].append(new_tpl)
                 if assign_to_profile and prof is not None:
@@ -2402,13 +2486,13 @@ class DashboardStore:
                     prof["vm_template_id"] = new_tpl["id"]
                     if new_tpl.get("cloud_init_template_id"):
                         prof["cloud_init_template_id"] = new_tpl["cloud_init_template_id"]
-                    if role == "cicd_runner":
-                        self._sync_template_density()
+                    self._sync_template_density()
                 self._persist()
             except Exception:
                 self.state["vm_templates"] = prev_vm_templates
                 self.state["profiles"] = prev_profiles
                 self.state["scaling"] = prev_scaling
+                self.state["cloud_init_templates"] = prev_ci_templates
                 raise
             return {"status": "ok", "vm_template": new_tpl}
 
@@ -2708,13 +2792,17 @@ class DashboardStore:
                         for i in self.state["instances"]
                         if i["status"] == "RUNNING" and i["role"] == role
                     ]
+                    previous_runner_slots = sum(
+                        int(i.get("runners_count", 1)) for i in existing_running_role
+                    )
+                    projected_runner_slots = previous_runner_slots
+                    max_runners_cap = max(
+                        int(prof.get("min_runners", 1)),
+                        int(pol.get("max_runners", 24)),
+                    )
                     if role == "cicd_runner":
                         projected_runner_slots = sum(
                             int(i.get("runners_count", 1)) for i in existing_running_role + new_records
-                        )
-                        max_runners_cap = max(
-                            int(prof.get("min_runners", 1)),
-                            int(pol.get("max_runners", 24)),
                         )
                         if projected_runner_slots > max_runners_cap:
                             raise ValueError(
@@ -2765,7 +2853,16 @@ class DashboardStore:
                         )
                     for created in new_records:
                         self.state["instances"].insert(0, created)
-                    self._consume_active_oom_events(role=role)
+                    if role == "cicd_runner":
+                        self._consume_active_oom_events(
+                            role=role,
+                            previous_runners=previous_runner_slots,
+                            current_runners=projected_runner_slots,
+                            step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
+                            max_runners=max_runners_cap,
+                        )
+                    else:
+                        self._consume_active_oom_events(role=role)
 
                 self._sync_fleet_telemetry()
                 self._persist()

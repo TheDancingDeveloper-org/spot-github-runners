@@ -97,6 +97,9 @@ write_files:
       RUNNER_GROUP="Default"
       RUNNER_LABELS="self-hosted,Linux,X64,spot-runner,rust,docker"
       RUNNERS_COUNT="4"
+      RUNNER_CPU_LIMIT="4"
+      RUNNER_MEMORY_GB="16"
+      HOST_RESERVE_GIB="0"
       DISK_DEVICE="/dev/disk/by-id/google-runner-data"
       DISK_MOUNT="/mnt/runner-data"
 
@@ -112,7 +115,7 @@ runcmd:
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker'''
   # 3. Download, Configure & Start Persistent GitHub Actions Runner Slots with live GCE region & machine-family labels
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && if [[ ! -f .runner ]]; then runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}"; fi && rm -f .service && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-0}?host_mem_gib-${HOST_RESERVE_GIB:-0}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-4}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-16}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && if [[ ! -f .runner ]]; then runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}"; fi && rm -f .service && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -513,8 +516,8 @@ runcmd:
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker"'''
   - 'bash -lc ''set -euo pipefail && install -d -m 0755 -o runner -g runner /opt/runner-rust/cargo /opt/runner-rust/rustup && curl --proto "=https" --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup runuser -u runner -- sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup component add rustfmt clippy --toolchain 1.99.0 && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && chown -R root:root /opt/runner-rust && chmod -R a-w /opt/runner-rust && ln -sfn /opt/runner-rust/cargo/bin/* /usr/local/bin/ && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "'''
-  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && cp /opt/gha-runners/host_admission.py /opt/gha-runners/build/host_admission.py && chmod 0755 /opt/gha-runners/build/entrypoint.sh /opt/gha-runners/build/job-started.sh /opt/gha-runners/build/job-completed.sh /opt/gha-runners/build/host_admission.py && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-56}" "${RUNNER_MEMORY_GB:-32}" "${HOST_RESERVE_GIB:-8}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -e RUNNER_CONFIGURE_ONLY=1 -e RUNNER_NAME="${name}" -e RUNNER_LABELS="${RUNNER_LABELS}" -e RUNNER_GROUP_NAME="${RUNNER_GROUP}" -e GITHUB_RUNNER_URL="${GITHUB_ORG_URL}" -e RUNNER_STATE=/runner-state -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e RUNNER_NAME="${name}" -e RUNNER_STATE=/runner-state -e GHA_ADMISSION_REQUIRED=1 -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; done'
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && cp /opt/gha-runners/host_admission.py /opt/gha-runners/build/host_admission.py && chmod 0755 /opt/gha-runners/build/entrypoint.sh /opt/gha-runners/build/job-started.sh /opt/gha-runners/build/job-completed.sh /opt/gha-runners/build/host_admission.py && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-56}" "${RUNNER_MEMORY_GB:-32}" "${HOST_RESERVE_GIB:-8}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -e RUNNER_CONFIGURE_ONLY=1 -e RUNNER_NAME="${name}" -e RUNNER_LABELS="${RUNNER_LABELS}" -e RUNNER_GROUP_NAME="${RUNNER_GROUP}" -e GITHUB_RUNNER_URL="${GITHUB_ORG_URL}" -e RUNNER_STATE=/runner-state -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e RUNNER_NAME="${name}" -e RUNNER_STATE=/runner-state -e GHA_ADMISSION_REQUIRED=1 -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; done'
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -609,10 +612,10 @@ write_files:
           && cargo install --locked -j4 cargo-nextest \\
           && cargo install --locked -j4 --version 0.29.2 cbindgen \\
           && rustc -vV && cargo -V && just --version && cbindgen --version && cargo nextest --version
-      RUN groupadd -g 1001 runner && useradd -m -u 1001 -g 1001 -s /bin/bash runner && install -d -o 1001 -g 1001 /src /target /cargo
+      RUN groupadd -g 1002 runner && useradd -m -u 1002 -g 1002 -s /bin/bash runner && install -d -o 1002 -g 1002 /src /target /cargo
       COPY entrypoint.py /usr/local/bin/oxidex-build-entrypoint
       RUN chmod 0755 /usr/local/bin/oxidex-build-entrypoint
-      USER 1001:1001
+      USER 1002:1002
       ENV PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       ENV CARGO_HOME=/cargo
       ENV CARGO_TARGET_DIR=/target
@@ -708,7 +711,7 @@ write_files:
                   child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
                   try:
                       finalize_source_tree(child_fd, device, depth + 1)
-                      os.fchown(child_fd, 1001, 1001)
+                      os.fchown(child_fd, 1002, 1002)
                       os.fchmod(child_fd, 0o2750)
                   finally:
                       os.close(child_fd)
@@ -767,7 +770,7 @@ write_files:
                                   )
                                   with os.fdopen(fd, 'wb') as out_f:
                                       shutil.copyfileobj(stream, out_f)
-                                      os.fchown(out_f.fileno(), 1001, 1001)
+                                      os.fchown(out_f.fileno(), 1002, 1002)
                                       os.fchmod(out_f.fileno(), file_mode)
                               finally:
                                   for fd_item in reversed(opened_fds):
@@ -775,7 +778,7 @@ write_files:
                           else:
                               raise RuntimeError('Unsupported non-regular archive member in source snapshot')
               finalize_source_tree(source_fd, root_info.st_dev)
-              os.fchown(source_fd, 0, 1001)
+              os.fchown(source_fd, 0, 1002)
               os.fchmod(source_fd, 0o750)
               os.fsync(source_fd)
           finally:
@@ -987,11 +990,14 @@ write_files:
                   path.mkdir(parents=True, exist_ok=True)
               if sys.argv[2:] == ['prepare']:
                   source = root / 'sources' / project
-                  for anc in (root, root / 'sources', source):
-                      os.chown(anc, 0, 1001)
+                  os.chown(root, 0, 0)
+                  root.chmod(0o755)
+                  for anc in (root / 'sources', source, root / 'targets'):
+                      os.chown(anc, 0, 1002)
                       anc.chmod(0o750)
                   for path in (root / 'targets' / project, root / 'cargo'):
-                      os.chown(path, 1001, 1001)
+                      os.chown(path, 1002, 1002)
+                      path.chmod(0o750)
                   print(source)
                   return
               command = sys.argv[2:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']
@@ -1000,7 +1006,7 @@ write_files:
               if cpus < 1 or memory_gib < 1:
                   raise ValueError('Resource limits must be positive')
               cmd = [
-                  'docker', 'run', '--rm', '--user=1001:1001', f'--cpus={cpus}',
+                  'docker', 'run', '--rm', '--user=1002:1002', f'--cpus={cpus}',
                   '--label=oxidex.remote-build=true',
                   f'--memory={memory_gib}g', f'--memory-swap={memory_gib}g', '--pids-limit=4096',
                   '--cap-drop=ALL', '--security-opt=no-new-privileges',
@@ -2751,3 +2757,54 @@ def parse_cloud_init(content: str) -> dict[str, Any]:
         "stages": stages,
         "line_count": len(lines),
     }
+
+
+def render_cloud_init_for_profile(
+    content: str,
+    *,
+    role: str = "cicd_runner",
+    runners_count: int = 4,
+    runner_vcpu: int = 4,
+    runner_ram_gib: float = 16.0,
+    instance_ram_gib: float = 64.0,
+    host_overhead_gib: float = 0.0,
+) -> str:
+    """Synchronize runner density and per-slot resource limits in a cloud-init template."""
+    text = str(content or "")
+    slots = max(1, int(runners_count))
+    vcpu = max(1, int(runner_vcpu))
+    ram_gib = max(1, int(round(float(runner_ram_gib))))
+    reserve_gib = max(0, int(round(float(host_overhead_gib))))
+    usable_work_gib = max(
+        ram_gib,
+        int(round(max(float(instance_ram_gib) - float(host_overhead_gib), float(ram_gib)))),
+    )
+    if role == "rust_builder":
+        text = re.sub(
+            r'("cpus"\s*:\s*)\d+',
+            rf"\g<1>{vcpu}",
+            text,
+        )
+        text = re.sub(
+            r'("memory_gib"\s*:\s*)\d+',
+            rf"\g<1>{ram_gib}",
+            text,
+        )
+        return text
+
+    replacements = {
+        "RUNNERS_COUNT": str(slots),
+        "RUNNER_CPU_LIMIT": str(vcpu),
+        "RUNNER_MEMORY_GB": str(ram_gib),
+        "HOST_RESERVE_GIB": str(reserve_gib),
+        "ADMISSION_WORK_GIB": str(usable_work_gib),
+    }
+    for env_key, env_val in replacements.items():
+        text = re.sub(
+            rf'^(\s*{re.escape(env_key)}=)"?[^"\n]*"?\s*$',
+            rf'\g<1>"{env_val}"',
+            text,
+            flags=re.M,
+        )
+    return text
+

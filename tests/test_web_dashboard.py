@@ -2661,7 +2661,162 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             DEFAULT_RUNNER_STRICT_CLOUD_INIT,
         )
 
+    def test_round17_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_CLOUD_INIT,
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+            parse_cloud_init,
+            render_cloud_init_for_profile,
+        )
+
+        # 1. Rust builder container and cache/source/target paths run under isolated UID/GID 1002:1002
+        self.assertIn(
+            "RUN groupadd -g 1002 runner && useradd -m -u 1002 -g 1002 -s /bin/bash runner && install -d -o 1002 -g 1002 /src /target /cargo",
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        self.assertIn("USER 1002:1002", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("--user=1002:1002", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("os.fchown(child_fd, 1002, 1002)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("os.fchown(out_f.fileno(), 1002, 1002)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("os.fchown(source_fd, 0, 1002)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("for anc in (root / 'sources', source, root / 'targets'):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("os.chown(anc, 0, 1002)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("os.chown(path, 1002, 1002)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertNotIn("--user=1001:1001", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        # 2. Selecting a 2-runner VM template or profile updates active cloud-init RUNNERS_COUNT and clamps to host fit_slots
+        self.assertIn('fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))"', DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn('fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        rendered_2slot = render_cloud_init_for_profile(
+            DEFAULT_RUNNER_CLOUD_INIT,
+            role="cicd_runner",
+            runners_count=2,
+            runner_vcpu=4,
+            runner_ram_gib=16,
+            instance_ram_gib=32,
+            host_overhead_gib=0,
+        )
+        self.assertEqual(parse_cloud_init(rendered_2slot)["env_vars"]["RUNNERS_COUNT"], "2")
+
+        self._post(
+            "/api/profile/cicd_runner",
+            {
+                "use_vm_template": False,
+                "min_instance_vcpu": 8,
+                "min_instance_ram_gib": 32,
+                "min_benchmark_score": 1000,
+                "runner_vcpu": 4,
+                "runner_ram_gib": 16,
+            },
+        )
+        ov_2slot = self._get("/api/overview")
+        active_ci = next(
+            t for t in ov_2slot["cloud_init_templates"] if t["id"] == "ci-runner-default"
+        )
+        self.assertEqual(active_ci["parsed"]["env_vars"]["RUNNERS_COUNT"], "2")
+
+        tpl_2slot = self._post(
+            "/api/vm-templates/from-instance",
+            {
+                "instance_name": "oxidex-runners-eu-belgium-01",
+                "template_name": "Belgium C4D-Standard-8 2-Runner Template",
+                "cloud_init_template_id": "ci-runner-default",
+                "assign_to_profile": True,
+            },
+        )["vm_template"]
+        self.assertEqual(tpl_2slot["runners_count"], 2)
+        ov_tpl_2slot = self._get("/api/overview")
+        active_ci_tpl = next(
+            t for t in ov_tpl_2slot["cloud_init_templates"] if t["id"] == "ci-runner-default"
+        )
+        self.assertEqual(active_ci_tpl["parsed"]["env_vars"]["RUNNERS_COUNT"], "2")
+
+        # 3. Partial regional scale-up (+1 runner when step_runners=2) keeps OOM active until full step is reached
+        for reg_clear in ("africa-south1", "us-south1", "europe-west1"):
+            self._post(
+                "/api/instances/scale-region",
+                {"region": reg_clear, "role": "cicd_runner", "target_instances": 0},
+            )
+        self._post(
+            "/api/profile/cicd_runner",
+            {
+                "use_vm_template": False,
+                "min_instance_vcpu": 4,
+                "min_instance_ram_gib": 16,
+                "min_benchmark_score": 500,
+                "runner_vcpu": 4,
+                "runner_ram_gib": 16,
+                "min_runners": 1,
+                "max_instances": 8,
+            },
+        )
+        self._post(
+            "/api/instances/scale-region",
+            {"region": "us-south1", "role": "cicd_runner", "target_instances": 1},
+        )
+        self._post(
+            "/api/scaling",
+            {
+                "role": "cicd_runner",
+                "acknowledge_all_ooms": True,
+                "telemetry": {
+                    "queued_jobs": 0,
+                    "provisioned_jobs": 0,
+                    "jobs_ran_past_hour": 5,
+                    "instance_cpu_percentages": [20.0],
+                },
+            },
+        )
+        # Currently 1 running 1-runner VM (1 total runner). Record an active OOM with step_runners=2:
+        oom_resp = self._post(
+            "/api/scaling",
+            {
+                "role": "cicd_runner",
+                "policy": {
+                    "scale_up_step_runners": 2,
+                    "min_runners": 1,
+                    "max_runners": 12,
+                    "max_scale_up_hourly_usd": 10.0,
+                    "max_scale_up_daily_usd": 50.0,
+                    "max_scale_up_monthly_usd": 500.0,
+                },
+                "add_github_oom_run": {
+                    "repository": "swack-tools/oxidex",
+                    "run_id": 99170001,
+                    "job_id": 99170002,
+                    "step_number": 4,
+                    "line_number": 88,
+                },
+            },
+        )
+        self.assertEqual(oom_resp["evaluation"]["desired_runners"], 3)
+
+        # Partial scale-up: +1 VM in us-south1 adds only +1 runner (total 2 runners < target 3)
+        self._post(
+            "/api/instances/scale-region",
+            {"region": "us-south1", "role": "cicd_runner", "target_instances": 2},
+        )
+        ov_partial = self._get("/api/overview")
+        oom_rec_partial = next(
+            r for r in ov_partial["scaling_telemetry"]["github_oom_runs"] if r.get("run_id") == 99170001
+        )
+        self.assertFalse(oom_rec_partial.get("handled", False))
+        self.assertEqual(ov_partial["scaling_evaluation"]["desired_runners"], 3)
+
+        # Completing the second +1 runner (total 3 runners >= baseline 1 + step 2) marks OOM handled
+        self._post(
+            "/api/instances/scale-region",
+            {"region": "us-south1", "role": "cicd_runner", "target_instances": 3},
+        )
+        ov_complete = self._get("/api/overview")
+        oom_rec_complete = next(
+            r for r in ov_complete["scaling_telemetry"]["github_oom_runs"] if r.get("run_id") == 99170001
+        )
+        self.assertTrue(oom_rec_complete.get("handled", False))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

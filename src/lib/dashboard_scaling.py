@@ -362,16 +362,16 @@ def evaluate_scaling_decision(
 
     # 1. GitHub Actions CI Run OOM Trigger (ignores TIMEOUT, external runners, or expired events)
     if cfg.get("enable_github_ci_oom_trigger", True) and github_oom_runs:
-        any_confirmed_oom = False
+        oom_target_runners = current_runners
         for run in github_oom_runs:
             if not _is_recent_unhandled_oom(run, now_ts, lookback_seconds):
                 continue
-            if (
-                run.get("baseline_runners") is not None
-                and current_runners > _finite_int_val(run["baseline_runners"], "baseline_runners")
-            ):
-                run["handled"] = True
-                continue
+            if run.get("baseline_runners") is not None:
+                baseline_val = _finite_int_val(run["baseline_runners"], "baseline_runners")
+                required_target = min(max_runners, baseline_val + step_runners)
+                if current_runners >= required_target and current_runners > baseline_val:
+                    run["handled"] = True
+                    continue
             if "error_excerpt" in run and run.get("error_excerpt") is not None:
                 excerpt = str(run.get("error_excerpt"))
             elif (
@@ -387,8 +387,11 @@ def evaluate_scaling_decision(
             classification = classify_github_ci_failure(excerpt, runner_name=runner_name)
             if not classification["is_self_hosted_runner"] or not classification["is_oom"]:
                 continue
-            run.setdefault("baseline_runners", current_runners)
-            any_confirmed_oom = True
+            baseline_val = _finite_int_val(
+                run.setdefault("baseline_runners", current_runners),
+                "baseline_runners",
+            )
+            oom_target_runners = max(oom_target_runners, baseline_val + step_runners)
             link = run.get("deep_link") or build_github_oom_deep_link(
                 run.get("repository", "swack-tools/oxidex"),
                 run.get("run_id", 37192272062),
@@ -412,12 +415,13 @@ def evaluate_scaling_decision(
                     "error_excerpt": excerpt,
                 }
             )
-        if any_confirmed_oom:
-            desired_runners = max(desired_runners, current_runners + step_runners)
+        if oom_target_runners > current_runners:
+            desired_runners = max(desired_runners, oom_target_runners)
 
     # 2. VM Journal OOM Trigger (only recent unhandled CI runner events; exclude Rust builder OOMs)
     if cfg.get("enable_journal_oom_trigger", True) and journal_oom_events:
         active_journal_ooms: list[dict[str, Any]] = []
+        journal_oom_target_runners = current_runners
         for evt in journal_oom_events:
             if not isinstance(evt, dict):
                 continue
@@ -428,13 +432,17 @@ def evaluate_scaling_decision(
                 continue
             if not _is_recent_unhandled_oom(evt, now_ts, lookback_seconds):
                 continue
-            if (
-                evt.get("baseline_runners") is not None
-                and current_runners > _finite_int_val(evt["baseline_runners"], "baseline_runners")
-            ):
-                evt["handled"] = True
-                continue
-            evt.setdefault("baseline_runners", current_runners)
+            if evt.get("baseline_runners") is not None:
+                baseline_val = _finite_int_val(evt["baseline_runners"], "baseline_runners")
+                required_target = min(max_runners, baseline_val + step_runners)
+                if current_runners >= required_target and current_runners > baseline_val:
+                    evt["handled"] = True
+                    continue
+            baseline_val = _finite_int_val(
+                evt.setdefault("baseline_runners", current_runners),
+                "baseline_runners",
+            )
+            journal_oom_target_runners = max(journal_oom_target_runners, baseline_val + step_runners)
             active_journal_ooms.append(evt)
         for evt in active_journal_ooms:
             scale_up_reasons.append(
@@ -451,8 +459,8 @@ def evaluate_scaling_decision(
                     ),
                 }
             )
-        if active_journal_ooms:
-            desired_runners = max(desired_runners, current_runners + step_runners)
+        if active_journal_ooms and journal_oom_target_runners > current_runners:
+            desired_runners = max(desired_runners, journal_oom_target_runners)
 
     # 3. Queued jobs waiting for a runner
     if cfg.get("enable_queued_jobs_trigger", True) and queued_jobs >= _finite_int_val(cfg.get("queued_jobs_threshold", 2), "queued_jobs_threshold"):
