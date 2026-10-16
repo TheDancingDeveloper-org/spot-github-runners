@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import ssl
+import sys
 import threading
 import time
 from typing import Any
@@ -200,6 +201,9 @@ def _build_instance_record(
         "deletion_trigger": deletion_trigger,
         "cloud_init_template_id": cloud_init_template_id,
         "vm_template_id": vm_template_id,
+        "service_account": None if role == "rust_builder" else "default",
+        "scopes": [] if role == "rust_builder" else ["https://www.googleapis.com/auth/cloud-platform"],
+        "gcloud_auth_flags": ["--no-service-account", "--no-scopes"] if role == "rust_builder" else [],
         "cpu_utilization_percent": cpu_utilization_percent,
         "ram_utilization_percent": ram_utilization_percent,
         "ssh_command": format_gcloud_ssh_command(name, zone, project),
@@ -3301,6 +3305,13 @@ def make_handler(
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         timeout = 10.0
 
+        def setup(self) -> None:
+            super().setup()
+            if isinstance(self.connection, ssl.SSLSocket):
+                if self.connection.gettimeout() is None:
+                    self.connection.settimeout(self.timeout or 10.0)
+                self.connection.do_handshake()
+
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
 
@@ -3655,6 +3666,16 @@ def make_handler(
     return DashboardRequestHandler
 
 
+class DashboardThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (TimeoutError, ssl.SSLError, ConnectionError, BrokenPipeError, OSError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def create_dashboard_server(
     host: str = "127.0.0.1",
     port: int = 8787,
@@ -3719,13 +3740,17 @@ def create_dashboard_server(
         auth_token=cleaned_token or None,
         require_secure_cookie=has_tls or not _is_loopback_host(host),
     )
-    server = ThreadingHTTPServer((host, port), handler)
+    server = DashboardThreadingHTTPServer((host, port), handler)
     if has_tls:
         try:
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ssl_ctx.load_cert_chain(certfile=cleaned_cert, keyfile=cleaned_key)
-            server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+            server.socket = ssl_ctx.wrap_socket(
+                server.socket,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
         except Exception:
             server.server_close()
             raise

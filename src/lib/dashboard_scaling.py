@@ -597,6 +597,28 @@ def evaluate_scaling_decision(
                 desired_runners = desired_instances * runners_per_vm
     else:
         desired_instances = math.ceil(desired_runners / runners_per_vm) if desired_runners > 0 else 0
+        desired_instances = min(current_instances_count, desired_instances)
+        if desired_instances == current_instances_count:
+            desired_runners = current_runners
+            scale_down_reasons.clear()
+        elif desired_instances == 0:
+            desired_runners = 0
+        elif known_current_instances is not None:
+            removed_instances = current_instances_count - desired_instances
+            desired_runners = max(capacity_floor, current_runners - removed_instances * runners_per_vm)
+        else:
+            desired_runners = desired_instances * runners_per_vm
+        if desired_runners < current_runners and not scale_down_reasons:
+            scale_down_reasons.append(
+                {
+                    "trigger": "max_runners_cap",
+                    "summary": (
+                        f"Current fleet ({current_runners} runners across {current_instances_count} VMs) "
+                        f"exceeds max_runners={max_runners} -> scaling down to {desired_runners} runners "
+                        f"({desired_instances} VMs)"
+                    ),
+                }
+            )
 
     raw_max_instances = (
         max_instances

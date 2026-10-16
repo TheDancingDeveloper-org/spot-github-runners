@@ -547,6 +547,7 @@ packages:
   - time
   - python3
   - util-linux
+  - iptables
   - clang
   - lld
   - cmake
@@ -569,7 +570,9 @@ write_files:
         "cpus": 16,
         "memory_gib": 28,
         "image": "oxidex-remote-builder:1.99.0",
-        "cache_mount": "/mnt/runner-data/remote-build"
+        "cache_mount": "/mnt/runner-data/remote-build",
+        "service_account": "none",
+        "scopes": []
       }
   - path: /opt/oxidex-builder/image/entrypoint.py
     permissions: '0755'
@@ -629,6 +632,11 @@ write_files:
       # Root-owned remote builder transaction wrapper; validates operations without allowing shell commands.
       import argparse, fcntl, hashlib, json, os, pwd, re, shutil, stat, subprocess, sys, tarfile
       from pathlib import Path
+
+      MAX_UPLOAD_ARCHIVE_BYTES = 256 * 1024 * 1024
+      MAX_SOURCE_ARCHIVE_MEMBERS = 50000
+      MAX_SOURCE_MEMBER_BYTES = 128 * 1024 * 1024
+      MAX_SOURCE_EXTRACTED_BYTES = 1024 * 1024 * 1024
 
       def validate_identity(project, run, upload):
           if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}', project):
@@ -726,14 +734,32 @@ write_files:
               os.fchmod(source_fd, 0o700)
               cleanup_source_fd(source_fd)
               upload_fd = os.open(upload_path, os.O_RDONLY | os.O_NOFOLLOW)
+              upload_info = os.fstat(upload_fd)
+              if not stat.S_ISREG(upload_info.st_mode) or upload_info.st_size > MAX_UPLOAD_ARCHIVE_BYTES:
+                  os.close(upload_fd)
+                  raise RuntimeError('Upload archive exceeds maximum size bound or is not a regular file')
               with os.fdopen(upload_fd, 'rb') as upload_f:
                   if expected_digest is not None:
-                      actual_digest = hashlib.sha256(upload_f.read()).hexdigest()
-                      if actual_digest != expected_digest:
+                      hasher = hashlib.sha256()
+                      hashed_bytes = 0
+                      while True:
+                          chunk = upload_f.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          hashed_bytes += len(chunk)
+                          if hashed_bytes > MAX_UPLOAD_ARCHIVE_BYTES:
+                              raise RuntimeError('Upload archive exceeds maximum size bound')
+                          hasher.update(chunk)
+                      if hasher.hexdigest() != expected_digest:
                           raise RuntimeError('Upload archive sha256 mismatch')
                       upload_f.seek(0)
                   with tarfile.open(fileobj=upload_f, mode='r:gz') as tar:
-                      for member in tar.getmembers():
+                      member_count = 0
+                      extracted_bytes = 0
+                      for member in tar:
+                          member_count += 1
+                          if member_count > MAX_SOURCE_ARCHIVE_MEMBERS:
+                              raise RuntimeError('Source archive member count exceeds limit')
                           rel_parts = Path(member.name).parts
                           if (
                               not rel_parts
@@ -752,6 +778,10 @@ write_files:
                                   for fd_item in reversed(opened_fds):
                                       os.close(fd_item)
                           elif member.isfile():
+                              if member.size < 0 or member.size > MAX_SOURCE_MEMBER_BYTES:
+                                  raise RuntimeError('Source archive member size exceeds limit')
+                              if extracted_bytes + member.size > MAX_SOURCE_EXTRACTED_BYTES:
+                                  raise RuntimeError('Source archive uncompressed size exceeds limit')
                               cur_fd = source_fd
                               opened_fds = []
                               try:
@@ -769,7 +799,20 @@ write_files:
                                       dir_fd=cur_fd,
                                   )
                                   with os.fdopen(fd, 'wb') as out_f:
-                                      shutil.copyfileobj(stream, out_f)
+                                      member_written = 0
+                                      while True:
+                                          buf = stream.read(65536)
+                                          if not buf:
+                                              break
+                                          member_written += len(buf)
+                                          extracted_bytes += len(buf)
+                                          if (
+                                              member_written > member.size
+                                              or member_written > MAX_SOURCE_MEMBER_BYTES
+                                              or extracted_bytes > MAX_SOURCE_EXTRACTED_BYTES
+                                          ):
+                                              raise RuntimeError('Source archive uncompressed size exceeds limit')
+                                          out_f.write(buf)
                                       os.fchown(out_f.fileno(), 1002, 1002)
                                       os.fchmod(out_f.fileno(), file_mode)
                               finally:
@@ -928,7 +971,7 @@ write_files:
       import fcntl, json, os, re, subprocess, sys
       from pathlib import Path
 
-      allowed_commands = {'cargo', 'rustc', 'rustfmt', 'clippy-driver', 'just', 'uv', 'python3', 'cbindgen'}
+      allowed_commands = {'cargo', 'rustc', 'rustfmt', 'clippy-driver', 'just', 'cbindgen'}
 
       def validate_project(project):
           if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}', project):
@@ -939,6 +982,29 @@ write_files:
           if path.resolve() != path or any(p.is_symlink() for p in (path, *path.parents)):
               raise ValueError('Symlinked builder paths are forbidden')
 
+      def ensure_metadata_isolation():
+          for chain, rule in (
+              ('DOCKER-USER', ['-d', '169.254.169.254/32', '-j', 'REJECT']),
+              ('OUTPUT', ['-d', '169.254.169.254/32', '-m', 'owner', '!', '--uid-owner', '0', '-j', 'REJECT']),
+          ):
+              if subprocess.run(
+                  ['iptables', '-C', chain, *rule],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              ).returncode != 0:
+                  subprocess.run(['iptables', '-I', chain, '1', *rule], check=True)
+          sa_probe = subprocess.run(
+              [
+                  'curl', '--fail', '--silent', '--max-time', '2',
+                  '-H', 'Metadata-Flavor:Google',
+                  'http://169.254.169.254/computeMetadata/v1/instance/service-accounts/',
+              ],
+              capture_output=True,
+              text=True,
+          )
+          if sa_probe.returncode == 0 and sa_probe.stdout.strip():
+              raise RuntimeError('Builder VM must be provisioned with --no-service-account --no-scopes')
+
       def main():
           if os.geteuid() != 0:
               raise RuntimeError('Invoke this root-owned launcher with sudo')
@@ -946,6 +1012,8 @@ write_files:
               op = 'cleanup' if sys.argv[1] == 'cleanup-export' else 'build'
               os.execv('/usr/local/bin/oxidex-remote-transaction', ['/usr/local/bin/oxidex-remote-transaction', op, *sys.argv[2:]])
           config = json.loads(Path('/etc/oxidex-remote-build.json').read_text())
+          if config.get('service_account', 'none') != 'none' or config.get('scopes', []):
+              raise RuntimeError('Builder config forbids attached service accounts or scopes')
           root = Path(config.get('cache_mount', '/mnt/runner-data/remote-build'))
           mount_root = root.parent if root.name == 'remote-build' else root
           if not os.path.ismount(mount_root):
@@ -954,6 +1022,7 @@ write_files:
           cpus = int(config.get('cpus', 16))
           memory_gib = int(config.get('memory_gib', 28))
           if sys.argv[1:] == ['--verify-readiness']:
+              ensure_metadata_isolation()
               subprocess.run(['docker', 'image', 'inspect', image], check=True, stdout=subprocess.DEVNULL)
               for sub in ('cargo', 'sources', 'targets'):
                   checked_path(root / sub)
@@ -979,6 +1048,8 @@ write_files:
                   if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
                       raise SystemExit(75)
               else:
+                  if int(os.environ.get('SUDO_UID') or '0') != 0:
+                      raise PermissionError('Direct container stage invocation requires root transaction wrapper')
                   try:
                       fcntl.flock(active_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                   except BlockingIOError:
@@ -1005,11 +1076,18 @@ write_files:
                   raise ValueError(f'Unsupported build command: {command[0]}')
               if cpus < 1 or memory_gib < 1:
                   raise ValueError('Resource limits must be positive')
+              ensure_metadata_isolation()
+              net_args = (
+                  ['--add-host=metadata.google.internal:127.0.0.1', '--add-host=metadata:127.0.0.1']
+                  if command[:2] == ['cargo', 'fetch']
+                  else ['--network=none']
+              )
               cmd = [
                   'docker', 'run', '--rm', '--user=1002:1002', f'--cpus={cpus}',
                   '--label=oxidex.remote-build=true',
                   f'--memory={memory_gib}g', f'--memory-swap={memory_gib}g', '--pids-limit=4096',
                   '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                  *net_args,
                   '--entrypoint=/usr/bin/time',
                   '-v', f'{root}/sources/{project}:/src',
                   '-v', f'{root}/targets/{project}:/target',
@@ -1031,6 +1109,8 @@ runcmd:
   - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - systemctl enable --now containerd docker
+  - iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT 2>/dev/null || iptables -I DOCKER-USER 1 -d 169.254.169.254/32 -j REJECT
+  - iptables -C OUTPUT -d 169.254.169.254/32 -m owner ! --uid-owner 0 -j REJECT 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254/32 -m owner ! --uid-owner 0 -j REJECT
   - DOCKER_BUILDKIT=0 docker build --memory=28g --memory-swap=28g --cpu-period=100000 --cpu-quota=1600000 -t oxidex-remote-builder:1.99.0 /opt/oxidex-builder/image
   - /usr/local/bin/oxidex-remote-build --verify-readiness
 """

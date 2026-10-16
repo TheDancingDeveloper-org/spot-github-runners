@@ -226,11 +226,11 @@ class DashboardScalingTests(unittest.TestCase):
         self.assertEqual(decision["desired_instances"], 2)
         self.assertEqual(decision["scale_down_reasons"][0]["trigger"], "hourly_runs_low")
 
-        # Preserve capacity for active provisioned jobs when provisioned_jobs > min_runners
+        # Preserve capacity for active provisioned jobs when provisioned_jobs > min_runners, quantized to whole VMs
         busy_telemetry = {**telemetry, "provisioned_jobs": 5}
         busy_decision = evaluate_scaling_decision(policy, busy_telemetry)
         self.assertEqual(busy_decision["direction"], "scale_down")
-        self.assertEqual(busy_decision["desired_runners"], 5)
+        self.assertEqual(busy_decision["desired_runners"], 6)
         self.assertEqual(busy_decision["desired_instances"], 3)
 
     def test_scale_up_on_oom_and_budget_cap_enforcement(self):
@@ -2814,6 +2814,219 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             r for r in ov_complete["scaling_telemetry"]["github_oom_runs"] if r.get("run_id") == 99170001
         )
         self.assertTrue(oom_rec_complete.get("handled", False))
+
+    def test_round18_codex_regressions(self) -> None:
+        import hashlib
+        import io
+        import os
+        import socket as _socket
+        import ssl as _ssl
+        import subprocess as _subprocess
+        import tarfile
+        import threading as _threading
+        import urllib.request as _urlreq
+        from lib.dashboard_models import (
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+            parse_cloud_init,
+        )
+        from lib.dashboard_server import create_dashboard_server
+
+        # 1. Bound uploaded archives before root extraction (streaming tar iteration, member-count & byte limits)
+        self.assertNotIn("tar.getmembers()", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertNotIn("shutil.copyfileobj(stream, out_f)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("MAX_UPLOAD_ARCHIVE_BYTES = 256 * 1024 * 1024", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("MAX_SOURCE_ARCHIVE_MEMBERS = 50000", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("MAX_SOURCE_MEMBER_BYTES = 128 * 1024 * 1024", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("MAX_SOURCE_EXTRACTED_BYTES = 1024 * 1024 * 1024", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("for member in tar:", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("Source archive member count exceeds limit", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("Source archive uncompressed size exceeds limit", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "source"
+            src_dir.mkdir(mode=0o700)
+            archive_ok = Path(tmp) / "ok.tar.gz"
+            with tarfile.open(archive_ok, "w:gz") as tf:
+                payload_bytes = b"fn main() {}\n"
+                ti = tarfile.TarInfo("src/main.rs")
+                ti.size = len(payload_bytes)
+                ti.mode = 0o644
+                tf.addfile(ti, io.BytesIO(payload_bytes))
+            digest_ok = hashlib.sha256(archive_ok.read_bytes()).hexdigest()
+
+            import textwrap
+
+            parsed_ci = parse_cloud_init(DEFAULT_RUST_BUILDER_CLOUD_INIT)
+            self.assertTrue(parsed_ci["valid"], parsed_ci["warnings"])
+            tx_script = textwrap.dedent(
+                DEFAULT_RUST_BUILDER_CLOUD_INIT.split(
+                    "- path: /usr/local/bin/oxidex-remote-transaction", 1
+                )[1]
+                .split("content: |\n", 1)[1]
+                .split("\n  - path: /usr/local/bin/oxidex-remote-build", 1)[0]
+            )
+            tx_ns: dict[str, object] = {}
+            exec(compile(tx_script, "/usr/local/bin/oxidex-remote-transaction", "exec"), tx_ns)
+            extract_fn = tx_ns["extract_safe_source_archive"]
+            orig_fstat = os.fstat
+
+            def _root_fstat(fd: int):
+                st = orig_fstat(fd)
+                if st.st_uid != 0:
+                    return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+                return st
+
+            with (
+                unittest.mock.patch("os.fstat", side_effect=_root_fstat),
+                unittest.mock.patch("os.fchown"),
+            ):
+                extract_fn(archive_ok, src_dir, digest_ok)
+                self.assertEqual((src_dir / "src" / "main.rs").read_bytes(), payload_bytes)
+
+                tx_ns["MAX_SOURCE_ARCHIVE_MEMBERS"] = 1
+                archive_many = Path(tmp) / "many.tar.gz"
+                with tarfile.open(archive_many, "w:gz") as tf:
+                    for idx in range(2):
+                        b_data = b"x"
+                        ti = tarfile.TarInfo(f"f{idx}.txt")
+                        ti.size = len(b_data)
+                        ti.mode = 0o644
+                        tf.addfile(ti, io.BytesIO(b_data))
+                with self.assertRaisesRegex(RuntimeError, "Source archive member count exceeds limit"):
+                    extract_fn(archive_many, src_dir, None)
+
+                tx_ns["MAX_SOURCE_ARCHIVE_MEMBERS"] = 50000
+                tx_ns["MAX_SOURCE_EXTRACTED_BYTES"] = 8
+                with self.assertRaisesRegex(RuntimeError, "Source archive uncompressed size exceeds limit"):
+                    extract_fn(archive_ok, src_dir, digest_ok)
+
+        # 2. Keep scale-down targets aligned with whole VM capacity (hold when desired_instances == current_instances)
+        lowered_max_hold = evaluate_scaling_decision(
+            policy={
+                "min_runners": 4,
+                "max_runners": 6,
+                "runners_per_instance": 4,
+                "queued_jobs_threshold": 1,
+                "enable_cpu_utilization_trigger": False,
+                "enable_hourly_runs_scale_down": False,
+            },
+            telemetry={
+                "current_runners": 8,
+                "current_instances": 2,
+                "queued_jobs": 1,
+                "provisioned_jobs": 2,
+                "jobs_ran_past_hour": 10,
+                "instance_cpu_percentages": [30.0, 35.0],
+            },
+        )
+        self.assertEqual(lowered_max_hold["direction"], "hold")
+        self.assertEqual(lowered_max_hold["desired_instances"], 2)
+        self.assertEqual(lowered_max_hold["desired_runners"], 8)
+
+        quantized_down = evaluate_scaling_decision(
+            policy={
+                "min_runners": 4,
+                "max_runners": 16,
+                "runners_per_instance": 4,
+                "enable_hourly_runs_scale_down": True,
+                "scale_down_max_jobs_past_hour": 5,
+                "scale_down_target_runners": 6,
+                "enable_cpu_utilization_trigger": False,
+            },
+            telemetry={
+                "current_runners": 12,
+                "current_instances": 3,
+                "queued_jobs": 0,
+                "provisioned_jobs": 0,
+                "jobs_ran_past_hour": 2,
+                "instance_cpu_percentages": [10.0, 10.0, 10.0],
+            },
+        )
+        self.assertEqual(quantized_down["direction"], "scale_down")
+        self.assertEqual(quantized_down["desired_instances"], 2)
+        self.assertEqual(quantized_down["desired_runners"], 8)
+
+        # 3. Bound TLS handshakes in worker threads so a stalled ClientHello does not block the accept loop
+        with tempfile.TemporaryDirectory() as tls_tmp:
+            cert_path = Path(tls_tmp) / "cert.pem"
+            key_path = Path(tls_tmp) / "key.pem"
+            _subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(key_path),
+                    "-out",
+                    str(cert_path),
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=127.0.0.1",
+                ],
+                check=True,
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+            )
+            tls_server, _ = create_dashboard_server(
+                host="127.0.0.1",
+                port=0,
+                state_path=Path(tls_tmp) / "tls_state.json",
+                tls_certfile=cert_path,
+                tls_keyfile=key_path,
+            )
+            tls_server.RequestHandlerClass.timeout = 0.35
+            tls_port = tls_server.server_address[1]
+            tls_thread = _threading.Thread(target=tls_server.serve_forever, daemon=True)
+            tls_thread.start()
+            try:
+                with _socket.create_connection(("127.0.0.1", tls_port), timeout=2.0) as stalled_peer:
+                    # Stalled peer sends no ClientHello; concurrent HTTPS client must still be accepted and served immediately
+                    client_ctx = _ssl.create_default_context()
+                    client_ctx.check_hostname = False
+                    client_ctx.verify_mode = _ssl.CERT_NONE
+                    with _urlreq.urlopen(
+                        f"https://127.0.0.1:{tls_port}/api/health",
+                        context=client_ctx,
+                        timeout=2.0,
+                    ) as resp:
+                        health_payload = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(health_payload["status"], "healthy")
+                    stalled_peer.settimeout(1.5)
+                    try:
+                        eof_data = stalled_peer.recv(16)
+                    except OSError:
+                        eof_data = b""
+                    self.assertEqual(eof_data, b"")
+            finally:
+                tls_server.shutdown()
+                tls_server.server_close()
+                tls_thread.join(timeout=2.0)
+
+        # 4. Block builder containers from metadata service & enforce --no-service-account --no-scopes
+        self.assertIn("def ensure_metadata_isolation():", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("('DOCKER-USER', ['-d', '169.254.169.254/32', '-j', 'REJECT'])", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn(
+            "('OUTPUT', ['-d', '169.254.169.254/32', '-m', 'owner', '!', '--uid-owner', '0', '-j', 'REJECT'])",
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        self.assertIn("['--network=none']", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("allowed_commands = {'cargo', 'rustc', 'rustfmt', 'clippy-driver', 'just', 'cbindgen'}", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertNotIn("'python3'", DEFAULT_RUST_BUILDER_CLOUD_INIT.split("allowed_commands =", 1)[1].split("\n", 1)[0])
+        self.assertIn(
+            "Builder VM must be provisioned with --no-service-account --no-scopes",
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        inst_resp = self._get("/api/instances")
+        builder_inst = next(
+            i for i in inst_resp["instances"] if i["role"] == "rust_builder"
+        )
+        self.assertIsNone(builder_inst["service_account"])
+        self.assertEqual(builder_inst["scopes"], [])
+        self.assertEqual(builder_inst["gcloud_auth_flags"], ["--no-service-account", "--no-scopes"])
 
 
 if __name__ == "__main__":
