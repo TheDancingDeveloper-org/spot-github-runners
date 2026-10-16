@@ -19,8 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .environment import load_env
-from .machine_profiles import (configure_storage, configure_cpu_platform, cpu_platform_satisfies,
-                               _requested_arch_and_isa)
+from .machine_profiles import configure_storage, configure_cpu_platform, cpu_platform_satisfies, _requested_arch_and_isa
 from .billing_catalog import catalog_skus, unit_price, monthly_to_daily
 from .storage_selection import storage_rates, cheapest_storage, throughput_floor, observed_storage_monthly, disk_monthly_cost
 from .project_costs import log_project_costs
@@ -150,12 +149,6 @@ def resolve_runner_patch(args: argparse.Namespace) -> RunnerPatch | None:
     return patch
 
 
-def _desired_runner_labels(args: argparse.Namespace) -> list[str]:
-    patch = resolve_runner_patch(args)
-    extra = list(patch.runner_labels()) if patch is not None else []
-    return list(dict.fromkeys([args.runner_label, args.instance_type, args.region, *extra]))
-
-
 def strict_pool_settings(args):
     count=getattr(args,'heavy_runner_pool',None)
     if count is None:return None
@@ -248,10 +241,11 @@ def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:
     core_rate, ram_rate = spot_rates(args.region, family)
     hourly = core_rate * cpu + ram_rate * priced_ram
     if args.cheapest_storage or args.max_total_daily_usd is not None:
+        arch, _ = _requested_arch_and_isa(args)
         rates = storage_rates(args.region)
         boot, data = args.boot_disk_type, args.disk_type
         if args.cheapest_storage:
-            boot, data, monthly = cheapest_storage(args.instance_type, args.disk_size_gb, rates)
+            boot, data, monthly = cheapest_storage(args.instance_type, args.disk_size_gb, rates, arch=arch)
         else:
             monthly = disk_monthly_cost(boot, 40, rates) + disk_monthly_cost(data, args.disk_size_gb, rates,
                 throughput=throughput_floor(args.disk_size_gb) if data == 'hyperdisk-throughput' else 140)
@@ -346,6 +340,12 @@ def cleanup_orphan_runner_disks(zone: str) -> list[str]:
     return deleted
 
 
+def _desired_runner_labels(args: argparse.Namespace) -> list[str]:
+    patch = resolve_runner_patch(args)
+    extra = list(patch.runner_labels()) if patch is not None else []
+    return list(dict.fromkeys([args.runner_label, args.instance_type, args.region, *extra]))
+
+
 def render_startup(args: argparse.Namespace, token: str, group_name: str, deployment_id: str) -> str:
     if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
         raise RuntimeError('Remote builders require a tier host with shared memory admission')
@@ -422,6 +422,7 @@ def write_deployment_receipt(args: argparse.Namespace, vm: GceVm) -> None:
 def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     configure_storage(args)
     configure_cpu_platform(args)
+    arch, required_isa = _requested_arch_and_isa(args)
     cleanup_orphan_runner_disks(zone)
     describe = subprocess.run(["gcloud", "compute", "instances", "describe", args.instance_name,
                                "--zone", zone, "--project", PROJECT, "--format=json"], text=True, capture_output=True)
@@ -436,7 +437,8 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
         actual_type = vm.get("machineType", "").rsplit("/", 1)[-1]
         if actual_type != args.instance_type:
             raise RuntimeError(f"Existing VM type {actual_type} does not match {args.instance_type}")
-        if vm.get('status') == 'RUNNING' and args.min_cpu_platform and not cpu_platform_satisfies(args.instance_type, vm.get('cpuPlatform', ''), args.min_cpu_platform):
+        if vm.get('status') == 'RUNNING' and args.min_cpu_platform and not cpu_platform_satisfies(
+                args.instance_type, vm.get('cpuPlatform', ''), args.min_cpu_platform, arch=arch, required_isa=required_isa):
             raise RuntimeError(f"Existing CPU platform {vm.get('cpuPlatform', 'unknown')} does not match requested {args.min_cpu_platform}")
         if args.min_cpu_platform and vm.get('status') in {'STOPPED', 'TERMINATED'}:
             gcloud(['compute', 'instances', 'update', args.instance_name,
@@ -655,6 +657,7 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
                   "--jq", ".runners[] | @json"], quiet=True)
     if getattr(args, 'heavy_runner_pool', None):verify_strict_identities(args,[json.loads(line)for line in output.splitlines()if line.strip()])
     seen: set[str] = set()
+    desired = _desired_runner_labels(args)
     for line in output.splitlines():
         if not line.strip():
             continue
@@ -663,7 +666,6 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
         if name not in expected_names:
             continue
         seen.add(name)
-        desired = _desired_runner_labels(args)
         current = {label.get("name") for label in runner.get("labels", [])} - DEFAULT_RUNNER_LABELS
         if current != set(desired):
             response = run(["gh", "api", "--method", "PUT",
@@ -675,6 +677,56 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
     if seen != set(expected_names):
         missing = sorted(set(expected_names) - seen)
         raise RuntimeError(f"GitHub did not list all expected runners for label sync: {missing}")
+
+
+def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
+    """Apply a compatible RunnerPatch live to a running VM and its active runner containers."""
+    patch = resolve_runner_patch(args)
+    if patch is None:
+        raise RuntimeError("Live patching requires --patch-repo or --patch-file")
+    vm = observed_deployment_vm(args, zone)
+    if not vm.running:
+        raise RuntimeError(f"Cannot hot-patch non-running VM: {vm_details(vm)}")
+    if vm.machine_type and vm.machine_type != args.instance_type:
+        raise RuntimeError(f"Existing VM type {vm.machine_type} does not match {args.instance_type}")
+    state_raw = gcloud(
+        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet",
+         "--command=sudo -n cat /var/lib/gha-runner-patch/state.json 2>/dev/null || true"],
+        quiet=True,
+    )
+    current_manifest = json.loads(state_raw).get("manifest") if state_raw.strip() else None
+    action = classify_patch_diff(current_manifest, patch)
+    if action == "noop":
+        LOG.info("VM %s is already at patch %s", args.instance_name, patch.patch_sha256[:12])
+        return "noop"
+    if action == "replace_vm":
+        raise RuntimeError(
+            f"Patch {patch.patch_sha256[:12]} changes hardware architecture or CPU ISA requirements; "
+            "a rolling VM replacement is required instead of --patch-live"
+        )
+    if action == "recreate_containers":
+        raise RuntimeError(
+            f"Patch {patch.patch_sha256[:12]} modifies container bind mounts; "
+            "containers must be drained and recreated instead of --patch-live"
+        )
+    prefix = f"{args.runner_prefix}-"
+    live_script = render_live_hot_patch_script(
+        patch,
+        base_dockerfile=RUNNER_DOCKERFILE,
+        runner_version=RUNNER_VERSION,
+        runner_prefix=prefix,
+    )
+    script_b64 = base64.b64encode(live_script.encode("utf-8")).decode("ascii")
+    remote_cmd = f"printf '%s' '{script_b64}' | base64 -d | sudo -n bash -euo pipefail"
+    output = gcloud(
+        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={remote_cmd}"],
+        quiet=True,
+    )
+    if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
+        raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
+    sync_runner_labels(args)
+    LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
+    return "hot_patch"
 
 
 def wait_for_bootstrap(args: argparse.Namespace, zone: str, deployment_id: str) -> None:
@@ -807,6 +859,7 @@ def observed_deployment_vm(args: argparse.Namespace, zone: str) -> GceVm:
                 raise RuntimeError(f'Observed CPU platform {vm.cpu_platform or "unknown"} does not match requested {requested}: {vm_details(vm)}')
             return vm
     raise RuntimeError(f"Cannot observe deployed VM specifications: {deployment_details(args)}")
+
 
 def main() -> int:
     global PROJECT, ORG

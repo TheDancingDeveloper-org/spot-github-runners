@@ -449,13 +449,7 @@ def parse_manifest_text(text: str) -> dict[str, Any]:
         if not isinstance(loaded, dict):
             raise ValueError("Manifest root must be a mapping")
         return loaded
-    try:
-        import yaml  # type: ignore[import-untyped]
-        loaded = yaml.safe_load(stripped)
-        if isinstance(loaded, dict):
-            return loaded
-    except Exception:
-        pass
+    # Stdlib-only parsing keeps the patch SHA independent of optional packages.
     try:
         import tomllib
         loaded = tomllib.loads(stripped)
