@@ -2654,10 +2654,10 @@ class DashboardServerIntegrationTests(unittest.TestCase):
 
         # 5. Strict runner admission daemon catches socket write errors on conn.sendall
         self.assertIn(
-            "                      try:\n"
-            "                          conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))\n"
-            "                      except OSError:\n"
-            "                          pass",
+            "              try:\n"
+            "                  conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))\n"
+            "              except OSError:\n"
+            "                  pass",
             DEFAULT_RUNNER_STRICT_CLOUD_INIT,
         )
 
@@ -3028,8 +3028,101 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(builder_inst["scopes"], [])
         self.assertEqual(builder_inst["gcloud_auth_flags"], ["--no-service-account", "--no-scopes"])
 
+    def test_round19_codex_regressions(self):
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+
+        # 1. Host admission daemon handles connections concurrently with per-container in-flight cap
+        self.assertIn("import concurrent.futures", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("MAX_INFLIGHT_PER_CONTAINER = 2", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("INFLIGHT_BY_CID = {}", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("def handle_client(conn):", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn(
+            "concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool",
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+        )
+        self.assertIn("pool.submit(handle_client, conn)", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 2. Persistent disk reuse clears persisted runner containers before starting replacements
+        self.assertIn('rm -rf "$mp/docker/containers"/*', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertGreaterEqual(
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT.count('old_cids="$(docker ps -aq)"'),
+            2,
+        )
+        self.assertIn("docker rm -f $old_cids >/dev/null 2>&1 || true", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 3. Builder transaction bounds decompression and tar extended headers before tarfile parses metadata
+        self.assertIn("MAX_TAR_EXTENDED_HEADER_BYTES = 65536", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("class BoundedGzipStream:", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("class SafeTarInfo(tarfile.TarInfo):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn(
+            "tarfile.open(fileobj=bounded_gz, mode='r:', tarinfo=SafeTarInfo)",
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+
+        # Verify BoundedGzipStream + SafeTarInfo reject oversized PAX headers before materializing them
+        import gzip as _gzip
+        import io as _io
+        import os as _os
+        import tarfile as _tarfile
+
+        tx_marker = "MAX_TAR_EXTENDED_HEADER_BYTES = 65536\n"
+        tx_start = DEFAULT_RUST_BUILDER_CLOUD_INIT.index(tx_marker)
+        tx_end = DEFAULT_RUST_BUILDER_CLOUD_INIT.index("def validate_identity(", tx_start)
+        tx_snippet = "\n".join(
+            line[6:] if line.startswith("      ") else line
+            for line in DEFAULT_RUST_BUILDER_CLOUD_INIT[tx_start:tx_end].splitlines()
+        )
+        tx_ns = {
+            "os": _os,
+            "tarfile": _tarfile,
+            "MAX_SOURCE_DECOMPRESSED_BYTES": 1024 * 1024,
+            "MAX_SOURCE_MEMBER_BYTES": 256 * 1024,
+        }
+        exec(tx_snippet, tx_ns)
+        BoundedGzipStream = tx_ns["BoundedGzipStream"]
+        SafeTarInfo = tx_ns["SafeTarInfo"]
+
+        pax_buf = _io.BytesIO()
+        with _gzip.GzipFile(fileobj=pax_buf, mode="wb") as gz_out:
+            with _tarfile.open(fileobj=gz_out, mode="w|", format=_tarfile.PAX_FORMAT) as tf_out:
+                ti = _tarfile.TarInfo("Cargo.toml")
+                ti.pax_headers = {"comment": "X" * (70 * 1024)}
+                payload = b"[package]\nname = 'demo'\n"
+                ti.size = len(payload)
+                tf_out.addfile(ti, _io.BytesIO(payload))
+        pax_buf.seek(0)
+        with self.assertRaises(RuntimeError) as pax_ctx:
+            with _gzip.GzipFile(fileobj=pax_buf, mode="rb") as gz_in:
+                bounded = BoundedGzipStream(gz_in, 1024 * 1024)
+                with _tarfile.open(fileobj=bounded, mode="r:", tarinfo=SafeTarInfo) as tf_in:
+                    for _ in tf_in:
+                        pass
+        self.assertIn("extended header exceeds size limit", str(pax_ctx.exception))
+
+        # 4. Multiline YAML flow collections and multiline quoted scalars are validated by the YAML parser
+        multiline_seq = (
+            "#cloud-config\n"
+            "packages: [\n"
+            "  curl,\n"
+            "  git\n"
+            "]\n"
+            "apt: {\n"
+            "  preserve_sources_list: true\n"
+            "}\n"
+            "final_message: \"Boot completed\n"
+            "  successfully\"\n"
+        )
+        parsed_multi = parse_cloud_init(multiline_seq)
+        self.assertTrue(parsed_multi["valid"], f"Expected valid multiline YAML, got errors: {parsed_multi['errors']}")
+        self.assertEqual(parsed_multi["packages"], ["curl", "git"])
+
+        unclosed_multi = "#cloud-config\npackages: [\n  curl,\n  git\n"
+        parsed_unclosed = parse_cloud_init(unclosed_multi)
+        self.assertFalse(parsed_unclosed["valid"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

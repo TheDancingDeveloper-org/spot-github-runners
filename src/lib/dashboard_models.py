@@ -168,12 +168,15 @@ write_files:
     owner: root:root
     content: |
       #!/usr/bin/env python3
-      import fcntl, json, os, re, socket, struct, subprocess, sys, time
+      import concurrent.futures, fcntl, json, os, re, socket, struct, subprocess, sys, threading, time
       from pathlib import Path
 
       CONFIG_PATH = Path('/etc/gha-admission.json')
       LEASES_PATH = Path('/var/lib/gha-admission/leases.json')
       SOCKET_PATH = Path('/run/gha-admission/socket')
+      INFLIGHT_LOCK = threading.Lock()
+      INFLIGHT_BY_CID = {}
+      MAX_INFLIGHT_PER_CONTAINER = 2
 
       class OrphanRunnerHook(ValueError):
           # The requesting hook has outlived its GitHub-assigned Worker.
@@ -295,6 +298,78 @@ write_files:
                       os.fsync(out_f.fileno())
                   tmp_path.replace(LEASES_PATH)
 
+      def handle_client(conn):
+          cid_slot = None
+          with conn:
+              try:
+                  conn.settimeout(5.0)
+                  pid, uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                  if uid != 1001:
+                      raise ValueError('Unauthorized admission peer')
+                  cid_slot = runner_cgroup(Path(f'/proc/{pid}/cgroup').read_text())
+                  if cid_slot is None:
+                      raise ValueError('Runner must belong to a Docker cgroup')
+                  with INFLIGHT_LOCK:
+                      cur_inflight = INFLIGHT_BY_CID.get(cid_slot, 0)
+                      if cur_inflight >= MAX_INFLIGHT_PER_CONTAINER:
+                          raise RuntimeError('Too many concurrent admission requests from container')
+                      INFLIGHT_BY_CID[cid_slot] = cur_inflight + 1
+                  cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+                  owner = peer_owner(pid, uid, cfg)
+                  raw = conn.recv(4096).decode('utf-8', errors='replace').strip()
+                  req = json.loads(raw)
+                  if req.get('kind', 'runner') != 'runner':
+                      raise ValueError('Admission kind does not match peer identity')
+                  action = req.get('action') or req.get('op')
+                  work_gib = host_work_budget_gib(cfg)
+                  lock_fd = os.open(str(LEASES_PATH) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                  with os.fdopen(lock_fd, 'r+') as lock_f:
+                      fcntl.flock(lock_f, fcntl.LOCK_EX)
+                      rows = json.loads(LEASES_PATH.read_text()) if LEASES_PATH.exists() else {}
+                      leases = {k: v for k, v in rows.items() if owner_alive(k)}
+                      if action == 'release':
+                          if owner_alive(owner):
+                              raise ValueError('Active Worker lease cannot be released while Runner.Worker is alive')
+                          leases.pop(owner, None)
+                          accepted = True
+                      elif action == 'acquire':
+                          runner_gib = runner_reservation(owner, cfg)
+                          if owner in leases or sum(leases.values()) + runner_gib <= work_gib:
+                              leases[owner] = runner_gib
+                              accepted = True
+                              if not owner_alive(owner):
+                                  leases.pop(owner, None)
+                                  accepted = False
+                          else:
+                              accepted = False
+                      else:
+                          raise ValueError('Unknown admission action')
+                      tmp_path = LEASES_PATH.with_suffix('.tmp')
+                      tmp_fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                      with os.fdopen(tmp_fd, 'w') as out_f:
+                          json.dump(leases, out_f, sort_keys=True)
+                          out_f.flush()
+                          os.fsync(out_f.fileno())
+                      tmp_path.replace(LEASES_PATH)
+                  answer = {'ok': accepted, 'accepted': accepted}
+              except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+                  answer = {'ok': False, 'accepted': False, 'error': str(exc)[:200]}
+                  if isinstance(exc, OrphanRunnerHook):
+                      answer['code'] = 'orphaned-runner-hook'
+                      answer['error'] = 'ORPHAN_RUNNER_HOOK: ' + str(exc)[:180]
+              finally:
+                  if cid_slot is not None:
+                      with INFLIGHT_LOCK:
+                          rem = INFLIGHT_BY_CID.get(cid_slot, 1) - 1
+                          if rem <= 0:
+                              INFLIGHT_BY_CID.pop(cid_slot, None)
+                          else:
+                              INFLIGHT_BY_CID[cid_slot] = rem
+              try:
+                  conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))
+              except OSError:
+                  pass
+
       def serve():
           if os.geteuid() != 0:
               raise RuntimeError('Admission service must run as root')
@@ -303,7 +378,10 @@ write_files:
           if not LEASES_PATH.exists():
               LEASES_PATH.write_text('{}\\n')
           SOCKET_PATH.unlink(missing_ok=True)
-          with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+          with (
+              socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv,
+              concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool,
+          ):
               srv.bind(str(SOCKET_PATH))
               os.chown(SOCKET_PATH, 0, 1001)
               os.chmod(SOCKET_PATH, 0o660)
@@ -318,57 +396,7 @@ write_files:
                       except Exception:
                           pass
                       continue
-                  with conn:
-                      try:
-                          conn.settimeout(5.0)
-                          pid, uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                          cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
-                          owner = peer_owner(pid, uid, cfg)
-                          raw = conn.recv(4096).decode('utf-8', errors='replace').strip()
-                          req = json.loads(raw)
-                          if req.get('kind', 'runner') != 'runner':
-                              raise ValueError('Admission kind does not match peer identity')
-                          action = req.get('action') or req.get('op')
-                          work_gib = host_work_budget_gib(cfg)
-                          lock_fd = os.open(str(LEASES_PATH) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-                          with os.fdopen(lock_fd, 'r+') as lock_f:
-                              fcntl.flock(lock_f, fcntl.LOCK_EX)
-                              rows = json.loads(LEASES_PATH.read_text()) if LEASES_PATH.exists() else {}
-                              leases = {k: v for k, v in rows.items() if owner_alive(k)}
-                              if action == 'release':
-                                  if owner_alive(owner):
-                                      raise ValueError('Active Worker lease cannot be released while Runner.Worker is alive')
-                                  leases.pop(owner, None)
-                                  accepted = True
-                              elif action == 'acquire':
-                                  runner_gib = runner_reservation(owner, cfg)
-                                  if owner in leases or sum(leases.values()) + runner_gib <= work_gib:
-                                      leases[owner] = runner_gib
-                                      accepted = True
-                                      if not owner_alive(owner):
-                                          leases.pop(owner, None)
-                                          accepted = False
-                                  else:
-                                      accepted = False
-                              else:
-                                  raise ValueError('Unknown admission action')
-                              tmp_path = LEASES_PATH.with_suffix('.tmp')
-                              tmp_fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-                              with os.fdopen(tmp_fd, 'w') as out_f:
-                                  json.dump(leases, out_f, sort_keys=True)
-                                  out_f.flush()
-                                  os.fsync(out_f.fileno())
-                              tmp_path.replace(LEASES_PATH)
-                          answer = {'ok': accepted, 'accepted': accepted}
-                      except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
-                          answer = {'ok': False, 'accepted': False, 'error': str(exc)[:200]}
-                          if isinstance(exc, OrphanRunnerHook):
-                              answer['code'] = 'orphaned-runner-hook'
-                              answer['error'] = 'ORPHAN_RUNNER_HOOK: ' + str(exc)[:180]
-                      try:
-                          conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))
-                      except OSError:
-                          pass
+                  pool.submit(handle_client, conn)
 
       def request(action='acquire'):
           with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -514,10 +542,10 @@ runcmd:
   - chmod a+r /etc/apt/keyrings/docker.asc
   - 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "${ID:-debian}") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list'
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
-  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker"'''
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && rm -rf "$mp/docker/containers"/* && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker" && old_cids="$(docker ps -aq)" && if [[ -n "$old_cids" ]]; then docker rm -f $old_cids >/dev/null 2>&1 || true; fi'''
   - 'bash -lc ''set -euo pipefail && install -d -m 0755 -o runner -g runner /opt/runner-rust/cargo /opt/runner-rust/rustup && curl --proto "=https" --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup runuser -u runner -- sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup component add rustfmt clippy --toolchain 1.99.0 && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && chown -R root:root /opt/runner-rust && chmod -R a-w /opt/runner-rust && ln -sfn /opt/runner-rust/cargo/bin/* /usr/local/bin/ && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "'''
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && cp /opt/gha-runners/host_admission.py /opt/gha-runners/build/host_admission.py && chmod 0755 /opt/gha-runners/build/entrypoint.sh /opt/gha-runners/build/job-started.sh /opt/gha-runners/build/job-completed.sh /opt/gha-runners/build/host_admission.py && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-56}" "${RUNNER_MEMORY_GB:-32}" "${HOST_RESERVE_GIB:-8}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -e RUNNER_CONFIGURE_ONLY=1 -e RUNNER_NAME="${name}" -e RUNNER_LABELS="${RUNNER_LABELS}" -e RUNNER_GROUP_NAME="${RUNNER_GROUP}" -e GITHUB_RUNNER_URL="${GITHUB_ORG_URL}" -e RUNNER_STATE=/runner-state -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e RUNNER_NAME="${name}" -e RUNNER_STATE=/runner-state -e GHA_ADMISSION_REQUIRED=1 -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; done'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && old_cids="$(docker ps -aq)" && if [[ -n "$old_cids" ]]; then docker rm -f $old_cids >/dev/null 2>&1 || true; fi && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -e RUNNER_CONFIGURE_ONLY=1 -e RUNNER_NAME="${name}" -e RUNNER_LABELS="${RUNNER_LABELS}" -e RUNNER_GROUP_NAME="${RUNNER_GROUP}" -e GITHUB_RUNNER_URL="${GITHUB_ORG_URL}" -e RUNNER_STATE=/runner-state -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --label oxidex.strict-runner=true --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e RUNNER_NAME="${name}" -e RUNNER_STATE=/runner-state -e GHA_ADMISSION_REQUIRED=1 -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; done'
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -630,13 +658,53 @@ write_files:
     content: |
       #!/usr/bin/env python3
       # Root-owned remote builder transaction wrapper; validates operations without allowing shell commands.
-      import argparse, fcntl, hashlib, json, os, pwd, re, shutil, stat, subprocess, sys, tarfile
+      import argparse, fcntl, gzip, hashlib, json, os, pwd, re, shutil, stat, subprocess, sys, tarfile
       from pathlib import Path
 
       MAX_UPLOAD_ARCHIVE_BYTES = 256 * 1024 * 1024
       MAX_SOURCE_ARCHIVE_MEMBERS = 50000
       MAX_SOURCE_MEMBER_BYTES = 128 * 1024 * 1024
       MAX_SOURCE_EXTRACTED_BYTES = 1024 * 1024 * 1024
+      MAX_SOURCE_DECOMPRESSED_BYTES = MAX_SOURCE_EXTRACTED_BYTES + 16 * 1024 * 1024
+      MAX_TAR_EXTENDED_HEADER_BYTES = 65536
+
+      class BoundedGzipStream:
+          def __init__(self, gz_stream, max_bytes):
+              self._gz = gz_stream
+              self._max_bytes = max_bytes
+
+          def _check_pos(self, pos):
+              if pos > self._max_bytes:
+                  raise RuntimeError('Source archive uncompressed size exceeds limit')
+
+          def read(self, size=-1):
+              if size is None or size < 0 or size > MAX_SOURCE_MEMBER_BYTES:
+                  raise RuntimeError('Source archive decompressed read exceeds limit')
+              self._check_pos(self._gz.tell() + size)
+              data = self._gz.read(size)
+              self._check_pos(self._gz.tell())
+              return data
+
+          def tell(self):
+              pos = self._gz.tell()
+              self._check_pos(pos)
+              return pos
+
+          def seek(self, offset, whence=os.SEEK_SET):
+              if whence == os.SEEK_SET and offset > self._max_bytes:
+                  raise RuntimeError('Source archive uncompressed size exceeds limit')
+              pos = self._gz.seek(offset, whence)
+              self._check_pos(pos)
+              return pos
+
+      class SafeTarInfo(tarfile.TarInfo):
+          def _proc_member(self, tarfile_obj):
+              if self.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK):
+                  if self.size < 0 or self.size > MAX_TAR_EXTENDED_HEADER_BYTES:
+                      raise RuntimeError('Source archive extended header exceeds size limit')
+              elif self.size < 0 or self.size > MAX_SOURCE_MEMBER_BYTES:
+                  raise RuntimeError('Source archive member size exceeds limit')
+              return super()._proc_member(tarfile_obj)
 
       def validate_identity(project, run, upload):
           if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}', project):
@@ -753,73 +821,75 @@ write_files:
                       if hasher.hexdigest() != expected_digest:
                           raise RuntimeError('Upload archive sha256 mismatch')
                       upload_f.seek(0)
-                  with tarfile.open(fileobj=upload_f, mode='r:gz') as tar:
-                      member_count = 0
-                      extracted_bytes = 0
-                      for member in tar:
-                          member_count += 1
-                          if member_count > MAX_SOURCE_ARCHIVE_MEMBERS:
-                              raise RuntimeError('Source archive member count exceeds limit')
-                          rel_parts = Path(member.name).parts
-                          if (
-                              not rel_parts
-                              or Path(member.name).is_absolute()
-                              or any(p in ('', '.', '..') for p in rel_parts)
-                          ):
-                              raise RuntimeError('Unsafe archive member path in source snapshot')
-                          if member.isdir():
-                              cur_fd = source_fd
-                              opened_fds = []
-                              try:
-                                  for part in rel_parts:
-                                      cur_fd = open_nofollow_subdir(cur_fd, part, root_info.st_dev)
-                                      opened_fds.append(cur_fd)
-                              finally:
-                                  for fd_item in reversed(opened_fds):
-                                      os.close(fd_item)
-                          elif member.isfile():
-                              if member.size < 0 or member.size > MAX_SOURCE_MEMBER_BYTES:
-                                  raise RuntimeError('Source archive member size exceeds limit')
-                              if extracted_bytes + member.size > MAX_SOURCE_EXTRACTED_BYTES:
-                                  raise RuntimeError('Source archive uncompressed size exceeds limit')
-                              cur_fd = source_fd
-                              opened_fds = []
-                              try:
-                                  for part in rel_parts[:-1]:
-                                      cur_fd = open_nofollow_subdir(cur_fd, part, root_info.st_dev)
-                                      opened_fds.append(cur_fd)
-                                  stream = tar.extractfile(member)
-                                  if stream is None:
-                                      raise RuntimeError('Unable to read archive file member')
-                                  file_mode = 0o750 if (member.mode & 0o100) else 0o640
-                                  fd = os.open(
-                                      rel_parts[-1],
-                                      os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                      0o600,
-                                      dir_fd=cur_fd,
-                                  )
-                                  with os.fdopen(fd, 'wb') as out_f:
-                                      member_written = 0
-                                      while True:
-                                          buf = stream.read(65536)
-                                          if not buf:
-                                              break
-                                          member_written += len(buf)
-                                          extracted_bytes += len(buf)
-                                          if (
-                                              member_written > member.size
-                                              or member_written > MAX_SOURCE_MEMBER_BYTES
-                                              or extracted_bytes > MAX_SOURCE_EXTRACTED_BYTES
-                                          ):
-                                              raise RuntimeError('Source archive uncompressed size exceeds limit')
-                                          out_f.write(buf)
-                                      os.fchown(out_f.fileno(), 1002, 1002)
-                                      os.fchmod(out_f.fileno(), file_mode)
-                              finally:
-                                  for fd_item in reversed(opened_fds):
-                                      os.close(fd_item)
-                          else:
-                              raise RuntimeError('Unsupported non-regular archive member in source snapshot')
+                  with gzip.GzipFile(fileobj=upload_f, mode='rb') as gz_f:
+                      bounded_gz = BoundedGzipStream(gz_f, MAX_SOURCE_DECOMPRESSED_BYTES)
+                      with tarfile.open(fileobj=bounded_gz, mode='r:', tarinfo=SafeTarInfo) as tar:
+                          member_count = 0
+                          extracted_bytes = 0
+                          for member in tar:
+                              member_count += 1
+                              if member_count > MAX_SOURCE_ARCHIVE_MEMBERS:
+                                  raise RuntimeError('Source archive member count exceeds limit')
+                              rel_parts = Path(member.name).parts
+                              if (
+                                  not rel_parts
+                                  or Path(member.name).is_absolute()
+                                  or any(p in ('', '.', '..') for p in rel_parts)
+                              ):
+                                  raise RuntimeError('Unsafe archive member path in source snapshot')
+                              if member.isdir():
+                                  cur_fd = source_fd
+                                  opened_fds = []
+                                  try:
+                                      for part in rel_parts:
+                                          cur_fd = open_nofollow_subdir(cur_fd, part, root_info.st_dev)
+                                          opened_fds.append(cur_fd)
+                                  finally:
+                                      for fd_item in reversed(opened_fds):
+                                          os.close(fd_item)
+                              elif member.isfile():
+                                  if member.size < 0 or member.size > MAX_SOURCE_MEMBER_BYTES:
+                                      raise RuntimeError('Source archive member size exceeds limit')
+                                  if extracted_bytes + member.size > MAX_SOURCE_EXTRACTED_BYTES:
+                                      raise RuntimeError('Source archive uncompressed size exceeds limit')
+                                  cur_fd = source_fd
+                                  opened_fds = []
+                                  try:
+                                      for part in rel_parts[:-1]:
+                                          cur_fd = open_nofollow_subdir(cur_fd, part, root_info.st_dev)
+                                          opened_fds.append(cur_fd)
+                                      stream = tar.extractfile(member)
+                                      if stream is None:
+                                          raise RuntimeError('Unable to read archive file member')
+                                      file_mode = 0o750 if (member.mode & 0o100) else 0o640
+                                      fd = os.open(
+                                          rel_parts[-1],
+                                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                          0o600,
+                                          dir_fd=cur_fd,
+                                      )
+                                      with os.fdopen(fd, 'wb') as out_f:
+                                          member_written = 0
+                                          while True:
+                                              buf = stream.read(65536)
+                                              if not buf:
+                                                  break
+                                              member_written += len(buf)
+                                              extracted_bytes += len(buf)
+                                              if (
+                                                  member_written > member.size
+                                                  or member_written > MAX_SOURCE_MEMBER_BYTES
+                                                  or extracted_bytes > MAX_SOURCE_EXTRACTED_BYTES
+                                              ):
+                                                  raise RuntimeError('Source archive uncompressed size exceeds limit')
+                                              out_f.write(buf)
+                                          os.fchown(out_f.fileno(), 1002, 1002)
+                                          os.fchmod(out_f.fileno(), file_mode)
+                                  finally:
+                                      for fd_item in reversed(opened_fds):
+                                          os.close(fd_item)
+                              else:
+                                  raise RuntimeError('Unsupported non-regular archive member in source snapshot')
               finalize_source_tree(source_fd, root_info.st_dev)
               os.fchown(source_fd, 0, 1002)
               os.fchmod(source_fd, 0o750)
@@ -2433,32 +2503,63 @@ def _validate_cloud_init_syntax(
         block_scalar_indent: int | None = None
         scopes: list[dict[str, Any]] = []
         defined_anchors: set[str] = set()
+        pending_flow_lines: list[str] = []
+        pending_flow_start_idx: int = 0
+        pending_flow_indent: int = 0
+        in_single = False
+        in_double = False
+        escape = False
+        bracket_depth = 0
+        brace_depth = 0
         for idx, raw in enumerate(lines[1:], start=2):
-            if not raw.strip() or raw.lstrip().startswith("#"):
-                continue
-            indent = len(raw) - len(raw.lstrip(" "))
-            if "\t" in raw[: len(raw) - len(raw.lstrip())]:
-                errors.append(f"YAML syntax error on line {idx}: tab characters are not allowed for indentation.")
-                continue
-            if block_scalar_indent is not None:
-                if indent > block_scalar_indent:
+            if not pending_flow_lines:
+                if not raw.strip() or raw.lstrip().startswith("#"):
                     continue
-                block_scalar_indent = None
+                indent = len(raw) - len(raw.lstrip(" "))
+                if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+                    errors.append(f"YAML syntax error on line {idx}: tab characters are not allowed for indentation.")
+                    continue
+                if block_scalar_indent is not None:
+                    if indent > block_scalar_indent:
+                        continue
+                    block_scalar_indent = None
 
-            stripped = _strip_yaml_inline_comment(raw.strip())
-            if not stripped:
-                continue
-            # Check balanced brackets, braces, and quotes on non-scalar YAML lines
-            in_single = False
-            in_double = False
+                stripped = _strip_yaml_inline_comment(raw.strip())
+                if not stripped:
+                    continue
+                pending_flow_lines = [stripped]
+                pending_flow_start_idx = idx
+                pending_flow_indent = indent
+                in_single = False
+                in_double = False
+                escape = False
+                bracket_depth = 0
+                brace_depth = 0
+                scan_segment = stripped
+            else:
+                if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+                    errors.append(f"YAML syntax error on line {idx}: tab characters are not allowed for indentation.")
+                    pending_flow_lines = []
+                    in_single = in_double = escape = False
+                    bracket_depth = brace_depth = 0
+                    continue
+                if not in_single and not in_double:
+                    if not raw.strip() or raw.lstrip().startswith("#"):
+                        continue
+                    scan_segment = _strip_yaml_inline_comment(raw.strip())
+                    if not scan_segment:
+                        continue
+                else:
+                    scan_segment = raw.strip()
+                pending_flow_lines.append(scan_segment)
+
+            # Check balanced brackets, braces, and quotes across single-line or multiline flow constructs
             escape = False
-            bracket_depth = 0
-            brace_depth = 0
-            for ch in stripped:
+            for ch in scan_segment:
                 if escape:
                     escape = False
                     continue
-                if ch == "\\":
+                if ch == "\\" and in_double:
                     escape = True
                     continue
                 if ch == "'" and not in_double:
@@ -2476,17 +2577,39 @@ def _validate_cloud_init_syntax(
                         brace_depth -= 1
                     if bracket_depth < 0 or brace_depth < 0:
                         break
-            if in_single or in_double or bracket_depth != 0 or brace_depth != 0:
+            if bracket_depth < 0 or brace_depth < 0:
                 errors.append(
-                    f"YAML syntax error on line {idx}: unclosed bracket, brace, or quote in '{stripped}'."
+                    f"YAML syntax error on line {idx}: unclosed bracket, brace, or quote in '{scan_segment}'."
                 )
+                pending_flow_lines = []
+                in_single = in_double = escape = False
+                bracket_depth = brace_depth = 0
                 continue
+            if in_single or in_double or bracket_depth > 0 or brace_depth > 0:
+                continue
+
+            if len(pending_flow_lines) > 1:
+                stripped = re.sub(r",\s*([\]}]+)$", r"\1", " ".join(pending_flow_lines))
+            else:
+                stripped = pending_flow_lines[0]
+            idx = pending_flow_start_idx
+            indent = pending_flow_indent
+            pending_flow_lines = []
 
             mapping_key_re = r'^(?P<key>[A-Za-z0-9_.-]+|"(?:[^"\\]|\\.)*"|\'(?:[^\']|\'\')*\')\s*:(?P<val>\s+.*|\s*)$'
             m_map_line = re.match(mapping_key_re, stripped)
             is_mapping = bool(m_map_line)
             is_list_item = bool(re.match(r"^-(?:\s+.*|\s*)$", stripped))
-            if not (is_mapping or is_list_item):
+            is_flow_collection_node = (
+                not is_mapping
+                and not is_list_item
+                and stripped.startswith(("[", "{"))
+                and indent > 0
+                and bool(scopes)
+                and scopes[-1]["allow_children"]
+                and scopes[-1]["child_indent"] is None
+            )
+            if not (is_mapping or is_list_item or is_flow_collection_node):
                 errors.append(
                     f"YAML syntax error on line {idx}: expected mapping 'key: value' or list item '- value'."
                 )
@@ -2494,6 +2617,13 @@ def _validate_cloud_init_syntax(
 
             while scopes and scopes[-1]["indent"] > indent:
                 scopes.pop()
+
+            if is_flow_collection_node:
+                errors.extend(
+                    _validate_yaml_flow_value(stripped, idx, defined_anchors=defined_anchors)
+                )
+                scopes[-1]["allow_children"] = False
+                continue
 
             if scopes and scopes[-1]["indent"] == indent:
                 prev_kind = scopes[-1]["kind"]
@@ -2621,6 +2751,11 @@ def _validate_cloud_init_syntax(
                         {"indent": indent, "kind": "map", "child_indent": None, "allow_children": False}
                     )
 
+        if pending_flow_lines:
+            errors.append(
+                f"YAML syntax error on line {pending_flow_start_idx}: unclosed bracket, brace, or quote in '{pending_flow_lines[0]}'."
+            )
+
         if not errors:
             yaml_doc = "\n".join(lines) + "\n"
             ruby_bin = shutil.which("ruby") or ("/usr/bin/ruby" if os.path.exists("/usr/bin/ruby") else None)
@@ -2689,16 +2824,56 @@ def parse_cloud_init(content: str) -> dict[str, Any]:
     def _extract_top_list(section_name: str) -> list[str]:
         items: list[str] = []
         in_section = False
+        flow_buf: list[str] = []
+        flow_depth = 0
         for raw in lines:
             stripped = raw.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            if re.match(rf'^["\']?{re.escape(section_name)}["\']?\s*:\s*$', raw):
-                in_section = True
+            if flow_buf:
+                seg = _strip_yaml_inline_comment(stripped)
+                if seg:
+                    flow_buf.append(seg)
+                    flow_depth += seg.count("[") - seg.count("]")
+                if flow_depth <= 0:
+                    joined = " ".join(flow_buf).strip()
+                    if joined.startswith("[") and joined.endswith("]"):
+                        for part in _split_yaml_flow_top_level(joined[1:-1], ","):
+                            cleaned = part.strip()
+                            if cleaned:
+                                items.append(cleaned)
+                    break
                 continue
+            m_sec = re.match(rf'^["\']?{re.escape(section_name)}["\']?\s*:\s*(.*)$', raw)
+            if m_sec:
+                rest = _strip_yaml_inline_comment(m_sec.group(1).strip())
+                if rest.startswith("["):
+                    flow_buf = [rest]
+                    flow_depth = rest.count("[") - rest.count("]")
+                    if flow_depth <= 0 and rest.endswith("]"):
+                        for part in _split_yaml_flow_top_level(rest[1:-1], ","):
+                            cleaned = part.strip()
+                            if cleaned:
+                                items.append(cleaned)
+                        break
+                    continue
+                if not rest:
+                    in_section = True
+                    continue
             if in_section:
                 if re.match(r'^["\']?[A-Za-z0-9_.-]+["\']?\s*:\s*', raw):
                     break
+                seg = _strip_yaml_inline_comment(stripped)
+                if seg.startswith("[") and not items:
+                    flow_buf = [seg]
+                    flow_depth = seg.count("[") - seg.count("]")
+                    if flow_depth <= 0 and seg.endswith("]"):
+                        for part in _split_yaml_flow_top_level(seg[1:-1], ","):
+                            cleaned = part.strip()
+                            if cleaned:
+                                items.append(cleaned)
+                        break
+                    continue
                 match = re.match(r"^\s*-\s+(.+)$", raw)
                 if match:
                     items.append(match.group(1).strip())
