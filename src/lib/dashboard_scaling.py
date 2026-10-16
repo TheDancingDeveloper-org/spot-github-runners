@@ -632,13 +632,21 @@ def evaluate_scaling_decision(
     if raw_max_instances is not None:
         max_instances_cap = max(1, _finite_int_val(raw_max_instances, "max_instances"))
         if desired_instances > max_instances_cap:
-            desired_instances = max(current_instances_count, max_instances_cap)
-            if desired_instances == current_instances_count:
-                desired_runners = current_runners
-            elif known_current_instances is not None:
-                desired_runners = current_runners + (desired_instances - current_instances_count) * runners_per_vm
+            if desired_instances < current_instances_count or bool(scale_down_reasons):
+                desired_instances = max_instances_cap
+                if known_current_instances is not None:
+                    removed_instances = current_instances_count - desired_instances
+                    desired_runners = max(capacity_floor, current_runners - removed_instances * runners_per_vm)
+                else:
+                    desired_runners = desired_instances * runners_per_vm
             else:
-                desired_runners = desired_instances * runners_per_vm
+                desired_instances = max(current_instances_count, max_instances_cap)
+                if desired_instances == current_instances_count:
+                    desired_runners = current_runners
+                elif known_current_instances is not None:
+                    desired_runners = current_runners + (desired_instances - current_instances_count) * runners_per_vm
+                else:
+                    desired_runners = desired_instances * runners_per_vm
 
     # Enforce max scale-up budget caps (hourly, daily, monthly) without turning a blocked scale-up into a scale-down
     unit_hourly = max(0.0001, _finite_float_val(per_instance_hourly_usd, "per_instance_hourly_usd"))

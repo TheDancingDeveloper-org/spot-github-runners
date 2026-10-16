@@ -32,6 +32,7 @@ from .dashboard_models import (
     calculate_spot_pricing,
     compute_cpu_benchmark_score,
     disk_category,
+    fetch_live_spot_pricing,
     format_gcloud_ssh_command,
     measure_region_latencies,
     normalize_budget,
@@ -1381,14 +1382,24 @@ class DashboardStore:
 
     def _refresh_instances_pricing(self) -> None:
         """Recompute active instance pricing using current live/catalog machine rates while preserving historical rates on deleted instances."""
-        for inst in self.state.get("instances", []):
-            if (
-                not isinstance(inst, dict)
-                or inst.get("status") != "RUNNING"
-                or not inst.get("region")
-                or not inst.get("machine_type")
-            ):
-                continue
+        running_insts = [
+            inst
+            for inst in self.state.get("instances", [])
+            if isinstance(inst, dict)
+            and inst.get("status") == "RUNNING"
+            and inst.get("region")
+            and inst.get("machine_type")
+        ]
+        if not running_insts:
+            return
+        active_regions = sorted({str(inst["region"]) for inst in running_insts})
+        active_mtypes = sorted({str(inst["machine_type"]) for inst in running_insts})
+        shared_live_pricing = fetch_live_spot_pricing(
+            project=self.project,
+            regions=active_regions,
+            machine_types=active_mtypes,
+        )
+        for inst in running_insts:
             cur_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else {}
             inst_role = str(inst.get("role", "cicd_runner"))
             prof_budget = (
@@ -1421,6 +1432,7 @@ class DashboardStore:
                 data_disk_gb=int(inst.get("data_disk_gb", 100)),
                 tax_rate_percent=tax_rate_pct,
                 machine_type=str(inst["machine_type"]),
+                live_pricing=shared_live_pricing,
                 project=self.project,
             )
 
@@ -1816,12 +1828,14 @@ class DashboardStore:
                     val_float = _finite_float(payload[key], key, min_val=None)
                     if val_float <= 0:
                         raise ValueError(f"{key} must be > 0")
-                    candidate[key] = val_float
+                    candidate[key] = (
+                        float(math.ceil(val_float)) if key == "runner_ram_gib" else val_float
+                    )
             if "host_overhead_gib" in payload:
                 overhead_val = _finite_float(
                     payload["host_overhead_gib"], "host_overhead_gib", min_val=0.0
                 )
-                candidate["host_overhead_gib"] = overhead_val
+                candidate["host_overhead_gib"] = float(math.ceil(overhead_val))
             if "disk_category" in payload:
                 d_cat = str(payload["disk_category"]).strip().lower()
                 if d_cat not in ("any", "hyperdrive", "normal"):
@@ -2063,9 +2077,11 @@ class DashboardStore:
                         self.state["profiles"]["cicd_runner"]["runner_vcpu"] = _finite_int(
                             pol.get("runner_vcpu", 4), "runner_vcpu", min_val=1
                         )
-                        self.state["profiles"]["cicd_runner"]["runner_ram_gib"] = _finite_float(
-                            pol.get("runner_ram_gib", 16), "runner_ram_gib", min_val=0.1
+                        runner_ram_ceil = float(
+                            math.ceil(_finite_float(pol.get("runner_ram_gib", 16), "runner_ram_gib", min_val=0.1))
                         )
+                        pol["runner_ram_gib"] = runner_ram_ceil
+                        self.state["profiles"]["cicd_runner"]["runner_ram_gib"] = runner_ram_ceil
                         if "runners_per_instance" not in payload["policy"]:
                             self._sync_template_density()
                     else:
@@ -2088,16 +2104,23 @@ class DashboardStore:
                             pol["builder_ram_gib"] = _finite_float(
                                 pol["container_ram_gib"], "container_ram_gib", min_val=0.1
                             )
+                        builder_ram_ceil = float(
+                            math.ceil(
+                                _finite_float(
+                                    pol.get("container_ram_gib", pol.get("builder_ram_gib", 28)),
+                                    "container_ram_gib",
+                                    min_val=0.1,
+                                )
+                            )
+                        )
+                        pol["container_ram_gib"] = builder_ram_ceil
+                        pol["builder_ram_gib"] = builder_ram_ceil
                         self.state["profiles"]["rust_builder"]["min_instances"] = min_inst_val
                         self.state["profiles"]["rust_builder"]["max_instances"] = max_inst_val
                         self.state["profiles"]["rust_builder"]["runner_vcpu"] = _finite_int(
                             pol.get("container_vcpu", pol.get("builder_vcpu", 16)), "container_vcpu", min_val=1
                         )
-                        self.state["profiles"]["rust_builder"]["runner_ram_gib"] = _finite_float(
-                            pol.get("container_ram_gib", pol.get("builder_ram_gib", 28)),
-                            "container_ram_gib",
-                            min_val=0.1,
-                        )
+                        self.state["profiles"]["rust_builder"]["runner_ram_gib"] = builder_ram_ceil
                         self._sync_template_density()
                 telem_payload = payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {}
                 if telem_payload:
@@ -2998,11 +3021,26 @@ class DashboardStore:
             )
 
             if is_non_delivered:
-                duration = (
-                    explicit_total
-                    if explicit_total is not None
-                    else (explicit_compile if explicit_compile is not None else 0.0)
-                )
+                if explicit_total is not None:
+                    duration = explicit_total
+                elif explicit_compile is not None:
+                    duration = explicit_compile
+                elif is_unsuccessful and (payload.get("requested_at") or existing_build.get("requested_at")):
+                    req_epoch_existing = _iso_to_epoch(
+                        str(payload.get("requested_at") or existing_build["requested_at"])
+                    )
+                    fin_epoch_target = (
+                        _iso_to_epoch(str(payload["finished_at"]))
+                        if payload.get("finished_at")
+                        else (
+                            _iso_to_epoch(str(existing_build["finished_at"]))
+                            if existing_build.get("finished_at")
+                            else now_ts
+                        )
+                    )
+                    duration = max(0.0, round(fin_epoch_target - req_epoch_existing, 2))
+                else:
+                    duration = 0.0
                 delivery_sec = explicit_delivery if explicit_delivery is not None else 0.0
             else:
                 if explicit_total is not None:
@@ -3087,8 +3125,8 @@ class DashboardStore:
                     fin_at = payload.get("finished_at")
                 elif existing_build.get("finished_at"):
                     fin_at = existing_build.get("finished_at")
-                elif is_unsuccessful and duration > 0:
-                    fin_at = _iso_seconds_ago(0, req_epoch + max(0.0, duration - delivery_sec))
+                elif is_unsuccessful:
+                    fin_at = _iso_seconds_ago(0, max(now_ts, req_epoch + max(0.0, duration - delivery_sec)))
                 else:
                     fin_at = None
                 del_at = (
@@ -3325,6 +3363,16 @@ def make_handler(
             secure_attr = "; Secure" if is_secure else ""
             return f"dashboard_session={expected_session_cookie}; HttpOnly; SameSite=Strict; Path=/{secure_attr}"
 
+        def _format_cleared_session_cookie(self) -> str:
+            forwarded_proto = (self.headers.get("X-Forwarded-Proto") or "").strip().lower()
+            is_secure = (
+                require_secure_cookie
+                or isinstance(getattr(self, "connection", None), ssl.SSLSocket)
+                or forwarded_proto == "https"
+            )
+            secure_attr = "; Secure" if is_secure else ""
+            return f"dashboard_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure_attr}"
+
         def _send_json(
             self,
             data: Any,
@@ -3516,50 +3564,58 @@ def make_handler(
                 self._send_json({"status": "healthy", "project": store.project, "org": store.org})
                 return
 
-            if path == "/api/overview":
-                include_deleted = qs.get("include_deleted", ["true"])[0].lower() != "false"
-                window_hours = float(qs.get("window_hours", ["24"])[0])
-                include_disk_tax = qs.get("include_disk_and_tax", ["true"])[0].lower() != "false"
-                sort_by = qs.get("sort_by", ["total_cost_in_window_usd"])[0]
-                sort_dir = qs.get("sort_dir", ["desc"])[0]
-                search = qs.get("search", [""])[0]
-                role_filter = qs.get("role", [""])[0]
-                self._send_json(
-                    store.get_overview(
-                        include_deleted=include_deleted,
-                        window_hours=window_hours,
-                        include_disk_and_tax=include_disk_tax,
-                        sort_by=sort_by,
-                        sort_dir=sort_dir,
-                        search_filter=search,
-                        role_filter=role_filter,
+            try:
+                if path == "/api/overview":
+                    include_deleted = qs.get("include_deleted", ["true"])[0].lower() != "false"
+                    window_hours = _finite_float(
+                        qs.get("window_hours", ["24"])[0], "window_hours", min_val=0.01
                     )
-                )
-                return
-
-            if path == "/api/instances":
-                include_deleted = qs.get("include_deleted", ["true"])[0].lower() != "false"
-                window_hours = float(qs.get("window_hours", ["24"])[0])
-                include_disk_tax = qs.get("include_disk_and_tax", ["true"])[0].lower() != "false"
-                sort_by = qs.get("sort_by", ["total_cost_in_window_usd"])[0]
-                sort_dir = qs.get("sort_dir", ["desc"])[0]
-                search = qs.get("search", [""])[0]
-                role_filter = qs.get("role", [""])[0]
-                self._send_json(
-                    store.query_instances(
-                        include_deleted=include_deleted,
-                        window_hours=window_hours,
-                        include_disk_and_tax=include_disk_tax,
-                        sort_by=sort_by,
-                        sort_dir=sort_dir,
-                        search_filter=search,
-                        role_filter=role_filter,
+                    include_disk_tax = qs.get("include_disk_and_tax", ["true"])[0].lower() != "false"
+                    sort_by = qs.get("sort_by", ["total_cost_in_window_usd"])[0]
+                    sort_dir = qs.get("sort_dir", ["desc"])[0]
+                    search = qs.get("search", [""])[0]
+                    role_filter = qs.get("role", [""])[0]
+                    self._send_json(
+                        store.get_overview(
+                            include_deleted=include_deleted,
+                            window_hours=window_hours,
+                            include_disk_and_tax=include_disk_tax,
+                            sort_by=sort_by,
+                            sort_dir=sort_dir,
+                            search_filter=search,
+                            role_filter=role_filter,
+                        )
                     )
-                )
-                return
+                    return
 
-            if path == "/api/rust-builds":
-                self._send_json(store.get_rust_builds_summary())
+                if path == "/api/instances":
+                    include_deleted = qs.get("include_deleted", ["true"])[0].lower() != "false"
+                    window_hours = _finite_float(
+                        qs.get("window_hours", ["24"])[0], "window_hours", min_val=0.01
+                    )
+                    include_disk_tax = qs.get("include_disk_and_tax", ["true"])[0].lower() != "false"
+                    sort_by = qs.get("sort_by", ["total_cost_in_window_usd"])[0]
+                    sort_dir = qs.get("sort_dir", ["desc"])[0]
+                    search = qs.get("search", [""])[0]
+                    role_filter = qs.get("role", [""])[0]
+                    self._send_json(
+                        store.query_instances(
+                            include_deleted=include_deleted,
+                            window_hours=window_hours,
+                            include_disk_and_tax=include_disk_tax,
+                            sort_by=sort_by,
+                            sort_dir=sort_dir,
+                            search_filter=search,
+                            role_filter=role_filter,
+                        )
+                    )
+                    return
+
+                if path == "/api/rust-builds":
+                    self._send_json(store.get_rust_builds_summary())
+                    return
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
             self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
@@ -3596,6 +3652,22 @@ def make_handler(
                     {"error": "Unauthorized: invalid dashboard authentication token"},
                     status=HTTPStatus.UNAUTHORIZED,
                     extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
+                )
+                return
+            if path == "/api/auth/logout":
+                try:
+                    self._read_json(max_bytes=MAX_LOGIN_BODY_BYTES)
+                except _PayloadTooLargeError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(
+                    {"status": "ok", "authenticated": False},
+                    extra_headers={
+                        "Set-Cookie": self._format_cleared_session_cookie()
+                    },
                 )
                 return
             if not self._check_auth():

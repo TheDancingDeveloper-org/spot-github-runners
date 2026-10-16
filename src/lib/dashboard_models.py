@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import math
 import os
 import re
 import socket
@@ -115,7 +116,7 @@ runcmd:
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker'''
   # 3. Download, Configure & Start Persistent GitHub Actions Runner Slots with live GCE region & machine-family labels
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-0}?host_mem_gib-${HOST_RESERVE_GIB:-0}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-4}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-16}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && if [[ ! -f .runner ]]; then runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}"; fi && rm -f .service && ./svc.sh install runner && ./svc.sh start); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-0}?host_mem_gib-${HOST_RESERVE_GIB:-0}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-4}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-16}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-4} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-16}G" && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && if [[ ! -f .runner ]]; then runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}"; fi && rm -f .service && ./svc.sh install runner && ./svc.sh start && unit_name="$(tr -d "[:space:]" < .service)" && install -d -m 0755 "/etc/systemd/system/${unit_name}.d" && printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/${unit_name}.d/runner-limits.conf" && systemctl daemon-reload && systemctl restart "${unit_name}"); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -1970,8 +1971,8 @@ def qualify_instances(
 
     # Per-runner / per-builder unit requirements
     unit_vcpu = max(1, int(profile_config.get("runner_vcpu", 4 if role == "cicd_runner" else 16)))
-    unit_ram_gib = max(1, float(profile_config.get("runner_ram_gib", 16 if role == "cicd_runner" else 28)))
-    host_overhead_gib = max(0.0, float(profile_config.get("host_overhead_gib", 0.0)))
+    unit_ram_gib = float(max(1, int(math.ceil(float(profile_config.get("runner_ram_gib", 16 if role == "cicd_runner" else 28))))))
+    host_overhead_gib = float(max(0, int(math.ceil(float(profile_config.get("host_overhead_gib", 0.0))))))
     min_instance_vcpu = max(unit_vcpu, int(profile_config.get("min_instance_vcpu", unit_vcpu)))
     min_instance_ram_gib = max(
         unit_ram_gib + host_overhead_gib,
@@ -2596,6 +2597,12 @@ def _validate_cloud_init_syntax(
             indent = pending_flow_indent
             pending_flow_lines = []
 
+            if stripped == "---" and indent == 0 and not scopes:
+                continue
+            if stripped == "..." and indent == 0:
+                scopes.clear()
+                continue
+
             mapping_key_re = r'^(?P<key>[A-Za-z0-9_.-]+|"(?:[^"\\]|\\.)*"|\'(?:[^\']|\'\')*\')\s*:(?P<val>\s+.*|\s*)$'
             m_map_line = re.match(mapping_key_re, stripped)
             is_mapping = bool(m_map_line)
@@ -3028,11 +3035,11 @@ def render_cloud_init_for_profile(
     text = str(content or "")
     slots = max(1, int(runners_count))
     vcpu = max(1, int(runner_vcpu))
-    ram_gib = max(1, int(round(float(runner_ram_gib))))
-    reserve_gib = max(0, int(round(float(host_overhead_gib))))
+    ram_gib = max(1, int(math.ceil(float(runner_ram_gib))))
+    reserve_gib = max(0, int(math.ceil(float(host_overhead_gib))))
     usable_work_gib = max(
         ram_gib,
-        int(round(max(float(instance_ram_gib) - float(host_overhead_gib), float(ram_gib)))),
+        int(math.floor(float(instance_ram_gib)) - reserve_gib),
     )
     if role == "rust_builder":
         text = re.sub(

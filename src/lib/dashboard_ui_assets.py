@@ -1516,6 +1516,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       return res.ok;
     }
 
+    async function logoutDashboardSession() {
+      try {
+        await NATIVE_FETCH("/api/auth/logout", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({})
+        });
+      } catch (_err) {
+        // Ignore network errors during logout cleanup.
+      }
+    }
+
     async function configureDashboardAuthToken() {
       const current = getDashboardAuthToken();
       const entered = window.prompt(
@@ -1525,6 +1540,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       if (entered === null) return;
       const clean = storeDashboardAuthToken(entered);
       if (!clean) {
+        await logoutDashboardSession();
         showToast("Cleared saved dashboard auth token");
         return;
       }

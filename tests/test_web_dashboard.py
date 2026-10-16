@@ -3123,6 +3123,128 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         parsed_unclosed = parse_cloud_init(unclosed_multi)
         self.assertFalse(parsed_unclosed["valid"])
 
+    def test_round20_codex_regressions(self):
+        from datetime import datetime, timedelta, timezone
+        from unittest import mock
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_CLOUD_INIT,
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            render_cloud_init_for_profile,
+        )
+        from lib.dashboard_ui_assets import render_dashboard_html
+
+        # 1. Standard runner cloud-init enforces per-runner CPUQuota and MemoryMax via systemd drop-in
+        self.assertIn('cpu_quota="$(( ${RUNNER_CPU_LIMIT:-4} * 100 ))%"', DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn('mem_max="${RUNNER_MEMORY_GB:-16}G"', DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn('unit_name="$(tr -d "[:space:]" < .service)"', DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn('"/etc/systemd/system/${unit_name}.d/runner-limits.conf"', DEFAULT_RUNNER_CLOUD_INIT)
+
+        # 2. Scale-downs are clamped to max_instances when reducing an oversized fleet
+        oversized_down = evaluate_scaling_decision(
+            policy={"min_runners": 1, "max_runners": 16, "runners_per_instance": 1, "max_instances": 4},
+            telemetry={
+                "current_runners": 8,
+                "current_instances": 8,
+                "active_jobs": 6,
+                "queued_jobs": 0,
+                "avg_cpu_utilization_pct": 10.0,
+                "avg_ram_utilization_pct": 10.0,
+                "idle_minutes": 45,
+            },
+            per_instance_hourly_usd=0.10,
+        )
+        self.assertEqual(oversized_down["direction"], "scale_down")
+        self.assertEqual(oversized_down["desired_instances"], 4)
+        self.assertEqual(oversized_down["desired_runners"], 4)
+
+        # 3. Status-only unsuccessful terminal transitions timestamp finished_at and derive elapsed duration
+        old_req = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-r20-failed-transition",
+                "status": "RUNNING",
+                "requested_at": old_req,
+                "crate_workspace": "oxidex-core",
+            },
+        )
+        failed_tr = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-r20-failed-transition",
+                "status": "FAILED",
+            },
+        )["build"]
+        self.assertIsNotNone(failed_tr["finished_at"])
+        self.assertGreaterEqual(failed_tr["total_duration_seconds"], 7000.0)
+        overview_after_fail = self._get("/api/overview")
+        self.assertGreaterEqual(
+            overview_after_fail["scaling_telemetry"]["builds_ran_past_hour"],
+            1,
+        )
+
+        # 4. YAML document-start and document-end markers are accepted by cloud-init validator
+        doc_marker_yaml = "#cloud-config\n---\npackage_update: true\npackages:\n  - curl\n...\n"
+        parsed_doc_marker = parse_cloud_init(doc_marker_yaml)
+        self.assertTrue(
+            parsed_doc_marker["valid"],
+            f"Expected valid YAML with --- marker, got: {parsed_doc_marker['errors']}",
+        )
+
+        # 5. Fractional memory requirements and host reserves round upward consistently
+        rendered_frac = render_cloud_init_for_profile(
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            role="cicd_runner",
+            runners_count=2,
+            runner_vcpu=4,
+            runner_ram_gib=16.5,
+            instance_ram_gib=64.0,
+            host_overhead_gib=1.2,
+        )
+        self.assertIn('RUNNER_MEMORY_GB="17"', rendered_frac)
+        self.assertIn('HOST_RESERVE_GIB="2"', rendered_frac)
+        prof_frac = self._post(
+            "/api/profile/cicd_runner",
+            {"runner_ram_gib": 16.5, "host_overhead_gib": 1.2},
+        )["profile"]
+        self.assertEqual(prof_frac["runner_ram_gib"], 17.0)
+        self.assertEqual(prof_frac["host_overhead_gib"], 2.0)
+
+        # 6. _refresh_instances_pricing batches live-pricing fetch once across all running instances
+        with mock.patch("lib.dashboard_server.fetch_live_spot_pricing", wraps=None) as mock_fetch:
+            mock_fetch.return_value = {
+                "source": "catalog_baseline",
+                "fetched_at": 0.0,
+                "component_rates": {},
+                "machine_hourly": {},
+                "disk_monthly_gib": {},
+            }
+            self.store._refresh_instances_pricing()
+            self.assertEqual(mock_fetch.call_count, 1)
+
+        # 7. Clearing auth token invokes POST /api/auth/logout and expires dashboard_session cookie
+        html_ui = render_dashboard_html(project="homelab-424523", org="swack-tools")
+        self.assertIn('"/api/auth/logout"', html_ui)
+        self.assertIn("await logoutDashboardSession();", html_ui)
+        logout_req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/auth/logout",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(logout_req, timeout=5) as logout_resp:
+            set_cookie = logout_resp.headers.get("Set-Cookie", "")
+            logout_body = json.loads(logout_resp.read().decode("utf-8"))
+        self.assertFalse(logout_body["authenticated"])
+        self.assertIn("dashboard_session=;", set_cookie)
+        self.assertIn("Max-Age=0", set_cookie)
+
+        # 8. Malformed GET query parameters return HTTP 400 JSON instead of dropping connection
+        with self.assertRaises(urllib.error.HTTPError) as bad_get_ctx:
+            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/api/overview?window_hours=abc", timeout=5)
+        self.assertEqual(bad_get_ctx.exception.code, 400)
+        bad_get_ctx.exception.close()
+
 
 if __name__ == "__main__":
     unittest.main()
