@@ -3020,6 +3020,19 @@ class DashboardStore:
                 else None
             )
 
+            req_matches_existing = bool(
+                existing_build.get("requested_at")
+                and (
+                    not payload.get("requested_at")
+                    or str(payload.get("requested_at")) == str(existing_build.get("requested_at"))
+                    or abs(
+                        _iso_to_epoch(str(payload["requested_at"]))
+                        - _iso_to_epoch(str(existing_build["requested_at"]))
+                    )
+                    < 1.0
+                    or prev_status_norm in UNFINISHED_BUILD_STATUSES
+                )
+            )
             if is_non_delivered:
                 if explicit_total is not None:
                     duration = explicit_total
@@ -3053,11 +3066,12 @@ class DashboardStore:
                         delivery_sec = min(8.0, round(duration * 0.2, 2))
                 elif (
                     was_non_delivered
-                    and existing_build.get("requested_at")
-                    and not payload.get("requested_at")
+                    and req_matches_existing
                     and explicit_compile is None
                 ):
-                    req_epoch_existing = _iso_to_epoch(str(existing_build["requested_at"]))
+                    req_epoch_existing = _iso_to_epoch(
+                        str(payload.get("requested_at") or existing_build["requested_at"])
+                    )
                     if payload.get("delivered_at"):
                         completion_epoch = _iso_to_epoch(str(payload["delivered_at"]))
                     elif payload.get("finished_at") and explicit_delivery is not None:
@@ -3136,12 +3150,11 @@ class DashboardStore:
                 )
             elif (
                 was_non_delivered
-                and existing_build.get("requested_at")
-                and not payload.get("requested_at")
+                and req_matches_existing
                 and explicit_total is None
                 and explicit_compile is None
             ):
-                req_at = str(existing_build["requested_at"])
+                req_at = str(payload.get("requested_at") or existing_build["requested_at"])
                 req_epoch = _iso_to_epoch(req_at)
                 if payload.get("delivered_at"):
                     del_at = str(payload["delivered_at"])

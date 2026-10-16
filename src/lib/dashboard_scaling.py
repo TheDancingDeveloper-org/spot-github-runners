@@ -574,7 +574,7 @@ def evaluate_scaling_decision(
         else:
             desired_runners = max(capacity_floor, current_runners)
     else:
-        desired_runners = max(capacity_floor, min(max_runners, desired_runners))
+        desired_runners = max(capacity_floor, current_runners, min(max_runners, desired_runners))
 
     # Compute desired instances from fleet state and runner density, quantizing scale-up to whole VM capacity
     if desired_runners == current_runners and known_current_instances is not None:
@@ -775,7 +775,7 @@ def evaluate_builder_scaling_decision(
     current_instances = max(
         0,
         _finite_int_val(
-            telemetry.get("current_builder_instances", telemetry.get("current_builders", 2)),
+            telemetry.get("current_builder_instances", telemetry.get("current_builders", telemetry.get("current_instances", 2))),
             "current_builder_instances",
         ),
     )
@@ -910,7 +910,7 @@ def evaluate_builder_scaling_decision(
         else:
             desired_instances = max(capacity_floor, min(max_instances, current_instances))
     else:
-        desired_instances = max(capacity_floor, min(max_instances, desired_instances))
+        desired_instances = max(capacity_floor, current_instances, min(max_instances, desired_instances))
 
     unit_hourly = max(0.0001, _finite_float_val(per_instance_hourly_usd, "per_instance_hourly_usd"))
     max_hourly_cap = _finite_float_val(cfg.get("max_scale_up_hourly_usd", 3.50), "max_scale_up_hourly_usd")

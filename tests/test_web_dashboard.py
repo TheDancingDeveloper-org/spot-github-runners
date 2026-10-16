@@ -3245,6 +3245,99 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(bad_get_ctx.exception.code, 400)
         bad_get_ctx.exception.close()
 
+    def test_round21_codex_regressions(self):
+        from datetime import datetime, timedelta, timezone
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_CLOUD_INIT,
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        from lib.dashboard_scaling import evaluate_builder_scaling_decision, evaluate_scaling_decision
+
+        # 1. Admission service reserves inflight capacity on accept before pool.submit
+        self.assertIn("MAX_TOTAL_INFLIGHT = 32", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("_, _, cid_slot = reserve_inflight(conn)", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("pool.submit(handle_client, conn)", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 2. Lease reclamation checks container cgroup for stray processes after Runner.Worker exits
+        self.assertIn("def container_job_active(cid, started, worker_start=None):", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("return container_job_active(cid, started, start)", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 3. Standard runner cloud-init rounds MemTotal up to nominal GiB for slot count and caps MemoryMax to usable RAM
+        self.assertIn('host_mem_gib="$(((mem_kib+mem_kib/48+524288)/2097152*2))"', DEFAULT_RUNNER_CLOUD_INIT)
+        self.assertIn('if (( slot_mem_mib > 0 && slot_mem_mib < req_mem_mib )); then mem_max="${slot_mem_mib}M"; fi', DEFAULT_RUNNER_CLOUD_INIT)
+
+        # 4. Updating an unfinished build to DELIVERED while repeating requested_at derives live duration and timestamp
+        old_req = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-r21-repeat-req",
+                "status": "RUNNING",
+                "requested_at": old_req,
+                "crate_workspace": "oxidex-core",
+            },
+        )
+        delivered_repeat = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "rb-r21-repeat-req",
+                "status": "DELIVERED",
+                "requested_at": old_req,
+            },
+        )["build"]
+        self.assertGreaterEqual(delivered_repeat["total_duration_seconds"], 1700.0)
+        self.assertNotEqual(delivered_repeat["delivered_at"], old_req)
+
+        # 5. Builder and runner autoscalers preserve current capacity when a scale-up trigger fires above max cap
+        builder_hold = evaluate_builder_scaling_decision(
+            policy={"min_instances": 1, "max_instances": 2},
+            telemetry={
+                "current_instances": 4,
+                "active_builds": 4,
+                "queued_builds": 3,
+                "avg_cpu_utilization_pct": 95.0,
+                "avg_ram_utilization_pct": 90.0,
+                "builds_ran_past_hour": 10,
+            },
+            per_instance_hourly_usd=0.10,
+        )
+        self.assertEqual(builder_hold["direction"], "hold")
+        self.assertEqual(builder_hold["desired_instances"], 4)
+
+        runner_hold = evaluate_scaling_decision(
+            policy={"min_runners": 1, "max_runners": 4, "runners_per_instance": 2, "max_instances": 2},
+            telemetry={
+                "current_runners": 8,
+                "current_instances": 4,
+                "active_jobs": 8,
+                "queued_jobs": 5,
+                "avg_cpu_utilization_pct": 95.0,
+                "avg_ram_utilization_pct": 90.0,
+                "jobs_ran_past_hour": 20,
+            },
+            per_instance_hourly_usd=0.10,
+        )
+        self.assertEqual(runner_hold["direction"], "hold")
+        self.assertEqual(runner_hold["desired_runners"], 8)
+
+        # 6. Source archive extraction rejects over-deep paths (>64 components) before creating directories
+        self.assertIn(
+            "dir_depth = len(rel_parts) if member.isdir() else (len(rel_parts) - 1)",
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        self.assertIn(
+            "raise RuntimeError('Source archive member path depth exceeds limit')",
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        depth_check_idx = DEFAULT_RUST_BUILDER_CLOUD_INIT.index(
+            "raise RuntimeError('Source archive member path depth exceeds limit')"
+        )
+        subdir_create_idx = DEFAULT_RUST_BUILDER_CLOUD_INIT.index(
+            "cur_fd = open_nofollow_subdir(cur_fd, part, root_info.st_dev)"
+        )
+        self.assertLess(depth_check_idx, subdir_create_idx)
+
 
 if __name__ == "__main__":
     unittest.main()

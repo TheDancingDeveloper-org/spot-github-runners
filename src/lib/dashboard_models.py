@@ -116,7 +116,7 @@ runcmd:
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker'''
   # 3. Download, Configure & Start Persistent GitHub Actions Runner Slots with live GCE region & machine-family labels
   - curl -fsSL https://github.com/actions/runner/releases/download/v2.322.0/actions-runner-linux-x64-2.322.0.tar.gz -o /tmp/actions-runner.tar.gz
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-0}?host_mem_gib-${HOST_RESERVE_GIB:-0}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-4}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-16}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-4} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-16}G" && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && if [[ ! -f .runner ]]; then runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}"; fi && rm -f .service && ./svc.sh install runner && ./svc.sh start && unit_name="$(tr -d "[:space:]" < .service)" && install -d -m 0755 "/etc/systemd/system/${unit_name}.d" && printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/${unit_name}.d/runner-limits.conf" && systemctl daemon-reload && systemctl restart "${unit_name}"); done && rm -f /tmp/actions-runner.tar.gz'
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$(((mem_kib+mem_kib/48+524288)/2097152*2))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-0}?host_mem_gib-${HOST_RESERVE_GIB:-0}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-4}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-16}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-4} * 100 ))%" && reserve_mib="$((${HOST_RESERVE_GIB:-0}>1?${HOST_RESERVE_GIB:-0}*1024:1024))" && usable_mem_mib="$((mem_kib/1024>reserve_mib?mem_kib/1024-reserve_mib:mem_kib/1024))" && slot_mem_mib="$((usable_mem_mib/${RUNNERS_COUNT:-4}))" && req_mem_mib="$((${RUNNER_MEMORY_GB:-16}*1024))" && mem_max="${RUNNER_MEMORY_GB:-16}G" && if (( slot_mem_mib > 0 && slot_mem_mib < req_mem_mib )); then mem_max="${slot_mem_mib}M"; fi && vm_zone="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null || true)")" && vm_region="${vm_zone%-*}" && vm_mtype="$(basename "$(curl -fsSL -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)")" && vm_family="${vm_mtype%%-*}" && eff_labels="${RUNNER_LABELS}" && [[ -z "${vm_region}" ]] || eff_labels="${eff_labels},gcp-${vm_region}" && [[ -z "${vm_family}" ]] || eff_labels="${eff_labels},${vm_family}" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o runner -g runner "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi; chown -R runner:runner "${state_dir}" "${work_dir}"; (cd "${state_dir}" && if [[ ! -f .runner ]]; then runuser -u runner -- ./config.sh --unattended --replace --name "$(hostname -s)-runner-${slot}" --url "${GITHUB_ORG_URL}" --token "${GITHUB_RUNNER_TOKEN}" --runnergroup "${RUNNER_GROUP}" --labels "${eff_labels}" --work "${work_dir}"; fi && rm -f .service && ./svc.sh install runner && ./svc.sh start && unit_name="$(tr -d "[:space:]" < .service)" && install -d -m 0755 "/etc/systemd/system/${unit_name}.d" && printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/${unit_name}.d/runner-limits.conf" && systemctl daemon-reload && systemctl restart "${unit_name}"); done && rm -f /tmp/actions-runner.tar.gz'
 """
 
 DEFAULT_RUNNER_STRICT_CLOUD_INIT = """#cloud-config
@@ -177,7 +177,9 @@ write_files:
       SOCKET_PATH = Path('/run/gha-admission/socket')
       INFLIGHT_LOCK = threading.Lock()
       INFLIGHT_BY_CID = {}
+      RESERVED_PEERS = {}
       MAX_INFLIGHT_PER_CONTAINER = 2
+      MAX_TOTAL_INFLIGHT = 32
 
       class OrphanRunnerHook(ValueError):
           # The requesting hook has outlived its GitHub-assigned Worker.
@@ -235,7 +237,47 @@ write_files:
               raise ValueError('Container is outside this runner deployment')
           return worker_owner(pid, cid, row['State']['StartedAt'])
 
-      def owner_alive(owner):
+      def container_job_active(cid, started, worker_start=None):
+          procs = {}
+          for entry in Path('/proc').iterdir():
+              if not entry.name.isdigit():
+                  continue
+              p = int(entry.name)
+              try:
+                  ppid, pstart, comm, cgrp = process_record(p)
+              except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
+                  continue
+              if runner_cgroup(cgrp) == cid:
+                  procs[p] = (ppid, int(pstart), comm)
+          if not procs:
+              return False
+          max_idle_start = int(worker_start) if worker_start is not None else None
+          listeners = [
+              (pstart, p)
+              for p, (_, pstart, comm) in procs.items()
+              if comm == 'Runner.Listener' and (max_idle_start is None or pstart <= max_idle_start)
+          ]
+          idle_pids = set()
+          if listeners:
+              _, lp = min(listeners)
+              cur = lp
+              while cur in procs and cur not in idle_pids:
+                  ppid, pstart, _ = procs[cur]
+                  if max_idle_start is not None and pstart > max_idle_start:
+                      break
+                  idle_pids.add(cur)
+                  cur = ppid
+          stray = [p for p in procs if p not in idle_pids]
+          if not stray:
+              return False
+          for p in stray:
+              try:
+                  os.kill(p, 9)
+              except OSError:
+                  pass
+          return True
+
+      def worker_alive(owner):
           try:
               match = re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)', owner)
               if match is None:
@@ -252,6 +294,18 @@ write_files:
           except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
               return True
 
+      def owner_alive(owner):
+          if worker_alive(owner):
+              return True
+          try:
+              match = re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)', owner)
+              if match is None:
+                  return False
+              cid, started, _, start = match.groups()
+              return container_job_active(cid, started, start)
+          except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+              return True
+
       def runner_reservation(owner, cfg):
           match = re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)', owner)
           if match is None:
@@ -262,7 +316,7 @@ write_files:
               raise ValueError('Runner identity changed before admission')
           if row['Name'].lstrip('/') not in cfg.get('runner_names', []):
               raise ValueError('Runner left this deployment')
-          if not owner_alive(owner):
+          if not worker_alive(owner):
               raise OrphanRunnerHook('Runner Worker exited before grant')
           runner_gib = int(cfg.get('runner_gib', 32))
           caps = row.get('HostConfig') or {}
@@ -299,22 +353,46 @@ write_files:
                       os.fsync(out_f.fileno())
                   tmp_path.replace(LEASES_PATH)
 
+      def reserve_inflight(conn):
+          conn.settimeout(5.0)
+          pid, uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+          if uid != 1001:
+              raise ValueError('Unauthorized admission peer')
+          cid_slot = runner_cgroup(Path(f'/proc/{pid}/cgroup').read_text())
+          if cid_slot is None:
+              raise ValueError('Runner must belong to a Docker cgroup')
+          with INFLIGHT_LOCK:
+              if sum(INFLIGHT_BY_CID.values()) >= MAX_TOTAL_INFLIGHT:
+                  raise RuntimeError('Too many concurrent admission requests')
+              cur_inflight = INFLIGHT_BY_CID.get(cid_slot, 0)
+              if cur_inflight >= MAX_INFLIGHT_PER_CONTAINER:
+                  raise RuntimeError('Too many concurrent admission requests from container')
+              INFLIGHT_BY_CID[cid_slot] = cur_inflight + 1
+              RESERVED_PEERS[id(conn)] = (pid, uid, cid_slot)
+          return pid, uid, cid_slot
+
+      def release_inflight(cid_slot):
+          if cid_slot is not None:
+              with INFLIGHT_LOCK:
+                  rem = INFLIGHT_BY_CID.get(cid_slot, 1) - 1
+                  if rem <= 0:
+                      INFLIGHT_BY_CID.pop(cid_slot, None)
+                  else:
+                      INFLIGHT_BY_CID[cid_slot] = rem
+
       def handle_client(conn):
           cid_slot = None
           with conn:
               try:
-                  conn.settimeout(5.0)
-                  pid, uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                  if uid != 1001:
-                      raise ValueError('Unauthorized admission peer')
-                  cid_slot = runner_cgroup(Path(f'/proc/{pid}/cgroup').read_text())
-                  if cid_slot is None:
-                      raise ValueError('Runner must belong to a Docker cgroup')
                   with INFLIGHT_LOCK:
-                      cur_inflight = INFLIGHT_BY_CID.get(cid_slot, 0)
-                      if cur_inflight >= MAX_INFLIGHT_PER_CONTAINER:
-                          raise RuntimeError('Too many concurrent admission requests from container')
-                      INFLIGHT_BY_CID[cid_slot] = cur_inflight + 1
+                      reserved = RESERVED_PEERS.pop(id(conn), None)
+                  if reserved is None:
+                      pid, uid, cid_slot = reserve_inflight(conn)
+                      with INFLIGHT_LOCK:
+                          RESERVED_PEERS.pop(id(conn), None)
+                  else:
+                      pid, uid, cid_slot = reserved
+                      conn.settimeout(5.0)
                   cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
                   owner = peer_owner(pid, uid, cfg)
                   raw = conn.recv(4096).decode('utf-8', errors='replace').strip()
@@ -338,7 +416,7 @@ write_files:
                           if owner in leases or sum(leases.values()) + runner_gib <= work_gib:
                               leases[owner] = runner_gib
                               accepted = True
-                              if not owner_alive(owner):
+                              if not worker_alive(owner):
                                   leases.pop(owner, None)
                                   accepted = False
                           else:
@@ -359,13 +437,7 @@ write_files:
                       answer['code'] = 'orphaned-runner-hook'
                       answer['error'] = 'ORPHAN_RUNNER_HOOK: ' + str(exc)[:180]
               finally:
-                  if cid_slot is not None:
-                      with INFLIGHT_LOCK:
-                          rem = INFLIGHT_BY_CID.get(cid_slot, 1) - 1
-                          if rem <= 0:
-                              INFLIGHT_BY_CID.pop(cid_slot, None)
-                          else:
-                              INFLIGHT_BY_CID[cid_slot] = rem
+                  release_inflight(cid_slot)
               try:
                   conn.sendall((json.dumps(answer) + '\\n').encode('utf-8'))
               except OSError:
@@ -397,7 +469,24 @@ write_files:
                       except Exception:
                           pass
                       continue
-                  pool.submit(handle_client, conn)
+                  try:
+                      _, _, cid_slot = reserve_inflight(conn)
+                  except (OSError, ValueError, RuntimeError) as exc:
+                      with conn:
+                          try:
+                              conn.sendall(
+                                  (json.dumps({'ok': False, 'accepted': False, 'error': str(exc)[:200]}) + '\\n').encode('utf-8')
+                              )
+                          except OSError:
+                              pass
+                      continue
+                  try:
+                      pool.submit(handle_client, conn)
+                  except Exception:
+                      with INFLIGHT_LOCK:
+                          RESERVED_PEERS.pop(id(conn), None)
+                      release_inflight(cid_slot)
+                      conn.close()
 
       def request(action='acquire'):
           with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -504,8 +593,27 @@ write_files:
     content: |
       #!/usr/bin/env bash
       set -Eeuo pipefail
-      # Leases are bound to live Runner.Worker process identity and reaped by the
-      # root host daemon once Runner.Worker exits after this hook completes.
+      # Terminate any background processes spawned by the job outside the live
+      # Runner.Listener / Runner.Worker / hook lineage before Runner.Worker exits.
+      python3 - <<'PY' || true
+      import os
+      from pathlib import Path
+      keep = set()
+      cur = os.getpid()
+      while cur > 1 and cur not in keep:
+          keep.add(cur)
+          try:
+              stat = Path(f'/proc/{cur}/stat').read_text().rsplit(')', 1)[1].split()
+              cur = int(stat[1])
+          except Exception:
+              break
+      for entry in Path('/proc').iterdir():
+          if entry.name.isdigit() and int(entry.name) not in keep:
+              try:
+                  os.kill(int(entry.name), 9)
+              except OSError:
+                  pass
+      PY
       exit 0
   - path: /opt/gha-runners/build/Dockerfile
     permissions: '0644'
@@ -545,8 +653,8 @@ runcmd:
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && rm -rf "$mp/docker/containers"/* && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker" && old_cids="$(docker ps -aq)" && if [[ -n "$old_cids" ]]; then docker rm -f $old_cids >/dev/null 2>&1 || true; fi'''
   - 'bash -lc ''set -euo pipefail && install -d -m 0755 -o runner -g runner /opt/runner-rust/cargo /opt/runner-rust/rustup && curl --proto "=https" --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup runuser -u runner -- sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup component add rustfmt clippy --toolchain 1.99.0 && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && chown -R root:root /opt/runner-rust && chmod -R a-w /opt/runner-rust && ln -sfn /opt/runner-rust/cargo/bin/* /usr/local/bin/ && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "'''
-  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && cp /opt/gha-runners/host_admission.py /opt/gha-runners/build/host_admission.py && chmod 0755 /opt/gha-runners/build/entrypoint.sh /opt/gha-runners/build/job-started.sh /opt/gha-runners/build/job-completed.sh /opt/gha-runners/build/host_admission.py && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-56}" "${RUNNER_MEMORY_GB:-32}" "${HOST_RESERVE_GIB:-8}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
-  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$((mem_kib/1048576))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && old_cids="$(docker ps -aq)" && if [[ -n "$old_cids" ]]; then docker rm -f $old_cids >/dev/null 2>&1 || true; fi && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -e RUNNER_CONFIGURE_ONLY=1 -e RUNNER_NAME="${name}" -e RUNNER_LABELS="${RUNNER_LABELS}" -e RUNNER_GROUP_NAME="${RUNNER_GROUP}" -e GITHUB_RUNNER_URL="${GITHUB_ORG_URL}" -e RUNNER_STATE=/runner-state -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --label oxidex.strict-runner=true --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e RUNNER_NAME="${name}" -e RUNNER_STATE=/runner-state -e GHA_ADMISSION_REQUIRED=1 -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; done'
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$(((mem_kib + mem_kib/48 + 524288) / 2097152 * 2))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && cp /opt/gha-runners/host_admission.py /opt/gha-runners/build/host_admission.py && chmod 0755 /opt/gha-runners/build/entrypoint.sh /opt/gha-runners/build/job-started.sh /opt/gha-runners/build/job-completed.sh /opt/gha-runners/build/host_admission.py && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-56}" "${RUNNER_MEMORY_GB:-32}" "${HOST_RESERVE_GIB:-8}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
+  - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && host_cpus="$(nproc 2>/dev/null || echo 16)" && mem_kib="$(grep -m1 "^MemTotal:" /proc/meminfo 2>/dev/null | tr -dc "0-9" || true)" && mem_kib="${mem_kib:-67108864}" && host_mem_gib="$(((mem_kib + mem_kib/48 + 524288) / 2097152 * 2))" && usable_mem_gib="$((host_mem_gib>${HOST_RESERVE_GIB:-8}?host_mem_gib-${HOST_RESERVE_GIB:-8}:host_mem_gib))" && max_by_cpu="$((host_cpus/${RUNNER_CPU_LIMIT:-8}))" && max_by_mem="$((usable_mem_gib/${RUNNER_MEMORY_GB:-32}))" && fit_slots="$((max_by_cpu<max_by_mem?max_by_cpu:max_by_mem))" && fit_slots="$((fit_slots<1?1:fit_slots))" && RUNNERS_COUNT="$((${RUNNERS_COUNT:-4}>fit_slots?fit_slots:${RUNNERS_COUNT:-4}))" && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && old_cids="$(docker ps -aq)" && if [[ -n "$old_cids" ]]; then docker rm -f $old_cids >/dev/null 2>&1 || true; fi && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -e RUNNER_CONFIGURE_ONLY=1 -e RUNNER_NAME="${name}" -e RUNNER_LABELS="${RUNNER_LABELS}" -e RUNNER_GROUP_NAME="${RUNNER_GROUP}" -e GITHUB_RUNNER_URL="${GITHUB_ORG_URL}" -e RUNNER_STATE=/runner-state -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --label oxidex.strict-runner=true --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e RUNNER_NAME="${name}" -e RUNNER_STATE=/runner-state -e GHA_ADMISSION_REQUIRED=1 -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; done'
 """
 
 DEFAULT_RUST_BUILDER_CLOUD_INIT = """#cloud-config
@@ -838,6 +946,9 @@ write_files:
                                   or any(p in ('', '.', '..') for p in rel_parts)
                               ):
                                   raise RuntimeError('Unsafe archive member path in source snapshot')
+                              dir_depth = len(rel_parts) if member.isdir() else (len(rel_parts) - 1)
+                              if dir_depth > 64 or len(rel_parts) > 64:
+                                  raise RuntimeError('Source archive member path depth exceeds limit')
                               if member.isdir():
                                   cur_fd = source_fd
                                   opened_fds = []
