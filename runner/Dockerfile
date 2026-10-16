@@ -4,7 +4,7 @@ USER root
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential clang cmake curl git jq libssl-dev make pkg-config python3 python3-pip \
       perl cpanminus libarchive-zip-perl zlib1g-dev libzstd-dev libarchive-dev ca-certificates unzip zip xz-utils \
-      zstd \
+      zstd socat iproute2 procps \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -o runner -g runner /runner-state /work /opt/runner-rust/cargo /opt/runner-rust/rustup \
     && install -m 0444 /dev/null /run/oxidex-spot-runner
@@ -13,7 +13,8 @@ COPY job-completed.sh /usr/local/bin/gha-runner-job-completed.sh
 COPY job-started.sh /usr/local/bin/gha-runner-job-started.sh
 COPY host_admission.py /usr/local/bin/gha-host-admission.py
 COPY clean_target.py /usr/local/bin/gha-runner-clean-target.py
-RUN chmod 0755 /usr/local/bin/gha-runner-job-started.sh /usr/local/bin/gha-runner-entrypoint /usr/local/bin/gha-runner-job-completed.sh
+COPY docker-wrapper.py /usr/local/bin/docker
+RUN chmod 0755 /usr/local/bin/docker /usr/local/bin/gha-runner-job-started.sh /usr/local/bin/gha-runner-entrypoint /usr/local/bin/gha-runner-job-completed.sh
 USER runner
 ENV CARGO_HOME=/opt/runner-rust/cargo
 ENV RUSTUP_HOME=/opt/runner-rust/rustup

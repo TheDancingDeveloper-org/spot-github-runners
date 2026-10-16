@@ -160,13 +160,13 @@ A human task prompt authorizes agents to work on an isolated feature branch, com
 
 1. **Local verification and review before opening a pull request**:
    - Run the full unit test suite and `vale` checks on all modified documentation files.
-   - Obtain an independent local Codex review of the complete diff against `origin/main` (for example via `codex exec --model gpt-6.1-sol -c model_reasoning_effort=high -c service_tier=default --sandbox read-only --ephemeral review --base origin/main`) and resolve any findings before opening the pull request.
-2. **Pull request review and `@codex rereview` loop**:
+   - Obtain an independent local review of the complete diff against `origin/main` from Antigravity (via an independent Antigravity subagent or session) or Codex (for example via `codex exec --model gpt-6.1-sol -c model_reasoning_effort=high -c service_tier=default --sandbox read-only --ephemeral review --base origin/main`) and resolve any findings before opening the pull request.
+2. **Pull request review loop**:
    - Push the feature branch and open a pull request targeting `main` in `swack-tools/spot-github-runners`.
-   - Trigger or await the GitHub Codex review (`@codex review`).
-   - Inspect every Codex review comment against the codebase. Fix every valid issue, rerun unit tests and Vale checks, push the signed commit, reply to the review comment with the fix and verification evidence, and resolve the review thread.
-   - After resolving review comments, comment `@codex rereview` (or `@codex review` if required by the connector trigger) on the pull request and wait for the updated review on the new head commit.
-   - Repeat this resolve-and-rerequest cycle until Codex reports no remaining issues (gives the go-ahead / `gtg` or 👍 reaction on the current head commit), all review threads are resolved, and required GitHub checks (such as CodeQL) pass.
+   - Obtain an independent Antigravity review on the pull request or trigger the GitHub Codex review (`@codex review`).
+   - Inspect every review comment against the codebase. Fix every valid issue, rerun unit tests and Vale checks, push the signed commit, reply to the review comment with the fix and verification evidence, and resolve the review thread.
+   - After resolving review comments, obtain a fresh Antigravity review or comment `@codex rereview` (or `@codex review` if required by the connector trigger) on the pull request and wait for the updated review on the new head commit.
+   - Repeat this resolve-and-rerequest cycle until the reviewer (Antigravity or Codex) reports no remaining issues (gives the go-ahead / `gtg` or 👍 reaction on the current head commit), all review threads are resolved, and required GitHub checks (such as CodeQL) pass.
 3. **Squash and merge**:
    - Confirm that `origin/main` has not advanced in a conflicting way and that the reviewed head commit matches the pull request head, then squash-merge the pull request into `main` while pinning the reviewed head commit so the review and CI gate cannot be raced:
      ```bash

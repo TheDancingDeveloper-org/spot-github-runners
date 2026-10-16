@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lib.runner_assets import (CLEAN_TARGET, JOB_COMPLETED, RUNNER_DOCKERFILE,
-                               RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
+from lib.runner_assets import (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED,
+                               RUNNER_DOCKERFILE, RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
 from lib.runner_manager import args_parser, render_startup
 
 
@@ -96,6 +96,7 @@ class JobCacheCleanupTests(unittest.TestCase):
     def test_missing_target_is_ok_and_assets_match_templates(self):
         self.assertFalse(clean_target.cleanup(self.work, self.env))
         for content, path in ((CLEAN_TARGET, "runner/clean_target.py"),
+                              (DOCKER_WRAPPER, "runner/docker-wrapper.py"),
                               (JOB_COMPLETED, "runner/job-completed.sh"),
                               (RUNNER_DOCKERFILE, "runner/Dockerfile"),
                               (RUNNER_ENTRYPOINT, "runner/entrypoint.sh"),
@@ -108,7 +109,7 @@ class JobCacheCleanupTests(unittest.TestCase):
     def test_rendered_startup_carries_both_hook_files(self):
         args = args_parser().parse_args(["--max-cost", ".5"])
         rendered = render_startup(args, "token", "group", "deployment")
-        for content in (CLEAN_TARGET, JOB_COMPLETED):
+        for content in (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED):
             self.assertIn(base64.b64encode(content.encode()).decode(), rendered)
         self.assertNotIn("{{", rendered)
 

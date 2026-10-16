@@ -27,8 +27,8 @@ from .fleet_logging import vm_details
 from .runner_fleet import GceVm, list_gcloud_vms
 from .log_format import configure_logging, error_detail, single_line
 from .runner_labels import DEFAULT_RUNNER_LABELS
-from .runner_assets import (CLEAN_TARGET, JOB_COMPLETED, RUNNER_DOCKERFILE,
-                            RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
+from .runner_assets import (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED,
+                            RUNNER_DOCKERFILE, RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
 from .builder_assets import BUILDER_DOCKERFILE, BUILDER_ENTRYPOINT, HOST_LAUNCHER
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -284,6 +284,7 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "ENTRYPOINT_B64": base64.b64encode(RUNNER_ENTRYPOINT.encode()).decode("ascii"),
         "JOB_COMPLETED_B64": base64.b64encode(JOB_COMPLETED.encode()).decode("ascii"),
         "CLEAN_TARGET_B64": base64.b64encode(CLEAN_TARGET.encode()).decode("ascii"),
+        "DOCKER_WRAPPER_B64": base64.b64encode(DOCKER_WRAPPER.encode()).decode("ascii"),
         "RUNNER_VERSION": "2.337.0",
         "ORG": getattr(args,'org',ORG),
         "RUNNER_LABELS": f"{args.runner_label},{args.instance_type},{args.region}",

@@ -111,6 +111,8 @@ printf '%s' '{{DOCKERFILE_B64}}' | base64 -d >/opt/gha-runners/build/Dockerfile
 printf '%s' '{{ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/build/entrypoint.sh
 printf '%s' '{{JOB_COMPLETED_B64}}' | base64 -d >/opt/gha-runners/build/job-completed.sh
 printf '%s' '{{CLEAN_TARGET_B64}}' | base64 -d >/opt/gha-runners/build/clean_target.py
+printf '%s' '{{DOCKER_WRAPPER_B64}}' | base64 -d >/opt/gha-runners/build/docker-wrapper.py
+chmod 0755 /opt/gha-runners/build/docker-wrapper.py
 printf '%s' '{{ADMISSION_B64}}' | base64 -d >/opt/gha-runners/build/host_admission.py
 printf '%s' '{{JOB_STARTED_B64}}' | base64 -d >/opt/gha-runners/build/job-started.sh
 printf '%s' '{{EVIDENCE_B64}}' | base64 -d >/opt/gha-runners/host_evidence.py
