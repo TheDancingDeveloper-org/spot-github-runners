@@ -29,6 +29,7 @@ from .fleet_logging import lifecycle_log, observe_vms, reconcile_deletion_identi
 from .log_format import configure_logging, error_detail
 from .vm_recovery import reconcile_lost_vms
 from .price_guard import check_running_prices, delete_overpriced_vm
+from .runner_drain import delete_vm_and_disks, is_repo_target, target_api_prefix
 from .project_costs import log_project_costs
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
@@ -49,6 +50,11 @@ SPEND_LOG_INTERVAL_SECONDS = 3600
 
 def now() -> float:
     return time.time()
+
+
+def _active_target(args: Any) -> str:
+    """Return configured target or fallback to org."""
+    return getattr(args, "target", None) or getattr(args, "org", "swack-tools")
 
 
 def count_online_runners(org: str, label: str) -> int:
@@ -140,16 +146,45 @@ def guard_inventory_fresh(state):
         raise RuntimeError('Fleet mutation held: runner inventory expired')
 
 
-def guard_fleet_mutation(state,vm=None):
+def guard_fleet_mutation(state, vm=None, is_rotation=False):
     guard_inventory_fresh(state)
-    protected=state.get('protected_heavy_routes',{})
+    protected = state.get('protected_heavy_routes', {})
+    active_rotation = bool(state.get("price_rotation")) or is_rotation
     if vm is None:
-        if heavy_route_capacity_hold(state):
+        if not active_rotation and heavy_route_capacity_hold(state):
             raise RuntimeError('Automatic launch held: heavy route has no verified replacement')
-    elif vm.status!='TERMINATED' and (not isinstance(protected,dict) or any(
-            not isinstance(row,dict) or row=={'name':vm.name,'zone':vm.zone}
-            for row in protected.values())):
-        raise RuntimeError('Retirement held: heavy route has no verified replacement')
+    elif vm.status != 'TERMINATED':
+        retiring_during_rotation = False
+        if active_rotation:
+            rotation = state.get("price_rotation", {})
+            out_vm = rotation.get("outgoing_vm", {})
+            repl_vm = rotation.get("replacement_vm", {})
+            if out_vm.get("name") == vm.name and repl_vm and rotation.get("readiness", {}).get("runners_online"):
+                retiring_during_rotation = True
+        if not retiring_during_rotation and (not isinstance(protected, dict) or any(
+                not isinstance(row, dict) or row == {'name': vm.name, 'zone': vm.zone}
+                for row in protected.values())):
+            raise RuntimeError('Retirement held: heavy route has no verified replacement')
+
+
+def max_allowed_hosts(args: argparse.Namespace, state: dict) -> int:
+    """Return maximum allowed hosts, granting +1 overlap allowance during make-before-break rotation."""
+    base = getattr(args, "maximum_hosts", 5)
+    if state.get("price_rotation") or state.get("migration"):
+        return base + 1
+    return base
+
+
+def rotation_spend_allowance(state: dict) -> Decimal:
+    """Return spend allowance granted to prevent temporary double billing during rotation overlap."""
+    rotation = state.get("price_rotation")
+    if not rotation:
+        return Decimal(0)
+    outgoing_cost = (
+        rotation.get("outgoing_vm", {}).get("total_daily_usd", 0)
+        or rotation.get("replacement_offer", {}).get("total_daily_usd", 0)
+    )
+    return Decimal(str(outgoing_cost or 0))
 
 
 def fleet_summary(vms, runners, state: dict) -> str:
@@ -197,6 +232,9 @@ def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner], state=None
     """Choose complete, idle Spot VMs for scale-down."""
     candidates = []
     fleet = spot_instances(vms)
+    min_floor = 1
+    if state and isinstance(state, dict):
+        min_floor = int(state.get("min_runner_floor", 1))
     for vm in fleet:
         assigned = host_runners(vm, runners, fleet)
         names = {runner.name for runner in assigned}
@@ -209,6 +247,9 @@ def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner], state=None
                 or any(not runner.online or runner.busy for runner in assigned)):
             continue
         candidates.append(vm)
+    if len(fleet) - len(candidates) < min_floor:
+        allowed_removals = max(0, len(fleet) - min_floor)
+        candidates = candidates[:allowed_removals]
     return candidates
 
 
@@ -374,7 +415,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 return True
             try:
                 from .runner_drain import drain_runners
-                fresh = list_github_runners(args.org)
+                fresh = list_github_runners(_active_target(args))
                 state['runner_inventory_observed_at']=time.time()
                 protected_heavy_routes(vms,fresh,state)
                 write_scale_state(state_path,state)
@@ -509,7 +550,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                     from .fleet_migration import guard_staged_retirement
                     if not guard_staged_retirement(vms,runners,args,state,state_path):
                         return True
-                    fresh = list_github_runners(args.org)
+                    fresh = list_github_runners(_active_target(args))
                     state['runner_inventory_observed_at']=time.time()
                     protected_heavy_routes(vms,fresh,state)
                     guard_fleet_mutation(state,vm)
@@ -926,29 +967,116 @@ def scale_up(additional_hosts: int, offers, args: argparse.Namespace, state=None
                 offers = refresh()
 
 
+BOOT_HYDRATE_TIMEOUT_SECONDS = 600
+READINESS_DEADLINE_SECONDS = 900
+DRAIN_DEADLINE_SECONDS = 3600
+
+
+def check_dashboard_health(ip: str, port: int = 8080, timeout: float = 5.0) -> dict | None:
+    """Probe replacement VM Web UI /api/health endpoint for health and state hydration."""
+    if not ip:
+        return None
+    url = f"http://{ip}:{port}/api/health"
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "SpotAutoscaler-HealthCheck/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        LOG.debug("Dashboard health probe to %s failed: %s", url, error_detail(exc))
+        return None
+    return None
+
+
+def switch_cloudflare_origin(replacement_vm: dict, port: int = 8080, args: argparse.Namespace = None) -> bool:
+    """Update Cloudflare Workers KV key 'origin:active' to route Web UI traffic to the replacement VM."""
+    ip = replacement_vm.get("ip")
+    name = replacement_vm.get("name")
+    zone = replacement_vm.get("zone")
+    payload = {
+        "origin_url": f"http://{ip}:{port}",
+        "instance_name": name,
+        "zone": zone,
+        "cutover_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    LOG.info("Cloudflare edge origin cutover: switching active origin to %s (http://%s:%d)", name, ip, port)
+
+    account_id = getattr(args, "cloudflare_account_id", os.environ.get("CLOUDFLARE_ACCOUNT_ID", "1c34335d7e9216e17699777fccd5fab6"))
+    namespace_id = getattr(args, "cloudflare_kv_namespace_id", os.environ.get("CLOUDFLARE_KV_NAMESPACE_ID", ""))
+    api_token = getattr(args, "cloudflare_api_token", os.environ.get("CLOUDFLARE_API_TOKEN", os.environ.get("CLOUDFLARE_TOKEN", "")))
+
+    if api_token and namespace_id and account_id:
+        try:
+            import urllib.request
+            url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/origin:active"
+            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                         headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+                                         method="PUT")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in (200, 201):
+                    LOG.info("Successfully updated Cloudflare KV origin:active via REST API")
+                    return True
+        except Exception as exc:
+            LOG.error("Failed to update Cloudflare KV origin:active via REST API: %s", error_detail(exc))
+
+    wrangler_bin = getattr(args, "wrangler_path", "/opt/homebrew/bin/wrangler")
+    if Path(wrangler_bin).exists() and namespace_id:
+        try:
+            subprocess.run([
+                wrangler_bin, "kv", "key", "put", "--namespace-id", namespace_id,
+                "origin:active", json.dumps(payload), "--remote"
+            ], check=True, text=True, capture_output=True, timeout=30)
+            LOG.info("Successfully updated Cloudflare KV origin:active via wrangler CLI")
+            return True
+        except Exception as exc:
+            LOG.warning("wrangler kv key put failed: %s", error_detail(exc))
+
+    LOG.info("Origin cutover recorded locally for %s (no Cloudflare KV credentials configured)", name)
+    return True
+
+
 def reconcile_prices(vms, runners, args, state, state_path) -> bool:
-    """Evict or restore one host, preserving the restoration target across polls."""
+    """Execute phased make-before-break price rotation or restore deficit hosts."""
+    if "price_rotation" in state:
+        return step_price_rotation(vms, runners, args, state, state_path)
+
     if state.get("host_operation"):
         return True
-    protected_heavy_routes(vms,runners,state)
-    if heavy_route_capacity_hold(state) or runner_inventory_stale(state):return True
+
+    protected_heavy_routes(vms, runners, state)
+    if heavy_route_capacity_hold(state) or runner_inventory_stale(state):
+        return True
+
     fleet = spot_instances(vms)
     overpriced = check_running_prices(fleet, args.project, args.max_daily_usd)
     if overpriced:
+        vm = overpriced[0]
+        use_rotation = (
+            "price_rotation" in state
+            or getattr(args, "make_before_break", False)
+            or getattr(args, "target", None) is not None
+            or getattr(args, "price_rotation", False)
+        )
+        if use_rotation:
+            LOG.info("Price exceeds cap for %s ($%s cap); initiating make-before-break rotation",
+                     vm_details(vm), args.max_daily_usd)
+            return begin_price_rotation(vm, vms, runners, args, state, state_path, reason="price_cap_exceeded")
+
         state["price_replacement_target"] = max(state.get("price_replacement_target", 0), len(fleet))
         state["idle_loops"] = 0
-        vm = overpriced[0]
-        guard_fleet_mutation(state,vm)
+        guard_fleet_mutation(state, vm)
         begin_host_operation("delete", vm, runners, vms, state, state_path, price_eviction=True)
         LOG.warning("Price exceeds cap: deleting %s with its disks, including any active jobs", vm_details(vm))
         try:
-            guard_fleet_mutation(state,vm)
+            guard_fleet_mutation(state, vm)
             delete_overpriced_vm(vm, args.project)
             LOG.info("Deleted overpriced Spot VM %s and its attached disks", vm_details(vm))
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             clear_rejected_deletion(vm, exc, state, state_path)
             LOG.error("Price eviction failed for %s; retrying next loop: %s", vm_details(vm), error_detail(exc))
         return True
+
     target = state.get("price_replacement_target", 0)
     pending = state.get("pending_vm_recovery", {})
     if any(not record.get("_cleanup_complete") for record in pending.values()):
@@ -963,13 +1091,468 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
         offers = refresh()
         if not offers or not scale_up(1, offers, args, state, state_path, refresh=refresh):
             LOG.warning("Replacement capacity is pending; retrying next loop")
-        return True  # Only fresh observations may clear the restoration target.
+        return True
     for record in pending.values():
         state.get("observed_vms", {}).pop(f"{record['zone']}/{record['name']}", None)
     state["pending_vm_recovery"] = {}
     state["price_replacement_target"] = 0
     state["idle_loops"] = 0
     write_scale_state(state_path, state)
+    return True
+
+
+def begin_price_rotation(outgoing_vm: GceVm, vms: list[GceVm], runners: list[GitHubRunner],
+                         args: argparse.Namespace, state: dict, state_path: Path,
+                         reason: str = "price_cap_exceeded", offer=None) -> bool:
+    """Initialize a zero-downtime make-before-break rotation transaction."""
+    target_name = getattr(args, "target", None) or getattr(args, "org", "swack-tools")
+    target_type = "repo" if ("/" in target_name or getattr(args, "target_type", "") == "repo") else "org"
+    cordon_mode = "labels" if target_type == "repo" else "isolated_group"
+
+    if offer is None:
+        refresh = offer_refresher(args)
+        offers = refresh()
+        if not offers:
+            LOG.warning("Make-before-break rotation deferred for %s: no qualifying replacement offer available below $%s/day; keeping running host undisturbed",
+                        vm_details(outgoing_vm), args.max_daily_usd)
+            return True
+        offer = offers[0]
+
+    state["price_rotation"] = {
+        "phase": "provision",
+        "target": target_name,
+        "target_type": target_type,
+        "reason": reason,
+        "outgoing_vm": {
+            "name": outgoing_vm.name,
+            "zone": outgoing_vm.zone,
+            "instance_id": outgoing_vm.instance_id,
+            "ip": getattr(outgoing_vm, "external_ip", "") or getattr(outgoing_vm, "ip", "") or "",
+            "machine_type": outgoing_vm.machine_type,
+            "vcpu": outgoing_vm.vcpu,
+            "ram_gib": outgoing_vm.ram_gib,
+            "total_daily_usd": float(getattr(offer, "total_daily_usd", 0) or 0)
+        },
+        "replacement_offer": {
+            "machine_type": offer.machine_type,
+            "zone": getattr(offer, "zone", "") or getattr(offer, "region", ""),
+            "region": offer.region,
+            "vcpu": offer.vcpu,
+            "ram_gib": float(offer.ram_gib),
+            "hourly_usd": float(getattr(offer, "hourly_usd", float(offer.total_daily_usd) / 24)),
+            "total_daily_usd": float(offer.total_daily_usd),
+            "cpu_platform": getattr(offer, "cpu_platform", "")
+        },
+        "replacement_vm": None,
+        "expected_runner_count": getattr(args, "runner_count", 1),
+        "readiness": {
+            "runners_online": False,
+            "dashboard_healthy": False,
+            "state_hydrated": False
+        },
+        "origin_switched": False,
+        "cordon_mode": cordon_mode,
+        "cordon_complete": False,
+        "drain_started_at": None,
+        "phase_started_at": time.time(),
+        "started_at": time.time(),
+        "updated_at": time.time(),
+        "attempt_count": 0,
+        "error": None
+    }
+    write_scale_state(state_path, state)
+    LOG.info("Initiated make-before-break rotation: %s -> replacement %s in %s ($%.2f/day)",
+             outgoing_vm.name, offer.machine_type, getattr(offer, "zone", offer.region), float(offer.total_daily_usd))
+    return step_price_rotation(vms, runners, args, state, state_path)
+
+
+def step_price_rotation(vms: list[GceVm], runners: list[GitHubRunner],
+                        args: argparse.Namespace, state: dict, state_path: Path) -> bool:
+    """Step the 8-phase make-before-break rotation state machine."""
+    rotation = state.get("price_rotation")
+    if not rotation:
+        return False
+
+    phase = rotation.get("phase", "select")
+    LOG.debug("Stepping make-before-break rotation for %s: phase=%s", rotation["outgoing_vm"]["name"], phase)
+
+    if phase == "select":
+        return _step_rotation_select(vms, runners, args, state, state_path, rotation)
+    elif phase == "provision":
+        return _step_rotation_provision(vms, runners, args, state, state_path, rotation)
+    elif phase == "boot_hydrate":
+        return _step_rotation_boot_hydrate(vms, runners, args, state, state_path, rotation)
+    elif phase == "verify_readiness":
+        return _step_rotation_verify_readiness(vms, runners, args, state, state_path, rotation)
+    elif phase == "origin_cutover":
+        return _step_rotation_origin_cutover(vms, runners, args, state, state_path, rotation)
+    elif phase == "cordon_drain":
+        return _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
+    elif phase == "deregister":
+        return _step_rotation_deregister(vms, runners, args, state, state_path, rotation)
+    elif phase == "delete":
+        return _step_rotation_delete(vms, runners, args, state, state_path, rotation)
+    else:
+        LOG.error("Unknown price rotation phase: %s; resetting transaction", phase)
+        state.pop("price_rotation", None)
+        write_scale_state(state_path, state)
+        return True
+
+
+def _step_rotation_select(vms, runners, args, state, state_path, rotation):
+    """Phase 1: Select replacement Spot VM offer respecting target constraints."""
+    refresh = offer_refresher(args)
+    offers = refresh()
+    if not offers:
+        LOG.warning("Rotation select: no qualifying offers available below $%s/day; keeping outgoing host undisturbed",
+                    args.max_daily_usd)
+        return True
+    offer = offers[0]
+    rotation["replacement_offer"] = {
+        "machine_type": offer.machine_type,
+        "zone": getattr(offer, "zone", "") or getattr(offer, "region", ""),
+        "region": offer.region,
+        "vcpu": offer.vcpu,
+        "ram_gib": float(offer.ram_gib),
+        "hourly_usd": float(getattr(offer, "hourly_usd", float(offer.total_daily_usd) / 24)),
+        "total_daily_usd": float(offer.total_daily_usd),
+        "cpu_platform": getattr(offer, "cpu_platform", "")
+    }
+    rotation["phase"] = "provision"
+    rotation["phase_started_at"] = time.time()
+    rotation["updated_at"] = time.time()
+    write_scale_state(state_path, state)
+    return _step_rotation_provision(vms, runners, args, state, state_path, rotation)
+
+
+def _step_rotation_provision(vms, runners, args, state, state_path, rotation):
+    """Phase 2: Launch replacement Spot VM. Old VM continues executing jobs."""
+    offer_dict = dict(rotation["replacement_offer"])
+    if "hourly_usd" not in offer_dict:
+        offer_dict["hourly_usd"] = float(offer_dict.get("total_daily_usd", 0)) / 24
+    if "total_daily_usd" in offer_dict and isinstance(offer_dict["total_daily_usd"], (int, float)):
+        offer_dict["total_daily_usd"] = Decimal(str(offer_dict["total_daily_usd"]))
+    if "hourly_usd" in offer_dict and isinstance(offer_dict["hourly_usd"], (int, float)):
+        offer_dict["hourly_usd"] = Decimal(str(offer_dict["hourly_usd"]))
+    offer = SimpleNamespace(**offer_dict)
+
+    fleet = spot_instances(vms)
+    max_hosts = max_allowed_hosts(args, state)
+    if len(fleet) >= max_hosts:
+        LOG.warning("Rotation launch held: fleet count %d reaches maximum with overlap %d", len(fleet), max_hosts)
+        return True
+
+    try:
+        guard_fleet_mutation(state, vm=None, is_rotation=True)
+        region = offer.region
+        letter = offer.zone.rsplit("-", 1)[-1] if "-" in offer.zone else "a"
+        suffix = f"{region.replace('-', '')}-{letter}-{int(time.time())}"
+        target_name = rotation.get("target", "swack-tools")
+        prefix = "newznab-spot-runners-" if "newznab" in target_name else "oxidex-runners-"
+        instance_name = f"{prefix}{suffix}"
+
+        launch_offer(offer, args, state, state_path)
+
+        repl_vm = next((v for v in spot_instances(vms) if v.name == instance_name or (v.name != rotation["outgoing_vm"]["name"] and v.spot)), None)
+        rotation["replacement_vm"] = {
+            "name": repl_vm.name if repl_vm else instance_name,
+            "zone": repl_vm.zone if repl_vm else offer.zone,
+            "instance_id": repl_vm.instance_id if repl_vm else "",
+            "ip": getattr(repl_vm, "external_ip", "") or getattr(repl_vm, "ip", "") if repl_vm else "",
+            "launched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        }
+        rotation["phase"] = "boot_hydrate"
+        rotation["phase_started_at"] = time.time()
+        rotation["updated_at"] = time.time()
+        write_scale_state(state_path, state)
+        LOG.info("Provisioned replacement VM %s; waiting for boot and state hydration", rotation["replacement_vm"]["name"])
+        return True
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        attempts = rotation.get("attempt_count", 0) + 1
+        rotation["attempt_count"] = attempts
+        rotation["error"] = error_detail(exc)
+        if attempts >= 3:
+            LOG.warning(
+                "Provisioning replacement VM for %s failed %d times (%s); resetting to 'select' phase to pick an alternative offer",
+                rotation["outgoing_vm"]["name"], attempts, error_detail(exc)
+            )
+            rotation["phase"] = "select"
+            rotation.pop("replacement_offer", None)
+            rotation["phase_started_at"] = time.time()
+        else:
+            LOG.error("Failed to provision replacement VM for %s: %s; retrying next loop (old host continues running)",
+                      rotation["outgoing_vm"]["name"], error_detail(exc))
+        write_scale_state(state_path, state)
+        return True
+
+
+def _step_rotation_boot_hydrate(vms, runners, args, state, state_path, rotation):
+    """Phase 3: Wait for new VM RUNNING; verify startup execution and state hydration."""
+    repl = rotation.get("replacement_vm")
+    if not repl:
+        rotation["phase"] = "provision"
+        write_scale_state(state_path, state)
+        return True
+
+    new_vm = next((v for v in vms if v.name == repl["name"]), None)
+    now_ts = time.time()
+
+    if not new_vm or new_vm.status != "RUNNING":
+        if now_ts - rotation.get("phase_started_at", now_ts) >= BOOT_HYDRATE_TIMEOUT_SECONDS:
+            LOG.error("Boot and hydration timed out for %s; aborting replacement to preserve old capacity", repl["name"])
+            if new_vm:
+                try:
+                    delete_vm_and_disks(new_vm, args.project)
+                except Exception as exc:
+                    LOG.error("Failed to delete timed-out replacement VM %s: %s", new_vm.name, error_detail(exc))
+            state.pop("price_rotation", None)
+            write_scale_state(state_path, state)
+            return True
+        LOG.info("Rotation waits for replacement VM %s to reach RUNNING status (currently %s)",
+                 repl["name"], new_vm.status if new_vm else "PROVISIONING")
+        return True
+
+    if not repl.get("instance_id") and new_vm.instance_id:
+        repl["instance_id"] = new_vm.instance_id
+    if not repl.get("ip"):
+        repl["ip"] = getattr(new_vm, "external_ip", "") or getattr(new_vm, "ip", "") or ""
+
+    rotation["phase"] = "verify_readiness"
+    rotation["phase_started_at"] = now_ts
+    rotation["updated_at"] = now_ts
+    write_scale_state(state_path, state)
+    LOG.info("Replacement VM %s is RUNNING; advancing to dual readiness verification gate", repl["name"])
+    return _step_rotation_verify_readiness(vms, runners, args, state, state_path, rotation)
+
+
+def _step_rotation_verify_readiness(vms, runners, args, state, state_path, rotation):
+    """Phase 4: Dual gate checking replacement runners registered/online AND Web UI healthy/hydrated."""
+    repl = rotation.get("replacement_vm")
+    now_ts = time.time()
+    readiness = rotation.setdefault("readiness", {"runners_online": False, "dashboard_healthy": False, "state_hydrated": False})
+
+    repl_name = repl["name"] if repl else ""
+    assigned = [r for r in runners if repl_name and (repl_name in r.name or r.name.startswith(f"gha-{repl_name}-"))]
+    expected_count = rotation.get("expected_runner_count", 1)
+    online_count = sum(1 for r in assigned if r.online)
+    if online_count >= expected_count:
+        readiness["runners_online"] = True
+    else:
+        readiness["runners_online"] = False
+
+    dashboard_enabled = getattr(args, "enable_dashboard", True)
+    if dashboard_enabled and repl and repl.get("ip"):
+        health = check_dashboard_health(repl["ip"], port=getattr(args, "dashboard_port", 8080))
+        if health and health.get("status") == "healthy":
+            readiness["dashboard_healthy"] = True
+            readiness["state_hydrated"] = bool(health.get("hydrated", False))
+        else:
+            readiness["dashboard_healthy"] = False
+            readiness["state_hydrated"] = False
+    elif not dashboard_enabled:
+        readiness["dashboard_healthy"] = True
+        readiness["state_hydrated"] = True
+
+    if readiness["runners_online"] and readiness["dashboard_healthy"] and readiness["state_hydrated"]:
+        LOG.info("Dual readiness gate PASSED for %s: %d/%d runners online, dashboard healthy, state hydrated",
+                 repl["name"] if repl else "new", online_count, expected_count)
+        rotation["phase"] = "origin_cutover"
+        rotation["phase_started_at"] = now_ts
+        rotation["updated_at"] = now_ts
+        write_scale_state(state_path, state)
+        return _step_rotation_origin_cutover(vms, runners, args, state, state_path, rotation)
+
+    if now_ts - rotation.get("phase_started_at", now_ts) >= READINESS_DEADLINE_SECONDS:
+        LOG.error("Dual readiness gate timed out for replacement %s; aborting replacement to preserve old capacity",
+                  repl["name"] if repl else "new")
+        repl_vm = next((v for v in vms if repl and v.name == repl["name"]), None)
+        if repl_vm:
+            try:
+                delete_vm_and_disks(repl_vm, args.project)
+            except Exception as exc:
+                LOG.error("Failed to delete unready replacement VM %s: %s", repl_vm.name, error_detail(exc))
+        state.pop("price_rotation", None)
+        write_scale_state(state_path, state)
+        return True
+
+    LOG.info("Rotation waits for dual readiness on %s: runners_online=%s (%d/%d), dashboard_healthy=%s, state_hydrated=%s",
+             repl["name"] if repl else "new", readiness["runners_online"], online_count, expected_count,
+             readiness["dashboard_healthy"], readiness["state_hydrated"])
+    write_scale_state(state_path, state)
+    return True
+
+
+def _step_rotation_origin_cutover(vms, runners, args, state, state_path, rotation):
+    """Phase 5: Update Cloudflare KV origin:active to route traffic to new VM."""
+    repl = rotation.get("replacement_vm")
+    port = getattr(args, "dashboard_port", 8080)
+
+    success = switch_cloudflare_origin(repl, port=port, args=args)
+    if not success:
+        LOG.warning("Origin cutover failed; retrying next loop before cordoning old host")
+        return True
+
+    rotation["origin_switched"] = True
+    rotation["phase"] = "cordon_drain"
+    rotation["drain_started_at"] = time.time()
+    rotation["phase_started_at"] = time.time()
+    rotation["updated_at"] = time.time()
+    write_scale_state(state_path, state)
+    LOG.info("Origin cutover complete; advancing to cordon and drain for outgoing VM %s", rotation["outgoing_vm"]["name"])
+    return True
+
+
+def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation):
+    """Phase 6: Cordon old runners, wait for in-flight jobs to complete."""
+    out_dict = rotation["outgoing_vm"]
+    out_name = out_dict["name"]
+    out_vm = next((v for v in vms if v.name == out_name), None)
+    target = rotation["target"]
+    target_type = rotation.get("target_type", "org")
+    now_ts = time.time()
+
+    assigned = host_runners(out_vm, runners, vms) if out_vm else [r for r in runners if out_name in r.name]
+
+    if not rotation.get("cordon_complete"):
+        from .runner_drain import api, isolated_group
+        cordon_success = True
+        cordon_mode = "labels"
+        if target_type == "repo":
+            for runner in assigned:
+                try:
+                    api(target, "DELETE", f"repos/{target}/actions/runners/{runner.runner_id}/labels")
+                except Exception as exc:
+                    cordon_success = False
+                    LOG.warning("Could not strip labels from repo runner %s: %s", runner.name, error_detail(exc))
+            cordon_mode = "labels"
+        else:
+            drain_group_name = f"spot-drain-{out_dict['name']}-{out_dict.get('instance_id', '')}"
+            operation = {"drain_group_name": drain_group_name, "drain_group_id": rotation.get("drain_group_id")}
+            try:
+                group_path = isolated_group(operation, target, lambda: None)
+                rotation["drain_group_id"] = operation.get("drain_group_id")
+                for runner in assigned:
+                    try:
+                        api(target, "DELETE", f"orgs/{target}/actions/runners/{runner.runner_id}/labels")
+                        api(target, "PUT", f"{group_path}/runners/{runner.runner_id}")
+                    except Exception as exc:
+                        cordon_success = False
+                        LOG.warning("Could not isolate org runner %s: %s", runner.name, error_detail(exc))
+                if cordon_success:
+                    cordon_mode = "isolated_group"
+            except Exception as exc:
+                LOG.warning("Could not set up isolated drain group: %s; stripping labels", error_detail(exc))
+                for runner in assigned:
+                    try:
+                        api(target, "DELETE", f"orgs/{target}/actions/runners/{runner.runner_id}/labels")
+                    except Exception as e2:
+                        cordon_success = False
+                        LOG.warning("Could not strip labels from org runner %s: %s", runner.name, error_detail(e2))
+                cordon_mode = "labels"
+
+        if not cordon_success:
+            rotation["cordon_complete"] = False
+            write_scale_state(state_path, state)
+            LOG.warning("Cordoning incomplete for outgoing VM %s; will retry next poll before draining", out_dict["name"])
+            return True
+
+        rotation["cordon_complete"] = True
+        rotation["cordon_mode"] = cordon_mode
+        write_scale_state(state_path, state)
+        LOG.info("Cordoned outgoing VM %s (%s mode); waiting for active jobs to complete", out_dict["name"], cordon_mode)
+        return True
+
+    busy_runners = [r for r in assigned if r.busy]
+
+    from .runner_drain import jobs_finished
+    jobs_done = jobs_finished(out_vm, state, target) if out_vm else True
+
+    if busy_runners or not jobs_done:
+        if now_ts - rotation.get("drain_started_at", now_ts) >= DRAIN_DEADLINE_SECONDS:
+            LOG.warning("Drain deadline exceeded for %s (%d busy runners); forcing advancement to deregistration",
+                        out_dict["name"], len(busy_runners))
+        else:
+            LOG.info("Drain waits for %d busy runners and CI jobs on %s", len(busy_runners), out_dict["name"])
+            write_scale_state(state_path, state)
+            return True
+
+    LOG.info("All CI jobs finished on %s; advancing to runner deregistration", out_dict["name"])
+    rotation["phase"] = "deregister"
+    rotation["phase_started_at"] = now_ts
+    rotation["updated_at"] = now_ts
+    write_scale_state(state_path, state)
+    return True
+
+
+def _step_rotation_deregister(vms, runners, args, state, state_path, rotation):
+    """Phase 7: Remove old runners from GitHub API."""
+    out_dict = rotation["outgoing_vm"]
+    out_name = out_dict["name"]
+    out_vm = next((v for v in vms if v.name == out_name), None)
+    target = rotation["target"]
+    target_type = rotation.get("target_type", "org")
+    assigned = host_runners(out_vm, runners, vms) if out_vm else [r for r in runners if out_name in r.name]
+
+    from .runner_drain import api
+    for runner in assigned:
+        endpoint = f"repos/{target}/actions/runners/{runner.runner_id}" if target_type == "repo" else f"orgs/{target}/actions/runners/{runner.runner_id}"
+        try:
+            api(target, "DELETE", endpoint)
+            LOG.info("Deregistered old runner %s (%d) from %s", runner.name, runner.runner_id, target)
+        except Exception as exc:
+            LOG.warning("Deregistration pending for runner %s: %s", runner.name, error_detail(exc))
+            return True
+
+    rotation["phase"] = "delete"
+    rotation["phase_started_at"] = time.time()
+    rotation["updated_at"] = time.time()
+    write_scale_state(state_path, state)
+    LOG.info("All old runners deregistered for %s; advancing to VM deletion", out_dict["name"])
+    return True
+
+
+def _step_rotation_delete(vms, runners, args, state, state_path, rotation):
+    """Phase 8: Delete old VM and auto-deleting disks."""
+    out_dict = rotation["outgoing_vm"]
+    repl_dict = rotation.get("replacement_vm")
+    out_name = out_dict["name"]
+    out_vm = next((v for v in vms if v.name == out_name), None)
+
+    protected = state.setdefault("protected_heavy_routes", {})
+    if out_dict.get("instance_id") in protected and repl_dict:
+        protected[repl_dict["instance_id"]] = {"name": repl_dict["name"], "zone": repl_dict["zone"]}
+        protected.pop(out_dict["instance_id"], None)
+        LOG.info("Transferred protected heavy route from %s to replacement %s", out_dict["name"], repl_dict["name"])
+
+    key = f"{out_dict['zone']}/{out_dict['name']}"
+    if key not in state.setdefault("intentional_deletions", []):
+        state["intentional_deletions"].append(key)
+    state.setdefault("intentional_deletion_ids", {})[key] = out_dict.get("instance_id", "")
+    write_scale_state(state_path, state)
+
+    vm_to_delete = out_vm or GceVm(out_dict["name"], out_dict["zone"], "RUNNING", out_dict.get("machine_type", "n4-highcpu-16"), True, instance_id=out_dict.get("instance_id", ""))
+    try:
+        guard_fleet_mutation(state, vm_to_delete, is_rotation=True)
+        delete_overpriced_vm(vm_to_delete, args.project)
+        LOG.info("Deleted old Spot VM %s and its attached disks", out_dict["name"])
+    except Exception as exc:
+        LOG.error("Failed to delete old VM %s: %s; retrying next loop", out_dict["name"], error_detail(exc))
+        return True
+
+    drain_group_id = rotation.get("drain_group_id")
+    if drain_group_id and rotation.get("target_type") == "org":
+        from .runner_drain import api
+        try:
+            api(rotation["target"], "DELETE", f"orgs/{rotation['target']}/actions/runner-groups/{drain_group_id}")
+            LOG.info("Cleaned up temporary drain runner group %s", drain_group_id)
+        except Exception as exc:
+            LOG.warning("Drain group cleanup pending: %s", error_detail(exc))
+
+    state.pop("price_rotation", None)
+    state["idle_loops"] = 0
+    write_scale_state(state_path, state)
+    LOG.info("Zero-downtime make-before-break rotation SUCCESS: replaced %s with %s",
+             out_dict["name"], repl_dict.get("name") if repl_dict else "new")
     return True
 
 
@@ -993,7 +1576,7 @@ def offer_refresher(args: argparse.Namespace):
     """Return a scan function that logs provider failures instead of stopping the controller."""
     def refresh():
         try:
-            return discover_offers(args.project, args.max_daily_usd, disk_size_gb=args.disk_size_gb)
+            return discover_offers(args.project, args.max_daily_usd, disk_size_gb=getattr(args, 'disk_size_gb', 100))
         except (RuntimeError, ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
             LOG.error("Spot scan failed; launches wait for the next check: %s", error_detail(exc))
             return []
@@ -1229,6 +1812,8 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             "--runner-prefix", runner_prefix,
             "--runner-label", args.label, "--apply",
         ]
+        if getattr(args, "target", None):
+            command.extend(["--target", args.target])
         if tier:
             command.extend(['--tier',tier.name,'--tier-slots',str(slots),
                             '--tier-job-memory-gib',str(job_memory)])
@@ -1315,7 +1900,8 @@ def registered_host(vm: GceVm, args: argparse.Namespace, count=8) -> bool:
                     if item.zone == vm.zone and item.name == vm.name), None)
     if not current or not current.running:
         return False
-    online = {runner.name for runner in host_runners(vm, list_github_runners(args.org), [vm]) if runner.online}
+    target = _active_target(args)
+    online = {runner.name for runner in host_runners(vm, list_github_runners(target), [vm]) if runner.online}
     return {f"gha-{vm.name}-{slot}" for slot in range(1, count+1)}.issubset(online)
 
 
@@ -1338,8 +1924,9 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
     if current and vm.instance_id and current.instance_id!=vm.instance_id:
         LOG.warning('Launch cleanup held: provider identity changed')
         return False
+    target = _active_target(args)
     if current:
-        fresh=list_github_runners(args.org)
+        fresh=list_github_runners(target)
         state['runner_inventory_observed_at']=time.time()
         protected_heavy_routes([current],fresh,state)
         guard_fleet_mutation(state,current)
@@ -1348,7 +1935,7 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
             if not vm.instance_id or current.instance_id!=vm.instance_id:
                 LOG.error('Tier launch cleanup holds: missing or changed provider identity')
                 return False
-            assigned=host_runners(vm,list_github_runners(args.org),[vm])
+            assigned=host_runners(vm,list_github_runners(target),[vm])
             operation.update(kind='drain',runner_ids=[r.runner_id for r in assigned],
                 runner_names={str(r.runner_id):r.name for r in assigned},
                 drain_mode='isolated_group',drain_group_name=f'spot-drain-{vm.name}-{vm.instance_id}')
@@ -1364,7 +1951,7 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
             inventory=subprocess.run(['gcloud','compute','disks','list',f'--project={args.project}',
                 f'--zones={vm.zone}','--format=json(name,id)'],check=True,text=True,capture_output=True,timeout=60)
             if (any(row.get('name') in names for row in json.loads(inventory.stdout))
-                    or host_runners(vm,list_github_runners(args.org),[vm])):
+                    or host_runners(vm,list_github_runners(target),[vm])):
                 LOG.warning('Tier launch cleanup holds until receipt proves orphan resource identity')
                 return False
             state.pop('host_operation')
@@ -1409,10 +1996,10 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
                         f"--project={args.project}", "--quiet"],
                        check=True, text=True, capture_output=True, timeout=120)
         LOG.info("Deleted disk %s left by launch %s", disk["name"], vm.name)
-    for runner in host_runners(vm, list_github_runners(args.org), [vm]):
-        subprocess.run(["gh", "api", "-X", "DELETE", f"orgs/{args.org}/actions/runners/{runner.runner_id}"],
+    for runner in host_runners(vm, list_github_runners(target), [vm]):
+        subprocess.run(["gh", "api", "-X", "DELETE", f"{target_api_prefix(target)}/actions/runners/{runner.runner_id}"],
                        check=True, text=True, capture_output=True, timeout=60)
-    if host_runners(vm, list_github_runners(args.org), [vm]):
+    if host_runners(vm, list_github_runners(target), [vm]):
         write_scale_state(state_path, state)
         return False
     state.pop("host_operation")
@@ -1466,6 +2053,9 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
 def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default="swack-tools")
+    parser.add_argument("--target", default=None, help="Target repository (owner/repo) or organization (org)")
+    parser.add_argument("--make-before-break", action=argparse.BooleanOptionalAction, default=False,
+                        help="Execute zero-downtime make-before-break rotation on price spikes")
     parser.add_argument("--github-user",help="Select an existing gh account without persisting its credential")
     parser.add_argument("--project", default="homelab-424523")
     parser.add_argument("--minimum-runners", type=int, default=25)
@@ -1563,7 +2153,7 @@ def _run_controller(args: argparse.Namespace) -> int:
                          len(args.cpu_platforms_by_zone))
             except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
                 LOG.error('CPU platform map unavailable; capacity launches paused until fresh inventory succeeds: %s', error_detail(exc))
-        runners = list_github_runners(args.org)
+        runners = list_github_runners(_active_target(args))
         state['runner_inventory_observed_at']=time.time()
         vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
         reconcile_deletion_identities(vms, state)

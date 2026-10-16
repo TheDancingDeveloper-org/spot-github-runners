@@ -889,6 +889,7 @@ class DashboardStore:
         self.state_path = state_path
         self.project = project
         self.org = org
+        self.hydrated = True
         if state_path and state_path.exists():
             try:
                 loaded = json.loads(state_path.read_text(encoding="utf-8"))
@@ -3570,11 +3571,18 @@ def make_handler(
                 )
                 return
 
-            if not self._check_auth():
+            # Unauthenticated health check endpoint for external readiness gates and proxies
+            if path == "/api/health":
+                self._send_json({
+                    "status": "healthy",
+                    "hydrated": getattr(store, "hydrated", True),
+                    "project": store.project,
+                    "org": store.org,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                })
                 return
 
-            if path == "/api/health":
-                self._send_json({"status": "healthy", "project": store.project, "org": store.org})
+            if not self._check_auth():
                 return
 
             try:

@@ -14,10 +14,16 @@ if [[ "${RUNNER_CONFIGURE_ONLY:-0}" == 1 ]]; then
   fi
   : "${GITHUB_RUNNER_URL:?GITHUB_RUNNER_URL is required}"
   : "${GITHUB_RUNNER_TOKEN:?GITHUB_RUNNER_TOKEN is required for initial registration}"
-  ./config.sh --unattended --replace --url "$GITHUB_RUNNER_URL" \
-    --token "$GITHUB_RUNNER_TOKEN" --name "$RUNNER_NAME" \
-    --labels "$RUNNER_LABELS" --runnergroup "$RUNNER_GROUP_NAME" \
+  config_args=(
+    --unattended --replace --url "$GITHUB_RUNNER_URL"
+    --token "$GITHUB_RUNNER_TOKEN" --name "$RUNNER_NAME"
+    --labels "$RUNNER_LABELS"
     --work /work
+  )
+  if [[ -n "${RUNNER_GROUP_NAME:-}" ]]; then
+    config_args+=(--runnergroup "$RUNNER_GROUP_NAME")
+  fi
+  ./config.sh "${config_args[@]}"
   exit 0
 fi
 if [[ ! -f "$config" ]]; then

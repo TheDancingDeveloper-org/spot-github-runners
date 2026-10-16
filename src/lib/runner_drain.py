@@ -1,13 +1,41 @@
 """Quarantine a single host's runners and wait for CI completion before removal."""
 from __future__ import annotations
 
+from typing import Any
 import json
 import logging
 import subprocess
 from .fleet_logging import vm_details
 from .runner_labels import DEFAULT_RUNNER_LABELS
+from .runner_fleet import GceVm
 
 LOG = logging.getLogger('spot_runner_autoscaler')
+
+
+def is_repo_target(target: Any) -> bool:
+    """Return True if target represents a repository ('owner/repo')."""
+    if hasattr(target, "is_repo"):
+        return bool(target.is_repo)
+    if hasattr(target, "name"):
+        return "/" in str(target.name)
+    return "/" in str(target)
+
+
+def target_api_prefix(target: Any) -> str:
+    """Return 'repos/{owner}/{repo}' or 'orgs/{org}'."""
+    if hasattr(target, "api_path"):
+        return target.api_path
+    name = getattr(target, "name", str(target)).strip()
+    return f"repos/{name}" if is_repo_target(target) else f"orgs/{name}"
+
+
+def resolve_target(operation: dict[str, Any], args: Any) -> str:
+    """Resolve target name from operation or args, defaulting to 'swack-tools'."""
+    return (
+        operation.get("target")
+        or getattr(args, "target", None)
+        or getattr(args, "org", "swack-tools")
+    )
 
 
 def api(org, method, path, body=None, paginate=False):
@@ -34,6 +62,8 @@ def pages(result, collection):
 
 
 def isolated_group(operation, org, save, mutation_guard=None):
+    if is_repo_target(org):
+        raise RuntimeError("Runner groups are not supported for personal repository targets")
     request=lambda *a,**kw:guarded_api(mutation_guard,*a,**kw)
     name = operation['drain_group_name']
     if not operation.get('drain_group_id'):
@@ -71,11 +101,25 @@ def jobs_finished(vm, state, org):
     return True
 
 
-def drain_runners(operation, vm, args, state, save, assigned,mutation_guard=None):
-    request=lambda *a,**kw:guarded_api(mutation_guard,*a,**kw)
+def drain_runners(operation, vm, args, state, save, assigned, mutation_guard=None):
+    request = lambda *a, **kw: guarded_api(mutation_guard, *a, **kw)
     """Return true only after fresh observations prove all draining runners absent."""
-    legacy_group = operation.get('drain_mode') != 'label_only'
-    path = isolated_group(operation, args.org, save,mutation_guard) if legacy_group else None
+    target = resolve_target(operation, args)
+    prefix = target_api_prefix(target)
+    repo_target = is_repo_target(target)
+
+    if repo_target:
+        legacy_group = False
+        operation['drain_mode'] = 'label_only'
+        operation['cordon_mode'] = 'labels'
+    else:
+        legacy_group = operation.get('cordon_mode') == 'isolated_group' or operation.get('drain_mode') != 'label_only'
+        if legacy_group:
+            operation.setdefault('drain_group_name', f'spot-drain-{vm.name}-{vm.instance_id}')
+            operation['cordon_mode'] = 'isolated_group'
+        else:
+            operation['cordon_mode'] = 'labels'
+    path = isolated_group(operation, target, save, mutation_guard) if legacy_group else None
     recorded = operation.setdefault('runner_names', {})
     done = set(operation.get('deregistered_runner_ids', []))
     changed = not operation.get('runners_isolated')
@@ -91,17 +135,17 @@ def drain_runners(operation, vm, args, state, save, assigned,mutation_guard=None
         if runner.runner_id in done:
             raise RuntimeError('A deregistered runner appeared again during drain')
     if legacy_group:
-        members = {row['id'] for row in pages(request(args.org, 'GET', path + '/runners', paginate=True), 'runners')}
+        members = {row['id'] for row in pages(request(target, 'GET', path + '/runners', paginate=True), 'runners')}
         if members - set(operation['runner_ids']):
             raise RuntimeError('Drain group contains unrelated runners')
     for runner in assigned:
         if set(runner.labels) - DEFAULT_RUNNER_LABELS:
-            result = request(args.org, 'DELETE', f'orgs/{args.org}/actions/runners/{runner.runner_id}/labels')
-            if any(label.get('type') != 'read-only' for label in result['labels']):
+            result = request(target, 'DELETE', f'{prefix}/actions/runners/{runner.runner_id}/labels')
+            if any(label.get('type') != 'read-only' for label in result.get('labels', [])):
                 raise RuntimeError('Custom scheduling labels remain after removal')
             changed = True
         if legacy_group and runner.runner_id not in members:
-            request(args.org, 'PUT', path + f'/runners/{runner.runner_id}')
+            request(target, 'PUT', path + f'/runners/{runner.runner_id}')
             changed = True
     if changed:
         operation['runners_isolated'] = True
@@ -122,17 +166,17 @@ def drain_runners(operation, vm, args, state, save, assigned,mutation_guard=None
     if any(not runner.online or runner.busy for runner in assigned):
         LOG.info('Drain waits for every runner to be online and idle on %s', vm_details(vm))
         return False
-    if not jobs_finished(vm, state, args.org):
+    if not jobs_finished(vm, state, target):
         return False
     if assigned:
         for runner in assigned:
-            fresh = request(args.org, 'GET', f'orgs/{args.org}/actions/runners/{runner.runner_id}')
+            fresh = request(target, 'GET', f'{prefix}/actions/runners/{runner.runner_id}')
             if fresh.get('name') != runner.name or fresh.get('busy') is not False or fresh.get('status') != 'online':
                 LOG.info('Drain waits for fresh idle confirmation on runner %s; %s', runner.name, vm_details(vm))
                 return False
             operation['deregistering_runner_id'] = runner.runner_id
             save()
-            request(args.org, 'DELETE', f'orgs/{args.org}/actions/runners/{runner.runner_id}')
+            request(target, 'DELETE', f'{prefix}/actions/runners/{runner.runner_id}')
             done.add(runner.runner_id)
             operation['deregistered_runner_ids'] = sorted(done)
             operation.pop('deregistering_runner_id', None)
@@ -141,19 +185,31 @@ def drain_runners(operation, vm, args, state, save, assigned,mutation_guard=None
     return True
 
 
-def cleanup_group(operation, org,mutation_guard=None):
+def cleanup_group(operation, org, mutation_guard=None):
+    target = resolve_target(operation, None) or org
+    if is_repo_target(target):
+        return
     request=lambda *a,**kw:guarded_api(mutation_guard,*a,**kw)
     if not operation.get('drain_group_id'):
         return
-    path = f"orgs/{org}/actions/runner-groups/{operation['drain_group_id']}"
+    path = f"orgs/{target}/actions/runner-groups/{operation['drain_group_id']}"
     try:
-        group = request(org, 'GET', path)
+        group = request(target, 'GET', path)
     except subprocess.CalledProcessError as exc:
         if 'HTTP 404' in (exc.stderr or ''):
             return
         raise
     if group.get('name') != operation['drain_group_name'] or group.get('default') or group.get('inherited'):
         raise RuntimeError('Refusing to remove a drain group with changed identity')
-    if pages(request(org, 'GET', path + '/runners', paginate=True), 'runners'):
+    if pages(request(target, 'GET', path + '/runners', paginate=True), 'runners'):
         raise RuntimeError('Drain group still contains runners')
-    request(org, 'DELETE', path)
+    request(target, 'DELETE', path)
+
+
+def delete_vm_and_disks(vm: GceVm, project: str, *, timeout: int = 180) -> None:
+    """Cleanly delete a GCP compute instance and all attached auto-deleting disks."""
+    subprocess.run([
+        "gcloud", "compute", "instances", "delete", vm.name,
+        f"--zone={vm.zone}", f"--project={project}", "--delete-disks=all", "--quiet",
+    ], check=True, text=True, capture_output=True, timeout=timeout)
+    LOG.info("Deleted drained Spot VM %s and its attached disks", vm_details(vm))

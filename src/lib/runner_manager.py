@@ -19,7 +19,8 @@ from decimal import Decimal
 from pathlib import Path
 
 from .environment import load_env
-from .machine_profiles import configure_storage, configure_cpu_platform, cpu_platform_satisfies
+from .machine_profiles import (configure_storage, configure_cpu_platform, cpu_platform_satisfies,
+                               _requested_arch_and_isa)
 from .billing_catalog import catalog_skus, unit_price, monthly_to_daily
 from .storage_selection import storage_rates, cheapest_storage, throughput_floor, observed_storage_monthly, disk_monthly_cost
 from .project_costs import log_project_costs
@@ -30,6 +31,16 @@ from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED,
                             RUNNER_DOCKERFILE, RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
 from .builder_assets import BUILDER_DOCKERFILE, BUILDER_ENTRYPOINT, HOST_LAUNCHER
+from .target_config import TargetConfig, resolve_target
+from .runner_patch import (
+    RunnerPatch,
+    classify_patch_diff,
+    fetch_patch_from_config_repo,
+    inject_startup_patch,
+    load_patch_from_file,
+    render_dockerfile,
+    render_live_hot_patch_script,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 PROJECT = "homelab-424523"
@@ -72,6 +83,8 @@ def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", default=PROJECT)
     parser.add_argument("--org", default=ORG)
+    parser.add_argument("--target", default=None,
+                        help="Target repository (owner/repo) or organization (org); overrides --org")
     parser.add_argument("--max-cost", type=Decimal, required=True, help="Maximum compute USD/hour for this VM")
     parser.add_argument('--max-total-daily-usd', type=Decimal, help='Maximum compute plus boot/data storage USD/day')
     parser.add_argument('--cheapest-storage', action='store_true', help='Choose compatible storage using current regional prices')
@@ -109,7 +122,38 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument('--tier-job-memory-gib',type=float,default=15,
                         help='Per-job cap/reservation; default 15 GiB is a verified compatible workload cap, not a measured peak')
     parser.add_argument('--host-overhead-gib',type=float,default=2)
+    parser.add_argument('--config-repo', help='Override central runner configuration repository (defaults to <org>/spot-runners-config)')
+    parser.add_argument('--patch-repo', help='Repository OWNER/REPO whose patch manifest should be loaded from the central config repo')
+    parser.add_argument('--patch-file', type=Path, help='Local path to a spot-runner-patch-v1 YAML/JSON manifest')
+    parser.add_argument('--patch-live', action='store_true', help='Hot-patch an already running Spot VM and its active runner containers in-place')
     return parser
+
+
+def resolve_runner_patch(args: argparse.Namespace) -> RunnerPatch | None:
+    patch = getattr(args, 'runner_patch', None)
+    if isinstance(patch, RunnerPatch):
+        return patch
+    patch_file = getattr(args, 'patch_file', None)
+    patch_repo = getattr(args, 'patch_repo', None)
+    if patch_file and patch_repo:
+        raise RuntimeError('Specify at most one of --patch-file or --patch-repo')
+    if patch_file:
+        patch = load_patch_from_file(Path(patch_file))
+    elif patch_repo:
+        patch = fetch_patch_from_config_repo(
+            patch_repo,
+            config_repo=getattr(args, 'config_repo', None),
+            org=getattr(args, 'org', ORG),
+        )
+    if patch is not None:
+        args.runner_patch = patch
+    return patch
+
+
+def _desired_runner_labels(args: argparse.Namespace) -> list[str]:
+    patch = resolve_runner_patch(args)
+    extra = list(patch.runner_labels()) if patch is not None else []
+    return list(dict.fromkeys([args.runner_label, args.instance_type, args.region, *extra]))
 
 
 def strict_pool_settings(args):
@@ -125,6 +169,12 @@ def strict_pool_settings(args):
 def select_sizing(args: argparse.Namespace) -> None:
     if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
         raise RuntimeError('Remote builders require a tier host with shared memory admission')
+    patch = resolve_runner_patch(args)
+    if patch is not None:
+        if patch.hardware.min_vcpu is not None and args.cpu < patch.hardware.min_vcpu:
+            raise RuntimeError(f'Host vCPU {args.cpu} is below patch minimum {patch.hardware.min_vcpu}')
+        if patch.hardware.min_ram_gib is not None and args.ram < patch.hardware.min_ram_gib:
+            raise RuntimeError(f'Host RAM {args.ram} GiB is below patch minimum {patch.hardware.min_ram_gib} GiB')
     configure_storage(args)
     configure_cpu_platform(args)
     strict=strict_pool_settings(args)
@@ -156,16 +206,32 @@ def select_sizing(args: argparse.Namespace) -> None:
         if len(f'{args.runner_prefix}-{args.instance_name}-{args.runner_count}') > 64:
             raise RuntimeError('GitHub runner name exceeds64 characters')
         return
+    host_overhead = int(getattr(args, 'host_overhead_gib', 2)) if args.ram <= 8 else (4 if args.ram <= 16 else 8)
+
     if not args.fixed_runner_sizing:
-        if args.cpu < 4:
-            raise RuntimeError("At least 4 host vCPUs are required for one runner")
-        args.runner_count = args.cpu // 4
-        args.runner_cpu = 4
-        args.runner_memory_gb = (args.ram - 8) // args.runner_count
+        if args.cpu < 2:
+            raise RuntimeError("At least 2 host vCPUs are required for one runner")
+        if args.ram < 4:
+            raise RuntimeError("At least 4 GiB host RAM is required for one runner")
+        if getattr(args, "runner_count", None) == 1 or args.cpu < 4 or args.ram <= 8:
+            args.runner_count = 1
+            args.runner_cpu = min(4, args.cpu)
+            args.runner_memory_gb = max(2, args.ram - host_overhead)
+        else:
+            args.runner_count = args.cpu // 4
+            args.runner_cpu = 4
+            args.runner_memory_gb = (args.ram - host_overhead) // args.runner_count
+            if args.runner_memory_gb < 2:
+                args.runner_count = 1
+                args.runner_cpu = min(4, args.cpu)
+                args.runner_memory_gb = max(2, args.ram - host_overhead)
+
     if args.runner_count < 1 or args.runner_cpu * args.runner_count > args.cpu:
         raise RuntimeError("Runner count or CPU limits exceed the requested host capacity")
-    if args.runner_memory_gb * args.runner_count > args.ram - 8:
-        raise RuntimeError("Runner RAM exceeds (host RAM - 8 GiB); lower runner count/memory")
+    if args.runner_memory_gb < 2:
+        raise RuntimeError(f"At least 2 GiB runner RAM is required; allocated {args.runner_memory_gb} GiB")
+    if args.runner_memory_gb * args.runner_count > args.ram - host_overhead:
+        raise RuntimeError(f"Runner RAM exceeds (host RAM - {host_overhead} GiB); lower runner count/memory")
     longest_name = len(f"{args.runner_prefix}-{args.instance_name}-{args.runner_count}")
     if longest_name > 64:
         raise RuntimeError(f"Runner name would be {longest_name} characters; GitHub allows at most 64")
@@ -230,17 +296,28 @@ def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:
 
 
 def verify_runner_group(args: argparse.Namespace) -> dict:
-    group = json.loads(run(["gh", "api", f"orgs/{ORG}/actions/runner-groups/{args.runner_group_id}"], quiet=True))
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    if target.is_repo:
+        raise RuntimeError(f"Runner groups are not supported for personal repository targets: {target.name}")
+    org = target.name
+    group = json.loads(run(["gh", "api", f"orgs/{org}/actions/runner-groups/{args.runner_group_id}"], quiet=True))
     if group.get("visibility") != "selected":
         raise RuntimeError("Runner group must be repository-scoped")
-    repos = json.loads(run(["gh", "api", f"orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/repositories"], quiet=True))
-    if not any(repo.get("full_name") == f"{ORG}/oxidex" for repo in repos.get("repositories", [])):
-        raise RuntimeError(f"Runner group {args.runner_group_id} is not enabled for {ORG}/oxidex")
-    if getattr(args,'heavy_runner_pool',None) and group.get('allows_public_repositories') is not True:
+    repos = json.loads(run(["gh", "api", f"orgs/{org}/actions/runner-groups/{args.runner_group_id}/repositories"], quiet=True))
+    if not any(repo.get("full_name") == f"{org}/oxidex" for repo in repos.get("repositories", [])):
+        raise RuntimeError(f"Runner group {args.runner_group_id} is not enabled for {org}/oxidex")
+    if getattr(args, 'heavy_runner_pool', None) and group.get('allows_public_repositories') is not True:
         raise RuntimeError('Strict runner group must permit the public OxiDex repository')
-    if getattr(args,'heavy_runner_pool',None) and [repo.get('full_name') for repo in repos.get('repositories',[])]!=[f'{ORG}/oxidex']:
+    if getattr(args, 'heavy_runner_pool', None) and [repo.get('full_name') for repo in repos.get('repositories', [])] != [f'{org}/oxidex']:
         raise RuntimeError('Strict runner group must select only OxiDex')
     return group
+
+
+def generate_registration_token(target: TargetConfig) -> str:
+    token = run(["gh", "api", "--method", "POST", target.registration_token_url, "--jq", ".token"], quiet=True)
+    if not token:
+        raise RuntimeError(f"GitHub returned an empty {target.target_type} runner registration token for {target.name}")
+    return token
 
 
 def cleanup_orphan_runner_disks(zone: str) -> list[str]:
@@ -272,6 +349,9 @@ def cleanup_orphan_runner_disks(zone: str) -> list[str]:
 def render_startup(args: argparse.Namespace, token: str, group_name: str, deployment_id: str) -> str:
     if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
         raise RuntimeError('Remote builders require a tier host with shared memory admission')
+    patch = resolve_runner_patch(args)
+    dockerfile_text = render_dockerfile(RUNNER_DOCKERFILE, patch)
+    labels_csv = ",".join(_desired_runner_labels(args))
     source = STARTUP_SCRIPT
     strict=strict_pool_settings(args)
     if strict and (args.runner_count!=strict or args.runner_memory_gb!=32 or args.runner_cpu!=8 or args.admission_work_gib!=32*strict or args.runner_label!='spot-heavy32'):raise RuntimeError('Strict pool sizing has not been selected')
@@ -280,14 +360,14 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
     evidence_source = Path(__file__).with_name('host_evidence.py').read_bytes()
     replacements = {
         "DISK_DEVICE": f"/dev/disk/by-id/google-{args.disk_device_name}",
-        "DOCKERFILE_B64": base64.b64encode(RUNNER_DOCKERFILE.encode()).decode("ascii"),
+        "DOCKERFILE_B64": base64.b64encode(dockerfile_text.encode()).decode("ascii"),
         "ENTRYPOINT_B64": base64.b64encode(RUNNER_ENTRYPOINT.encode()).decode("ascii"),
         "JOB_COMPLETED_B64": base64.b64encode(JOB_COMPLETED.encode()).decode("ascii"),
         "CLEAN_TARGET_B64": base64.b64encode(CLEAN_TARGET.encode()).decode("ascii"),
         "DOCKER_WRAPPER_B64": base64.b64encode(DOCKER_WRAPPER.encode()).decode("ascii"),
         "RUNNER_VERSION": "2.337.0",
-        "ORG": getattr(args,'org',ORG),
-        "RUNNER_LABELS": f"{args.runner_label},{args.instance_type},{args.region}",
+        "ORG": getattr(args, "target", None) or getattr(args, "org", None) or ORG,
+        "RUNNER_LABELS": labels_csv,
         "RUNNER_GROUP": group_name,
         "RUNNER_PREFIX": args.runner_prefix,
         "REGISTRATION_TOKEN": shlex.quote(token),
@@ -313,6 +393,7 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
     }
     for key, value in replacements.items():
         source = source.replace("{{" + key + "}}", value)
+    source = inject_startup_patch(source, patch)
     if "{{" in source:
         raise RuntimeError("Unexpanded value in GCE startup script")
     return source
@@ -423,6 +504,8 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                                     if args.boot_disk_type == 'hyperdisk-balanced' else [])
                 network = ("--network-interface=network=default,nic-type=GVNIC"
                            if args.boot_disk_type == 'hyperdisk-balanced' else "--network=default")
+                arch, _ = _requested_arch_and_isa(args)
+                image_family = "--image-family=debian-13-arm64" if arch == "arm64" else "--image-family=debian-13"
                 created = gcloud(["compute", "instances", "create", args.instance_name, f"--zone={zone}",
                         f"--machine-type={args.instance_type}", "--provisioning-model=SPOT",
                         *([f'--min-cpu-platform={args.min_cpu_platform}'] if args.min_cpu_platform else []),
@@ -430,7 +513,7 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                         f"--boot-disk-type={args.boot_disk_type}", "--boot-disk-size=40GB",
                         "--boot-disk-auto-delete",
                         f"--boot-disk-interface={args.boot_disk_interface}", *boot_performance,
-                        "--image-family=debian-13", "--image-project=debian-cloud",
+                        image_family, "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
                         network, f"--metadata-from-file=startup-script={script_path}",
                         "--format=json(id,name,zone,status,disks,cpuPlatform,minCpuPlatform)",
@@ -477,16 +560,17 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
 
 
 def online_runners(args: argparse.Namespace) -> list[str]:
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
     expected_names = {f"{args.runner_prefix}-{args.instance_name}-{n}" for n in range(1, args.runner_count + 1)}
     online: list[str] = []
     for _ in range(120):
-        output = run(["gh", "api", "--paginate", f"orgs/{ORG}/actions/runners", "--jq", ".runners[] | @json"], quiet=True)
+        output = run(["gh", "api", "--paginate", target.runners_url, "--jq", ".runners[] | @json"], quiet=True)
         runners = [json.loads(row) for row in output.splitlines() if row.strip()]
         matches = [runner for runner in runners if runner.get("name") in expected_names]
         online = [runner["name"] for runner in matches if runner.get("status") == "online"]
         if online and hasattr(args, "deployment_started_at") and not getattr(args, "registration_logged", False):
             LOG.info("Instance first seen online in %s runners, registered to take jobs: %s; %.1f seconds "
-                     "from starting VM deployment; %d/%d runners online", ORG, deployment_details(args),
+                     "from starting VM deployment; %d/%d runners online", target.name, deployment_details(args),
                      time.monotonic() - args.deployment_started_at, len(online), args.runner_count)
             args.registration_logged = True
         if len(online) == args.runner_count:
@@ -496,16 +580,17 @@ def online_runners(args: argparse.Namespace) -> list[str]:
 
 
 def verify_strict_runner_membership(args) -> dict[str, int] | None:
-    if not getattr(args,'heavy_runner_pool',None):return None
-    expected={f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1,args.runner_count+1)}
-    output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/runners','--jq','.runners[] | @json'],quiet=True)
-    rows=[json.loads(line) for line in output.splitlines() if line.strip()]
-    selected=[row for row in rows if row.get('name') in expected]
-    if (len(selected)!=len(expected) or {row.get('name') for row in selected}!=expected
-        or any(type(row.get('id'))is not int for row in selected)
-        or len({row['id'] for row in selected})!=len(expected)):
+    if not getattr(args, 'heavy_runner_pool', None): return None
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    expected = {f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1, args.runner_count + 1)}
+    output = run(['gh', 'api', '--paginate', f'orgs/{target.name}/actions/runner-groups/{args.runner_group_id}/runners', '--jq', '.runners[] | @json'], quiet=True)
+    rows = [json.loads(line) for line in output.splitlines() if line.strip()]
+    selected = [row for row in rows if row.get('name') in expected]
+    if (len(selected) != len(expected) or {row.get('name') for row in selected} != expected
+        or any(type(row.get('id')) is not int for row in selected)
+        or len({row['id'] for row in selected}) != len(expected)):
         raise RuntimeError('Registered strict runners are not in the verified OxiDex group')
-    return {row['name']:row['id'] for row in selected}
+    return {row['name']: row['id'] for row in selected}
 
 
 def start_retained_strict_host(args, zone):
@@ -552,21 +637,23 @@ def verify_strict_identities(args,org_rows=None):
     group_ids=verify_strict_runner_membership(args)
     cached=read_cached_runner_ids(args)
     if org_rows is None:
-        output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runners','--jq','.runners[] | @json'],quiet=True)
+        target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+        output=run(['gh','api','--paginate',f'orgs/{target.name}/actions/runners','--jq','.runners[] | @json'],quiet=True)
         org_rows=[json.loads(line)for line in output.splitlines()if line.strip()]
     validate_strict_identity_join(group_ids,cached,org_rows)
 
 
 def sync_runner_labels(args: argparse.Namespace) -> None:
     """Ensure every Spot VM runner has the common scheduling labels."""
-    if getattr(args,'heavy_runner_pool',None):
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    if getattr(args, 'heavy_runner_pool', None):
         verify_runner_group(args)
         verify_strict_runner_membership(args)
     expected_names = {f"{args.runner_prefix}-{args.instance_name}-{n}": n
                       for n in range(1, args.runner_count + 1)}
-    output = run(["gh", "api", "--paginate", f"orgs/{ORG}/actions/runners",
+    output = run(["gh", "api", "--paginate", target.runners_url,
                   "--jq", ".runners[] | @json"], quiet=True)
-    if getattr(args,'heavy_runner_pool',None):verify_strict_identities(args,[json.loads(line)for line in output.splitlines()if line.strip()])
+    if getattr(args, 'heavy_runner_pool', None):verify_strict_identities(args,[json.loads(line)for line in output.splitlines()if line.strip()])
     seen: set[str] = set()
     for line in output.splitlines():
         if not line.strip():
@@ -576,11 +663,11 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
         if name not in expected_names:
             continue
         seen.add(name)
-        desired = list(dict.fromkeys([args.runner_label, args.instance_type, args.region]))
+        desired = _desired_runner_labels(args)
         current = {label.get("name") for label in runner.get("labels", [])} - DEFAULT_RUNNER_LABELS
         if current != set(desired):
             response = run(["gh", "api", "--method", "PUT",
-                            f"orgs/{ORG}/actions/runners/{runner['id']}/labels", "--input", "-"],
+                            f"{target.runners_url}/{runner['id']}/labels", "--input", "-"],
                            quiet=True, input_data=json.dumps({"labels": desired}))
             actual = {label.get("name") for label in json.loads(response).get("labels", [])} - DEFAULT_RUNNER_LABELS
             if actual != set(desired):
@@ -661,11 +748,62 @@ def deployment_details(args: argparse.Namespace) -> str:
     return "planned " + vm_details(vm)
 
 
+def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
+    patch = resolve_runner_patch(args)
+    if patch is None:
+        raise RuntimeError("Live patching requires --patch-repo or --patch-file")
+    vm = observed_deployment_vm(args, zone)
+    if not vm.running:
+        raise RuntimeError(f"Cannot hot-patch non-running VM: {vm_details(vm)}")
+    if vm.machine_type and vm.machine_type != args.instance_type:
+        raise RuntimeError(f"Existing VM type {vm.machine_type} does not match {args.instance_type}")
+    state_raw = gcloud(
+        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet",
+         "--command=sudo -n cat /var/lib/gha-runner-patch/state.json 2>/dev/null || true"],
+        quiet=True,
+    )
+    current_manifest = json.loads(state_raw).get("manifest") if state_raw.strip() else None
+    action = classify_patch_diff(current_manifest, patch)
+    if action == "noop":
+        LOG.info("VM %s is already at patch %s", args.instance_name, patch.patch_sha256[:12])
+        return "noop"
+    if action == "replace_vm":
+        raise RuntimeError(
+            f"Patch {patch.patch_sha256[:12]} changes hardware architecture or CPU ISA requirements; "
+            "a rolling VM replacement is required instead of --patch-live"
+        )
+    if action == "recreate_containers":
+        raise RuntimeError(
+            f"Patch {patch.patch_sha256[:12]} modifies container bind mounts; "
+            "containers must be drained and recreated instead of --patch-live"
+        )
+    prefix = f"{args.runner_prefix}-"
+    live_script = render_live_hot_patch_script(
+        patch,
+        base_dockerfile=RUNNER_DOCKERFILE,
+        runner_version=RUNNER_VERSION,
+        runner_prefix=prefix,
+    )
+    script_b64 = base64.b64encode(live_script.encode("utf-8")).decode("ascii")
+    remote_cmd = f"printf '%s' '{script_b64}' | base64 -d | sudo -n bash -euo pipefail"
+    output = gcloud(
+        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={remote_cmd}"],
+        quiet=True,
+    )
+    if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
+        raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
+    sync_runner_labels(args)
+    LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
+    return "hot_patch"
+
+
 def observed_deployment_vm(args: argparse.Namespace, zone: str) -> GceVm:
+    arch, required_isa = _requested_arch_and_isa(args)
     for vm in list_gcloud_vms(PROJECT, name_prefix=args.instance_name):
         if vm.name == args.instance_name and vm.zone == zone:
             requested = getattr(args, 'min_cpu_platform', None)
-            if requested and vm.running and not cpu_platform_satisfies(args.instance_type, vm.cpu_platform, requested):
+            if requested and vm.running and not cpu_platform_satisfies(
+                    args.instance_type, vm.cpu_platform, requested, arch=arch, required_isa=required_isa):
                 raise RuntimeError(f'Observed CPU platform {vm.cpu_platform or "unknown"} does not match requested {requested}: {vm_details(vm)}')
             return vm
     raise RuntimeError(f"Cannot observe deployed VM specifications: {deployment_details(args)}")
@@ -678,6 +816,9 @@ def main() -> int:
     PROJECT, ORG = args.project, args.org
     zone = args.zone or f"{args.region}-a"
     select_sizing(args)
+    if getattr(args, "patch_live", False):
+        apply_live_patch(args, zone)
+        return 0
     if args.existing_instance:
         args.deployment_vm = observed_deployment_vm(args, zone)
     hourly = verify_price_and_capacity(args, zone)
@@ -686,15 +827,17 @@ def main() -> int:
         LOG.info("Preview only. Add --apply to provision through GCE startup metadata and register the runners.")
         return 0
 
-    group = verify_runner_group(args)
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    group_name = ""
+    if target.is_org and getattr(args, "runner_group_id", None):
+        group = verify_runner_group(args)
+        group_name = group["name"]
     if args.existing_instance:
-        start_retained_strict_host(args,zone)
+        start_retained_strict_host(args, zone)
         verify_strict_identities(args)
-    token = run(["gh", "api", "--method", "POST", f"orgs/{ORG}/actions/runners/registration-token", "--jq", ".token"], quiet=True)
-    if not token:
-        raise RuntimeError("GitHub returned an empty org runner registration token")
+    token = generate_registration_token(target)
     deployment_id = uuid.uuid4().hex
-    script = render_startup(args, token, group["name"], deployment_id)
+    script = render_startup(args, token, group_name, deployment_id)
     token = ""
 
     failure: BaseException | None = None

@@ -19,7 +19,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from .log_format import error_detail
 
@@ -113,56 +113,80 @@ def _command_json(args: Sequence[str]) -> object:
 
 
 def count_active_github_runners(
-    org: str = "swack-tools",
+    org: str | Any = "swack-tools",
     *,
+    target: str | Any | None = None,
     label: str | None = None,
     gh_binary: str = "gh",
 ) -> int:
-    """Count online organization self-hosted runners, optionally by label."""
+    """Count online organization or repository self-hosted runners, optionally by label."""
     return sum(
         runner.online
-        for runner in list_github_runners(org, gh_binary=gh_binary)
+        for runner in list_github_runners(org, target=target, gh_binary=gh_binary)
         if label is None or label in runner.labels
     )
 
 
-def list_github_runners(org: str = "swack-tools", *, gh_binary: str = "gh") -> tuple[GitHubRunner, ...]:
-    """List all organization self-hosted runners using the authenticated gh command-line tool."""
-    command = [gh_binary, "api", "--paginate", "--slurp",
-               f"orgs/{org}/actions/runners?per_page=100"]
+def list_github_runners(
+    org: str | Any = "swack-tools",
+    *,
+    target: str | Any | None = None,
+    gh_binary: str = "gh",
+) -> tuple[GitHubRunner, ...]:
+    """List all organization or repository self-hosted runners using the authenticated gh command-line tool."""
+    target_val = target if target is not None else org
+    if hasattr(target_val, "runners_url"):
+        endpoint = f"{target_val.runners_url}?per_page=100"
+        target_name = getattr(target_val, "name", str(target_val))
+    elif hasattr(target_val, "api_path"):
+        endpoint = f"{target_val.api_path}/actions/runners?per_page=100"
+        target_name = getattr(target_val, "name", str(target_val))
+    else:
+        target_name = str(target_val).strip()
+        if target_name.startswith(("repos/", "orgs/")):
+            if target_name.endswith("/actions/runners"):
+                endpoint = f"{target_name}?per_page=100"
+            else:
+                endpoint = f"{target_name}/actions/runners?per_page=100"
+        elif "/" in target_name:
+            endpoint = f"repos/{target_name}/actions/runners?per_page=100"
+        else:
+            endpoint = f"orgs/{target_name}/actions/runners?per_page=100"
+
+    command = [gh_binary, "api", "--paginate", "--slurp", endpoint]
     try:
         result = subprocess.run(command, check=True, text=True, capture_output=True, timeout=60)
-        if result.stderr.strip():raise ValueError("GitHub inventory diagnostic")
-        pages=json.loads(result.stdout)
-        if not isinstance(pages,list) or not pages or not isinstance(pages[0],dict):
+        if result.stderr.strip(): raise ValueError("GitHub inventory diagnostic")
+        pages = json.loads(result.stdout)
+        if not isinstance(pages, list) or not pages or not isinstance(pages[0], dict):
             raise ValueError("Missing runner pages")
-        total=pages[0].get('total_count')
-        if type(total) is not int or total<0:raise ValueError("Invalid runner total")
-        items=[]
+        total = pages[0].get('total_count')
+        if type(total) is not int or total < 0: raise ValueError("Invalid runner total")
+        items = []
         for page in pages:
-            if (not isinstance(page,dict) or page.get('total_count')!=total
-                or not isinstance(page.get('runners'),list)):
+            if (not isinstance(page, dict) or page.get('total_count') != total
+                or not isinstance(page.get('runners'), list)):
                 raise ValueError("Incomplete runner page")
             items.extend(page['runners'])
-        if (len(items)!=total or len(pages)!=max(1,(total+99)//100)
-            or any(len(page['runners'])!=min(100,max(0,total-index*100))
-                   for index,page in enumerate(pages))):
+        if (len(items) != total or len(pages) != max(1, (total + 99) // 100)
+            or any(len(page['runners']) != min(100, max(0, total - index * 100))
+                   for index, page in enumerate(pages))):
             raise ValueError("Partial runner inventory")
-        runners=[];seen=set()
+        runners = []; seen = set()
         for item in items:
-            if (not isinstance(item,dict) or type(item.get('id')) is not int
+            if (not isinstance(item, dict) or type(item.get('id')) is not int
                 or item['id'] in seen or type(item.get('name')) is not str
-                or item.get('status') not in ('online','offline')
-                or type(item.get('busy')) is not bool or not isinstance(item.get('labels'),list)
-                or any(not isinstance(label,dict) or type(label.get('name')) is not str
+                or item.get('status') not in ('online', 'offline')
+                or type(item.get('busy')) is not bool or not isinstance(item.get('labels'), list)
+                or any(not isinstance(label, dict) or type(label.get('name')) is not str
                        for label in item['labels'])):
                 raise ValueError("Malformed or duplicate runner")
             seen.add(item['id'])
-            runners.append(GitHubRunner(item['id'],item['name'],item['status'],item['busy'],
+            runners.append(GitHubRunner(item['id'], item['name'], item['status'], item['busy'],
                                         tuple(label['name'] for label in item['labels'])))
         return tuple(runners)
-    except (FileNotFoundError,subprocess.SubprocessError,ValueError,TypeError,KeyError) as exc:
-        raise RuntimeError(f"Complete GitHub runner inventory unavailable for {org}") from exc
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError(f"Complete GitHub runner inventory unavailable for {target_name}") from exc
 
 
 
@@ -247,7 +271,8 @@ def count_running_gcloud_vms(
 
 def observe_fleet(
     *,
-    org: str = "swack-tools",
+    org: str | Any = "swack-tools",
+    target: str | Any | None = None,
     project: str = "homelab-424523",
     label: str | None = None,
     vm_name_prefix: str | None = None,
@@ -255,8 +280,9 @@ def observe_fleet(
     gcloud_binary: str = "gcloud",
 ) -> FleetSnapshot:
     """Fetch GitHub and GCE state concurrently and return a single snapshot."""
+    target_val = target if target is not None else org
     with ThreadPoolExecutor(max_workers=2) as pool:
-        runners_future = pool.submit(list_github_runners, org, gh_binary=gh_binary)
+        runners_future = pool.submit(list_github_runners, target_val, gh_binary=gh_binary)
         vms_future = pool.submit(list_gcloud_vms, project, name_prefix=vm_name_prefix, gcloud_binary=gcloud_binary)
         runners = runners_future.result()
         vms = vms_future.result()
@@ -291,7 +317,8 @@ def plan_scale_out(
 def reconcile_minimum_runners(
     launch_hosts: Callable[[int], None],
     *,
-    org: str = "swack-tools",
+    org: str | Any = "swack-tools",
+    target: str | Any | None = None,
     project: str = "homelab-424523",
     label: str | None = None,
     vm_name_prefix: str | None = None,
@@ -312,6 +339,7 @@ def reconcile_minimum_runners(
     """
     snapshot = observe_fleet(
         org=org,
+        target=target,
         project=project,
         label=label,
         vm_name_prefix=vm_name_prefix,
@@ -337,6 +365,7 @@ def reconcile_minimum_runners(
         time.sleep(poll_interval_seconds)
         snapshot = observe_fleet(
             org=org,
+            target=target,
             project=project,
             label=label,
             vm_name_prefix=vm_name_prefix,
@@ -366,6 +395,7 @@ def _print_status(snapshot: FleetSnapshot, *, floor: int, runners_per_vm: int) -
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default="swack-tools")
+    parser.add_argument("--target", help="Optional target repository (owner/repo) or organization")
     parser.add_argument("--project", default="homelab-424523")
     parser.add_argument("--label", help="Optional runner label to count only a subset")
     parser.add_argument("--vm-name-prefix", help="Optional GCE VM name prefix filter")
@@ -375,8 +405,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--gcloud-binary", default="gcloud")
     args = parser.parse_args(argv)
     try:
+        target = args.target or args.org
         snapshot = observe_fleet(
-            org=args.org,
+            target=target,
             project=args.project,
             label=args.label,
             vm_name_prefix=args.vm_name_prefix,
