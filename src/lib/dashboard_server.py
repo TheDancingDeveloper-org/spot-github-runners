@@ -2912,6 +2912,29 @@ class DashboardStore:
                         delivery_sec = max(0.0, duration - min(explicit_compile, duration))
                     else:
                         delivery_sec = min(8.0, round(duration * 0.2, 2))
+                elif (
+                    was_non_delivered
+                    and existing_build.get("requested_at")
+                    and not payload.get("requested_at")
+                    and explicit_compile is None
+                ):
+                    req_epoch_existing = _iso_to_epoch(str(existing_build["requested_at"]))
+                    if payload.get("delivered_at"):
+                        completion_epoch = _iso_to_epoch(str(payload["delivered_at"]))
+                    elif payload.get("finished_at") and explicit_delivery is not None:
+                        completion_epoch = _iso_to_epoch(str(payload["finished_at"])) + explicit_delivery
+                    elif payload.get("finished_at"):
+                        completion_epoch = max(_iso_to_epoch(str(payload["finished_at"])), now_ts)
+                    else:
+                        completion_epoch = now_ts
+                    duration = max(1.0, round(completion_epoch - req_epoch_existing, 2))
+                    if explicit_delivery is not None:
+                        delivery_sec = min(explicit_delivery, duration)
+                    elif payload.get("finished_at"):
+                        fin_ep = _iso_to_epoch(str(payload["finished_at"]))
+                        delivery_sec = min(duration, max(0.0, round(completion_epoch - fin_ep, 2)))
+                    else:
+                        delivery_sec = min(8.0, round(duration * 0.2, 2))
                 else:
                     delivery_sec = explicit_delivery if explicit_delivery is not None else 8.0
                     c_sec = explicit_compile if explicit_compile is not None else 87.0
@@ -2972,6 +2995,25 @@ class DashboardStore:
                     if "delivered_at" in payload
                     else existing_build.get("delivered_at")
                 )
+            elif (
+                was_non_delivered
+                and existing_build.get("requested_at")
+                and not payload.get("requested_at")
+                and explicit_total is None
+                and explicit_compile is None
+            ):
+                req_at = str(existing_build["requested_at"])
+                req_epoch = _iso_to_epoch(req_at)
+                if payload.get("delivered_at"):
+                    del_at = str(payload["delivered_at"])
+                    del_epoch = _iso_to_epoch(del_at)
+                else:
+                    del_epoch = max(now_ts, req_epoch + duration)
+                    del_at = _iso_seconds_ago(0, del_epoch)
+                if payload.get("finished_at"):
+                    fin_at = str(payload["finished_at"])
+                else:
+                    fin_at = _iso_seconds_ago(0, max(req_epoch, del_epoch - delivery_sec))
             elif (payload.get("requested_at") or existing_build.get("requested_at")) and not payload.get("delivered_at"):
                 req_at = str(payload.get("requested_at") or existing_build["requested_at"])
                 req_epoch = _iso_to_epoch(req_at)
@@ -3244,18 +3286,6 @@ def make_handler(
                     if sess_val and hmac.compare_digest(sess_val, expected_session_cookie):
                         return True
 
-            qs = parse_qs(urlparse(self.path).query)
-            if "token" in qs:
-                q_token = (qs["token"][0] or "").strip()
-                if q_token and hmac.compare_digest(q_token, expected_token):
-                    return True
-                self._send_json(
-                    {"error": "Unauthorized: valid Bearer token or X-Dashboard-Token required"},
-                    status=HTTPStatus.UNAUTHORIZED,
-                    extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
-                )
-                return False
-
             if allow_html_shell:
                 return True
 
@@ -3354,13 +3384,12 @@ def make_handler(
                     return
                 extra_hdrs: dict[str, str] | None = None
                 if expected_token:
-                    q_token = (qs.get("token", [""])[0] or "").strip()
                     auth_hdr = (self.headers.get("Authorization") or "").strip()
                     hdr_token = (self.headers.get("X-Dashboard-Token") or "").strip()
                     supplied = (
                         auth_hdr[7:].strip()
                         if auth_hdr.lower().startswith("bearer ")
-                        else (hdr_token or q_token)
+                        else hdr_token
                     )
                     if supplied and hmac.compare_digest(supplied, expected_token):
                         extra_hdrs = {

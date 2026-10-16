@@ -155,7 +155,8 @@ write_files:
       RUNNERS_COUNT="4"
       RUNNER_CPU_LIMIT="8"
       RUNNER_MEMORY_GB="32"
-      ADMISSION_WORK_GIB="64"
+      HOST_RESERVE_GIB="8"
+      ADMISSION_WORK_GIB="56"
       STRICT_HEAVY_POOL="1"
       DISK_DEVICE="/dev/disk/by-id/google-runner-data"
       DISK_MOUNT="/mnt/runner-data"
@@ -263,6 +264,34 @@ write_files:
               raise ValueError('Runner memory cap differs from reservation')
           return runner_gib
 
+      def host_work_budget_gib(cfg):
+          configured_work = int(cfg.get('work_gib', 56))
+          reserve_gib = max(4, int(cfg.get('host_reserve_gib', 8)))
+          try:
+              for line in Path('/proc/meminfo').read_text().splitlines():
+                  if line.startswith('MemTotal:'):
+                      mem_kib = int(line.split()[1])
+                      phys_gib = mem_kib // (1024 * 1024)
+                      return max(0, min(configured_work, phys_gib - reserve_gib))
+          except (OSError, ValueError, IndexError):
+              pass
+          return configured_work
+
+      def reap_dead_leases():
+          lock_fd = os.open(str(LEASES_PATH) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(lock_fd, 'r+') as lock_f:
+              fcntl.flock(lock_f, fcntl.LOCK_EX)
+              rows = json.loads(LEASES_PATH.read_text()) if LEASES_PATH.exists() else {}
+              leases = {k: v for k, v in rows.items() if owner_alive(k)}
+              if leases != rows:
+                  tmp_path = LEASES_PATH.with_suffix('.tmp')
+                  tmp_fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                  with os.fdopen(tmp_fd, 'w') as out_f:
+                      json.dump(leases, out_f, sort_keys=True)
+                      out_f.flush()
+                      os.fsync(out_f.fileno())
+                  tmp_path.replace(LEASES_PATH)
+
       def serve():
           if os.geteuid() != 0:
               raise RuntimeError('Admission service must run as root')
@@ -276,8 +305,16 @@ write_files:
               os.chown(SOCKET_PATH, 0, 1001)
               os.chmod(SOCKET_PATH, 0o660)
               srv.listen(128)
+              srv.settimeout(1.0)
               while True:
-                  conn, _ = srv.accept()
+                  try:
+                      conn, _ = srv.accept()
+                  except socket.timeout:
+                      try:
+                          reap_dead_leases()
+                      except Exception:
+                          pass
+                      continue
                   with conn:
                       try:
                           conn.settimeout(5.0)
@@ -289,13 +326,15 @@ write_files:
                           if req.get('kind', 'runner') != 'runner':
                               raise ValueError('Admission kind does not match peer identity')
                           action = req.get('action') or req.get('op')
-                          work_gib = int(cfg.get('work_gib', 64))
+                          work_gib = host_work_budget_gib(cfg)
                           lock_fd = os.open(str(LEASES_PATH) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
                           with os.fdopen(lock_fd, 'r+') as lock_f:
                               fcntl.flock(lock_f, fcntl.LOCK_EX)
                               rows = json.loads(LEASES_PATH.read_text()) if LEASES_PATH.exists() else {}
                               leases = {k: v for k, v in rows.items() if owner_alive(k)}
                               if action == 'release':
+                                  if owner_alive(owner):
+                                      raise ValueError('Active Worker lease cannot be released while Runner.Worker is alive')
                                   leases.pop(owner, None)
                                   accepted = True
                               elif action == 'acquire':
@@ -339,7 +378,7 @@ write_files:
               raise RuntimeError(resp['error'])
           return bool(resp.get('accepted'))
 
-      def write_config(runners_count, work_gib, runner_gib):
+      def write_config(runners_count, work_gib, runner_gib, host_reserve_gib=8):
           host = socket.gethostname().split('.')[0]
           names = [f'{host}-runner-{i}' for i in range(1, int(runners_count) + 1)]
           CONFIG_PATH.write_text(
@@ -348,6 +387,7 @@ write_files:
                       'role': 'runner',
                       'work_gib': int(work_gib),
                       'runner_gib': int(runner_gib),
+                      'host_reserve_gib': int(host_reserve_gib),
                       'runner_names': names,
                       'heavy_runners': names,
                   },
@@ -362,7 +402,8 @@ write_files:
           if sys.argv[1:] == ['serve']:
               serve()
           elif sys.argv[1:2] == ['write-config']:
-              write_config(sys.argv[2], sys.argv[3], sys.argv[4])
+              reserve_arg = sys.argv[5] if len(sys.argv) > 5 else 8
+              write_config(sys.argv[2], sys.argv[3], sys.argv[4], reserve_arg)
           elif sys.argv[1:] == ['acquire']:
               while True:
                   try:
@@ -428,9 +469,9 @@ write_files:
     content: |
       #!/usr/bin/env bash
       set -Eeuo pipefail
-      if [[ "${GHA_ADMISSION_REQUIRED:-0}" == 1 ]]; then
-        python3 /usr/local/bin/gha-host-admission.py release
-      fi
+      # Leases are bound to live Runner.Worker process identity and reaped by the
+      # root host daemon once Runner.Worker exits after this hook completes.
+      exit 0
   - path: /opt/gha-runners/build/Dockerfile
     permissions: '0644'
     owner: root:root
@@ -469,7 +510,7 @@ runcmd:
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
   - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && mp="${DISK_MOUNT:-/mnt/runner-data}" && systemctl stop docker containerd || true && cp -a /var/lib/containerd/. "$mp/containerd/" && install -d -m 0755 /etc/docker /etc/systemd/system/containerd.service.d && printf "{\\"data-root\\":\\"%s/docker\\",\\"log-driver\\":\\"local\\",\\"log-opts\\":{\\"max-size\\":\\"20m\\",\\"max-file\\":\\"3\\"}}\\n" "$mp" > /etc/docker/daemon.json && printf "[Service]\\nExecStart=\\nExecStart=/usr/bin/containerd --root %s/containerd --state /run/containerd\\n" "$mp" > /etc/systemd/system/containerd.service.d/runner-data.conf && systemctl daemon-reload && systemctl enable --now containerd docker && test "$(docker info --format=json | jq -r .DockerRootDir)" = "$mp/docker"'''
   - 'bash -lc ''set -euo pipefail && install -d -m 0755 -o runner -g runner /opt/runner-rust/cargo /opt/runner-rust/rustup && curl --proto "=https" --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup runuser -u runner -- sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 && rm -f /tmp/rustup-init.sh && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup component add rustfmt clippy --toolchain 1.99.0 && CARGO_HOME=/opt/runner-rust/cargo RUSTUP_HOME=/opt/runner-rust/rustup PATH="/opt/runner-rust/cargo/bin:$PATH" runuser -u runner -- rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin && chown -R root:root /opt/runner-rust && chmod -R a-w /opt/runner-rust && ln -sfn /opt/runner-rust/cargo/bin/* /usr/local/bin/ && rustc --version | grep "^rustc 1.99.0 " && cargo --version | grep "^cargo 1.99.0 "'''
-  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && cp /opt/gha-runners/host_admission.py /opt/gha-runners/build/host_admission.py && chmod 0755 /opt/gha-runners/build/entrypoint.sh /opt/gha-runners/build/job-started.sh /opt/gha-runners/build/job-completed.sh /opt/gha-runners/build/host_admission.py && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-64}" "${RUNNER_MEMORY_GB:-32}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
+  - 'bash -lc ''set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && install -d -m 0755 /run/gha-admission /var/lib/gha-admission && cp /opt/gha-runners/host_admission.py /opt/gha-runners/build/host_admission.py && chmod 0755 /opt/gha-runners/build/entrypoint.sh /opt/gha-runners/build/job-started.sh /opt/gha-runners/build/job-completed.sh /opt/gha-runners/build/host_admission.py && /usr/bin/python3 /opt/gha-runners/host_admission.py write-config "${RUNNERS_COUNT:-4}" "${ADMISSION_WORK_GIB:-56}" "${RUNNER_MEMORY_GB:-32}" "${HOST_RESERVE_GIB:-8}" && printf "[Unit]\\nDescription=Strict runner memory admission\\nAfter=docker.service\\nRequires=docker.service\\n[Service]\\nExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve\\nRestart=always\\nRestartSec=5\\n[Install]\\nWantedBy=multi-user.target\\n" > /etc/systemd/system/gha-admission.service && systemctl daemon-reload && systemctl enable --now gha-admission && docker build -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build'''
   - bash -lc 'set -euo pipefail && set -a && . /etc/runner-setup.env && set +a && gpasswd -d runner docker >/dev/null 2>&1 || true && gpasswd -d runner sudo >/dev/null 2>&1 || true && gpasswd -d runner admin >/dev/null 2>&1 || true && rm -f /etc/sudoers.d/runner /etc/sudoers.d/90-cloud-init-users && mp="${DISK_MOUNT:-/mnt/runner-data}" && cpu_quota="$(( ${RUNNER_CPU_LIMIT:-8} * 100 ))%" && mem_max="${RUNNER_MEMORY_GB:-32}G" && for slot in $(seq 1 "${RUNNERS_COUNT:-4}"); do name="$(hostname -s)-runner-${slot}"; state_dir="${mp}/instances/actions-runner-${slot}"; work_dir="${mp}/work/runner-${slot}"; dir="/opt/actions-runner-${slot}"; install -d -m 0755 -o 1001 -g 1001 "${state_dir}" "${work_dir}"; ln -sfn "${state_dir}" "${dir}"; install -d -m 0755 "/etc/systemd/system/gha-runner-${slot}.service.d"; printf "[Service]\\nCPUAccounting=yes\\nMemoryAccounting=yes\\nCPUQuota=%s\\nMemoryMax=%s\\nMemorySwapMax=0\\nNoNewPrivileges=yes\\n" "${cpu_quota}" "${mem_max}" > "/etc/systemd/system/gha-runner-${slot}.service.d/heavy32-limits.conf"; env_file="/run/${name}.env"; umask 077; printf "GITHUB_RUNNER_TOKEN=%s\\n" "${GITHUB_RUNNER_TOKEN}" > "${env_file}"; docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --env-file "${env_file}" -e RUNNER_CONFIGURE_ONLY=1 -e RUNNER_NAME="${name}" -e RUNNER_LABELS="${RUNNER_LABELS}" -e RUNNER_GROUP_NAME="${RUNNER_GROUP}" -e GITHUB_RUNNER_URL="${GITHUB_ORG_URL}" -e RUNNER_STATE=/runner-state -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; rm -f "${env_file}"; docker rm -f "${name}" >/dev/null 2>&1 || true; docker run -d --restart unless-stopped --name "${name}" --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges:true --cpu-shares=1024 --cpus="${RUNNER_CPU_LIMIT:-8}" --memory="${RUNNER_MEMORY_GB:-32}g" --memory-swap="${RUNNER_MEMORY_GB:-32}g" -e RUNNER_NAME="${name}" -e RUNNER_STATE=/runner-state -e GHA_ADMISSION_REQUIRED=1 -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/gha-runner-job-completed.sh -v /run/gha-admission:/run/gha-admission:ro -v "${state_dir}:/runner-state" -v "${work_dir}:/work" oxidex-self-hosted-runner:2.337.0; done'
 """
 
@@ -797,38 +838,51 @@ write_files:
                   raise SystemExit(75)
               source = root / 'sources' / project
               target = root / 'targets' / project
-              subprocess.run(['/usr/local/bin/oxidex-remote-build', project, 'prepare'], check=True)
-              with open(f'/run/oxidex-cache-active-{project}.lock', 'a') as cache_lock:
+              lock_fd = os.open(f'/run/oxidex-cache-active-{project}.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+              os.fchown(lock_fd, 0, 0)
+              os.fchmod(lock_fd, 0o600)
+              with os.fdopen(lock_fd, 'a') as cache_lock:
                   try:
                       fcntl.flock(cache_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                   except BlockingIOError:
                       raise SystemExit(75)
+                  tx_env = {**os.environ, 'OXIDEX_ACTIVE_LOCK_FD': str(cache_lock.fileno())}
+                  subprocess.run(
+                      ['/usr/local/bin/oxidex-remote-build', project, 'prepare'],
+                      check=True,
+                      env=tx_env,
+                      pass_fds=(cache_lock.fileno(),),
+                  )
                   reconcile_project_containers(source, target)
                   extract_safe_source_archive(upload_path, source, digest)
-              stages = [['cargo', 'fetch', '--locked', '--target', 'x86_64-unknown-linux-gnu']]
-              if profile == 'release':
-                  stages.append(['just', 'cbindgen-check'])
-              build_cmd = ['cargo', 'build'] + (['--release'] if profile == 'release' else []) + ['--locked', '--bin', 'oxidex']
-              run_cmd = ['cargo', 'run'] + (['--release'] if profile == 'release' else []) + ['--locked', '--bin', 'oxidex', '--', '--readonly', '--version']
-              stages.extend([build_cmd, run_cmd])
-              for stage in stages:
-                  rc = subprocess.run(['/usr/local/bin/oxidex-remote-build', project, *stage]).returncode
-                  if rc != 0:
-                      raise SystemExit(rc)
-              binary = target / profile / 'oxidex'
-              if not binary.is_file() or binary.is_symlink() or binary.resolve() != binary:
-                  raise RuntimeError('Verified build binary is missing or a symlink')
-              export = root / 'exports' / run / 'oxidex'
-              export.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-              os.chown(root / 'exports', 0, 0)
-              os.chmod(root / 'exports', 0o755)
-              os.chown(export.parent, 0, 0)
-              os.chmod(export.parent, 0o755)
-              shutil.copy2(binary, export)
-              os.chown(export, 0, 0)
-              os.chmod(export, 0o755)
-              out_digest = hashlib.sha256(export.read_bytes()).hexdigest()
-              print(f'{out_digest}  {export}')
+                  stages = [['cargo', 'fetch', '--locked', '--target', 'x86_64-unknown-linux-gnu']]
+                  if profile == 'release':
+                      stages.append(['just', 'cbindgen-check'])
+                  build_cmd = ['cargo', 'build'] + (['--release'] if profile == 'release' else []) + ['--locked', '--bin', 'oxidex']
+                  run_cmd = ['cargo', 'run'] + (['--release'] if profile == 'release' else []) + ['--locked', '--bin', 'oxidex', '--', '--readonly', '--version']
+                  stages.extend([build_cmd, run_cmd])
+                  for stage in stages:
+                      rc = subprocess.run(
+                          ['/usr/local/bin/oxidex-remote-build', project, *stage],
+                          env=tx_env,
+                          pass_fds=(cache_lock.fileno(),),
+                      ).returncode
+                      if rc != 0:
+                          raise SystemExit(rc)
+                  binary = target / profile / 'oxidex'
+                  if not binary.is_file() or binary.is_symlink() or binary.resolve() != binary:
+                      raise RuntimeError('Verified build binary is missing or a symlink')
+                  export = root / 'exports' / run / 'oxidex'
+                  export.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                  os.chown(root / 'exports', 0, 0)
+                  os.chmod(root / 'exports', 0o755)
+                  os.chown(export.parent, 0, 0)
+                  os.chmod(export.parent, 0o755)
+                  shutil.copy2(binary, export)
+                  os.chown(export, 0, 0)
+                  os.chmod(export, 0o755)
+                  out_digest = hashlib.sha256(export.read_bytes()).hexdigest()
+                  print(f'{out_digest}  {export}')
           finally:
               upload_path.unlink(missing_ok=True)
 
@@ -903,12 +957,26 @@ write_files:
           if len(sys.argv) < 2:
               raise ValueError('Project identifier is required')
           project = validate_project(sys.argv[1])
-          with open('/run/oxidex-build.lock', 'a') as lock, open(f'/run/oxidex-cache-active-{project}.lock', 'a') as active_lock:
+          active_lock_path = Path(f'/run/oxidex-cache-active-{project}.lock')
+          active_lock_fd = os.open(active_lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+          os.fchown(active_lock_fd, 0, 0)
+          os.fchmod(active_lock_fd, 0o600)
+          with open('/run/oxidex-build.lock', 'a') as lock, os.fdopen(active_lock_fd, 'a') as active_lock:
               fcntl.flock(lock, fcntl.LOCK_SH)
-              try:
-                  fcntl.flock(active_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-              except BlockingIOError:
-                  raise SystemExit(75)
+              inherited_fd = os.environ.get('OXIDEX_ACTIVE_LOCK_FD')
+              if inherited_fd is not None:
+                  try:
+                      fd_stat = os.fstat(int(inherited_fd))
+                      path_stat = active_lock_path.lstat()
+                  except (OSError, ValueError):
+                      raise SystemExit(75)
+                  if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+                      raise SystemExit(75)
+              else:
+                  try:
+                      fcntl.flock(active_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                  except BlockingIOError:
+                      raise SystemExit(75)
               if Path('/run/oxidex-build-draining').exists():
                   raise SystemExit(75)
               for path in (root, root / 'sources', root / 'targets', root / 'cargo', root / 'sources' / project, root / 'targets' / project):

@@ -1540,17 +1540,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     (function bootstrapUrlAuthToken() {
       try {
         const url = new URL(window.location.href);
-        const queryToken = url.searchParams.get("token");
+        const hadQueryToken = url.searchParams.has("token");
+        if (hadQueryToken) {
+          url.searchParams.delete("token");
+        }
         const hashParams = new URLSearchParams((url.hash || "").replace(/^#/, ""));
         const hashToken = hashParams.get("token");
-        const initialToken = queryToken || hashToken;
-        if (initialToken) {
-          storeDashboardAuthToken(initialToken);
-          url.searchParams.delete("token");
-          if (hashToken) {
-            hashParams.delete("token");
-            url.hash = hashParams.toString() ? `#${hashParams.toString()}` : "";
-          }
+        if (hashToken) {
+          storeDashboardAuthToken(hashToken);
+          hashParams.delete("token");
+          url.hash = hashParams.toString() ? `#${hashParams.toString()}` : "";
+        }
+        if (hadQueryToken || hashToken) {
           window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
         }
       } catch (_err) {

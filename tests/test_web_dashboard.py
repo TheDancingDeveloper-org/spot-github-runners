@@ -2238,7 +2238,13 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                     b"Content-Type: application/json\r\n"
                     b"Content-Length: 64\r\n\r\n"
                 )
-                resp_bytes = sock.recv(4096)
+                chunks = []
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                resp_bytes = b"".join(chunks)
             self.assertIn(b"400", resp_bytes)
             self.assertIn(b"Request body read timed out", resp_bytes)
         finally:
@@ -2418,7 +2424,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         # 2 & 3. Rust builder cloud-init reconciles lingering containers and holds active lock across prepare + docker run
         self.assertIn("def reconcile_project_containers(source, target):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
         self.assertIn("reconcile_project_containers(source, target)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
-        self.assertIn("open(f'/run/oxidex-cache-active-{project}.lock', 'a') as active_lock:", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("active_lock_path = Path(f'/run/oxidex-cache-active-{project}.lock')", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("os.fdopen(active_lock_fd, 'a') as active_lock:", DEFAULT_RUST_BUILDER_CLOUD_INIT)
 
         # 4. parse_cloud_init accepts indicator-first YAML block-scalar headers like |-2 and >+4
         block_scalar_yaml = (
@@ -2496,6 +2503,98 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         )
         burn_no_tax = self._get("/api/overview")["scaling_evaluation"]["projected_hourly_usd"]
         self.assertAlmostEqual(burn_zero_tax, burn_no_tax, places=5)
+
+    def test_round15_codex_regressions(self) -> None:
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        # 1. Rust builder cloud-init holds root-only /run/oxidex-cache-active-{project}.lock across entire build + export transaction
+        self.assertIn("os.open(active_lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("os.fchmod(active_lock_fd, 0o600)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("os.fchown(active_lock_fd, 0, 0)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("OXIDEX_ACTIVE_LOCK_FD", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("pass_fds=(cache_lock.fileno(),)", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        # 2. Strict runner admission daemon rejects release while Runner.Worker is alive and sweeps dead leases on socket timeout
+        self.assertIn("Active Worker lease cannot be released while Runner.Worker is alive", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("srv.settimeout(1.0)", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 3. Strict runner admission daemon reserves HOST_RESERVE_GIB=8 and defaults ADMISSION_WORK_GIB=56
+        self.assertIn('ADMISSION_WORK_GIB="56"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn('HOST_RESERVE_GIB="8"', DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("def host_work_budget_gib(cfg):", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("return max(0, min(configured_work, phys_gib - reserve_gib))", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        # 4. Query-string ?token= authentication is rejected while header/cookie/hash auth remains supported
+        self.assertNotIn('url.searchParams.get("token")', DASHBOARD_HTML)
+        self.assertIn('hashParams.get("token")', DASHBOARD_HTML)
+        auth_srv, _ = create_dashboard_server(
+            host="127.0.0.1",
+            port=0,
+            state_path=self.state_file,
+            auth_token="round15-secret",
+        )
+        auth_port = auth_srv.server_address[1]
+        auth_thread = threading.Thread(target=auth_srv.serve_forever, daemon=True)
+        auth_thread.start()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx_qs:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{auth_port}/api/overview?token=round15-secret",
+                    timeout=5,
+                )
+            self.assertEqual(ctx_qs.exception.code, 401)
+            ctx_qs.exception.close()
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{auth_port}/?token=round15-secret",
+                timeout=5,
+            ) as shell_resp:
+                self.assertEqual(shell_resp.status, 200)
+                self.assertIsNone(shell_resp.headers.get("Set-Cookie"))
+
+            req_hdr = urllib.request.Request(
+                f"http://127.0.0.1:{auth_port}/api/overview",
+                headers={"Authorization": "Bearer round15-secret"},
+            )
+            with urllib.request.urlopen(req_hdr, timeout=5) as resp_hdr:
+                self.assertEqual(resp_hdr.status, 200)
+        finally:
+            auth_srv.shutdown()
+            auth_srv.server_close()
+            auth_thread.join(timeout=5)
+
+        # 5. Completing an existing RUNNING build derives elapsed duration and completion time from now_ts when omitted
+        import datetime
+
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        two_hours_ago_iso = (now_dt - datetime.timedelta(seconds=7200)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "bld-round15-long",
+                "project_name": "oxidex",
+                "status": "RUNNING",
+                "requested_at": two_hours_ago_iso,
+            },
+        )
+        before_builds_hr = self.store.state["scaling_telemetry"]["builds_ran_past_hour"]
+        completed_res = self._post(
+            "/api/rust-builds",
+            {
+                "build_id": "bld-round15-long",
+                "status": "DELIVERED",
+            },
+        )
+        completed_rec = completed_res["build"]
+        self.assertEqual(completed_rec["requested_at"], two_hours_ago_iso)
+        self.assertNotEqual(completed_rec["delivered_at"], two_hours_ago_iso)
+        self.assertGreaterEqual(completed_rec["total_duration_seconds"], 7100.0)
+        after_builds_hr = self.store.state["scaling_telemetry"]["builds_ran_past_hour"]
+        self.assertGreaterEqual(after_builds_hr, before_builds_hr + 1)
 
 
 if __name__ == "__main__":
