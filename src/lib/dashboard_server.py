@@ -1971,7 +1971,7 @@ class DashboardStore:
             step_val = max(1, int(step_runners or 1))
             max_val = int(max_runners) if max_runners is not None else (baseline_val + step_val)
             required_target = min(max_val, baseline_val + step_val)
-            return int(current_runners) >= required_target and int(current_runners) > baseline_val
+            return int(current_runners) >= required_target and (int(current_runners) > baseline_val or baseline_val >= max_val)
 
         if role in (None, "cicd_runner"):
             for run in telem.get("github_oom_runs", []):
@@ -2267,7 +2267,7 @@ class DashboardStore:
                     self.state["scaling_telemetry"],
                     per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
                     other_role_hourly_usd=(
-                        runner_burn_for_builder
+                        max(runner_burn_for_builder, float(cicd_eval.get("projected_hourly_usd", 0.0)))
                         if (global_budget_shared or self.state["scaling"]["rust_builder"].get("shared_global_budget"))
                         else 0.0
                     ),

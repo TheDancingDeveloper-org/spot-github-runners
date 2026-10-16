@@ -188,6 +188,8 @@ write_files:
       def process_record(pid):
           root = Path(f'/proc/{pid}')
           stat = (root / 'stat').read_text().rsplit(')', 1)[1].split()
+          if stat[0] == 'Z':
+              raise FileNotFoundError('Zombie process')
           return int(stat[1]), stat[19], (root / 'comm').read_text().strip(), (root / 'cgroup').read_text()
 
       def runner_cgroup(cgroup):
@@ -250,6 +252,8 @@ write_files:
               if runner_cgroup(cgrp) == cid:
                   procs[p] = (ppid, int(pstart), comm)
           if not procs:
+              return False
+          if any(comm == 'Runner.Worker' for _, (_, _, comm) in procs.items()):
               return False
           max_idle_start = int(worker_start) if worker_start is not None else None
           listeners = [
@@ -533,8 +537,10 @@ write_files:
                   try:
                       if request('acquire'):
                           break
-                  except OSError:
-                      # Retry when the root admission service restarts during an assigned job.
+                  except OrphanRunnerHook:
+                      raise
+                  except (OSError, RuntimeError):
+                      # Retry when the root admission service restarts or rejects concurrent requests during an assigned job.
                       time.sleep(5)
                   else:
                       time.sleep(5)
@@ -1032,9 +1038,16 @@ write_files:
               text=True,
           ).split()
           for cid in ids:
-              rows = json.loads(
-                  subprocess.check_output(['/usr/bin/docker', 'inspect', cid], text=True)
-              )
+              try:
+                  rows = json.loads(
+                      subprocess.check_output(
+                          ['/usr/bin/docker', 'inspect', cid],
+                          text=True,
+                          stderr=subprocess.DEVNULL,
+                      )
+                  )
+              except (subprocess.CalledProcessError, json.JSONDecodeError):
+                  continue
               if not rows or not isinstance(rows[0], dict):
                   raise SystemExit(75)
               record = rows[0]
@@ -1056,7 +1069,12 @@ write_files:
               )
               if not is_stopped:
                   raise SystemExit(75)
-              subprocess.run(['/usr/bin/docker', 'rm', cid], check=True, stdout=subprocess.DEVNULL)
+              subprocess.run(
+                  ['/usr/bin/docker', 'rm', cid],
+                  check=False,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              )
 
       def run_build(root, project, run, upload_path, digest, profile, instance_id):
           if not re.fullmatch(r'[0-9a-f]{64}', digest):

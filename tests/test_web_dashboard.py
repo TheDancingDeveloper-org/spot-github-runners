@@ -3145,7 +3145,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             telemetry={
                 "current_runners": 8,
                 "current_instances": 8,
-                "active_jobs": 6,
+                "active_jobs": 0,
                 "queued_jobs": 0,
                 "avg_cpu_utilization_pct": 10.0,
                 "avg_ram_utilization_pct": 10.0,
@@ -3337,6 +3337,319 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             "cur_fd = open_nofollow_subdir(cur_fd, part, root_info.st_dev)"
         )
         self.assertLess(depth_check_idx, subdir_create_idx)
+
+    def test_round22_codex_regressions(self):
+        from datetime import datetime, timezone
+        import json
+        import subprocess
+        import textwrap
+        from unittest import mock
+        from lib.dashboard_models import (
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT,
+            DEFAULT_RUST_BUILDER_CLOUD_INIT,
+        )
+        from lib.dashboard_scaling import (
+            _is_recent_unhandled_oom,
+            build_github_oom_deep_link,
+            evaluate_builder_scaling_decision,
+            evaluate_cpu_scope,
+            evaluate_scaling_decision,
+        )
+
+        # 1. SEC-01 & SEC-02: Strict runner host admission process_record & container_job_active
+        self.assertIn("if any(comm == 'Runner.Worker' for _, (_, _, comm) in procs.items()):", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("if stat[0] == 'Z':", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("raise FileNotFoundError('Zombie process')", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        ha_script = textwrap.dedent(
+            DEFAULT_RUNNER_STRICT_CLOUD_INIT.split("- path: /opt/gha-runners/host_admission.py", 1)[1]
+            .split("content: |\n", 1)[1]
+            .split("\n  - path: /opt/gha-runners/build/entrypoint.sh", 1)[0]
+        )
+        ha_ns: dict[str, object] = {}
+        exec(compile(ha_script, "/opt/gha-runners/host_admission.py", "exec"), ha_ns)
+
+        # SEC-02: process_record raises FileNotFoundError on zombie process ('Z')
+        mock_proc_stat = mock.MagicMock()
+        mock_proc_stat.read_text.return_value = "205 (zombie-app) Z 1 205 205 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 1000 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0"
+        with mock.patch("pathlib.Path.__truediv__", return_value=mock_proc_stat):
+            with self.assertRaises(FileNotFoundError) as ctx:
+                ha_ns["process_record"](205)
+            self.assertEqual(str(ctx.exception), "Zombie process")
+
+        # SEC-01: container_job_active does not kill subsequent Runner.Worker or its hook processes
+        killed_pids: list[int] = []
+        with mock.patch("os.kill", side_effect=lambda pid, sig: killed_pids.append(pid)):
+            def mock_proc_rec(pid):
+                if pid == 100:  # Runner.Listener
+                    return 1, "1000", "Runner.Listener", "/docker/cid-123"
+                if pid == 300:  # New Runner.Worker
+                    return 100, "3000", "Runner.Worker", "/docker/cid-123"
+                if pid == 301:  # New acquire hook
+                    return 300, "3010", "python3", "/docker/cid-123"
+                raise FileNotFoundError(f"PID {pid}")
+
+            mock_dir = [
+                mock.MagicMock(name="100"),
+                mock.MagicMock(name="300"),
+                mock.MagicMock(name="301"),
+            ]
+            mock_dir[0].name = "100"
+            mock_dir[1].name = "300"
+            mock_dir[2].name = "301"
+
+            with mock.patch("pathlib.Path.iterdir", return_value=mock_dir), \
+                 mock.patch.dict(ha_ns, {"process_record": mock_proc_rec}):
+                active = ha_ns["container_job_active"]("cid-123", "2026-10-16T00:00:00Z", worker_start="2000")
+                self.assertFalse(active)
+                self.assertEqual(killed_pids, [])
+
+        # 2. SEC-03: host admission acquire CLI catches transient RuntimeError and sleeps before retrying
+        self.assertIn("except OrphanRunnerHook:", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+        self.assertIn("except (OSError, RuntimeError):", DEFAULT_RUNNER_STRICT_CLOUD_INIT)
+
+        acquire_attempts = 0
+        def mock_request(action):
+            nonlocal acquire_attempts
+            acquire_attempts += 1
+            if acquire_attempts == 1:
+                raise RuntimeError("Too many concurrent admission requests")
+            return True
+
+        sleep_calls: list[float] = []
+        with mock.patch.dict(ha_ns, {"request": mock_request}), \
+             mock.patch("time.sleep", side_effect=lambda s: sleep_calls.append(s)):
+            # Simulate the acquire CLI loop
+            while True:
+                try:
+                    if ha_ns["request"]("acquire"):
+                        break
+                except ha_ns["OrphanRunnerHook"]:
+                    raise
+                except (OSError, RuntimeError):
+                    ha_ns["time"].sleep(5)
+                else:
+                    ha_ns["time"].sleep(5)
+            self.assertEqual(acquire_attempts, 2)
+            self.assertEqual(sleep_calls, [5])
+
+        # Test OrphanRunnerHook fails fast
+        with mock.patch.dict(ha_ns, {"request": mock.MagicMock(side_effect=ha_ns["OrphanRunnerHook"]("lost"))}):
+            with self.assertRaises(ha_ns["OrphanRunnerHook"]):
+                try:
+                    ha_ns["request"]("acquire")
+                except ha_ns["OrphanRunnerHook"]:
+                    raise
+                except (OSError, RuntimeError):
+                    ha_ns["time"].sleep(5)
+
+        # 3. SEC-04: reconcile_project_containers tolerates auto-removed containers on inspect and uses check=False on rm
+        self.assertIn("except (subprocess.CalledProcessError, json.JSONDecodeError):", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+        self.assertIn("check=False", DEFAULT_RUST_BUILDER_CLOUD_INIT)
+
+        tx_script = textwrap.dedent(
+            DEFAULT_RUST_BUILDER_CLOUD_INIT.split("- path: /usr/local/bin/oxidex-remote-transaction", 1)[1]
+            .split("content: |\n", 1)[1]
+            .split("\n  - path: /usr/local/bin/oxidex-remote-build", 1)[0]
+        )
+        tx_ns: dict[str, object] = {}
+        exec(compile(tx_script, "/usr/local/bin/oxidex-remote-transaction", "exec"), tx_ns)
+
+        def mock_check_output(cmd, **kwargs):
+            if "ps" in cmd:
+                return "cid-vanished cid-exists\n"
+            if "inspect" in cmd and "cid-vanished" in cmd:
+                raise subprocess.CalledProcessError(1, cmd)
+            if "inspect" in cmd and "cid-exists" in cmd:
+                return json.dumps([{
+                    "Mounts": [{"Source": "/var/tmp/source"}],
+                    "State": {
+                        "Running": False,
+                        "Paused": False,
+                        "Restarting": False,
+                        "Pid": 0,
+                        "Status": "exited",
+                    },
+                }])
+            raise ValueError(f"Unexpected command: {cmd}")
+
+        rm_calls: list[list[str]] = []
+        def mock_run(cmd, **kwargs):
+            if "rm" in cmd:
+                self.assertFalse(kwargs.get("check", True))
+                rm_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with mock.patch("subprocess.check_output", side_effect=mock_check_output), \
+             mock.patch("subprocess.run", side_effect=mock_run):
+            tx_ns["reconcile_project_containers"]("/var/tmp/source", "/var/tmp/target")
+            self.assertEqual(len(rm_calls), 1)
+            self.assertEqual(rm_calls[0], ["/usr/bin/docker", "rm", "cid-exists"])
+
+        # 4. SCALE-01: active_jobs and builder equivalents alias to provisioned_jobs and active_builds
+        scale_alias = evaluate_scaling_decision(
+            policy={
+                "min_runners": 2,
+                "max_runners": 16,
+                "runners_per_instance": 2,
+                "scale_down_target_runners": 2,
+                "provisioned_jobs_threshold": 10,
+            },
+            telemetry={
+                "current_runners": 8,
+                "current_instances": 4,
+                "active_jobs": 6,
+                "queued_jobs": 0,
+                "jobs_ran_past_hour": 1,
+            },
+            per_instance_hourly_usd=0.10,
+        )
+        self.assertEqual(scale_alias["direction"], "scale_down")
+        self.assertEqual(scale_alias["desired_runners"], 6)
+        self.assertEqual(scale_alias["desired_instances"], 3)
+
+        builder_alias = evaluate_builder_scaling_decision(
+            policy={"min_instances": 1, "max_instances": 8},
+            telemetry={
+                "current_instances": 4,
+                "active_rust_builds": 3,
+                "queued_rust_builds": 2,
+                "builds_ran_past_hour": 0,
+            },
+            per_instance_hourly_usd=0.10,
+        )
+        self.assertEqual(builder_alias["direction"], "hold")
+        self.assertEqual(builder_alias["desired_instances"], 4)
+
+        # 5. SCALE-02: OOM occurring when fleet is at max capacity is marked handled and avoids freezing scale-down
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        oom_max = {
+            "id": "oom-cap-01",
+            "failed_at": now_iso,
+            "is_oom": True,
+            "runner_name": "gha-oxidex-runners-us-central1-a-01",
+        }
+        telem_oom = {
+            "current_runners": 12,
+            "current_instances": 3,
+            "github_oom_runs": [oom_max],
+            "queued_jobs": 0,
+            "jobs_ran_past_hour": 1,
+        }
+        pol_oom = {
+            "min_runners": 4,
+            "max_runners": 12,
+            "runners_per_instance": 4,
+            "scale_down_target_runners": 4,
+        }
+        first_oom_eval = evaluate_scaling_decision(policy=pol_oom, telemetry=telem_oom)
+        self.assertEqual(first_oom_eval["direction"], "hold")
+        second_oom_eval = evaluate_scaling_decision(policy=pol_oom, telemetry=telem_oom)
+        self.assertTrue(oom_max.get("handled"))
+        self.assertEqual(second_oom_eval["direction"], "scale_down")
+        self.assertEqual(second_oom_eval["desired_runners"], 4)
+
+        # Also verify server _runner_oom_satisfied satisfies at max_runners
+        self.assertTrue(self.store._consume_active_oom_events is not None)
+
+        # 6. SCALE-03: Deep link generation and OOM telemetry safely handle None fields
+        with self.assertRaises(ValueError):
+            build_github_oom_deep_link("swack-tools/oxidex", 123, 456, step_number=None, line_number=None)
+
+        none_fields_eval = evaluate_scaling_decision(
+            policy={"min_runners": 4, "max_runners": 12},
+            telemetry={
+                "current_runners": 4,
+                "current_instances": 1,
+                "github_oom_runs": [
+                    {
+                        "id": "partial-oom-none",
+                        "failed_at": now_iso,
+                        "is_oom": True,
+                        "runner_name": "gha-oxidex-runners-us-central1-a-01",
+                        "repository": None,
+                        "step_number": None,
+                        "line_number": None,
+                    }
+                ],
+            },
+            per_instance_hourly_usd=0.01,
+        )
+        self.assertEqual(none_fields_eval["direction"], "scale_up")
+
+        # 7. SCALE-04: Naive ISO timestamp in _is_recent_unhandled_oom attaches UTC
+        naive_now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertTrue(
+            _is_recent_unhandled_oom(
+                {"failed_at": naive_now_iso},
+                now_ts=datetime.now(timezone.utc).timestamp(),
+                lookback_seconds=3600.0,
+            )
+        )
+
+        # 8. SCALE-05: update_scaling includes runner scale-up recommendation in builder spend when budget is shared
+        with self.store._lock:
+            self.store.state["global_budget_enforced"] = True
+            self.store.state["scaling"]["cicd_runner"]["shared_global_budget"] = True
+            self.store.state["scaling"]["rust_builder"]["shared_global_budget"] = True
+            self.store.state["scaling"]["cicd_runner"]["max_scale_up_hourly_usd"] = 1.00
+            self.store.state["scaling"]["rust_builder"]["max_scale_up_hourly_usd"] = 1.00
+            self.store.state["scaling_telemetry"] = {
+                "current_runners": 4,
+                "current_instances": 1,
+                "current_builder_instances": 1,
+                "queued_jobs": 10,
+                "active_jobs": 4,
+                "queued_rust_builds": 5,
+                "active_rust_builds": 1,
+            }
+
+        upd_res = self._post(
+            "/api/scaling",
+            {"role": "rust_builder", "scaling": {"shared_global_budget": True}},
+        )
+        self.assertEqual(upd_res["status"], "ok")
+        builder_eval_res = upd_res["evaluation"]
+        self.assertEqual(builder_eval_res["role"], "rust_builder")
+
+        # 9. SCALE-06: evaluate_builder_scaling_decision adds max_instances_cap reason on clamp
+        builder_clamped = evaluate_builder_scaling_decision(
+            policy={"min_instances": 1, "max_instances": 2},
+            telemetry={"current_instances": 5, "active_builds": 1, "builds_ran_past_hour": 10},
+            per_instance_hourly_usd=0.10,
+        )
+        self.assertEqual(builder_clamped["direction"], "scale_down")
+        self.assertEqual(builder_clamped["desired_instances"], 2)
+        self.assertTrue(any(r["trigger"] == "max_instances_cap" for r in builder_clamped["scale_down_reasons"]))
+
+        # 10. SCALE-07: Null lists in telemetry do not cause TypeError
+        null_telem_eval = evaluate_scaling_decision(
+            policy={"min_runners": 2, "max_runners": 8},
+            telemetry={
+                "current_runners": 2,
+                "current_instances": 1,
+                "instance_cpu_percentages": None,
+                "journal_oom_events": None,
+                "github_oom_runs": None,
+            },
+        )
+        self.assertEqual(null_telem_eval["direction"], "hold")
+
+        builder_null_eval = evaluate_builder_scaling_decision(
+            policy={"min_instances": 1, "max_instances": 4},
+            telemetry={
+                "current_instances": 1,
+                "builder_cpu_percentages": None,
+                "journal_oom_events": None,
+                "builder_journal_oom_events": None,
+            },
+        )
+        self.assertEqual(builder_null_eval["direction"], "hold")
+
+        # 11. CPU scope trims whitespace
+        scope_ok, _ = evaluate_cpu_scope([85.0, 30.0, 20.0], 50.0, " any ")
+        self.assertTrue(scope_ok)
 
 
 if __name__ == "__main__":

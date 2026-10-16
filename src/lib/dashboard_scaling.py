@@ -5,7 +5,7 @@ generator for the Web UI Dashboard.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import re
 import time
@@ -30,21 +30,23 @@ def build_github_oom_deep_link(
     repository: str,
     run_id: int | str,
     job_id: int | str,
-    step_number: int,
-    line_number: int,
+    step_number: int | str | None,
+    line_number: int | str | None,
 ) -> str:
     """Build an exact GitHub Actions job step + line deep link.
 
     Example:
     https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50
     """
-    repo = str(repository).strip().strip("/")
+    repo = str(repository or "").strip().strip("/")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise ValueError(f"Invalid GitHub repository '{repository}'")
-    run_str = str(run_id).strip()
-    job_str = str(job_id).strip()
+    run_str = str(run_id or "").strip()
+    job_str = str(job_id or "").strip()
     if not run_str.isdigit() or not job_str.isdigit():
         raise ValueError("run_id and job_id must be numeric")
+    if step_number is None or line_number is None:
+        raise ValueError("step_number and line_number cannot be None")
     step = int(step_number)
     line = int(line_number)
     if step < 1 or line < 1:
@@ -175,6 +177,8 @@ def _is_recent_unhandled_oom(
         return False
     try:
         dt = datetime.fromisoformat(str(ts_raw).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         age_seconds = now_ts - dt.timestamp()
         return 0.0 <= age_seconds <= lookback_seconds
     except ValueError:
@@ -281,7 +285,7 @@ def evaluate_cpu_scope(
         return False, "No active instances reporting CPU utilization"
     hot_count = sum(1 for val in cpu_percentages if val > threshold_percent)
     total = len(cpu_percentages)
-    norm_scope = (scope or "majority").lower()
+    norm_scope = (scope or "majority").strip().lower()
     if norm_scope == "all":
         triggered = hot_count == total
         detail = f"{hot_count}/{total} instances > {threshold_percent:g}% CPU (requires ALL)"
@@ -347,14 +351,24 @@ def evaluate_scaling_decision(
     step_runners = max(1, _finite_int_val(cfg.get("scale_up_step_runners", 2), "scale_up_step_runners"))
 
     jobs_ran_past_hour = max(0, _finite_int_val(telemetry.get("jobs_ran_past_hour", 0), "jobs_ran_past_hour"))
-    provisioned_jobs = max(0, _finite_int_val(telemetry.get("provisioned_jobs", 0), "provisioned_jobs"))
-    queued_jobs = max(0, _finite_int_val(telemetry.get("queued_jobs", 0), "queued_jobs"))
+    raw_prov = (
+        telemetry.get("provisioned_jobs")
+        if telemetry.get("provisioned_jobs") is not None
+        else telemetry.get("active_jobs", 0)
+    )
+    provisioned_jobs = max(0, _finite_int_val(raw_prov, "provisioned_jobs"))
+    raw_queued = (
+        telemetry.get("queued_jobs")
+        if telemetry.get("queued_jobs") is not None
+        else telemetry.get("queued_runner_jobs", 0)
+    )
+    queued_jobs = max(0, _finite_int_val(raw_queued, "queued_jobs"))
     cpu_percentages = [
         _finite_float_val(x, "instance_cpu_percentages")
-        for x in telemetry.get("instance_cpu_percentages", [])
+        for x in (telemetry.get("instance_cpu_percentages") or [])
     ]
-    journal_oom_events = list(telemetry.get("journal_oom_events", []))
-    github_oom_runs = list(telemetry.get("github_oom_runs", []))
+    journal_oom_events = list(telemetry.get("journal_oom_events") or [])
+    github_oom_runs = list(telemetry.get("github_oom_runs") or [])
 
     scale_up_reasons: list[dict[str, Any]] = []
     scale_down_reasons: list[dict[str, Any]] = []
@@ -369,7 +383,7 @@ def evaluate_scaling_decision(
             if run.get("baseline_runners") is not None:
                 baseline_val = _finite_int_val(run["baseline_runners"], "baseline_runners")
                 required_target = min(max_runners, baseline_val + step_runners)
-                if current_runners >= required_target and current_runners > baseline_val:
+                if current_runners >= required_target and (current_runners > baseline_val or baseline_val >= max_runners):
                     run["handled"] = True
                     continue
             if "error_excerpt" in run and run.get("error_excerpt") is not None:
@@ -392,13 +406,16 @@ def evaluate_scaling_decision(
                 "baseline_runners",
             )
             oom_target_runners = max(oom_target_runners, baseline_val + step_runners)
-            link = run.get("deep_link") or build_github_oom_deep_link(
-                run.get("repository", "swack-tools/oxidex"),
-                run.get("run_id", 37192272062),
-                run.get("job_id", 111407847874),
-                run.get("step_number", 8),
-                run.get("line_number", 106),
-            )
+            try:
+                link = run.get("deep_link") or build_github_oom_deep_link(
+                    run.get("repository") or "swack-tools/oxidex",
+                    run.get("run_id") or 37192272062,
+                    run.get("job_id") or 111407847874,
+                    run.get("step_number") or 8,
+                    run.get("line_number") or 106,
+                )
+            except (ValueError, TypeError):
+                link = ""
             scale_up_reasons.append(
                 {
                     "trigger": "github_ci_oom",
@@ -435,7 +452,7 @@ def evaluate_scaling_decision(
             if evt.get("baseline_runners") is not None:
                 baseline_val = _finite_int_val(evt["baseline_runners"], "baseline_runners")
                 required_target = min(max_runners, baseline_val + step_runners)
-                if current_runners >= required_target and current_runners > baseline_val:
+                if current_runners >= required_target and (current_runners > baseline_val or baseline_val >= max_runners):
                     evt["handled"] = True
                     continue
             baseline_val = _finite_int_val(
@@ -785,18 +802,28 @@ def evaluate_builder_scaling_decision(
     builds_ran_past_hour = max(
         0, _finite_int_val(telemetry.get("builds_ran_past_hour", 5), "builds_ran_past_hour")
     )
-    active_builds = max(0, _finite_int_val(telemetry.get("active_builds", 0), "active_builds"))
-    queued_builds = max(0, _finite_int_val(telemetry.get("queued_builds", 0), "queued_builds"))
+    raw_builds = (
+        telemetry.get("active_builds")
+        if telemetry.get("active_builds") is not None
+        else telemetry.get("active_rust_builds", 0)
+    )
+    active_builds = max(0, _finite_int_val(raw_builds, "active_builds"))
+    raw_q_builds = (
+        telemetry.get("queued_builds")
+        if telemetry.get("queued_builds") is not None
+        else telemetry.get("queued_rust_builds", 0)
+    )
+    queued_builds = max(0, _finite_int_val(raw_q_builds, "queued_builds"))
     cpu_percentages = [
         _finite_float_val(x, "builder_cpu_percentages")
-        for x in telemetry.get("builder_cpu_percentages", [])
+        for x in (telemetry.get("builder_cpu_percentages") or [])
     ]
     if "builder_journal_oom_events" in telemetry:
         journal_oom_events = list(telemetry.get("builder_journal_oom_events") or [])
     else:
         journal_oom_events = [
             evt
-            for evt in telemetry.get("journal_oom_events", [])
+            for evt in (telemetry.get("journal_oom_events") or [])
             if str(evt.get("role", "")) == "rust_builder"
             or str(evt.get("instance_name", "")).lower().startswith("builder-")
         ]
@@ -830,7 +857,10 @@ def evaluate_builder_scaling_decision(
                 continue
             if (
                 evt.get("baseline_instances") is not None
-                and current_instances > _finite_int_val(evt["baseline_instances"], "baseline_instances")
+                and (
+                    current_instances > _finite_int_val(evt["baseline_instances"], "baseline_instances")
+                    or (current_instances >= max_instances and _finite_int_val(evt["baseline_instances"], "baseline_instances") >= max_instances)
+                )
             ):
                 evt["handled"] = True
                 continue
@@ -911,6 +941,17 @@ def evaluate_builder_scaling_decision(
             desired_instances = max(capacity_floor, min(max_instances, current_instances))
     else:
         desired_instances = max(capacity_floor, current_instances, min(max_instances, desired_instances))
+
+    if desired_instances < current_instances and not scale_down_reasons:
+        scale_down_reasons.append(
+            {
+                "trigger": "max_instances_cap",
+                "summary": (
+                    f"Current fleet ({current_instances} builder VMs) "
+                    f"exceeds max_instances={max_instances} -> scaling down to {desired_instances} instance(s)"
+                ),
+            }
+        )
 
     unit_hourly = max(0.0001, _finite_float_val(per_instance_hourly_usd, "per_instance_hourly_usd"))
     max_hourly_cap = _finite_float_val(cfg.get("max_scale_up_hourly_usd", 3.50), "max_scale_up_hourly_usd")
