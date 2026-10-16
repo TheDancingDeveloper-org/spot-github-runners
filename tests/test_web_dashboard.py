@@ -1742,7 +1742,17 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                 "lib.spot_pricing.load_catalog_rates",
                 new=AsyncMock(return_value={("us-south1", "n2", "CPU", "SPOT"): 0.0085}),
             ) as mock_load_rates,
+            # Keep the case hermetic: without these stubs, live gcloud credentials
+            # return real capacityHistory prices and flip the source.
+            patch("lib.compute_api.get_auth") as mock_api_key_auth,
+            patch(
+                "lib.spot_pricing.spot_price",
+                new=AsyncMock(return_value=("us-south1", "n2-standard-16", None)),
+            ),
         ):
+            mock_api_key_auth.return_value = type(
+                "AuthStub", (), {"token": "gcloud-oauth-token", "project": "homelab-424523"}
+            )()
             live_api_key = fetch_live_spot_pricing(project="homelab-424523", force_refresh=True)
             self.assertEqual(live_api_key["source"], "gcp_billing_catalog")
             self.assertEqual(live_api_key["component_rates"][("us-south1", "n2", "CPU", "SPOT")], 0.0085)
