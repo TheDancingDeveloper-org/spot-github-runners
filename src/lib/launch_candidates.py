@@ -27,9 +27,17 @@ def candidate_key(offer) -> str:
             f"{getattr(offer, 'machine_type', '')}/{getattr(offer, 'cpu_platform', '')}")
 
 
-def _quota_shortfall(offer: CpuOffer, inventory: LaunchInventory, disk_size_gb: int) -> str | None:
+def _quota_shortfall(
+    offer: CpuOffer,
+    inventory: LaunchInventory,
+    disk_size_gb: int,
+    *,
+    arch: str = 'x86_64',
+) -> str | None:
     quotas = inventory.region_quotas.get(offer.region, {})
-    profile = machine_profile(offer.machine_type)
+    profile = machine_profile(offer.machine_type, arch=arch)
+    if profile is None:
+        return f'unsupported {arch} machine type'
     preemptible = quotas.get('PREEMPTIBLE_CPUS', (0.0, 0.0))
     # Spot VMs consume preemptible CPU quota when the project has any; otherwise regular CPU quota.
     cpu_metric = 'PREEMPTIBLE_CPUS' if preemptible[0] > 0 else 'CPUS'
@@ -52,12 +60,23 @@ def _quota_shortfall(offer: CpuOffer, inventory: LaunchInventory, disk_size_gb: 
     return None
 
 
-def _zone_problem(offer: CpuOffer, zone: str, inventory: LaunchInventory) -> str | None:
+def _zone_problem(
+    offer: CpuOffer,
+    zone: str,
+    inventory: LaunchInventory,
+    *,
+    arch: str = 'x86_64',
+    required_isa: tuple[str, ...] | list[str] = (),
+) -> str | None:
     if zone not in inventory.platforms_by_zone:
         return 'zone is not UP'
     if offer.cpu_platform not in inventory.platforms_by_zone[zone]:
         return 'zone does not advertise the CPU platform'
-    if offer.cpu_platform not in {platform for _, platform in platform_preferences(offer.machine_type, zone)}:
+    if offer.cpu_platform not in {
+        platform for _, platform in platform_preferences(
+            offer.machine_type, zone, arch=arch, required_isa=required_isa
+        )
+    }:
         return 'CPU platform is not selectable for this shape in the zone'
     available = inventory.disk_types_by_zone.get(zone, set())
     for kind in (offer.boot_disk_type, offer.data_disk_type):
@@ -66,8 +85,14 @@ def _zone_problem(offer: CpuOffer, zone: str, inventory: LaunchInventory) -> str
     return None
 
 
-def launchable_candidates(ranked: list[CpuOffer], inventory: LaunchInventory,
-                          disk_size_gb: int) -> tuple[list[CpuOffer], list[str]]:
+def launchable_candidates(
+    ranked: list[CpuOffer],
+    inventory: LaunchInventory,
+    disk_size_gb: int,
+    *,
+    arch: str = 'x86_64',
+    required_isa: tuple[str, ...] | list[str] = (),
+) -> tuple[list[CpuOffer], list[str]]:
     """Keep rank order; return zone candidates and why offers had no launchable zone."""
     selected: list[CpuOffer] = []
     skipped: list[str] = []
@@ -76,13 +101,13 @@ def launchable_candidates(ranked: list[CpuOffer], inventory: LaunchInventory,
         if not offer.zones:
             skipped.append(f'{label}: machine type is not offered in any zone')
             continue
-        shortfall = _quota_shortfall(offer, inventory, disk_size_gb)
+        shortfall = _quota_shortfall(offer, inventory, disk_size_gb, arch=arch)
         if shortfall:
             skipped.append(f'{label}: {shortfall}')
             continue
         problems = []
         for zone in offer.zones:
-            problem = _zone_problem(offer, zone, inventory)
+            problem = _zone_problem(offer, zone, inventory, arch=arch, required_isa=required_isa)
             if problem:
                 problems.append(f'{zone} {problem}')
             else:

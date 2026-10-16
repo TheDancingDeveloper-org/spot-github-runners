@@ -31,6 +31,11 @@ MACHINE_PROFILES = {
     'e2': MachineProfile(9, 'E2_CPUS'),
 }
 
+ARM_MACHINE_PROFILES = {
+    'c4a': MachineProfile(0, 'C4A_CPUS', 'hyperdisk-balanced', 'NVME'),
+    't2a': MachineProfile(1, 'T2A_CPUS', 'pd-standard', 'SCSI'),
+}
+
 # Provisional family/platform preferences; no measured Cargo timings yet.
 # E2 remains recognized for existing/manual hosts, but cannot pin a platform.
 CPU_PREFERENCES = (
@@ -43,6 +48,11 @@ CPU_PREFERENCES = (
     ('n2d', 'AMD Milan'),
     ('n2', 'Intel Ice Lake'),
     ('n2', 'Intel Cascade Lake'),
+)
+
+ARM_CPU_PREFERENCES = (
+    ('c4a', 'Google Axion'),
+    ('t2a', 'Ampere Altra'),
 )
 
 # Google documents all-shape C4 Granite Rapids selection in these zones.
@@ -70,9 +80,36 @@ class CpuOffer(Offer):
         return Decimal(str(self.hourly_usd)) * 24 + monthly_to_daily(self.storage_monthly_usd)
 
 
-def platform_preferences(machine_type: str, zone: str | None = None) -> list[tuple[int, str]]:
+def _requested_arch_and_isa(args) -> tuple[str, tuple[str, ...]]:
+    patch = getattr(args, 'runner_patch', None)
+    arch = getattr(args, 'arch', None) or (patch.hardware.arch if patch else 'x86_64')
+    isa = tuple(getattr(args, 'required_isa', ()) or (patch.hardware.isa if patch else ()))
+    return arch, isa
+
+
+def platform_satisfies_isa(machine_type: str, cpu_platform: str, required_isa: tuple[str, ...] | list[str]) -> bool:
+    """Return whether (machine_type, cpu_platform) supports all requested ISA capabilities."""
+    if not required_isa:
+        return True
+    from .runner_patch import ISA_CAPABILITIES
     family = machine_type.split('-', 1)[0]
-    preferences = [(rank, platform) for rank, (series, platform) in enumerate(CPU_PREFERENCES)
+    for feature in required_isa:
+        spec = ISA_CAPABILITIES.get(feature)
+        if not spec or (family, cpu_platform) not in spec['gce_platforms']:
+            return False
+    return True
+
+
+def platform_preferences(
+    machine_type: str,
+    zone: str | None = None,
+    *,
+    arch: str = 'x86_64',
+    required_isa: tuple[str, ...] | list[str] = (),
+) -> list[tuple[int, str]]:
+    family = machine_type.split('-', 1)[0]
+    table = ARM_CPU_PREFERENCES if arch == 'arm64' else CPU_PREFERENCES
+    preferences = [(rank, platform) for rank, (series, platform) in enumerate(table)
                    if series == family]
     if family == 'c4':
         parts = machine_type.split('-')
@@ -81,37 +118,56 @@ def platform_preferences(machine_type: str, zone: str | None = None) -> list[tup
             preferences = [(rank, platform) for rank, platform in preferences if platform == 'Intel Granite Rapids']
         elif zone is not None and zone not in C4_GRANITE_MIN_CPU_ZONES:
             preferences = [(rank, platform) for rank, platform in preferences if platform == 'Intel Emerald Rapids']
+    if required_isa:
+        preferences = [(rank, platform) for rank, platform in preferences
+                       if platform_satisfies_isa(machine_type, platform, required_isa)]
     return preferences
 
 
 def configure_cpu_platform(args) -> None:
     """Default to the preferred platform; reject incompatible explicit requests."""
     zone = getattr(args, 'zone', '') or f'{args.region}-a'
-    platforms = [platform for _, platform in platform_preferences(args.instance_type, zone)]
+    arch, required_isa = _requested_arch_and_isa(args)
+    platforms = [platform for _, platform in platform_preferences(
+        args.instance_type, zone, arch=arch, required_isa=required_isa)]
     requested = getattr(args, 'min_cpu_platform', None)
+    if required_isa and not platforms:
+        raise RuntimeError(
+            f'Machine type {args.instance_type} in {zone} does not support required ISA {list(required_isa)}')
     if requested and requested not in platforms:
         raise RuntimeError(f'CPU platform {requested} is unsupported for {args.instance_type}')
     args.min_cpu_platform = requested or (platforms[0] if platforms else None)
 
 
-def cpu_platform_satisfies(machine_type: str, observed: str, requested: str) -> bool:
+def cpu_platform_satisfies(
+    machine_type: str,
+    observed: str,
+    requested: str,
+    *,
+    arch: str = 'x86_64',
+    required_isa: tuple[str, ...] | list[str] = (),
+) -> bool:
     """Accept the requested minimum or a known newer CPU in that family."""
-    ranks = {platform: rank for rank, platform in platform_preferences(machine_type)}
+    ranks = {platform: rank for rank, platform in platform_preferences(
+        machine_type, arch=arch, required_isa=required_isa)}
     return observed in ranks and requested in ranks and ranks[observed] <= ranks[requested]
 
 
-def machine_profile(machine_type: str) -> MachineProfile | None:
-    """Reject ARM, accelerators, bare metal, and separately billed Local SSD."""
+def machine_profile(machine_type: str, *, arch: str = 'x86_64') -> MachineProfile | None:
+    """Reject unsupported architectures, accelerators, bare metal, and separately billed Local SSD."""
     if not re.fullmatch(r'[a-z0-9]+-(?:(?:standard|highcpu|highmem)-[1-9][0-9]*|custom-[1-9][0-9]*-[1-9][0-9]*(?:-ext)?)', machine_type):
         return None
-    return MACHINE_PROFILES.get(machine_type.split('-', 1)[0])
+    profiles = ARM_MACHINE_PROFILES if arch == 'arm64' else MACHINE_PROFILES
+    return profiles.get(machine_type.split('-', 1)[0])
 
 
 def configure_storage(args) -> MachineProfile:
     """Choose compatible boot/data defaults before any provisioning action."""
-    profile = machine_profile(args.instance_type)
+    arch, _ = _requested_arch_and_isa(args)
+    profile = machine_profile(args.instance_type, arch=arch)
     if profile is None:
-        raise RuntimeError(f'Unsupported x86 runner machine type: {args.instance_type}')
+        label = 'ARM64' if arch == 'arm64' else 'x86'
+        raise RuntimeError(f'Unsupported {label} runner machine type: {args.instance_type}')
     if args.disk_type is None:
         args.disk_type = profile.disk_type
     if profile.disk_type == 'hyperdisk-balanced' and args.disk_type not in {'hyperdisk-balanced', 'hyperdisk-throughput'}:

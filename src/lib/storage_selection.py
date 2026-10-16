@@ -56,8 +56,11 @@ def disk_monthly_cost(kind: str, size_gib: int, rates: dict,
     return cost
 
 
-def cheapest_storage(machine_type: str, size_gib: int, rates: dict) -> tuple[str, str, Decimal]:
-    profile = machine_profile(machine_type)
+def cheapest_storage(machine_type: str, size_gib: int, rates: dict, *, arch: str | None = None) -> tuple[str, str, Decimal]:
+    if arch is not None:
+        profile = machine_profile(machine_type, arch=arch)
+    else:
+        profile = machine_profile(machine_type, arch='x86_64') or machine_profile(machine_type, arch='arm64')
     if profile is None:
         raise RuntimeError(f'Unsupported storage machine type {machine_type}')
     modern = profile.disk_type == 'hyperdisk-balanced'
