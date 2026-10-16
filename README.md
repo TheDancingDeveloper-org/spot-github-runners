@@ -35,6 +35,7 @@ For the simplification target and remaining work, see
 | Render a dedicated builder launch | `src/render_builder_startup.py` | Writes local files; the generated launch command creates a VM |
 | Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
 | Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
+| Run the Web UI control plane and telemetry dashboard | `src/web_dashboard.py` | Updates local dashboard state file |
 
 Keep the distinction between registered listeners and active jobs. Twenty
 registered runners do not mean that twenty jobs can each use 32 GiB at once.
@@ -159,6 +160,7 @@ python3 src/spot_runner_manager.py --help
 python3 src/spot_runner_autoscaler.py --help
 python3 src/render_builder_startup.py --help
 python3 src/remote_rust_build.py --help
+python3 src/web_dashboard.py --help
 ```
 
 ## Find and inspect capacity
@@ -726,6 +728,7 @@ native macOS work to native hosts; see the separate [M4 Air guide](m4air/README.
 | `builder/standalone/` | Standalone Rust 1.99 image, entry point, and probe |
 | `builder/dedicated/` | Dedicated host launcher and Docker admission adapter |
 | `src/lib/qualification_trust/` | Source authentication, sealed import, and qualification mounts |
+| `src/lib/dashboard_*.py`, `rust_build_telemetry.py` | Web UI control plane, CPU benchmarks, OOM deep links, and Rust builder telemetry |
 | `tests/` | Unit and lifecycle controls |
 
 ## Development and validation
