@@ -16,6 +16,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import ssl
 import sys
 import threading
@@ -24,6 +25,24 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 import uuid
 
+from .dashboard_auth import (
+    OAUTH_STATE_COOKIE_NAME,
+    SESSION_COOKIE_NAME,
+    GitHubApiError,
+    GitHubOAuthManager,
+    format_cleared_session_cookie,
+    format_cleared_state_cookie,
+    format_session_cookie,
+    format_state_cookie,
+    parse_allowed_admins,
+    parse_controlled_targets,
+    parse_controlled_targets_env,
+    parse_cookie_header,
+    render_login_gate_html,
+    safe_return_path,
+    ENV_ALLOWED_ADMINS,
+    ENV_CONTROLLED_TARGETS,
+)
 from .dashboard_models import (
     DEFAULT_RUNNER_CLOUD_INIT,
     DEFAULT_RUNNER_STRICT_CLOUD_INIT,
@@ -872,6 +891,8 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         "vm_templates": vm_templates,
         "instances": instances,
         "rust_builds": rust_builds,
+        # Dynamic GitHub OAuth controlled targets (empty by default); see dashboard_auth.
+        "controlled_targets": [],
     }
 
 
@@ -2294,6 +2315,30 @@ class DashboardStore:
                 },
             }
 
+    def get_controlled_targets(self) -> list[str]:
+        """Return the dynamic controlled target names (orgs and owner/repo) stored in dashboard state."""
+        with self._lock:
+            raw = self.state.get("controlled_targets", [])
+            if not isinstance(raw, list):
+                # Fail closed: an unparseable entry makes every OAuth authorization check deny access.
+                return ["!invalid-controlled-targets"]
+            return [t if isinstance(t, str) else "!invalid-controlled-target" for t in raw]
+
+    def set_controlled_targets(self, targets: Any) -> list[str]:
+        """Validate and replace the dynamic controlled target list; raises ValueError on any invalid entry."""
+        if not isinstance(targets, list):
+            raise ValueError("targets must be a JSON array of organization or owner/repo names")
+        names = [t.name for t in parse_controlled_targets(targets)]
+        with self._lock:
+            previous = copy.deepcopy(self.state.get("controlled_targets", []))
+            self.state["controlled_targets"] = names
+            try:
+                self._persist()
+            except Exception:
+                self.state["controlled_targets"] = previous
+                raise
+            return list(names)
+
     def update_regions(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Enable/disable regions individually or by latency/capability filter."""
         with self._lock:
@@ -3334,14 +3379,33 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+_HOST_HEADER_RE = re.compile(r"[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?|\[[0-9A-Fa-f:.]{2,45}\](?::[0-9]{1,5})?")
+
+
 def make_handler(
     store: DashboardStore,
     *,
     auth_token: str | None = None,
     require_secure_cookie: bool = False,
+    oauth_manager: GitHubOAuthManager | None = None,
+    controlled_targets: list[str] | tuple[str, ...] | None = None,
 ) -> type[BaseHTTPRequestHandler]:
-    """Create the HTTP handler bound to a DashboardStore instance."""
+    """Create the HTTP handler bound to a DashboardStore instance.
+
+    Authentication precedence for protected routes: an explicit ``Authorization``/``X-Dashboard-Token``
+    header is checked against the legacy ``auth_token`` first (a wrong token is rejected with 401);
+    then the legacy ``dashboard_session`` cookie; then the GitHub OAuth ``spot_session`` cookie, which
+    must be signed, unexpired, allowlisted, and verified for every controlled target (otherwise 403).
+    """
     from .dashboard_ui_assets import render_dashboard_html
+
+    static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
+    auth_required = bool(str(auth_token).strip() if auth_token else "") or oauth_manager is not None
+    unauthorized_message = (
+        "Unauthorized: sign in with GitHub or provide a valid dashboard token"
+        if oauth_manager is not None
+        else "Unauthorized: valid Bearer token or X-Dashboard-Token required"
+    )
 
     expected_token = str(auth_token).strip() if auth_token else ""
     expected_session_cookie = (
@@ -3392,6 +3456,7 @@ def make_handler(
             data: Any,
             status: int = HTTPStatus.OK,
             extra_headers: dict[str, str] | None = None,
+            cookies: list[str] | None = None,
         ) -> None:
             body = json.dumps(data, allow_nan=False).encode("utf-8")
             self.send_response(status)
@@ -3401,6 +3466,8 @@ def make_handler(
             if extra_headers:
                 for k, v in extra_headers.items():
                     self.send_header(k, v)
+            for cookie_hdr in cookies or []:
+                self.send_header("Set-Cookie", cookie_hdr)
             self.end_headers()
             self.wfile.write(body)
 
@@ -3409,6 +3476,7 @@ def make_handler(
             html_text: str,
             status: int = HTTPStatus.OK,
             extra_headers: dict[str, str] | None = None,
+            cookies: list[str] | None = None,
         ) -> None:
             body = html_text.encode("utf-8")
             self.send_response(status)
@@ -3418,13 +3486,21 @@ def make_handler(
             if extra_headers:
                 for k, v in extra_headers.items():
                     self.send_header(k, v)
+            for cookie_hdr in cookies or []:
+                self.send_header("Set-Cookie", cookie_hdr)
             self.end_headers()
             self.wfile.write(body)
 
-        def _check_auth(self, *, allow_html_shell: bool = False) -> bool:
-            """Verify Bearer token, X-Dashboard-Token, or session cookie when authentication is configured."""
-            if not expected_token:
-                return True
+        def _send_redirect(self, location: str, cookies: list[str] | None = None) -> None:
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            for cookie_hdr in cookies or []:
+                self.send_header("Set-Cookie", cookie_hdr)
+            self.end_headers()
+
+        def _header_token_candidate(self) -> str:
             auth_hdr = (self.headers.get("Authorization") or "").strip()
             hdr_token = (self.headers.get("X-Dashboard-Token") or "").strip()
             candidate = ""
@@ -3434,33 +3510,241 @@ def make_handler(
                 candidate = auth_hdr
             if not candidate and hdr_token:
                 candidate = hdr_token
-            if candidate:
-                if hmac.compare_digest(candidate, expected_token):
+            return candidate
+
+        def _effective_controlled_targets(self) -> list[str]:
+            return static_targets + store.get_controlled_targets()
+
+        def _evaluate_auth(self) -> tuple[str, dict[str, Any]]:
+            """Classify the request as ("ok" | "unauthenticated" | "forbidden", details) without responding."""
+            if not auth_required:
+                return "ok", {"method": "none"}
+            candidate = self._header_token_candidate()
+            if candidate and expected_token:
+                if hmac.compare_digest(candidate.encode("utf-8"), expected_token.encode("utf-8")):
+                    return "ok", {"method": "token"}
+                return "unauthenticated", {"explicit_token_rejected": True}
+            cookies = parse_cookie_header(self.headers.get("Cookie"))
+            if expected_token:
+                sess_val = cookies.get("dashboard_session", "").strip()
+                if sess_val and hmac.compare_digest(
+                    sess_val.encode("utf-8"), expected_session_cookie.encode("utf-8")
+                ):
+                    return "ok", {"method": "dashboard_session"}
+            if oauth_manager is not None:
+                oauth_cookie = cookies.get(SESSION_COOKIE_NAME, "")
+                if oauth_cookie:
+                    check = oauth_manager.check_session(oauth_cookie, self._effective_controlled_targets())
+                    if check.status == "ok" and check.session is not None:
+                        return "ok", {"method": "github_oauth", "user": check.session.user_login}
+                    if check.status == "forbidden" and check.session is not None:
+                        return "forbidden", {
+                            "method": "github_oauth",
+                            "user": check.session.user_login,
+                            "message": check.message,
+                            "missing_targets": list(check.missing_targets),
+                        }
+            return "unauthenticated", {}
+
+        def _send_forbidden(self, info: dict[str, Any]) -> None:
+            self._send_json(
+                {
+                    "error": info.get("message") or "Forbidden",
+                    "user": info.get("user", ""),
+                    "missing_targets": info.get("missing_targets", []),
+                },
+                status=HTTPStatus.FORBIDDEN,
+            )
+
+        def _oauth_redirect_uri(self) -> str | None:
+            if oauth_manager is None:
+                return None
+            if oauth_manager.redirect_uri:
+                return oauth_manager.redirect_uri
+            host = (self.headers.get("Host") or "").strip()
+            if not _HOST_HEADER_RE.fullmatch(host):
+                return None
+            forwarded_proto = (self.headers.get("X-Forwarded-Proto") or "").strip().lower()
+            is_https = (
+                require_secure_cookie
+                or isinstance(getattr(self, "connection", None), ssl.SSLSocket)
+                or forwarded_proto == "https"
+            )
+            return f"{'https' if is_https else 'http'}://{host}/auth/github/callback"
+
+        def _login_gate(self, *, message: str = "", user: str = "", status: int = HTTPStatus.OK,
+                        cookies: list[str] | None = None) -> None:
+            assert oauth_manager is not None
+            self._send_html(
+                render_login_gate_html(
+                    device_flow=oauth_manager.device_flow_enabled,
+                    web_flow=oauth_manager.web_flow_enabled,
+                    legacy_token=bool(expected_token),
+                    message=message,
+                    signed_in_as=user,
+                ),
+                status=status,
+                cookies=cookies,
+            )
+
+        def _handle_oauth_get(self, path: str, qs: dict[str, list[str]]) -> bool:
+            """Serve public OAuth GET routes. Returns True when the request was handled."""
+            if path in ("/auth/status", "/api/auth/status"):
+                status, info = self._evaluate_auth()
+                self._send_json(
+                    {
+                        "authenticated": status == "ok",
+                        "status": status,
+                        "method": info.get("method"),
+                        "user": info.get("user"),
+                        "missing_targets": info.get("missing_targets", []),
+                        "oauth": {
+                            "enabled": oauth_manager is not None,
+                            "device_flow": bool(oauth_manager and oauth_manager.device_flow_enabled),
+                            "web_flow": bool(oauth_manager and oauth_manager.web_flow_enabled),
+                        },
+                        "legacy_token": bool(expected_token),
+                    }
+                )
+                return True
+            if path not in ("/auth/github/login", "/auth/github/callback"):
+                return False
+            if oauth_manager is None or not oauth_manager.web_flow_enabled:
+                self._send_json(
+                    {"error": "GitHub web login is not configured (set GITHUB_OAUTH_CLIENT_ID and GITHUB_OAUTH_CLIENT_SECRET)"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return True
+            redirect_uri = self._oauth_redirect_uri()
+            if not redirect_uri:
+                self._send_json({"error": "Cannot determine OAuth redirect URI"}, status=HTTPStatus.BAD_REQUEST)
+                return True
+            if path == "/auth/github/login":
+                state = oauth_manager.create_state(safe_return_path(qs.get("next", ["/"])[0]))
+                self._send_redirect(
+                    oauth_manager.create_authorize_url(redirect_uri, state),
+                    cookies=[format_state_cookie(state)],
+                )
+                return True
+            # /auth/github/callback
+            clear_state = [format_cleared_state_cookie()]
+            if qs.get("error"):
+                self._login_gate(message="GitHub authorization was not granted.", status=HTTPStatus.FORBIDDEN,
+                                 cookies=clear_state)
+                return True
+            cookie_state = parse_cookie_header(self.headers.get("Cookie")).get(OAUTH_STATE_COOKIE_NAME, "")
+            ok_state, return_to = oauth_manager.validate_state(qs.get("state", [""])[0], cookie_state)
+            if not ok_state:
+                self._login_gate(message="Sign-in request expired or is invalid. Please try again.",
+                                 status=HTTPStatus.BAD_REQUEST, cookies=clear_state)
+                return True
+            try:
+                token = oauth_manager.exchange_code_for_token(qs.get("code", [""])[0], redirect_uri)["access_token"]
+            except GitHubApiError:
+                self._login_gate(message="GitHub sign-in failed.", status=HTTPStatus.FORBIDDEN, cookies=clear_state)
+                return True
+            decision = oauth_manager.authorize(token, self._effective_controlled_targets())
+            if not decision.authorized:
+                self._login_gate(message=decision.message, status=HTTPStatus.FORBIDDEN, cookies=clear_state)
+                return True
+            session_cookie = format_session_cookie(oauth_manager.issue_session(decision), oauth_manager.session_ttl_seconds)
+            self._send_redirect(return_to, cookies=clear_state + [session_cookie])
+            return True
+
+        def _handle_oauth_post(self, path: str) -> bool:
+            """Serve public OAuth POST routes (already same-origin/JSON validated). Returns True when handled."""
+            if path not in ("/auth/device/code", "/auth/device/token", "/auth/logout"):
+                return False
+            try:
+                payload = self._read_json(max_bytes=MAX_LOGIN_BODY_BYTES)
+            except _PayloadTooLargeError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return True
+            if path == "/auth/logout":
+                cleared = [format_cleared_session_cookie()]
+                if expected_token:
+                    cleared.insert(0, self._format_cleared_session_cookie())
+                self._send_json({"status": "ok", "authenticated": False}, cookies=cleared)
+                return True
+            if oauth_manager is None:
+                self._send_json({"error": "GitHub login is not configured (set GITHUB_OAUTH_CLIENT_ID)"},
+                                status=HTTPStatus.NOT_FOUND)
+                return True
+            if path == "/auth/device/code":
+                try:
+                    started = oauth_manager.start_device_flow()
+                except GitHubApiError:
+                    self._send_json({"error": "GitHub device authorization is unavailable"}, status=HTTPStatus.BAD_GATEWAY)
                     return True
                 self._send_json(
-                    {"error": "Unauthorized: valid Bearer token or X-Dashboard-Token required"},
-                    status=HTTPStatus.UNAUTHORIZED,
-                    extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
+                    {
+                        "user_code": started["user_code"],
+                        "verification_uri": started["verification_uri"],
+                        "expires_in": started["expires_in"],
+                        "interval": started["interval"],
+                        "device_handle": oauth_manager.seal_device_code(started["device_code"], started["expires_in"]),
+                    }
                 )
-                return False
-
-            raw_cookie = self.headers.get("Cookie") or ""
-            if raw_cookie:
-                cookie = SimpleCookie()
-                try:
-                    cookie.load(raw_cookie)
-                except Exception:  # noqa: BLE001
-                    cookie = SimpleCookie()
-                if "dashboard_session" in cookie:
-                    sess_val = cookie["dashboard_session"].value.strip()
-                    if sess_val and hmac.compare_digest(sess_val, expected_session_cookie):
-                        return True
-
-            if allow_html_shell:
                 return True
-
+            # /auth/device/token
+            device_code = oauth_manager.open_device_handle(payload.get("device_handle"))
+            if device_code is None:
+                self._send_json({"status": "invalid", "error": "Invalid or expired device handle"},
+                                status=HTTPStatus.BAD_REQUEST)
+                return True
+            polled = oauth_manager.poll_device_token(device_code)
+            result = polled.get("status")
+            if result in ("pending", "slow_down"):
+                body: dict[str, Any] = {"status": result}
+                if result == "slow_down":
+                    body["interval"] = polled.get("interval", 10)
+                self._send_json(body)
+                return True
+            if result == "expired":
+                self._send_json({"status": "expired", "error": "Device code expired"}, status=HTTPStatus.BAD_REQUEST)
+                return True
+            if result == "denied":
+                self._send_json({"status": "denied", "error": "GitHub authorization was denied"},
+                                status=HTTPStatus.FORBIDDEN)
+                return True
+            if result != "success":
+                self._send_json({"status": "error", "error": "GitHub device token request failed"},
+                                status=HTTPStatus.BAD_GATEWAY)
+                return True
+            decision = oauth_manager.authorize(str(polled.get("access_token", "")), self._effective_controlled_targets())
+            if not decision.authorized:
+                self._send_json(
+                    {
+                        "status": "forbidden",
+                        "error": decision.message,
+                        "message": decision.message,
+                        "user": decision.user_login,
+                        "missing_targets": decision.missing_targets,
+                    },
+                    status=HTTPStatus.FORBIDDEN,
+                )
+                return True
             self._send_json(
-                {"error": "Unauthorized: valid Bearer token or X-Dashboard-Token required"},
+                {"status": "authorized", "user": decision.user_login},
+                cookies=[format_session_cookie(oauth_manager.issue_session(decision), oauth_manager.session_ttl_seconds)],
+            )
+            return True
+
+        def _check_auth(self, *, allow_html_shell: bool = False) -> bool:
+            """Verify credentials for a protected route; respond 401 (unauthenticated) or 403 (unauthorized)."""
+            status, info = self._evaluate_auth()
+            if status == "ok":
+                return True
+            if status == "forbidden":
+                self._send_forbidden(info)
+                return False
+            if allow_html_shell and not info.get("explicit_token_rejected"):
+                return True
+            self._send_json(
+                {"error": unauthorized_message},
                 status=HTTPStatus.UNAUTHORIZED,
                 extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
             )
@@ -3550,7 +3834,22 @@ def make_handler(
             qs = parse_qs(parsed.query)
 
             if path in ("/", "/index.html"):
-                if not self._check_auth(allow_html_shell=True):
+                if oauth_manager is not None:
+                    gate_status, gate_info = self._evaluate_auth()
+                    if gate_status != "ok":
+                        if gate_info.get("explicit_token_rejected"):
+                            self._check_auth()
+                            return
+                        if gate_status == "forbidden":
+                            self._login_gate(
+                                message=str(gate_info.get("message", "")),
+                                user=str(gate_info.get("user", "")),
+                                status=HTTPStatus.FORBIDDEN,
+                            )
+                        else:
+                            self._login_gate()
+                        return
+                elif not self._check_auth(allow_html_shell=True):
                     return
                 extra_hdrs: dict[str, str] | None = None
                 if expected_token:
@@ -3582,7 +3881,20 @@ def make_handler(
                 })
                 return
 
+            if self._handle_oauth_get(path, qs):
+                return
+
             if not self._check_auth():
+                return
+
+            if path == "/api/auth/targets":
+                self._send_json(
+                    {
+                        "static_targets": list(static_targets),
+                        "dynamic_targets": store.get_controlled_targets(),
+                        "controlled_targets": self._effective_controlled_targets(),
+                    }
+                )
                 return
 
             try:
@@ -3659,9 +3971,17 @@ def make_handler(
                     return
                 token_candidate = str(payload.get("token", "")).strip()
                 if not expected_token:
+                    if oauth_manager is not None:
+                        self._send_json(
+                            {"error": "Dashboard token login is not configured; sign in with GitHub"},
+                            status=HTTPStatus.UNAUTHORIZED,
+                        )
+                        return
                     self._send_json({"status": "ok", "authenticated": True})
                     return
-                if token_candidate and hmac.compare_digest(token_candidate, expected_token):
+                if token_candidate and hmac.compare_digest(
+                    token_candidate.encode("utf-8"), expected_token.encode("utf-8")
+                ):
                     self._send_json(
                         {"status": "ok", "authenticated": True},
                         extra_headers={
@@ -3684,17 +4004,27 @@ def make_handler(
                 except Exception as exc:  # noqa: BLE001
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                     return
-                self._send_json(
-                    {"status": "ok", "authenticated": False},
-                    extra_headers={
-                        "Set-Cookie": self._format_cleared_session_cookie()
-                    },
-                )
+                logout_cookies = [self._format_cleared_session_cookie()]
+                if oauth_manager is not None:
+                    logout_cookies.append(format_cleared_session_cookie())
+                self._send_json({"status": "ok", "authenticated": False}, cookies=logout_cookies)
+                return
+            if self._handle_oauth_post(path):
                 return
             if not self._check_auth():
                 return
             try:
                 payload = self._read_json(max_bytes=MAX_JSON_BODY_BYTES)
+                if path == "/api/auth/targets":
+                    store.set_controlled_targets(payload.get("targets"))
+                    self._send_json(
+                        {
+                            "static_targets": list(static_targets),
+                            "dynamic_targets": store.get_controlled_targets(),
+                            "controlled_targets": self._effective_controlled_targets(),
+                        }
+                    )
+                    return
                 if path == "/api/budget":
                     self._send_json(store.update_budget(payload))
                     return
@@ -3779,8 +4109,15 @@ def create_dashboard_server(
     tls_certfile: str | Path | None = None,
     tls_keyfile: str | Path | None = None,
     allow_insecure_non_loopback: bool | None = None,
+    oauth_manager: GitHubOAuthManager | None = None,
+    controlled_targets: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
-    """Instantiate the ThreadingHTTPServer and DashboardStore."""
+    """Instantiate the ThreadingHTTPServer and DashboardStore.
+
+    ``oauth_manager`` enables GitHub OAuth login (additive to ``auth_token``); ``controlled_targets`` are
+    static organization or ``owner/repo`` targets on which OAuth users must be administrators, in
+    addition to the dynamic list stored in dashboard state.
+    """
     resolved_token = (
         auth_token
         if auth_token is not None
@@ -3815,10 +4152,11 @@ def create_dashboard_server(
         )
     )
     if not _is_loopback_host(host):
-        if not cleaned_token:
+        if not cleaned_token and oauth_manager is None:
             raise ValueError(
                 f"Refusing to bind Web UI Dashboard to non-loopback address '{host}' without authentication. "
-                "Provide --auth-token or set DASHBOARD_AUTH_TOKEN, or bind to 127.0.0.1 / ::1 / localhost."
+                "Provide --auth-token or set DASHBOARD_AUTH_TOKEN, configure GitHub OAuth "
+                "(GITHUB_OAUTH_CLIENT_ID and DASHBOARD_SESSION_SECRET), or bind to 127.0.0.1 / ::1 / localhost."
             )
         if not has_tls and not resolved_allow_insecure:
             raise ValueError(
@@ -3827,11 +4165,14 @@ def create_dashboard_server(
                 "bind to a loopback address (127.0.0.1 / ::1 / localhost) behind a TLS proxy, or pass "
                 "--allow-insecure-non-loopback (DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1) if a trusted network proxy terminates TLS."
             )
+    static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
     store = DashboardStore(state_path=state_path, project=project, org=org)
     handler = make_handler(
         store,
         auth_token=cleaned_token or None,
         require_secure_cookie=has_tls or not _is_loopback_host(host),
+        oauth_manager=oauth_manager,
+        controlled_targets=static_targets,
     )
     server = DashboardThreadingHTTPServer((host, port), handler)
     if has_tls:
@@ -3848,6 +4189,29 @@ def create_dashboard_server(
             server.server_close()
             raise
     return server, store
+
+
+def build_oauth_config(
+    *,
+    allowed_admins: str | None = None,
+    controlled_targets: str | None = None,
+    redirect_uri: str | None = None,
+    environ: dict[str, str] | None = None,
+) -> tuple[GitHubOAuthManager | None, list[str]]:
+    """Resolve GitHub OAuth settings from CLI values (preferred) and the environment.
+
+    Returns ``(None, targets)`` when ``GITHUB_OAUTH_CLIENT_ID`` is unset. Raises ValueError when OAuth is
+    enabled without an adequate ``DASHBOARD_SESSION_SECRET`` or when any setting is invalid.
+    """
+    env = os.environ if environ is None else environ
+    admins = parse_allowed_admins(allowed_admins) if allowed_admins is not None else None
+    extra: dict[str, Any] = {}
+    if redirect_uri:
+        extra["redirect_uri"] = redirect_uri
+    manager = GitHubOAuthManager.from_environ(env, allowed_admins=admins, **extra)
+    raw_targets = controlled_targets if controlled_targets is not None else env.get(ENV_CONTROLLED_TARGETS, "")
+    targets = [t.name for t in parse_controlled_targets_env(raw_targets)]
+    return manager, targets
 
 
 def args_parser():
@@ -3882,6 +4246,21 @@ def args_parser():
         help="Explicitly allow plaintext HTTP on a non-loopback --host when behind a trusted TLS-terminating proxy (or set DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1)",
     )
     parser.add_argument(
+        "--allowed-admins",
+        default=None,
+        help=f"Comma-separated GitHub logins allowed to sign in with GitHub OAuth (overrides {ENV_ALLOWED_ADMINS}; default: swackhamer,xbmc4lyfe)",
+    )
+    parser.add_argument(
+        "--controlled-targets",
+        default=None,
+        help=f"Comma-separated orgs and owner/repo targets on which OAuth users must be admins (overrides {ENV_CONTROLLED_TARGETS}; default: none)",
+    )
+    parser.add_argument(
+        "--oauth-redirect-uri",
+        default=None,
+        help="Absolute GitHub OAuth callback URL, for example https://spot.example.com/auth/github/callback (or set GITHUB_OAUTH_REDIRECT_URI; default: derived from the Host header)",
+    )
+    parser.add_argument(
         "--state-file",
         type=Path,
         default=None,
@@ -3902,6 +4281,11 @@ def main(argv: list[str] | None = None) -> int:
         store = DashboardStore(state_path=args.state_file, project=args.project, org=args.org)
         print(json.dumps(store.get_overview(), indent=2))
         return 0
+    oauth_manager, controlled_targets = build_oauth_config(
+        allowed_admins=args.allowed_admins,
+        controlled_targets=args.controlled_targets,
+        redirect_uri=args.oauth_redirect_uri,
+    )
     server, _ = create_dashboard_server(
         host=args.host,
         port=args.port,
@@ -3912,6 +4296,8 @@ def main(argv: list[str] | None = None) -> int:
         tls_certfile=args.tls_certfile,
         tls_keyfile=args.tls_keyfile,
         allow_insecure_non_loopback=args.allow_insecure_non_loopback,
+        oauth_manager=oauth_manager,
+        controlled_targets=controlled_targets,
     )
     actual_host, actual_port = server.server_address[:2]
     scheme = "https" if isinstance(server.socket, ssl.SSLSocket) else "http"
