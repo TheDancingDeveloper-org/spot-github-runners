@@ -1450,6 +1450,12 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         rejected = _run_gate_script(script, stored=self.LEGACY_TOKEN, hash_part="", login_ok=False,
                                     recent=False, login_status=403)
         self.assertNotIn("dashboard_auth_token", rejected["session"])
+        self.assertNotIn("dashboard_gate_token_attempt", rejected["session"])
+        # A fresh #token= link inside the retry cooldown is still tried (and kept on success).
+        fresh = _run_gate_script(script, stored="", hash_part="#token=" + self.LEGACY_TOKEN, login_ok=True,
+                                 recent=True)
+        self.assertEqual(fresh["posts"], [["/api/auth/login", {"token": self.LEGACY_TOKEN}]])
+        self.assertEqual(fresh["session"].get("dashboard_auth_token"), self.LEGACY_TOKEN)
 
     def _gate_script(self):
         _, _, raw = self.request("GET", "/")

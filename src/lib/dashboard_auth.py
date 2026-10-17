@@ -1391,12 +1391,15 @@ def render_login_gate_html(
   (async function tryExistingToken() {
     // No session cookie does not mean a stored or linked dashboard token is stale: try it first,
     // and discard it only when the server rejects it.
-    const candidate = (takeUrlToken() || storage(function () {
+    const fromUrl = takeUrlToken().trim();
+    const candidate = fromUrl || (storage(function () {
       return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY);
     }) || "").trim();
     if (!candidate) return;
+    // A fresh #token= link is always tried: it is removed from the URL, so it cannot cause a loop.
+    // A stored token is retried at most every 30s in case its cookie did not stick last time.
     const last = Number(storage(function () { return sessionStorage.getItem(ATTEMPT_KEY); }) || 0);
-    if (Date.now() - last < 30000) return;  // The cookie did not stick last time; avoid a reload loop.
+    if (!fromUrl && Date.now() - last < 30000) return;
     storage(function () { sessionStorage.setItem(ATTEMPT_KEY, String(Date.now())); });
     const [res] = await postJson("/api/auth/login", {token: candidate});
     if (res.ok) {
@@ -1406,7 +1409,9 @@ def render_login_gate_html(
     }
     if (res.status === 401 || res.status === 403) {
       // The server rejected the credential: it is stale, so discard it.
-      storage(function () { sessionStorage.removeItem(TOKEN_KEY); localStorage.removeItem(TOKEN_KEY); });
+      storage(function () {
+        sessionStorage.removeItem(TOKEN_KEY); localStorage.removeItem(TOKEN_KEY); sessionStorage.removeItem(ATTEMPT_KEY);
+      });
       return;
     }
     // Transient failure (network, 429, 5xx): keep the credential (including one taken from the URL)
