@@ -211,6 +211,7 @@ class FakeHttp:
             if slot not in self.health:
                 raise cv.KvError("unreachable")
             status, data = self.health[slot]
+            data = dict(data, state_version=self.versions.get(slot, data.get("state_version")))  # live version
             return status, json.dumps(data).encode()
         op = path.rsplit("/", 1)[-1]
         token = headers["Authorization"].removeprefix("Bearer ")
@@ -715,6 +716,10 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
 
     def with_new_vm(self, h, status="RUNNING", healthy=True):
         h.gcloud.add("b", status=status, zone="us-east1-b")
+        t = h.transition
+        if t["step"] in ("cutover", "propagate", "delete_old", "abort") and not t.get("import_skipped"):
+            # Resuming after the import step: the replacement already holds the frozen state.
+            h.http.versions["b"] = max(h.http.versions["b"], t.get("frozen_version") or 0)
         if healthy:
             h.http.healthy("b")
 
@@ -1305,6 +1310,159 @@ class ProvisionalOldStateTests(unittest.TestCase):
         h.tick()
         self.assertIn("--keep-disks=boot", self.old_delete(h))
         self.assertIn("never confirmed frozen", h.state[cv.STATE_KEY]["retained_disks"][0]["reason"])
+
+
+class TransferredVersionFloorTests(unittest.TestCase):
+    """Codex P1 round 16: a replacement holding less than the transferred state is never accepted."""
+
+    setup_rotation = ResumeFromPersistedStepTests.setup_rotation
+    with_new_vm = ResumeFromPersistedStepTests.with_new_vm
+
+    def restarted_replacement_at_delete_old(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0, freeze_requested=True,
+                                frozen_version=10, old_frozen=True)
+        h.kv.set_origin("b")
+        h.http.versions["a"] = 10  # the frozen old VM holds v10
+        self.with_new_vm(h)
+        h.http.versions["b"] = 8  # restarted after the import and recovered an older KV snapshot
+        return h
+
+    def old_deletes(self, h):
+        return [c for c in h.gcloud.calls if c[2:5] == ["instances", "delete", "spot-control-a"]]
+
+    def test_delete_old_never_deletes_old_vm_for_replacement_below_floor(self):
+        h = self.restarted_replacement_at_delete_old()
+        h.http.import_status = 500  # the re-import does not take
+        h.tick()
+        self.assertEqual(self.old_deletes(h), [])
+        self.assertEqual(h.transition["step"], "delete_old")
+        self.assertIn("below the transferred state_version 10", h.transition["error"])
+        h.clock[0] += cv.REPLACEMENT_READY_GRACE_SECONDS
+        h.tick()  # still below the floor after the grace: the regular rollback to the old VM
+        self.assertIsNone(h.transition)
+        self.assertEqual(self.old_deletes(h), [])
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertEqual(h.http.versions["a"], 10)
+        self.assertIn(("unfreeze", "a"), h.events)
+        self.assertEqual(h.state[cv.STATE_KEY]["history"][-1]["result"], "aborted")
+
+    def test_reimport_brings_replacement_back_to_floor_before_deleting(self):
+        h = self.restarted_replacement_at_delete_old()
+        h.tick()
+        self.assertEqual(h.mutations(), [("import", "b")])  # re-import from the frozen old VM's snapshot
+        self.assertIn(("snapshot", "a"), h.events)
+        self.assertEqual(self.old_deletes(h), [])  # fresh health must confirm it first
+        self.assertEqual(h.http.versions["b"], 10)
+        h.tick()
+        self.assertIn("--delete-disks=all", self.old_deletes(h)[0])  # confirmed freeze and floor reached
+        self.assertIsNone(h.transition)
+
+    def test_reimport_attempts_are_bounded(self):
+        h = self.restarted_replacement_at_delete_old()
+        h.http.import_status = 500
+        for _ in range(cv.STEP_RETRY_LIMIT + 2):
+            h.tick()
+        self.assertEqual(h.events.count(("import", "b")), cv.STEP_RETRY_LIMIT)
+        self.assertEqual(self.old_deletes(h), [])
+
+    def test_missing_state_version_is_below_floor(self):
+        h = self.restarted_replacement_at_delete_old()
+        h.http.versions["b"] = 10
+        real = h.http.__call__
+
+        def no_version(method, url, headers, body, timeout):
+            status, raw = real(method, url, headers, body, timeout)
+            if url.endswith("/api/health") and "spot-origin-b" in url:
+                data = json.loads(raw)
+                data.pop("state_version")
+                raw = json.dumps(data).encode()
+            return status, raw
+
+        manager = cv.ControlVmManager(h.config, h.state, h.save, gcloud=h.gcloud, kv=h.kv, requester=no_version,
+                                      offer_source=lambda: list(h.offers), clock=lambda: h.clock[0])
+        manager.tick(apply=True)
+        self.assertEqual(self.old_deletes(h), [])
+        self.assertIn("reports state_version None", h.transition["error"])
+
+    def test_import_response_version_is_the_floor(self):
+        h = self.setup_rotation("import", freeze_requested=True, frozen_version=7, old_frozen=True)
+        self.with_new_vm(h)
+        h.http.versions["b"] = 9  # the import response confirms more than the frozen version
+        h.tick()
+        self.assertEqual(h.transition["required_version"], 9)
+        self.assertEqual(h.kv.origin_slot(), "b")
+        h.http.versions["b"] = 8  # above frozen_version 7, below what the replacement confirmed
+        h.http.import_status = 500
+        h.clock[0] += cv.PROPAGATION_SECONDS + 1
+        h.tick()
+        self.assertEqual(self.old_deletes(h), [])
+        self.assertIn("below the transferred state_version 9", h.transition["error"])
+
+    def test_kv_catch_up_version_is_the_floor(self):
+        h = self.setup_rotation("cutover", mode=cv.MODE_RECOVER, import_skipped=True)
+        h.gcloud.status("a", "TERMINATED")
+        self.with_new_vm(h)
+        h.http.versions["b"] = 7
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({"k": 8}, 8, "a", now=1))
+        h.tick()
+        self.assertEqual(h.transition["required_version"], 8)
+        h.http.versions["b"] = 7  # restarted and lost the caught-up version
+        h.http.import_status = 500
+        h.clock[0] += cv.PROPAGATION_SECONDS + 1
+        h.tick()
+        self.assertEqual(self.old_deletes(h), [])
+        self.assertIn("below the transferred state_version 8", h.transition["error"])
+
+    def test_cutover_gate_rolls_back_when_replacement_stays_below_floor(self):
+        h = self.setup_rotation("cutover", freeze_requested=True, frozen_version=7, old_frozen=True)
+        self.with_new_vm(h)
+        h.http.versions["b"] = 5
+        h.http.import_status = 500
+        h.tick()
+        self.assertNotIn(("origin", "b"), h.events)  # users never pointed at the older state
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertIsNone(h.transition)  # price rotation: the frozen old VM is unfrozen and kept
+        self.assertIn(("unfreeze", "a"), h.events)
+        self.assertIn("spot-control-a", h.gcloud.vms)
+
+    def test_reimport_reply_below_floor_is_not_a_success(self):
+        h = self.setup_rotation("cutover", freeze_requested=True, frozen_version=7, old_frozen=True)
+        self.with_new_vm(h)
+        h.http.versions["b"] = 5
+        real = h.http.__call__
+
+        def short_import(method, url, headers, body, timeout):
+            status, raw = real(method, url, headers, body, timeout)
+            if url.endswith("/api/control/import") and "spot-origin-b" in url:
+                h.http.versions["b"] = 5
+                return 200, b'{"state_version": 5, "imported": true}'
+            return status, raw
+
+        manager = cv.ControlVmManager(h.config, h.state, h.save, gcloud=h.gcloud, kv=h.kv, requester=short_import,
+                                      offer_source=lambda: list(h.offers), clock=lambda: h.clock[0])
+        manager.tick(apply=True)
+        self.assertIsNone(h.transition)  # not treated as re-imported: the rollback runs at once
+        self.assertEqual(h.kv.origin_slot(), "a")
+
+    def test_reimport_skips_a_cached_snapshot_below_the_floor(self):
+        h = self.restarted_replacement_at_delete_old()
+        manager = h.manager()
+        manager._snapshot = build_snapshot({}, 5, "a", now=1)
+        snapshot = manager._snapshot_for_import(h.transition, 10)
+        self.assertEqual(snapshot["state_version"], 10)  # the frozen old VM's snapshot, not the stale cache
+
+    def test_cutover_reimports_and_waits_for_health_to_confirm(self):
+        h = self.setup_rotation("cutover", freeze_requested=True, frozen_version=7, old_frozen=True)
+        self.with_new_vm(h)
+        h.http.versions["b"] = 5
+        h.tick()
+        self.assertEqual(h.mutations(), [("import", "b")])
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertEqual(h.transition["step"], "cutover")
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "b")
+        self.assertEqual(h.transition["step"], "propagate")
 
 
 class InstanceIdentityTests(unittest.TestCase):

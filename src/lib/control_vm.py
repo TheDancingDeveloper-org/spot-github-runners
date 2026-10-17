@@ -1358,20 +1358,62 @@ class ControlVmManager:
             return self._abort(t, "old VM did not freeze")
         return "wait"
 
-    def _snapshot_for_import(self, t: dict) -> dict[str, Any] | None:
-        floor = t.get("frozen_version") or 0
-        candidates = [self._snapshot]
-        if self._snapshot is None:
+    def _snapshot_for_import(self, t: dict, floor: int | None = None) -> dict[str, Any] | None:
+        """The first snapshot at or above ``floor`` (default: the frozen version): this run's frozen
+        snapshot, then the old VM's snapshot, then the KV snapshot."""
+        floor = (t.get("frozen_version") or 0) if floor is None else floor
+        if self._snapshot is not None and self._snapshot["state_version"] >= floor:
+            return self._snapshot
+        candidates = []
+        if t.get("old_slot"):
             status, body = self._control(t["old_slot"], "snapshot", "GET")
             candidates.append(parse_snapshot(body) if status == 200 and isinstance(body, dict) else None)
-            try:
-                candidates.append(parse_snapshot(self.kv.get(KV_STATE_KEY)))
-            except KvError:
-                pass
+        try:
+            candidates.append(parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None)
+        except KvError:
+            pass
         for snapshot in candidates:
             if snapshot is not None and snapshot["state_version"] >= floor:
                 return snapshot
         return None
+
+    # -- transferred-state floor ---------------------------------------------------------
+    @staticmethod
+    def _required_version(t: dict) -> int:
+        """Lowest state_version the replacement must report: what it confirmed it holds after the import
+        or KV catch-up, and never below the old VM's frozen version (also for transitions saved before
+        ``required_version`` was recorded)."""
+        return max(t.get("required_version") or 0, t.get("frozen_version") or 0)
+
+    def _raise_required_version(self, t: dict, version: int) -> None:
+        if version > (t.get("required_version") or 0):
+            t["required_version"] = version
+            self.save()
+
+    def _reimport_replacement(self, t: dict) -> bool:
+        """Import a snapshot at or above the floor into a replacement that reports less (for example after
+        it restarted and recovered an older KV snapshot). Bounded by STEP_RETRY_LIMIT per transition;
+        True when the replacement confirmed at least the floor (fresh health must still confirm it)."""
+        floor = self._required_version(t)
+        attempts = t.get("reimport_attempts", 0)
+        if attempts >= STEP_RETRY_LIMIT:
+            return False
+        t["reimport_attempts"] = attempts + 1
+        self.save()
+        snapshot = self._snapshot_for_import(t, floor)
+        if snapshot is None:
+            self._note("no snapshot at or above state_version %d to re-import into slot %s", floor, t["new_slot"],
+                       level=logging.ERROR)
+            return False
+        status, body = self._control(t["new_slot"], "import", "POST", snapshot)
+        version = body.get("state_version") if isinstance(body, dict) else None
+        if status == 200 and isinstance(version, int) and not isinstance(version, bool) and version >= floor:
+            self._note("re-imported state_version %d into slot %s, which had fallen below %d", version,
+                       t["new_slot"], floor, level=logging.WARNING)
+            return True
+        self._note("re-import into slot %s returned %s (state_version=%s, need >= %d)", t["new_slot"], status,
+                   version, floor, level=logging.WARNING)
+        return False
 
     def _step_import(self, t: dict, obs: Observation) -> str:
         snapshot = self._snapshot_for_import(t)
@@ -1383,6 +1425,7 @@ class ControlVmManager:
         version = body.get("state_version") if isinstance(body, dict) else None
         floor = max(t.get("frozen_version") or 0, snapshot["state_version"])
         if status == 200 and isinstance(version, int) and not isinstance(version, bool) and version >= floor:
+            self._raise_required_version(t, version)
             self._note("slot %s imported state_version %d", t["new_slot"], version)
             return self._advance_step(t)
         if self._fail_attempt(t, f"import returned {status} (state_version={version}, need >= {floor})"):
@@ -1412,6 +1455,7 @@ class ControlVmManager:
                 self._fail_attempt(t, f"replacement did not reach KV state_version {snapshot['state_version']} "
                                       f"(import returned {status}, state_version={version})", limit=10**9)
                 return False
+            self._raise_required_version(t, version)
             self._note("slot %s caught up with KV at state_version %d before cutover", t["new_slot"], version)
         t["kv_caught_up"] = True
         self.save()
@@ -1462,7 +1506,14 @@ class ControlVmManager:
     def _step_cutover(self, t: dict, obs: Observation) -> str:
         # Never point users at a replacement that was preempted or went unhealthy after import, or
         # when resuming a saved cutover step: recheck it immediately before the origin write.
-        ready, why = self._replacement_ready(t, obs)
+        ready, why, below_floor = self._replacement_ready(t, obs)
+        if not ready and below_floor and self._reimport_replacement(t):
+            # Not the writer yet, so re-importing is safe; the next tick's fresh health must confirm it.
+            t["error"] = f"{why}; re-imported, waiting for health to confirm"
+            self.save()
+            return "wait"
+        if ready:
+            t.pop("reimport_attempts", None)
         if not ready:
             if t["mode"] == MODE_PRICE:
                 # The old VM is still active (only frozen); abort unfreezes it and keeps it serving.
@@ -1514,10 +1565,15 @@ class ControlVmManager:
             return "wait"
         old = obs.vm(t["old_slot"])
         if old is not None:
-            ready, detail = self._replacement_ready(t, obs)
+            ready, detail, below_floor = self._replacement_ready(t, obs)
             if not ready:
+                # Never delete the old VM (or its disk) while the replacement holds less than was
+                # transferred: re-import, and keep the regular grace and rollback rules running meanwhile.
+                if below_floor and self._reimport_replacement(t):
+                    detail += "; re-imported, waiting for health to confirm"
                 return self._replacement_not_ready(t, obs, detail)
             t.pop("replacement_unready_since", None)
+            t.pop("reimport_attempts", None)
             # Without a confirmed freeze (recovery without an import, an unfrozen snapshot, or an old VM
             # fenced by stop) the old disk may hold changes that never reached the replacement: keep it.
             keep = t.get("import_skipped") or not self._old_state_confirmed(t)
@@ -1530,19 +1586,26 @@ class ControlVmManager:
                 return "wait"
         return self._finish(t)
 
-    def _replacement_ready(self, t: dict, obs: Observation) -> tuple[bool, str]:
-        """Fresh check that the replacement is RUNNING, healthy, and answers as its own slot."""
+    def _replacement_ready(self, t: dict, obs: Observation) -> tuple[bool, str, bool]:
+        """Fresh check that the replacement is RUNNING, healthy, answers as its own slot, and still holds
+        at least the transferred state. Returns (ready, detail, below_floor)."""
         new = obs.vm(t["new_slot"])
         if new is None:
-            return False, f"replacement slot {t['new_slot']} VM is missing"
+            return False, f"replacement slot {t['new_slot']} VM is missing", False
         if new.status != "RUNNING":
-            return False, f"replacement {new.name} is {new.status}"
+            return False, f"replacement {new.name} is {new.status}", False
         result = probe_health(self.requester, self.config, t["new_slot"])
         if not result.ok:
-            return False, f"replacement {new.name} is not healthy: {result.detail}"
+            return False, f"replacement {new.name} is not healthy: {result.detail}", False
         if result.slot != t["new_slot"]:
-            return False, f"replacement hostname answered as slot {result.slot!r}, expected {t['new_slot']!r}"
-        return True, "ready"
+            return (False, f"replacement hostname answered as slot {result.slot!r}, expected {t['new_slot']!r}",
+                    False)
+        floor = self._required_version(t)
+        if floor and (result.state_version is None or result.state_version < floor):
+            # For example it restarted after the import and recovered an older KV snapshot.
+            return (False, f"replacement {new.name} reports state_version {result.state_version}, below the "
+                           f"transferred state_version {floor}", True)
+        return True, "ready", False
 
     def _replacement_not_ready(self, t: dict, obs: Observation, detail: str) -> str:
         """Never delete the old VM for an unready replacement: wait a bounded time, then fall back.
