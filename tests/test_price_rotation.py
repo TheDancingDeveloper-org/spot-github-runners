@@ -699,7 +699,9 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             path = Path(tmpdir) / "state.json"
             with patch("lib.runner_drain.jobs_finished", return_value=True), \
                     patch("lib.spot_runner_autoscaler.now", return_value=2000000010.0), \
-                    patch("lib.runner_drain.api") as mock_api, \
+                    patch("lib.runner_drain.api", side_effect=lambda target, method, path, body=None: (
+                        {"name": "gha-oxidex-runners-old-1", "busy": False, "status": "online"}
+                        if method == "GET" else {})) as mock_api, \
                     patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True) as quiesce, \
                     patch("lib.runner_drain.subprocess.run") as mock_delete_cmd:
                 # Step 1: Drain finishes -> advances to deregister
@@ -1141,12 +1143,12 @@ class RotationHarness:
         rotation.update(extra)
         return {"price_rotation": rotation}
 
-    def step(self, state, vms, runners, api=None, builders_quiet=True):
+    def step(self, state, vms, runners, api=None, builders_quiet=True, jobs_done=True):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
             api_kwargs = {"side_effect": api} if api is not None else {"return_value": {}}
             with patch("lib.runner_drain.api", **api_kwargs) as mock_api, \
-                    patch("lib.runner_drain.jobs_finished", return_value=True), \
+                    patch("lib.runner_drain.jobs_finished", return_value=jobs_done), \
                     patch("lib.spot_runner_autoscaler.delete_overpriced_vm") as delete_old, \
                     patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete_new, \
                     patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=builders_quiet), \
@@ -1304,7 +1306,9 @@ class LostCapacityRecoveryTests(RotationHarness, unittest.TestCase):
         self.assertTrue(rotation["cordon_complete"])  # Old host stays out of service.
 
     def test_uncertain_deregistration_counts_as_lost_capacity(self):
-        def failing_delete(*args, **kwargs):
+        def failing_delete(target, method, path, body=None, paginate=False):
+            if method == "GET":
+                return {"name": "gha-oxidex-runners-old-1", "busy": False, "status": "online"}
             raise subprocess.CalledProcessError(1, ["gh"], stderr="timeout")
         state = self.state("deregister")
         mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
@@ -1736,13 +1740,121 @@ class FloorQuiescenceSelectionTests(unittest.TestCase):
         self.assertEqual(removable_spot_vms(vms[:2], runners[:2], state=state), [])
         args = SimpleNamespace(scaling_mode="legacy", state_file=Path("/nonexistent"))
         with tempfile.TemporaryDirectory() as tmpdir, \
-                patch.object(controller, "removable_spot_vms",
-                             side_effect=lambda v, r: removable_spot_vms(v, r, state=state)), \
                 patch.object(controller, "quiesce_remote_builder",
                              side_effect=lambda vm, a: vm.name != "oxidex-runners-vm1"), \
                 patch.object(controller, "reconcile_host_operation"):
             controller.scale_down(vms, runners, args, state=state, state_path=Path(tmpdir) / "s.json")
         self.assertEqual(state["host_operation"]["vm"]["name"], "oxidex-runners-vm2")
+
+    def test_scale_down_honors_state_floor(self):
+        from lib import spot_runner_autoscaler as controller
+        vms = [GceVm(f"oxidex-runners-vm{i}", "z", "RUNNING", "n2-standard-2", True, instance_id=f"vm-{i}")
+               for i in (1, 2, 3)]
+        runners = [GitHubRunner(i, f"gha-oxidex-runners-vm{i}-1", "online", False, ("spot",)) for i in (1, 2, 3)]
+        state = {"min_runner_floor": 3,
+                 "host_deployments": {f"z/vm-{i}": {"expected_runner_count": 1} for i in (1, 2, 3)}}
+        args = SimpleNamespace(scaling_mode="legacy", state_file=Path("/nonexistent"))
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch.object(controller, "quiesce_remote_builder", return_value=True) as quiesce, \
+                patch.object(controller, "reconcile_host_operation"):
+            self.assertEqual(controller.scale_down(vms, runners, args, state=state,
+                                                   state_path=Path(tmpdir) / "s.json"), 0)
+        quiesce.assert_not_called()
+        self.assertNotIn("host_operation", state)
+
+
+
+class DeregisterIdleRecheckTests(RotationHarness, unittest.TestCase):
+    """Round 8: never deregister or delete an outgoing host that picked up work after cordoning."""
+
+    def idle_get(self, busy=False):
+        def api(target, method, path, body=None, paginate=False):
+            if method == "GET":
+                return {"name": "gha-oxidex-runners-old-1", "busy": busy, "status": "online"}
+            return {}
+        return api
+
+    def deletes(self, mock_api):
+        return [c.args for c in mock_api.call_args_list if c.args[1] == "DELETE"]
+
+    def test_busy_runner_in_fresh_inventory_returns_to_drain(self):
+        busy = replace_vm(self.old_runner, busy=True)
+        mock_api, _, _, saved = self.step(self.state("deregister"), [self.outgoing_vm, self.replacement_vm],
+                                          [busy, self.new_runner], api=self.idle_get())
+        self.assertEqual(self.deletes(mock_api), [])
+        self.assertEqual(saved["price_rotation"]["phase"], "cordon_drain")
+        self.assertTrue(saved["price_rotation"]["cordon_complete"])
+
+    def test_runner_busy_on_fresh_get_is_not_deregistered(self):
+        mock_api, _, _, saved = self.step(self.state("deregister"), [self.outgoing_vm, self.replacement_vm],
+                                          [self.old_runner, self.new_runner], api=self.idle_get(busy=True))
+        self.assertEqual(self.deletes(mock_api), [])
+        self.assertEqual(saved["price_rotation"]["phase"], "cordon_drain")
+        self.assertNotIn("deregistering_runner_id", saved["price_rotation"])
+
+    def test_active_tracked_job_blocks_deregistration(self):
+        mock_api, _, _, saved = self.step(self.state("deregister"), [self.outgoing_vm, self.replacement_vm],
+                                          [self.old_runner, self.new_runner], api=self.idle_get(), jobs_done=False)
+        mock_api.assert_not_called()
+        self.assertEqual(saved["price_rotation"]["phase"], "cordon_drain")
+
+    def test_idle_runner_is_deregistered_after_fresh_confirmation(self):
+        mock_api, _, _, saved = self.step(self.state("deregister"), [self.outgoing_vm, self.replacement_vm],
+                                          [self.old_runner, self.new_runner], api=self.idle_get())
+        self.assertEqual(self.deletes(mock_api),
+                         [("xbmc4lyfe/newznab-tmux", "DELETE", "repos/xbmc4lyfe/newznab-tmux/actions/runners/99")])
+        self.assertEqual(saved["price_rotation"]["phase"], "delete")
+
+    def test_delete_waits_for_active_job_on_host(self):
+        state = self.state("delete")
+        _, delete_old, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm], [self.new_runner],
+                                            jobs_done=False)
+        delete_old.assert_not_called()
+        self.assertEqual(saved["price_rotation"]["phase"], "delete")
+        self.assertNotIn("asia-east2-a/oxidex-runners-old", saved.get("intentional_deletions", []))
+
+    def test_delete_waits_for_busy_leftover_runner(self):
+        busy = replace_vm(self.old_runner, busy=True)
+        _, delete_old, _, _ = self.step(self.state("delete"), [self.outgoing_vm, self.replacement_vm],
+                                        [busy, self.new_runner])
+        delete_old.assert_not_called()
+
+
+class ReplacementCleanupRetryTests(unittest.TestCase):
+    """Round 8: a failed abort-time replacement deletion is retried until confirmed."""
+
+    def test_failed_deletion_persists_and_retries_until_absent(self):
+        from lib.spot_runner_autoscaler import _abort_runner_rotation, reconcile_replacement_cleanups
+        outgoing = GceVm("oxidex-runners-old", "z", "RUNNING", "n4-highcpu-16", True, instance_id="old")
+        dead = GceVm("oxidex-runners-new", "z", "TERMINATED", "n4-highcpu-16", True, instance_id="new")
+        args = SimpleNamespace(project="p")
+        state = {"price_rotation": {"phase": "verify_readiness", "target": "swack-tools",
+                                    "outgoing_vm": {"name": outgoing.name, "zone": "z", "instance_id": "old"},
+                                    "replacement_vm": {"name": dead.name, "zone": "z", "instance_id": "new"}}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks",
+                       side_effect=subprocess.CalledProcessError(1, ["gcloud"])):
+                _abort_runner_rotation(state["price_rotation"], [outgoing, dead], args, state, path, "timeout")
+                self.assertNotIn("price_rotation", state)
+                self.assertEqual(read_scale_state(path)["replacement_cleanups"]["z/oxidex-runners-new"],
+                                 {"name": dead.name, "zone": "z", "instance_id": "new"})
+                reconcile_replacement_cleanups([outgoing, dead], args, state, path)  # Still failing.
+            self.assertIn("z/oxidex-runners-new", read_scale_state(path)["replacement_cleanups"])
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as retry:
+                reconcile_replacement_cleanups([outgoing, dead], args, state, path)
+                retry.assert_called_once_with(dead, "p")
+                self.assertIn("z/oxidex-runners-new", state["replacement_cleanups"])  # Not yet confirmed.
+                # A same-named VM with another identity is not this cleanup's VM: absence is confirmed.
+                reconcile_replacement_cleanups([outgoing, replace_vm(dead, instance_id="other")], args, state, path)
+                retry.assert_called_once()
+            self.assertEqual(read_scale_state(path)["replacement_cleanups"], {})
+
+    def test_controller_loop_runs_cleanup_each_check(self):
+        import inspect
+        from lib import spot_runner_autoscaler as controller
+        self.assertIn("reconcile_replacement_cleanups(vms, args, state, state_path)",
+                      inspect.getsource(controller._run_controller))
 
 
 class LaunchAgentArgumentTests(unittest.TestCase):

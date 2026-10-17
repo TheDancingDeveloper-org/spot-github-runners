@@ -976,7 +976,7 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     state_path = state_path or args.state_file.expanduser()
     if state.get("host_operation") or len(spot_instances(vms)) <= 1:
         return 0
-    candidates = removable_spot_vms(vms, runners)
+    candidates = removable_spot_vms(vms, runners, state)
     if not candidates:
         LOG.info("Scale-down waits: no complete idle host is available")
         return 0
@@ -1395,11 +1395,41 @@ def _delete_replacement(repl_vm, args, state, state_path) -> None:
     if key not in state.setdefault("intentional_deletions", []):
         state["intentional_deletions"].append(key)
     state.setdefault("intentional_deletion_ids", {})[key] = repl_vm.instance_id
+    # The intentional-deletion marker suppresses loss recovery, so persist a cleanup obligation
+    # that is retried every check until fresh inventory confirms the VM is gone.
+    state.setdefault("replacement_cleanups", {})[key] = {
+        "name": repl_vm.name, "zone": repl_vm.zone, "instance_id": repl_vm.instance_id}
     write_scale_state(state_path, state)
     try:
         delete_vm_and_disks(repl_vm, args.project)
     except Exception as exc:
-        LOG.error("Failed to delete replacement VM %s: %s", repl_vm.name, error_detail(exc))
+        LOG.error("Failed to delete replacement VM %s: %s; cleanup retries next check",
+                  repl_vm.name, error_detail(exc))
+
+
+def reconcile_replacement_cleanups(vms, args, state, state_path) -> None:
+    """Retry deletion of aborted replacements until fresh inventory shows them absent."""
+    cleanups = state.get("replacement_cleanups")
+    if not isinstance(cleanups, dict) or not cleanups:
+        return
+    for key, record in list(cleanups.items()):
+        current = next((vm for vm in vms if vm.name == record.get("name") and vm.zone == record.get("zone")
+                        and (not record.get("instance_id") or vm.instance_id == record["instance_id"])), None)
+        if current is None:
+            cleanups.pop(key)
+            LOG.info("Confirmed aborted replacement %s is deleted", record.get("name"))
+            write_scale_state(state_path, state)
+            continue
+        key_ids = state.setdefault("intentional_deletion_ids", {})
+        if key not in state.setdefault("intentional_deletions", []):
+            state["intentional_deletions"].append(key)
+        key_ids[key] = current.instance_id
+        write_scale_state(state_path, state)
+        try:
+            delete_vm_and_disks(current, args.project)
+            LOG.info("Retried deletion of aborted replacement %s", current.name)
+        except Exception as exc:
+            LOG.warning("Aborted replacement %s still pending deletion: %s", current.name, error_detail(exc))
 
 
 def _replacement_safe_to_delete(repl_vm, runners, args, *, require_offline=False) -> bool:
@@ -1811,6 +1841,25 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
     return True
 
 
+def _outgoing_work_active(out_vm, assigned, state, target) -> str | None:
+    """Return why the outgoing host may still be running CI work, or None when it is idle."""
+    from .runner_drain import jobs_finished
+    busy = [r.name for r in assigned if r.busy]
+    if busy:
+        return f"runners {', '.join(busy)} are busy"
+    if out_vm is not None and not jobs_finished(out_vm, state, target):
+        return "a tracked CI job is still active on the host"
+    return None
+
+
+def _return_to_drain(rotation, state, state_path, reason: str) -> bool:
+    """Send a rotation back to draining instead of deregistering a host that has work."""
+    LOG.warning("Deregistration of %s deferred: %s; returning to drain", rotation["outgoing_vm"]["name"], reason)
+    rotation["drain_started_at"] = now()
+    _advance_rotation(rotation, "cordon_drain", state, state_path)
+    return True
+
+
 def _step_rotation_deregister(vms, runners, args, state, state_path, rotation):
     """Phase 6: Remove old runners from GitHub API."""
     out_dict = rotation["outgoing_vm"]
@@ -1823,8 +1872,19 @@ def _step_rotation_deregister(vms, runners, args, state, state_path, rotation):
     assigned = host_runners(out_vm, runners, vms) if out_vm else [r for r in runners if out_name in r.name]
 
     from .runner_drain import api
+    busy = _outgoing_work_active(out_vm, assigned, state, target)
+    if busy:
+        return _return_to_drain(rotation, state, state_path, busy)
     for runner in assigned:
         endpoint = f"repos/{target}/actions/runners/{runner.runner_id}" if target_type == "repo" else f"orgs/{target}/actions/runners/{runner.runner_id}"
+        try:
+            fresh = api(target, "GET", endpoint) or {}
+        except Exception as exc:
+            LOG.warning("Deregistration waits for fresh state of runner %s: %s", runner.name, error_detail(exc))
+            return True
+        if fresh.get("name") != runner.name or fresh.get("busy") is not False:
+            # Repository runners keep built-in labels, so a job can still land after cordoning.
+            return _return_to_drain(rotation, state, state_path, f"runner {runner.name} is not freshly idle")
         # Persist intent first: from here on, rollback can no longer restore this listener.
         rotation["deregistering_runner_id"] = runner.runner_id
         write_scale_state(state_path, state)
@@ -1859,6 +1919,14 @@ def _step_rotation_delete(vms, runners, args, state, state_path, rotation):
         protected[repl_dict["instance_id"]] = {"name": repl_dict["name"], "zone": repl_dict["zone"]}
         protected.pop(out_dict["instance_id"], None)
         LOG.info("Transferred protected heavy route from %s to replacement %s", out_dict["name"], repl_dict["name"])
+
+    if out_vm is not None:
+        leftover = host_runners(out_vm, runners, vms)
+        busy = _outgoing_work_active(out_vm, leftover, state, rotation["target"])
+        if busy:
+            LOG.warning("Rotation deletion of %s waits: %s", out_name, busy)
+            write_scale_state(state_path, state)
+            return True
 
     if out_vm is not None and not quiesce_remote_builder(out_vm, args):
         # Re-confirm under the builder lock right before deletion; never delete under a build.
@@ -2548,6 +2616,7 @@ def _run_controller(args: argparse.Namespace) -> int:
         jobs.poll(vms)
         observe_vms(vms, state)
         write_scale_state(state_path, state)
+        reconcile_replacement_cleanups(vms, args, state, state_path)
         LOG.info(fleet_summary(vms, runners, state))
         log_hourly_spend(vms, args, state, state_path)
         if getattr(args, 'manage_control_vm', False):

@@ -607,6 +607,31 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(h.gcloud.mutating(), [])
         self.assertEqual(h.mutations(), [])
 
+    def test_failed_zones_reset_when_every_available_zone_failed(self):
+        h = Harness()
+        self.healthy_active(h)
+        h.gcloud.fail_create_zones = {"us-central1-a", "us-east1-b"}  # only two zones exist
+        h.tick()
+        self.assertEqual(sorted(h.transition["failed_zones"]), ["us-central1-a", "us-east1-b"])
+        h.tick()  # candidates exhausted: the list resets instead of filtering every zone forever
+        self.assertEqual(h.transition["failed_zones"], [])
+        h.gcloud.fail_create_zones = set()
+        h.tick()
+        self.assertEqual(h.transition["step"], "wait_health")
+
+    def test_failed_zone_records_expire(self):
+        h = Harness()
+        manager = h.manager()
+        t = {"failed_zones": []}
+        manager._mark_zone_failed(t, "us-central1-a")
+        self.assertEqual(manager._failed_zones(t), ["us-central1-a"])
+        h.clock[0] += cv.FAILED_ZONE_TTL_SECONDS
+        self.assertEqual(manager._failed_zones(t), [])
+        legacy = {"failed_zones": ["us-east1-b"]}  # recorded before timestamps existed
+        self.assertEqual(manager._failed_zones(legacy), ["us-east1-b"])
+        h.clock[0] += cv.FAILED_ZONE_TTL_SECONDS
+        self.assertEqual(manager._failed_zones(legacy), [])
+
     def test_price_create_failures_abort_without_touching_old(self):
         h = Harness()
         self.healthy_active(h)
@@ -973,6 +998,43 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.assertIn("--keep-disks=boot", delete_call(h, "spot-control-a"))
         self.assertEqual(h.state[cv.STATE_KEY]["retained_disks"][0]["disk"], "spot-control-a")
         self.assertIsNone(h.transition)
+
+    def add_duplicate_b(self, h):
+        row = dict(h.gcloud.vms["spot-control-b"], zone="projects/proj/zones/us-west1-a", id="id-b2")
+        h.gcloud.extra_rows.append(row)
+
+    def test_duplicate_appearing_mid_transition_pauses_before_next_step(self):
+        h = self.setup_rotation("wait_health")
+        self.with_new_vm(h)
+        real = h.gcloud.__call__
+        lists = []
+
+        def gcloud(argv):
+            if argv[2:4] == ["instances", "list"]:
+                lists.append(1)
+                if len(lists) == 2:  # the re-observation after wait_health advanced
+                    self.add_duplicate_b(h)
+            return real(argv)
+
+        manager = cv.ControlVmManager(h.config, h.state, h.save, gcloud=gcloud, kv=h.kv, requester=h.http,
+                                      offer_source=lambda: list(h.offers), clock=lambda: h.clock[0])
+        manager.tick(apply=True)
+        self.assertEqual(h.transition["step"], "freeze")
+        self.assertEqual(h.mutations(), [])  # no freeze, import, or origin write
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertTrue(h.transition["error"].startswith("paused: more than one control VM for slot b"))
+
+    def test_abort_with_duplicate_keeps_everything_frozen(self):
+        h = self.setup_rotation("abort", freeze_requested=True, cutover_attempted=True, abort_reason="x")
+        self.with_new_vm(h)
+        self.add_duplicate_b(h)
+        h.kv.set_origin("b")
+        manager = h.manager()
+        manager.advance(manager.observe(want_offers=False))
+        self.assertEqual(h.mutations(), [])
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertEqual(h.kv.origin_slot(), "b")
+        self.assertEqual(h.transition["step"], "abort")
 
     def test_delete_old_refuses_while_origin_points_at_old(self):
         h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0)

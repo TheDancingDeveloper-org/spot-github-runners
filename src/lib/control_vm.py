@@ -121,6 +121,7 @@ MIN_SAVINGS_DAILY_USD = Decimal("0.05")
 CREATE_ATTEMPTS_PER_TICK = 3
 PRICE_CREATE_MAX_FAILURES = 3
 STEP_RETRY_LIMIT = 5
+FAILED_ZONE_TTL_SECONDS = 1800     # A zone that failed a create is retried after this long.
 MAX_STEPS_PER_TICK = 12
 
 STOPPED_STATES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED"})
@@ -845,6 +846,7 @@ class ControlVmManager:
             "excluded_zones": ([old_vm.zone] if (old_vm and mode == MODE_RECOVER) else [])
                               + self._retained_zones(new_slot),
             "failed_zones": [],
+            "failed_zones_at": {},
             "step": "create",
             "started_at": now,
             "step_started_at": now,
@@ -942,6 +944,16 @@ class ControlVmManager:
             if not t:
                 return
             step = t["step"]
+            if obs.problems:
+                # Same safety gate as planning, before every step: no create, start, freeze, import,
+                # unfreeze, origin write, or delete while the observation is unsafe (for example two VMs
+                # for one slot). Everything stays as it is until the problem is resolved.
+                t["error"] = "paused: " + "; ".join(obs.problems)
+                t["updated_at"] = self.clock()
+                self.save()
+                self._note("transition paused at step %s: %s", step, "; ".join(obs.problems),
+                           level=logging.ERROR)
+                return
             handler = getattr(self, f"_step_{step}", None)
             if handler is None:
                 self._abort(t, f"unknown step {step!r}")
@@ -966,7 +978,7 @@ class ControlVmManager:
             return "exists"
         if _NOT_FOUND_RE.search(result.stderr or ""):
             t.pop("pending_create", None)
-            t.setdefault("failed_zones", []).append(pending["zone"])
+            self._mark_zone_failed(t, pending["zone"])
             self.save()
             return "absent"
         t["error"] = (f"cannot confirm whether {pending['name']} exists in {pending['zone']}: "
@@ -997,15 +1009,21 @@ class ControlVmManager:
             except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
                 self._note("control VM price scan failed: %s", exc, level=logging.WARNING)
                 offers = []
-        candidates = [o for o in offers if o.daily_usd <= self.config.max_daily_usd
-                      and o.zone not in t.get("failed_zones", [])]
+        failed = self._failed_zones(t)
+        affordable = [o for o in offers if o.daily_usd <= self.config.max_daily_usd]
+        candidates = [o for o in affordable if o.zone not in failed]
         preferred = [o for o in candidates if o.zone not in t.get("excluded_zones", [])]
         candidates = preferred or candidates
-        if t.get("offer") and not t.get("failed_zones"):
+        if t.get("offer") and not failed:
             planned = ControlOffer.from_dict(t["offer"])
             candidates = [planned] + [o for o in candidates if o != planned]
         if not candidates:
-            return self._create_failed(t, "no priced offer under the cap in an untried zone")
+            if affordable:
+                # Every available zone failed recently: start over with the full list next tick
+                # (stockouts are transient), however few zones there are.
+                t["failed_zones"], t["failed_zones_at"] = [], {}
+                return self._create_failed(t, "every affordable zone failed; retrying all zones next tick")
+            return self._create_failed(t, "no priced offer under the cap")
         script = render_control_startup()
         with tempfile.TemporaryDirectory(prefix="spot-control-") as tmp:
             script_path = Path(tmp) / "control-vm-startup.sh"
@@ -1032,7 +1050,7 @@ class ControlVmManager:
                 self._note("create in %s failed: %s", offer.zone, stderr[:300], level=logging.WARNING)
                 if _DEFINITIVE_CREATE_ERROR_RE.search(stderr):
                     t.pop("pending_create", None)
-                    t.setdefault("failed_zones", []).append(offer.zone)
+                    self._mark_zone_failed(t, offer.zone)
                     self.save()
                     continue
                 outcome = self._reconcile_pending_create(t)
@@ -1041,11 +1059,27 @@ class ControlVmManager:
                     return "wait"
         return self._create_failed(t, "every create attempt this tick failed")
 
+    def _mark_zone_failed(self, t: dict, zone: str) -> None:
+        zones = t.setdefault("failed_zones", [])
+        if zone not in zones:
+            zones.append(zone)
+        t.setdefault("failed_zones_at", {})[zone] = self.clock()
+
+    def _failed_zones(self, t: dict) -> list[str]:
+        """Zones that failed within FAILED_ZONE_TTL_SECONDS; older failures expire so capacity is retried."""
+        now = self.clock()
+        stamps = t.setdefault("failed_zones_at", {})
+        for zone in t.get("failed_zones", []):
+            stamps.setdefault(zone, now)  # Records from before timestamps existed start their TTL now.
+        fresh = [z for z in t.get("failed_zones", []) if now - stamps[z] < FAILED_ZONE_TTL_SECONDS]
+        if fresh != t.get("failed_zones", []):
+            t["failed_zones"] = fresh
+            t["failed_zones_at"] = {z: stamps[z] for z in fresh}
+        return list(fresh)
+
     def _create_failed(self, t: dict, error: str) -> str:
         t["create_failures"] = t.get("create_failures", 0) + 1
         t["error"] = error
-        if len(t.get("failed_zones", [])) >= 6:
-            t["failed_zones"] = []  # Retry the full list later; stockouts are transient.
         self.save()
         if t["mode"] == MODE_PRICE and t["create_failures"] >= PRICE_CREATE_MAX_FAILURES:
             return self._abort(t, f"replacement create failed {t['create_failures']} times: {error}")
