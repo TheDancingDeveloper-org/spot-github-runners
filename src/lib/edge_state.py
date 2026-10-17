@@ -190,8 +190,19 @@ class OriginRecord:
 
 
 def read_origin(kv: CloudflareKv) -> OriginRecord | None:
-    """Return the active origin, None if unset. Raises KvError when KV cannot be read."""
-    return OriginRecord.from_json(kv.get(KV_ORIGIN_KEY))
+    """Return the active origin, or None only when the key does not exist.
+
+    Raises KvError when KV cannot be read or when ``origin:active`` exists but is malformed: an
+    unreadable pointer must hold lifecycle changes, never look like an unset one that allows a
+    bootstrap without freezing or importing the previous writer.
+    """
+    raw = kv.get(KV_ORIGIN_KEY)
+    if raw is None:
+        return None
+    record = OriginRecord.from_json(raw)
+    if record is None:
+        raise KvError(f"{KV_ORIGIN_KEY} exists but is not a valid origin record")
+    return record
 
 
 def write_origin(kv: CloudflareKv, record: OriginRecord) -> bool:

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lib import control_vm as cv
+from lib import edge_state
 from lib.edge_state import (
     KV_ORIGIN_KEY,
     KV_STATE_KEY,
@@ -1423,3 +1424,27 @@ class PartialInventoryTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["env"]["CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR"], "false")
             cv.default_gcloud(["gcloud", "secrets", "versions", "access", "latest"])
             self.assertIsNone(run.call_args.kwargs["env"])
+
+
+class MalformedOriginTests(unittest.TestCase):
+    """Codex M4 round 10: an invalid origin:active must hold lifecycle changes, not allow bootstrap."""
+
+    def test_read_origin_distinguishes_missing_from_malformed(self):
+        h = Harness()
+        self.assertIsNone(edge_state.read_origin(h.kv))  # genuinely missing
+        for raw in ("{not json", '{"slot": "z", "url": "https://x", "vm": "v", "updated_at": 1}', "[]"):
+            with self.subTest(raw=raw):
+                h.kv.store[edge_state.KV_ORIGIN_KEY] = raw
+                with self.assertRaises(edge_state.KvError):
+                    edge_state.read_origin(h.kv)
+
+    def test_malformed_origin_blocks_bootstrap_with_both_slots_present(self):
+        h = Harness()
+        h.gcloud.add("a")
+        h.gcloud.add("b", zone="us-east1-b")
+        h.http.healthy("a")
+        h.http.healthy("b")
+        h.kv.store[edge_state.KV_ORIGIN_KEY] = "{corrupt"
+        h.tick()
+        self.assertEqual(h.kv.store[edge_state.KV_ORIGIN_KEY], "{corrupt")  # never rewritten
+        self.assertEqual(h.mutations(), [])
