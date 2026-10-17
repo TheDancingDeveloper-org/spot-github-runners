@@ -313,10 +313,9 @@ def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner], state=None
                 or any(not runner.online or runner.busy for runner in assigned)):
             continue
         candidates.append(vm)
-    if len(fleet) - len(candidates) < min_floor:
-        allowed_removals = max(0, len(fleet) - min_floor)
-        candidates = candidates[:allowed_removals]
-    return candidates
+    # Scale-down removes one host at a time, so the floor limits whether any removal is allowed,
+    # not which candidate: keep them all so builder quiescence can pick a quiet host.
+    return candidates if len(fleet) - 1 >= min_floor else []
 
 
 def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRunner],
@@ -1129,6 +1128,10 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
         LOG.warning("Replacement waits until previous drives and runner records have been verified deleted")
         return True
     if not target:
+        if pending:
+            # Completed cleanups with no restoration target (e.g. rotation-owned replacement
+            # losses) must not stay pending, or lost-host recovery would block scaling forever.
+            retire_completed_recoveries(state, state_path)
         return False
     missing = max(0, target - len(fleet))
     if missing:
@@ -1145,6 +1148,19 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
     state["idle_loops"] = 0
     write_scale_state(state_path, state)
     return True
+
+
+def retire_completed_recoveries(state, state_path, only=None) -> None:
+    """Remove recovery records whose cleanup completed; ``only`` filters which records."""
+    pending = state.get("pending_vm_recovery", {})
+    done = [key for key, record in pending.items()
+            if record.get("_cleanup_complete") and (only is None or only(record))]
+    for key in done:
+        record = pending.pop(key)
+        state.get("observed_vms", {}).pop(f"{record.get('zone')}/{record.get('name')}", None)
+    if done:
+        LOG.info("Retired %d completed lost-host recovery records", len(done))
+        write_scale_state(state_path, state)
 
 
 def begin_price_rotation(outgoing_vm: GceVm, vms: list[GceVm], runners: list[GitHubRunner],
@@ -1256,7 +1272,14 @@ def _step_rotation_select(vms, runners, args, state, state_path, rotation):
         LOG.warning("Rotation select: no qualifying offers available below $%s/day; keeping outgoing host undisturbed",
                     args.max_daily_usd)
         return True
-    rotation["replacement_offer"] = _offer_record(offers[0])
+    failed = rotation.setdefault("failed_offer_keys", [])
+    untried = [offer for offer in offers if candidate_key(offer) not in failed]
+    if not untried:
+        # Every current candidate failed; retry the full list, as scale_up does.
+        LOG.warning("Rotation select: all %d offers failed; retrying the full list", len(offers))
+        failed.clear()
+        untried = offers
+    rotation["replacement_offer"] = _offer_record(untried[0])
     rotation["attempt_count"] = 0
     _advance_rotation(rotation, "provision", state, state_path)
     return _step_rotation_provision(vms, runners, args, state, state_path, rotation)
@@ -1337,6 +1360,9 @@ def _step_rotation_provision(vms, runners, args, state, state_path, rotation):
                 rotation["outgoing_vm"]["name"], attempts, error_detail(exc)
             )
             rotation["phase"] = "select"
+            failed_key = candidate_key(SimpleNamespace(**rotation.get("replacement_offer") or {}))
+            if failed_key not in rotation.setdefault("failed_offer_keys", []):
+                rotation["failed_offer_keys"].append(failed_key)
             rotation.pop("replacement_offer", None)
             rotation["phase_started_at"] = now()
         else:

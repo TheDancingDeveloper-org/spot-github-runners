@@ -325,9 +325,10 @@ class AutoscalerFloorAndOverlapTests(unittest.TestCase):
                 "asia-east2-a/vm-2": {"expected_runner_count": 1},
             }
         }
-        # 2 VMs present, floor is 1: exactly 1 VM may be removed
+        # 2 VMs present, floor is 1: a removal is allowed and every idle host stays a candidate so
+        # builder quiescence can choose; scale_down still removes only one host per step.
         removals = removable_spot_vms(vms, runners, state=state)
-        self.assertEqual(len(removals), 1)
+        self.assertEqual(removals, [vm1, vm2])
 
     def test_max_allowed_hosts_temporary_plus_one(self):
         args = SimpleNamespace(maximum_hosts=3)
@@ -1631,6 +1632,117 @@ class RotationLossAccountingTests(unittest.TestCase):
 
     def test_ordinary_losses_are_unchanged_without_rotation(self):
         self.assertEqual(self.record([self.other, self.replacement], self.outgoing, rotation=False), 3)
+
+
+
+class RotationOwnedRecoveryRetirementTests(unittest.TestCase):
+    """Round 7: a rotation-owned replacement loss never leaves an unclearable recovery record."""
+
+    def test_full_sequence_retires_record_and_scaling_resumes(self):
+        from contextlib import ExitStack
+        from dataclasses import asdict
+        from lib import spot_runner_autoscaler as controller
+        from lib.fleet_logging import observe_vms
+        from lib.vm_recovery import reconcile_lost_vms
+        other = GceVm("oxidex-runners-a", "z", "RUNNING", "n4-standard-32", True, instance_id="1")
+        outgoing = GceVm("oxidex-runners-b", "z", "RUNNING", "n4-standard-32", True, instance_id="2")
+        replacement = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-standard-32", True, instance_id="3")
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            path = Path(directory) / "state.json"
+            args = controller.args_parser().parse_args(["--once", "--state-file", str(path)])
+            import time as clock
+            state = {"runner_inventory_observed_at": clock.time(), "price_rotation": {
+                "phase": "verify_readiness", "target": "swack-tools",
+                "outgoing_vm": {"name": outgoing.name, "zone": "z", "instance_id": "2"},
+                "replacement_vm": {"name": replacement.name, "zone": "z", "instance_id": "3"}}}
+            observe_vms([other, outgoing, replacement], state)
+            observe_vms([other, outgoing], state)  # The replacement is preempted mid-rotation.
+            self.assertEqual(len(state["pending_vm_recovery"]), 1)
+            # Ordinary recovery cleans up the lost replacement (disks and runners).
+            stack.enter_context(patch("lib.vm_recovery.cleanup_lost_vm", return_value=True))
+            stack.enter_context(patch("lib.spot_runner_autoscaler.step_price_rotation", return_value=True))
+            self.assertTrue(reconcile_lost_vms([other, outgoing], [], args, state, path))
+            self.assertEqual(state.get("price_replacement_target", 0), 0)
+            key = state["host_operation"]["recovery_key"]
+            state["pending_vm_recovery"][key]["_cleanup_complete"] = True
+            state.pop("host_operation")
+            state.pop("price_rotation")  # The rotation completed (or aborted) on its own.
+            self.assertFalse(reconcile_lost_vms([other, outgoing], [], args, state, path))
+            self.assertEqual(state["pending_vm_recovery"], {})
+            # A full controller check now reaches the scaling decision.
+            for name, value in [("clear_catalog_cache", None), ("load_cpu_platform_map", {}),
+                                ("list_github_runners", []), ("list_gcloud_vms", (other, outgoing)),
+                                ("log_hourly_spend", None), ("check_running_prices", [])]:
+                stack.enter_context(patch.object(controller, name, return_value=value))
+            stack.enter_context(patch.object(controller, "JobRecovery"))
+            controller.write_scale_state(path, state)  # The controller restarts from durable state.
+            metrics = stack.enter_context(patch.object(controller, "read_utilization", return_value=None))
+            controller._run_controller(args)
+            metrics.assert_called_once()
+            self.assertEqual(read_scale_state(path)["pending_vm_recovery"], {})
+
+    def test_legacy_completed_record_without_target_is_cleared_by_price_reconcile(self):
+        state = {"pending_vm_recovery": {"z/gone": {"name": "gone", "zone": "z", "_cleanup_complete": True}},
+                 "observed_vms": {"z/gone": {}}}
+        args = SimpleNamespace(project="p", max_daily_usd=Decimal("4"))
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("lib.spot_runner_autoscaler.check_running_prices", return_value=[]):
+            self.assertFalse(reconcile_prices([], [], args, state, Path(tmpdir) / "state.json"))
+        self.assertEqual(state["pending_vm_recovery"], {})
+        self.assertNotIn("z/gone", state["observed_vms"])
+
+
+class RotationReselectTests(unittest.TestCase):
+    """Round 7: reselect after repeated stockouts skips offers that already failed."""
+
+    def offer(self, zone):
+        return SimpleNamespace(region="asia-east2", zone=zone, machine_type="n4-highcpu-16", vcpu=16,
+                               ram_gib=32.0, hourly_usd=0.15, total_daily_usd=Decimal("3.60"),
+                               cpu_platform="Intel Emerald Rapids")
+
+    def test_failed_offer_is_skipped_until_alternatives_are_exhausted(self):
+        offers = [self.offer("asia-east2-a"), self.offer("asia-east2-b")]
+        outgoing = GceVm("oxidex-runners-old", "asia-east2-a", "RUNNING", "n4-highcpu-16", True, instance_id="o")
+        args = SimpleNamespace(project="p", max_daily_usd=Decimal("4"), maximum_hosts=5)
+        state = {"price_rotation": {"phase": "select", "target": "swack-tools",
+                                    "outgoing_vm": {"name": outgoing.name, "zone": "asia-east2-a"}}}
+        chosen = []
+
+        def launch(offer, *a, **k):
+            chosen.append(offer.zone)
+            raise RuntimeError("ZONE_RESOURCE_POOL_EXHAUSTED")
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("lib.spot_runner_autoscaler.offer_refresher", return_value=lambda: offers), \
+                patch("lib.spot_runner_autoscaler.guard_fleet_mutation"), \
+                patch("lib.spot_runner_autoscaler.launch_offer", side_effect=launch):
+            path = Path(tmpdir) / "state.json"
+            for _ in range(9):
+                step_price_rotation([outgoing], [], args, state, path)
+        # Three attempts per offer, then the second offer, then history resets to the first.
+        self.assertEqual(chosen, ["asia-east2-a"] * 3 + ["asia-east2-b"] * 3 + ["asia-east2-a"] * 3)
+
+
+class FloorQuiescenceSelectionTests(unittest.TestCase):
+    """Round 7: a building first candidate does not block a quiescent second one."""
+
+    def test_scale_down_drains_the_quiescent_host(self):
+        from lib import spot_runner_autoscaler as controller
+        vms = [GceVm(f"oxidex-runners-vm{i}", "z", "RUNNING", "n2-standard-2", True, instance_id=f"vm-{i}")
+               for i in (1, 2, 3)]
+        runners = [GitHubRunner(i, f"gha-oxidex-runners-vm{i}-1", "online", False, ("spot",)) for i in (1, 2, 3)]
+        state = {"min_runner_floor": 2,
+                 "host_deployments": {f"z/vm-{i}": {"expected_runner_count": 1} for i in (1, 2, 3)}}
+        self.assertEqual(removable_spot_vms(vms, runners, state=state), vms)
+        self.assertEqual(removable_spot_vms(vms[:2], runners[:2], state=state), [])
+        args = SimpleNamespace(scaling_mode="legacy", state_file=Path("/nonexistent"))
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch.object(controller, "removable_spot_vms",
+                             side_effect=lambda v, r: removable_spot_vms(v, r, state=state)), \
+                patch.object(controller, "quiesce_remote_builder",
+                             side_effect=lambda vm, a: vm.name != "oxidex-runners-vm1"), \
+                patch.object(controller, "reconcile_host_operation"):
+            controller.scale_down(vms, runners, args, state=state, state_path=Path(tmpdir) / "s.json")
+        self.assertEqual(state["host_operation"]["vm"]["name"], "oxidex-runners-vm2")
 
 
 class LaunchAgentArgumentTests(unittest.TestCase):

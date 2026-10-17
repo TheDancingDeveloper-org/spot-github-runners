@@ -535,6 +535,30 @@ def update_tracking(control_state: dict, origin: OriginRecord | None, vms: Seque
 # Commands
 # --------------------------------------------------------------------------------------------
 
+# gcloud create errors that prove no instance was created in that zone (capacity or quota).
+_DEFINITIVE_CREATE_ERROR_RE = re.compile(
+    r"ZONE_RESOURCE_POOL_EXHAUSTED|QUOTA_EXCEEDED|Quota '[^']*' exceeded|does not have enough resources|"
+    r"resource pool exhausted|STOCKOUT", re.IGNORECASE)
+_NOT_FOUND_RE = re.compile(r"was not found|notFound|HTTP 404|code: 404|\b404\b", re.IGNORECASE)
+
+
+def describe_command(name: str, zone: str, project: str) -> list[str]:
+    return ["gcloud", "compute", "instances", "describe", name, f"--zone={zone}", f"--project={project}",
+            "--format=json(name,zone,status,labels,id,machineType)"]
+
+
+def duplicate_slot_problems(vms: Sequence[ControlVm]) -> list[str]:
+    """One problem per slot that has more than one VM (instance names are only unique per zone)."""
+    problems = []
+    for slot in CONTROL_SLOTS:
+        same = [vm for vm in vms if vm.slot == slot]
+        if len(same) > 1:
+            where = ", ".join(f"{vm.name} in {vm.zone} ({vm.status}, id {vm.instance_id or '?'})" for vm in same)
+            problems.append(f"more than one control VM for slot {slot}: {where}; they share the slot's tunnel "
+                            f"and KV writer identity, so nothing changes until an operator deletes the extra")
+    return problems
+
+
 def list_command(project: str) -> list[str]:
     return ["gcloud", "compute", "instances", "list", f"--project={project}",
             f"--filter=labels.{ROLE_LABEL}={ROLE_VALUE}",
@@ -695,6 +719,10 @@ class ControlVmManager:
         if result.returncode != 0:
             raise RuntimeError(f"control VM inventory failed: {(result.stderr or '').strip()[:300]}")
         vms = parse_control_vms(json.loads(result.stdout or "[]"))
+        for problem in duplicate_slot_problems(vms):
+            # Split brain risk: never pick one automatically (no origin writes, no deletes); alert and wait.
+            self._note(problem, level=logging.ERROR)
+            problems.append(problem)
         origin, known = None, False
         if self.kv is None:
             problems.append("Cloudflare KV is not configured (CLOUDFLARE_ACCOUNT_ID, "
@@ -926,9 +954,36 @@ class ControlVmManager:
 
     # Each step returns "advance" (continue with fresh observations), "wait", or "done".
 
+    def _reconcile_pending_create(self, t: dict) -> str:
+        """Settle a create whose gcloud call did not succeed: "exists", "absent", or "unknown"."""
+        pending = t.get("pending_create")
+        if not pending:
+            return "absent"
+        result = self.gcloud(describe_command(pending["name"], pending["zone"], self.config.project))
+        if result.returncode == 0:
+            self._note("create of %s in %s failed in gcloud but the instance exists; adopting it",
+                       pending["name"], pending["zone"], level=logging.WARNING)
+            return "exists"
+        if _NOT_FOUND_RE.search(result.stderr or ""):
+            t.pop("pending_create", None)
+            t.setdefault("failed_zones", []).append(pending["zone"])
+            self.save()
+            return "absent"
+        t["error"] = (f"cannot confirm whether {pending['name']} exists in {pending['zone']}: "
+                      f"{(result.stderr or '').strip()[:200]}")
+        self.save()
+        self._note(t["error"], level=logging.WARNING)
+        return "unknown"
+
     def _step_create(self, t: dict, obs: Observation) -> str:
         vm = obs.vm(t["new_slot"])
+        if vm is None and t.get("pending_create"):
+            # A previous create may have landed even though gcloud failed: never try another zone (which
+            # could leave two VMs with this slot's name and identity) until that attempt is settled.
+            if self._reconcile_pending_create(t) != "absent":
+                return "wait"
         if vm is not None:
+            t.pop("pending_create", None)
             t["new_vm"].update(zone=vm.zone, machine_type=vm.machine_type)
             if vm.status in STOPPED_STATES:
                 self._start(vm)
@@ -960,18 +1015,30 @@ class ControlVmManager:
                     command = create_command(self.config, t["new_slot"], offer, str(script_path))
                 except ValueError as exc:
                     return self._create_failed(t, f"invalid control VM settings: {exc}")
-                # Persist the intended identity before the provider call so a crash adopts it.
+                # Persist the intended identity and the pending attempt before the provider call, so a
+                # crash or an ambiguous failure is reconciled in this zone before any other zone is tried.
                 t["new_vm"] = {"name": control_vm_name(t["new_slot"]), "zone": offer.zone,
                                "machine_type": offer.machine_type}
+                t["pending_create"] = {"name": control_vm_name(t["new_slot"]), "zone": offer.zone,
+                                       "machine_type": offer.machine_type, "at": self.clock()}
                 self.save()
                 result = self.gcloud(command)
                 if result.returncode == 0:
+                    t.pop("pending_create", None)
                     self._note("created %s (%s) in %s at $%.4f/day", control_vm_name(t["new_slot"]),
                                offer.machine_type, offer.zone, offer.daily_usd)
                     return self._advance_step(t)
-                t.setdefault("failed_zones", []).append(offer.zone)
-                self._note("create in %s failed: %s", offer.zone, (result.stderr or "").strip()[:300],
-                           level=logging.WARNING)
+                stderr = (result.stderr or "").strip()
+                self._note("create in %s failed: %s", offer.zone, stderr[:300], level=logging.WARNING)
+                if _DEFINITIVE_CREATE_ERROR_RE.search(stderr):
+                    t.pop("pending_create", None)
+                    t.setdefault("failed_zones", []).append(offer.zone)
+                    self.save()
+                    continue
+                outcome = self._reconcile_pending_create(t)
+                if outcome != "absent":
+                    # "exists": wait for the inventory to list it; "unknown": retry the check next tick.
+                    return "wait"
         return self._create_failed(t, "every create attempt this tick failed")
 
     def _create_failed(self, t: dict, error: str) -> str:

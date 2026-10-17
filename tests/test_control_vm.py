@@ -59,6 +59,9 @@ class FakeGcloud:
         self.start_rc = 0
         self.delete_rc = 0
         self.scripts: list[str] = []
+        self.land_but_fail_zones: set[str] = set()  # create succeeds in GCE but gcloud exits nonzero
+        self.describe_error: str | None = None  # ambiguous describe failure (not a 404)
+        self.extra_rows: list[dict] = []  # additional inventory rows (for duplicate-name tests)
 
     def add(self, slot, status="RUNNING", zone="us-central1-a", machine="e2-small"):
         name = f"spot-control-{slot}"
@@ -73,7 +76,8 @@ class FakeGcloud:
         self.calls.append(list(argv))
         verb = argv[2:4]
         if verb == ["instances", "list"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(list(self.vms.values())), stderr="")
+            return SimpleNamespace(returncode=0, stdout=json.dumps(list(self.vms.values()) + self.extra_rows),
+                                   stderr="")
         if verb == ["machine-types", "list"]:
             return SimpleNamespace(returncode=0, stdout="[]", stderr="")
         name = argv[4]
@@ -88,7 +92,19 @@ class FakeGcloud:
             machine = next(a.split("=", 1)[1] for a in argv if a.startswith("--machine-type="))
             self.add(slot, status="PROVISIONING", zone=zone, machine=machine)
             self.events.append(("create", name, zone))
+            if zone in self.land_but_fail_zones:
+                return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: operation polling failed")
             return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        if verb == ["instances", "describe"]:
+            self.events.append(("describe", name, zone))
+            if self.describe_error:
+                return SimpleNamespace(returncode=1, stdout="", stderr=self.describe_error)
+            row = self.vms.get(name)
+            if row and row["zone"].rsplit("/", 1)[-1] == zone:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(row), stderr="")
+            return SimpleNamespace(returncode=1, stdout="",
+                                   stderr=f"ERROR: The resource 'projects/proj/zones/{zone}/instances/{name}' "
+                                          "was not found")
         if verb == ["instances", "start"]:
             self.events.append(("start", name))
             if self.start_rc == 0:
@@ -525,6 +541,71 @@ class ExecutorTests(unittest.TestCase):
         h.tick()
         self.assertEqual([e[0] for e in h.events], ["create_failed", "create"])
         self.assertEqual(h.transition["new_vm"]["zone"], "us-east1-b")
+
+    def test_ambiguous_create_failure_adopts_vm_that_landed(self):
+        h = Harness()
+        self.healthy_active(h)
+        h.gcloud.land_but_fail_zones = {"us-central1-a"}
+        h.tick()
+        creates = [e for e in h.events if e[0] == "create"]
+        self.assertEqual(creates, [("create", "spot-control-b", "us-central1-a")])  # no second zone
+        self.assertIn(("describe", "spot-control-b", "us-central1-a"), h.events)
+        self.assertEqual(h.transition["step"], "create")
+        h.tick()  # the inventory now lists it
+        self.assertEqual(h.transition["step"], "wait_health")
+        self.assertNotIn("pending_create", h.transition)
+        self.assertEqual([e for e in h.events if e[0] == "create"], creates)
+
+    def test_ambiguous_create_failure_confirmed_absent_tries_next_zone(self):
+        h = Harness()
+        self.healthy_active(h)
+        real = h.gcloud.__call__
+
+        def polling_failure_without_vm(argv):
+            if argv[2:4] == ["instances", "create"] and "--zone=us-central1-a" in argv:
+                h.gcloud.calls.append(list(argv))
+                h.events.append(("create_ambiguous", argv[4], "us-central1-a"))
+                return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: deadline exceeded")
+            return real(argv)
+
+        manager = cv.ControlVmManager(h.config, h.state, h.save, gcloud=polling_failure_without_vm, kv=h.kv,
+                                      requester=h.http, offer_source=lambda: list(h.offers),
+                                      clock=lambda: h.clock[0])
+        manager.tick(apply=True)
+        self.assertIn(("describe", "spot-control-b", "us-central1-a"), h.events)
+        self.assertIn(("create", "spot-control-b", "us-east1-b"), h.events)
+        self.assertEqual(h.transition["step"], "wait_health")
+
+    def test_describe_failure_keeps_pending_attempt_and_waits(self):
+        h = Harness()
+        self.healthy_active(h)
+        h.gcloud.land_but_fail_zones = {"us-central1-a"}
+        h.gcloud.describe_error = "ERROR: backend error"
+        h.tick()
+        h.gcloud.vms.pop("spot-control-b")  # GCE later reports it absent
+        h.tick()  # describe still ambiguous: wait, no other zone
+        self.assertEqual([e[2] for e in h.events if e[0] == "create"], ["us-central1-a"])
+        self.assertEqual(h.transition["pending_create"]["zone"], "us-central1-a")
+        self.assertIn("cannot confirm", h.transition["error"])
+        h.gcloud.describe_error = None
+        h.gcloud.land_but_fail_zones = set()
+        h.tick()  # confirmed absent: now another zone may be tried
+        self.assertEqual([e[2] for e in h.events if e[0] == "create"], ["us-central1-a", "us-east1-b"])
+        self.assertEqual(h.transition["step"], "wait_health")
+
+    def test_two_vms_with_one_slot_never_act(self):
+        h = Harness()
+        self.healthy_active(h)
+        h.gcloud.add("b", zone="us-east1-b")
+        row = dict(h.gcloud.vms["spot-control-b"], zone="projects/proj/zones/us-west1-a", id="id-b2")
+        h.gcloud.extra_rows.append(row)
+        h.http.healthy("b")
+        h.kv.set_origin("b")
+        plan = h.tick()
+        self.assertEqual(plan.action, "wait")
+        self.assertIn("more than one control VM for slot b", plan.reason)
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertEqual(h.mutations(), [])
 
     def test_price_create_failures_abort_without_touching_old(self):
         h = Harness()

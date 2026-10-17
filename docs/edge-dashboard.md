@@ -99,6 +99,11 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   the newer of its snapshot and the KV snapshot into the old VM, unfreezes the old VM, points
   `origin:active` back at it, and deletes the new VM. Without a running old VM, it waits and deletes
   nothing.
+- **Uncertain creates**: if `gcloud` reports a failed create without a capacity or quota error, the
+  autoscaler checks that zone for the instance before it tries another zone, and adopts the instance if
+  it exists. If it can't tell, it waits.
+- **Duplicate slots**: if two VMs carry the same slot, the autoscaler logs an error and changes nothing,
+  including `origin:active`, until an operator deletes the extra VM.
 - **Retained boot disks**: when the autoscaler can't confirm that a VM's state reached its successor,
   it deletes the VM with `--keep-disks=boot`. The boot disk keeps the VM's name. The autoscaler logs an
   error and records the disk under `retained_disks` in its controller state, and later creates for that
