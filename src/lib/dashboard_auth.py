@@ -8,8 +8,13 @@ This module is standard-library only. It provides:
   configured controlled target, the user must be an administrator
   (``GET /repos/{owner}/{repo}`` -> ``permissions.admin is True``; ``GET /user/memberships/orgs/{org}``
   -> ``state == "active"`` and ``role == "admin"``). Any API error denies access.
-* Stateless HMAC-SHA256 tokens for sessions, CSRF ``state`` values, and device-flow handles.
-  The GitHub access token is never stored in any token or cookie.
+* Stateless HMAC-SHA256 tokens for sessions and CSRF ``state`` values. The GitHub access token is
+  never stored in any token or cookie.
+* PKCE (S256) on the Authorization Code flow. The ``code_verifier`` is derived from the signed
+  state nonce with a dedicated HMAC key, so it needs no server-side storage and only the browser
+  holding the matching ``__Host-spot_oauth_state`` cookie can complete the exchange.
+* Bounded, thread-safe rate limiting for the unauthenticated login endpoints, a bounded
+  single-use nonce set for ``state``, and server-enforced device-flow polling intervals.
 
 Token format (verifiable by any process holding the same session secret, for example an
 edge worker or a replacement VM)::
@@ -17,10 +22,25 @@ edge worker or a replacement VM)::
     purpose_key = HMAC-SHA256(key=session_secret_utf8, msg=b"spot-dashboard/<purpose>/v1")
     token       = base64url_nopad(compact_json) + "." + hex(HMAC-SHA256(purpose_key, base64url_part_ascii))
 
-``<purpose>`` is ``session``, ``oauth-state``, or ``device``. Session payloads are
-``{"v": 1, "sub": login, "uid": github_id, "iat": epoch, "exp": epoch, "tgt": [verified target keys]}``.
-A session grants access only while ``exp`` is in the future, ``sub`` is still allowlisted, and every
-currently configured controlled target key appears in ``tgt``.
+``<purpose>`` is ``session`` or ``oauth-state`` (``pkce`` is used only to derive verifiers). Session
+payloads are ``{"v": 1, "sub": login, "uid": github_id, "iat": epoch, "exp": epoch, "tgt": [verified
+target keys]}`` and travel in the ``__Host-spot_session`` cookie. A verifier (backend or edge worker)
+must accept a session only when the signature is valid, ``uid`` is a positive integer, ``exp`` is in
+the future, ``iat >= DASHBOARD_SESSION_NOT_BEFORE``, ``sub`` is still allowlisted, and every currently
+configured controlled target key appears in ``tgt``.
+
+Per-process state (login handshakes only): device-flow handles are opaque random strings that map
+to the GitHub ``device_code`` in a bounded in-memory table, so the browser never sees the
+``device_code``. The device poll must therefore reach the same dashboard process that issued the
+handle; the edge pins traffic to one active origin, so this holds in production. A process restart
+abandons in-flight device logins (users request a new code). Sessions stay stateless.
+
+Residual risk (stateless sessions): a session cannot be revoked individually. Removing a login
+from the allowlist or adding a controlled target takes effect on the next request, but losing
+GitHub admin rights on an existing target is noticed only at the next sign-in, so a session can
+outlive a GitHub permission change by up to ``DASHBOARD_SESSION_TTL_SECONDS`` (default 12 hours).
+For bulk revocation set ``DASHBOARD_SESSION_NOT_BEFORE`` to the current Unix time (rejects every
+session issued earlier) or rotate ``DASHBOARD_SESSION_SECRET``, on every backend and edge worker.
 """
 
 from __future__ import annotations
@@ -31,6 +51,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import re
 import secrets
@@ -51,10 +72,14 @@ ENV_SESSION_SECRET = "DASHBOARD_SESSION_SECRET"
 ENV_SESSION_TTL = "DASHBOARD_SESSION_TTL_SECONDS"
 ENV_ALLOWED_ADMINS = "DASHBOARD_ALLOWED_ADMINS"
 ENV_CONTROLLED_TARGETS = "DASHBOARD_CONTROLLED_TARGETS"
+ENV_SESSION_NOT_BEFORE = "DASHBOARD_SESSION_NOT_BEFORE"
 
-SESSION_COOKIE_NAME = "spot_session"
-OAUTH_STATE_COOKIE_NAME = "spot_oauth_state"
-OAUTH_STATE_COOKIE_PATH = "/auth/github"
+# ``__Host-`` cookies must be Secure, Path=/, and carry no Domain, so a sibling subdomain cannot set,
+# overwrite, or shadow them. Browsers treat http://localhost as a secure context; any other origin
+# must be served over HTTPS for these cookies to be stored.
+SESSION_COOKIE_NAME = "__Host-spot_session"
+OAUTH_STATE_COOKIE_NAME = "__Host-spot_oauth_state"
+OAUTH_STATE_COOKIE_PATH = "/"
 
 DEFAULT_SCOPES = "repo read:org"
 DEFAULT_SESSION_TTL_SECONDS = 604_800  # Contract default for create_session_cookie_value.
@@ -70,6 +95,18 @@ MAX_TOKEN_CHARS = 4096
 MAX_GITHUB_RESPONSE_BYTES = 1_048_576
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 CLOCK_SKEW_SECONDS = 60
+MAX_STATE_TOKEN_CHARS = 3072  # Keeps the state cookie well under the 4 KiB browser cookie limit.
+MAX_USED_STATE_NONCES = 4096
+MAX_DEVICE_HANDSHAKES = 1024
+MAX_DYNAMIC_CONTROLLED_TARGETS = 32
+DEVICE_MIN_INTERVAL_SECONDS = 5
+DEVICE_SLOW_DOWN_INCREMENT_SECONDS = 5
+DEVICE_MAX_INTERVAL_SECONDS = 60
+# Rate limits as (per-client-IP requests, global requests) per 60-second window.
+LOGIN_START_RATE_LIMIT = (10, 30)  # /auth/device/code, /auth/github/login, target-change re-auth
+LOGIN_COMPLETE_RATE_LIMIT = (60, 240)  # /auth/device/token, /auth/github/callback
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+MAX_RATE_LIMIT_KEYS = 4096
 
 GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
@@ -92,6 +129,72 @@ HttpRequester = Callable[..., "tuple[int, bytes]"]
 
 class GitHubApiError(RuntimeError):
     """Raised when a GitHub OAuth or REST call fails or returns an unusable response."""
+
+
+class AuthCapacityError(RuntimeError):
+    """Raised when a bounded login table is full; callers answer 429 with ``Retry-After``."""
+
+    def __init__(self, message: str, retry_after: float = 60.0) -> None:
+        super().__init__(message)
+        self.retry_after = max(1, int(math.ceil(retry_after)))
+
+
+# --- Rate limiting ---
+
+
+class RateLimiter:
+    """Thread-safe fixed-window rate limiter with a per-key limit, a global limit, and bounded keys.
+
+    When the key table is full and no window has expired, unseen keys are refused (fail closed)
+    instead of evicting live windows, so rotating source addresses cannot reset other clients.
+    """
+
+    def __init__(
+        self,
+        per_key_limit: int,
+        global_limit: int,
+        window_seconds: float = RATE_LIMIT_WINDOW_SECONDS,
+        *,
+        max_keys: int = MAX_RATE_LIMIT_KEYS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if per_key_limit < 1 or global_limit < 1 or window_seconds <= 0 or max_keys < 1:
+            raise ValueError("Rate limits, window, and key capacity must be positive")
+        self.per_key_limit = int(per_key_limit)
+        self.global_limit = int(global_limit)
+        self.window_seconds = float(window_seconds)
+        self.max_keys = int(max_keys)
+        self._clock = clock
+        self._keys: dict[str, list[float]] = {}  # key -> [window_start, count]
+        self._global = [0.0, 0]
+        self._lock = threading.Lock()
+
+    def check(self, key: str) -> float:
+        """Count one request. Returns 0.0 when allowed, otherwise the seconds to wait (Retry-After)."""
+        now = float(self._clock())
+        with self._lock:
+            if now - self._global[0] >= self.window_seconds:
+                self._global = [now, 0]
+            entry = self._keys.get(key)
+            if entry is not None and now - entry[0] >= self.window_seconds:
+                entry = None
+                del self._keys[key]
+            if entry is None and len(self._keys) >= self.max_keys:
+                for k in [k for k, e in self._keys.items() if now - e[0] >= self.window_seconds]:
+                    del self._keys[k]
+                if len(self._keys) >= self.max_keys:
+                    oldest = min(e[0] for e in self._keys.values())
+                    return max(1.0, oldest + self.window_seconds - now)
+            if self._global[1] >= self.global_limit:
+                return max(1.0, self._global[0] + self.window_seconds - now)
+            if entry is not None and entry[1] >= self.per_key_limit:
+                return max(1.0, entry[0] + self.window_seconds - now)
+            if entry is None:
+                entry = [now, 0]
+                self._keys[key] = entry
+            entry[1] += 1
+            self._global[1] += 1
+            return 0.0
 
 
 # --- Allowlist and controlled-target parsing ---
@@ -202,6 +305,46 @@ def parse_controlled_targets_env(raw: str | None) -> list[ControlledTarget]:
     return parse_controlled_targets(_split_list(raw or ""))
 
 
+def target_list_digest(names: Iterable[str]) -> str:
+    """SHA-256 of a dynamic target list, used as a compare-and-swap base for pending changes."""
+    return hashlib.sha256(json.dumps([str(n) for n in names], separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class TargetChange:
+    """A proposed dynamic controlled-target list awaiting a fresh GitHub verification.
+
+    ``targets`` is the proposed list, ``base`` is :func:`target_list_digest` of the list it replaces
+    (the change is refused if the stored list moved on), and ``uid``/``login`` identify the session
+    that proposed it; only the same GitHub account can complete it.
+    """
+
+    targets: tuple[str, ...]
+    base: str
+    uid: int
+    login: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"t": list(self.targets), "b": self.base, "u": self.uid, "l": self.login}
+
+    @classmethod
+    def from_payload(cls, data: Any) -> TargetChange | None:
+        if not isinstance(data, Mapping):
+            return None
+        t, b, u, login = data.get("t"), data.get("b"), data.get("u"), data.get("l")
+        if not isinstance(t, list) or len(t) > MAX_DYNAMIC_CONTROLLED_TARGETS:
+            return None
+        try:
+            names = tuple(x.name for x in parse_controlled_targets(t))
+        except ValueError:
+            return None
+        if len(names) != len(t) or not isinstance(b, str) or not _HEX64_RE.match(b):
+            return None
+        if not _is_int(u) or u <= 0 or not isinstance(login, str) or not _LOGIN_RE.match(login):
+            return None
+        return cls(targets=names, base=b, uid=u, login=login)
+
+
 # --- Signed token primitives ---
 
 
@@ -250,12 +393,16 @@ def _is_int(value: Any) -> bool:
 
 
 def safe_return_path(value: Any) -> str:
-    """Accept only same-origin absolute paths (no scheme, host, backslash, or control characters)."""
+    """Accept only same-origin absolute paths of printable ASCII (no scheme, host, or backslash).
+
+    Anything outside 0x21-0x7E (controls, spaces, DEL, non-ASCII) falls back to ``/`` so the value is
+    always safe to emit in a ``Location`` header.
+    """
     if not isinstance(value, str) or not value or len(value) > 512:
         return "/"
     if not value.startswith("/") or value.startswith("//") or "\\" in value:
         return "/"
-    if any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in value):
+    if any(not 0x21 <= ord(ch) <= 0x7E for ch in value):
         return "/"
     parsed = urllib.parse.urlsplit(value)
     if parsed.scheme or parsed.netloc:
@@ -266,7 +413,7 @@ def safe_return_path(value: Any) -> str:
 @dataclass(frozen=True)
 class SessionData:
     user_login: str
-    user_id: int | None
+    user_id: int
     issued_at: int
     expires_at: int
     verified_targets: tuple[str, ...] = ()
@@ -288,7 +435,7 @@ class SessionData:
         sub, uid, iat, exp, tgt = data.get("sub"), data.get("uid"), data.get("iat"), data.get("exp"), data.get("tgt")
         if not isinstance(sub, str) or not _LOGIN_RE.match(sub):
             return None
-        if uid is not None and not _is_int(uid):
+        if not _is_int(uid) or uid <= 0:  # Identity is pinned to the GitHub numeric id.
             return None
         if not _is_int(iat) or not _is_int(exp) or exp <= iat:
             return None
@@ -449,10 +596,12 @@ class SessionCheck:
 
 
 class TargetVerificationCache:
-    """Thread-safe, bounded cache of POSITIVE admin verifications keyed by (login, target key).
+    """Thread-safe, bounded cache of POSITIVE admin verifications keyed by (uid, login, target key).
 
-    Denials and API errors are never cached, so a newly granted admin is not locked out and a
-    transient GitHub error never turns into a cached decision.
+    Keying by the GitHub numeric id as well as the login means a deleted-and-recreated or renamed
+    account never inherits another account's cached verification. Denials and API errors are never
+    cached, so a newly granted admin is not locked out and a transient GitHub error never turns into
+    a cached decision.
     """
 
     def __init__(
@@ -464,11 +613,11 @@ class TargetVerificationCache:
         self.ttl_seconds = float(ttl_seconds)
         self.max_entries = int(max_entries)
         self._clock = clock
-        self._entries: dict[tuple[str, str], float] = {}
+        self._entries: dict[tuple[int, str, str], float] = {}
         self._lock = threading.Lock()
 
-    def is_verified(self, login: str, target_key: str) -> bool:
-        k = (login.lower(), target_key.lower())
+    def is_verified(self, uid: int, login: str, target_key: str) -> bool:
+        k = (int(uid), login.lower(), target_key.lower())
         now = self._clock()
         with self._lock:
             exp = self._entries.get(k)
@@ -479,7 +628,7 @@ class TargetVerificationCache:
                 return False
             return True
 
-    def mark_verified(self, login: str, target_key: str) -> None:
+    def mark_verified(self, uid: int, login: str, target_key: str) -> None:
         if self.ttl_seconds <= 0:
             return
         now = self._clock()
@@ -489,11 +638,32 @@ class TargetVerificationCache:
                     del self._entries[k]
                 while len(self._entries) >= self.max_entries:
                     del self._entries[next(iter(self._entries))]
-            self._entries[(login.lower(), target_key.lower())] = now + self.ttl_seconds
+            self._entries[(int(uid), login.lower(), target_key.lower())] = now + self.ttl_seconds
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+
+
+@dataclass(frozen=True)
+class OAuthStateResult:
+    """Outcome of validating an Authorization Code ``state`` against the browser's state cookie."""
+
+    ok: bool
+    return_to: str = "/"
+    code_verifier: str = ""
+    target_change: TargetChange | None = None
+
+
+@dataclass
+class DeviceHandshake:
+    """Server-side record behind an opaque device handle (never sent to the browser)."""
+
+    device_code: str
+    expires_at: float
+    interval: int
+    next_poll_at: float
+    target_change: TargetChange | None = None
 
 
 # --- OAuth manager ---
@@ -516,6 +686,7 @@ class GitHubOAuthManager:
         timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
         verification_cache: TargetVerificationCache | None = None,
         clock: Callable[[], float] = time.time,
+        session_not_before: int = 0,
     ) -> None:
         cid = str(client_id or "").strip()
         if not _CLIENT_ID_RE.match(cid):
@@ -541,6 +712,11 @@ class GitHubOAuthManager:
             parsed = urllib.parse.urlsplit(redirect)
             if parsed.scheme not in ("https", "http") or not parsed.netloc or parsed.fragment:
                 raise ValueError(f"{ENV_REDIRECT_URI} must be an absolute http(s) URL without a fragment")
+        if not _is_int(session_not_before) or session_not_before < 0:
+            raise ValueError(f"{ENV_SESSION_NOT_BEFORE} must be a non-negative integer Unix timestamp")
+        if session_not_before > clock() + CLOCK_SKEW_SECONDS:
+            # A future cut-off would also reject every newly issued session (sign-in loop).
+            raise ValueError(f"{ENV_SESSION_NOT_BEFORE} must not be in the future")
         self.client_id = cid
         self.client_secret = str(client_secret or "").strip()
         self.allowed_admins: frozenset[str] = admins
@@ -551,11 +727,18 @@ class GitHubOAuthManager:
         self._request = http_requester or default_http_request
         self._clock = clock
         self.verification_cache = verification_cache or TargetVerificationCache(clock=clock)
+        self.session_not_before = int(session_not_before)
         self._session_key = derive_purpose_key(secret_bytes, "session")
         self._state_key = derive_purpose_key(secret_bytes, "oauth-state")
-        self._device_key = derive_purpose_key(secret_bytes, "device")
+        self._pkce_key = derive_purpose_key(secret_bytes, "pkce")
         self._used_state_nonces: dict[str, float] = {}
         self._nonce_lock = threading.Lock()
+        self._device_handshakes: dict[str, DeviceHandshake] = {}
+        self._device_lock = threading.Lock()
+        self.rate_limiters: dict[str, RateLimiter] = {
+            "start": RateLimiter(*LOGIN_START_RATE_LIMIT, clock=clock),
+            "complete": RateLimiter(*LOGIN_COMPLETE_RATE_LIMIT, clock=clock),
+        }
 
     # -- configuration --
 
@@ -597,10 +780,16 @@ class GitHubOAuthManager:
             ttl = int(ttl_raw) if ttl_raw else DEFAULT_DASHBOARD_SESSION_TTL_SECONDS
         except ValueError as exc:
             raise ValueError(f"{ENV_SESSION_TTL} must be an integer number of seconds") from exc
+        nbf_raw = str(env.get(ENV_SESSION_NOT_BEFORE, "") or "").strip()
+        try:
+            nbf = int(nbf_raw) if nbf_raw else 0
+        except ValueError as exc:
+            raise ValueError(f"{ENV_SESSION_NOT_BEFORE} must be an integer Unix timestamp") from exc
         params: dict[str, Any] = {
             "scopes": str(env.get(ENV_SCOPES, "") or "") or DEFAULT_SCOPES,
             "redirect_uri": str(env.get(ENV_REDIRECT_URI, "") or ""),
             "session_ttl_seconds": ttl,
+            "session_not_before": nbf,
         }
         params.update(kwargs)
         return cls(client_id, client_secret, admins, str(env.get(ENV_SESSION_SECRET, "") or ""), **params)
@@ -703,11 +892,105 @@ class GitHubOAuthManager:
             return {"status": "error", "error": "invalid_token_response"}
         return {"status": "success", "access_token": token.strip(), "scope": str(data.get("scope", ""))}
 
-    # -- Authorization Code flow --
+    # -- Device login handshakes (opaque handle -> server-side device_code) --
+
+    def _prune_device_handshakes(self, now: float) -> None:
+        for k in [k for k, h in self._device_handshakes.items() if h.expires_at <= now]:
+            del self._device_handshakes[k]
+
+    def begin_device_login(self, target_change: TargetChange | None = None) -> dict[str, Any]:
+        """Start a device login and return the browser-safe fields plus an opaque ``device_handle``.
+
+        Raises :class:`AuthCapacityError` (before calling GitHub) when the handshake table is full,
+        and :class:`GitHubApiError` when GitHub refuses. The ``device_code`` stays server-side.
+        """
+        with self._device_lock:
+            self._prune_device_handshakes(self._clock())
+            if len(self._device_handshakes) >= MAX_DEVICE_HANDSHAKES:
+                raise AuthCapacityError("Too many device logins in progress; try again later")
+        started = self.start_device_flow()
+        now = self._clock()
+        handle = secrets.token_urlsafe(32)
+        with self._device_lock:
+            self._prune_device_handshakes(now)
+            if len(self._device_handshakes) >= MAX_DEVICE_HANDSHAKES:
+                raise AuthCapacityError("Too many device logins in progress; try again later")
+            self._device_handshakes[handle] = DeviceHandshake(
+                device_code=started["device_code"],
+                expires_at=now + started["expires_in"],
+                interval=started["interval"],
+                next_poll_at=now + started["interval"],
+                target_change=target_change,
+            )
+        return {
+            "user_code": started["user_code"],
+            "verification_uri": started["verification_uri"],
+            "expires_in": started["expires_in"],
+            "interval": started["interval"],
+            "device_handle": handle,
+        }
+
+    def poll_device_login(self, handle: Any) -> dict[str, Any]:
+        """Poll GitHub for an opaque handle, enforcing the polling interval server-side.
+
+        A poll that arrives before the handle's next allowed time is answered ``slow_down`` (with the
+        interval raised by 5 seconds, as RFC 8628 requires of clients) without contacting GitHub.
+        Terminal outcomes consume the handle. ``success`` carries ``access_token`` (never forward it)
+        and the bound ``target_change`` (or None).
+        """
+        if not isinstance(handle, str) or not handle or len(handle) > 128:
+            return {"status": "invalid"}
+        now = self._clock()
+        with self._device_lock:
+            entry = self._device_handshakes.get(handle)
+            if entry is None:
+                return {"status": "invalid"}
+            if entry.expires_at <= now:
+                del self._device_handshakes[handle]
+                return {"status": "expired", "error": "expired_token"}
+            if now < entry.next_poll_at:
+                entry.interval = min(entry.interval + DEVICE_SLOW_DOWN_INCREMENT_SECONDS, DEVICE_MAX_INTERVAL_SECONDS)
+                entry.next_poll_at = now + entry.interval
+                return {"status": "slow_down", "error": "slow_down", "interval": entry.interval}
+            entry.next_poll_at = now + entry.interval
+            device_code, change = entry.device_code, entry.target_change
+        polled = self.poll_device_token(device_code)
+        status = polled.get("status")
+        with self._device_lock:
+            entry = self._device_handshakes.get(handle)
+            if status == "slow_down" and entry is not None:
+                gh_interval = polled.get("interval")
+                bumped = entry.interval + DEVICE_SLOW_DOWN_INCREMENT_SECONDS
+                if _is_int(gh_interval) and gh_interval > bumped:
+                    bumped = gh_interval
+                entry.interval = min(bumped, DEVICE_MAX_INTERVAL_SECONDS)
+                entry.next_poll_at = self._clock() + entry.interval
+                polled = {**polled, "interval": entry.interval}
+            elif status not in ("pending", "slow_down") and not (
+                status == "error" and polled.get("error") == "github_unavailable"
+            ):
+                self._device_handshakes.pop(handle, None)
+        if status == "success":
+            polled = {**polled, "target_change": change}
+        return polled
+
+    # -- Authorization Code flow (with PKCE S256) --
+
+    def _pkce_verifier(self, nonce: str) -> str:
+        """Derive the 43-character PKCE code_verifier for a state nonce (RFC 7636 unreserved chars)."""
+        return _b64encode(hmac.new(self._pkce_key, nonce.encode("ascii"), hashlib.sha256).digest())
+
+    @staticmethod
+    def pkce_challenge(verifier: str) -> str:
+        return _b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
 
     def create_authorize_url(self, redirect_uri: str, state: str) -> str:
         if not self.web_flow_enabled:
             raise ValueError(f"Web login requires {ENV_CLIENT_ID} and {ENV_CLIENT_SECRET}")
+        data = verify_token(self._state_key, state)
+        nonce = data.get("n") if data else None
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+            raise ValueError("create_authorize_url requires a state created by create_state")
         query = urllib.parse.urlencode(
             {
                 "client_id": self.client_id,
@@ -715,16 +998,20 @@ class GitHubOAuthManager:
                 "scope": self.scopes,
                 "state": state,
                 "allow_signup": "false",
+                "code_challenge": self.pkce_challenge(self._pkce_verifier(nonce)),
+                "code_challenge_method": "S256",
             }
         )
         return f"{GITHUB_AUTHORIZE_URL}?{query}"
 
-    def exchange_code_for_token(self, code: str, redirect_uri: str) -> dict[str, Any]:
-        """Exchange an authorization code. Returns ``{"access_token": ..., "scope": ...}`` or raises."""
+    def exchange_code_for_token(self, code: str, redirect_uri: str, code_verifier: str) -> dict[str, Any]:
+        """Exchange an authorization code with its PKCE verifier. Returns ``{"access_token", "scope"}`` or raises."""
         if not self.web_flow_enabled:
             raise GitHubApiError("Web login is not configured")
         if not isinstance(code, str) or not _OPAQUE_RE.match(code):
             raise GitHubApiError("Invalid authorization code")
+        if not isinstance(code_verifier, str) or not re.fullmatch(r"[A-Za-z0-9._~-]{43,128}", code_verifier):
+            raise GitHubApiError("Invalid PKCE code_verifier")
         status, data = self._post_form(
             GITHUB_ACCESS_TOKEN_URL,
             {
@@ -732,6 +1019,7 @@ class GitHubOAuthManager:
                 "client_secret": self.client_secret,
                 "code": code,
                 "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
             },
         )
         if "error" in data:
@@ -743,53 +1031,77 @@ class GitHubOAuthManager:
 
     # -- CSRF state (stateless, HMAC-bound, expiring, bound to a browser cookie) --
 
-    def create_state(self, return_to: str = "/") -> str:
-        now = int(self._clock())
-        return sign_token(
-            self._state_key,
-            {"v": 1, "n": secrets.token_hex(16), "iat": now, "exp": now + DEFAULT_STATE_TTL_SECONDS, "r": safe_return_path(return_to)},
-        )
+    def _prune_used_nonces(self, now: float) -> None:
+        for k in [k for k, e in self._used_state_nonces.items() if e <= now]:
+            del self._used_state_nonces[k]
 
-    def validate_state(self, state: Any, cookie_state: Any) -> tuple[bool, str]:
-        """Validate the callback ``state`` against the signed-cookie copy. Returns (ok, return_to)."""
+    def _nonce_capacity_retry_after(self, now: float) -> float:
+        return max(1.0, min(self._used_state_nonces.values()) - now) if self._used_state_nonces else 1.0
+
+    def create_state(self, return_to: str = "/", *, target_change: TargetChange | None = None) -> str:
+        """Create a signed, expiring ``state``; optionally bind a pending controlled-target change.
+
+        Raises :class:`AuthCapacityError` when the single-use nonce table is full (new logins are
+        refused instead of evicting live nonces) and ValueError when the state would not fit in a cookie.
+        """
+        now_f = self._clock()
+        with self._nonce_lock:
+            self._prune_used_nonces(now_f)
+            if len(self._used_state_nonces) >= MAX_USED_STATE_NONCES:
+                raise AuthCapacityError(
+                    "Too many recent sign-ins; try again later", self._nonce_capacity_retry_after(now_f)
+                )
+        now = int(now_f)
+        payload: dict[str, Any] = {
+            "v": 1,
+            "n": secrets.token_hex(16),
+            "iat": now,
+            "exp": now + DEFAULT_STATE_TTL_SECONDS,
+            "r": safe_return_path(return_to),
+        }
+        if target_change is not None:
+            payload["tc"] = target_change.to_payload()
+        state = sign_token(self._state_key, payload)
+        if len(state) > MAX_STATE_TOKEN_CHARS:
+            raise ValueError("The proposed controlled-target list is too large for a sign-in request")
+        return state
+
+    def validate_state(self, state: Any, cookie_state: Any) -> OAuthStateResult:
+        """Validate the callback ``state`` against the browser's state cookie (single use).
+
+        On success the result carries the sanitized return path, the PKCE ``code_verifier`` derived
+        from the state nonce, and any bound :class:`TargetChange`.
+        """
+        fail = OAuthStateResult(False)
         if not isinstance(state, str) or not isinstance(cookie_state, str) or not state or not cookie_state:
-            return False, "/"
+            return fail
         if len(state) > MAX_TOKEN_CHARS or len(cookie_state) > MAX_TOKEN_CHARS:
-            return False, "/"
+            return fail
         if not hmac.compare_digest(state.encode("utf-8", "replace"), cookie_state.encode("utf-8", "replace")):
-            return False, "/"
+            return fail
         data = verify_token(self._state_key, state)
         if data is None or data.get("v") != 1:
-            return False, "/"
+            return fail
         nonce, iat, exp = data.get("n"), data.get("iat"), data.get("exp")
         now = self._clock()
-        if not isinstance(nonce, str) or not _is_int(iat) or not _is_int(exp):
-            return False, "/"
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce) or not _is_int(iat) or not _is_int(exp):
+            return fail
         if exp <= now or iat > now + CLOCK_SKEW_SECONDS or exp - iat > DEFAULT_STATE_TTL_SECONDS:
-            return False, "/"
+            return fail
+        change = None
+        if "tc" in data:
+            change = TargetChange.from_payload(data.get("tc"))
+            if change is None:
+                return fail
         with self._nonce_lock:
-            for k in [k for k, e in self._used_state_nonces.items() if e <= now]:
-                del self._used_state_nonces[k]
+            self._prune_used_nonces(now)
             if nonce in self._used_state_nonces:
-                return False, "/"
+                return fail
+            if len(self._used_state_nonces) >= MAX_USED_STATE_NONCES:
+                # Cannot record the nonce, so single use cannot be guaranteed: refuse.
+                return fail
             self._used_state_nonces[nonce] = float(exp)
-        return True, safe_return_path(data.get("r"))
-
-    # -- Device handle (keeps the browser from submitting arbitrary device codes) --
-
-    def seal_device_code(self, device_code: str, expires_in: int) -> str:
-        now = int(self._clock())
-        ttl = max(1, min(int(expires_in), MAX_DEVICE_HANDLE_TTL_SECONDS))
-        return sign_token(self._device_key, {"v": 1, "dc": device_code, "iat": now, "exp": now + ttl})
-
-    def open_device_handle(self, handle: Any) -> str | None:
-        data = verify_token(self._device_key, handle)
-        if data is None or data.get("v") != 1:
-            return None
-        dc, exp = data.get("dc"), data.get("exp")
-        if not isinstance(dc, str) or not _OPAQUE_RE.match(dc) or not _is_int(exp) or exp <= self._clock():
-            return None
-        return dc
+        return OAuthStateResult(True, safe_return_path(data.get("r")), self._pkce_verifier(nonce), change)
 
     # -- GitHub identity and admin verification --
 
@@ -802,8 +1114,16 @@ class GitHubOAuthManager:
             raise GitHubApiError("GitHub /user returned an invalid identity")
         return login, uid
 
-    def check_target_admin(self, access_token: str, login: str, target: ControlledTarget) -> TargetCheck:
-        if self.verification_cache.is_verified(login, target.key):
+    def check_target_admin(
+        self,
+        access_token: str,
+        login: str,
+        uid: int,
+        target: ControlledTarget,
+        *,
+        use_cache: bool = True,
+    ) -> TargetCheck:
+        if use_cache and self.verification_cache.is_verified(uid, login, target.key):
             return TargetCheck(target.name, target.key, target.kind, True, "verified (cached)", cached=True)
         try:
             status, data = self._api_get(target.api_path(), access_token)
@@ -821,11 +1141,22 @@ class GitHubOAuthManager:
                 f"membership state={data.get('state')!r} role={data.get('role')!r}; need active admin"
             )
         if ok:
-            self.verification_cache.mark_verified(login, target.key)
+            self.verification_cache.mark_verified(uid, login, target.key)
         return TargetCheck(target.name, target.key, target.kind, ok, reason)
 
-    def authorize(self, access_token: str, controlled_targets: Iterable[Any] | None) -> AuthorizationDecision:
-        """Fail-closed authorization: allowlisted login AND admin on every controlled target."""
+    def authorize(
+        self,
+        access_token: str,
+        controlled_targets: Iterable[Any] | None,
+        *,
+        use_cache: bool = True,
+        expected_uid: int | None = None,
+    ) -> AuthorizationDecision:
+        """Fail-closed authorization: allowlisted login AND admin on every controlled target.
+
+        ``use_cache=False`` forces a fresh GitHub check of every target (used before committing a
+        controlled-target change). ``expected_uid`` requires the token to belong to that GitHub id.
+        """
         if not isinstance(access_token, str) or not access_token.strip():
             return AuthorizationDecision(False, 403, "Forbidden: missing GitHub access token")
         token = access_token.strip()
@@ -843,7 +1174,13 @@ class GitHubOAuthManager:
                 False, 403, f"Forbidden: GitHub user '{login}' is not an authorized administrator",
                 user_login=login, user_id=uid, controlled_targets=names,
             )
-        checks = [self.check_target_admin(token, login, t) for t in targets]
+        if expected_uid is not None and uid != expected_uid:
+            return AuthorizationDecision(
+                False, 403,
+                f"Forbidden: GitHub user '{login}' is not the account that requested this change",
+                user_login=login, user_id=uid, controlled_targets=names,
+            )
+        checks = [self.check_target_admin(token, login, uid, t, use_cache=use_cache) for t in targets]
         verified = [c.target for c in checks if c.is_admin]
         missing = [c.target for c in checks if not c.is_admin]
         if missing:
@@ -874,11 +1211,13 @@ class GitHubOAuthManager:
         user: str,
         ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS,
         *,
-        user_id: int | None = None,
+        user_id: int,
         verified_targets: Iterable[str] = (),
     ) -> str:
         if not isinstance(user, str) or not _LOGIN_RE.match(user):
             raise ValueError("Session user must be a valid GitHub login")
+        if not _is_int(user_id) or user_id <= 0:
+            raise ValueError("Session user_id must be the positive GitHub numeric user id")
         ttl = max(1, min(int(ttl_seconds), MAX_SESSION_TTL_SECONDS))
         now = int(self._clock())
         session = SessionData(
@@ -911,6 +1250,8 @@ class GitHubOAuthManager:
         if session.expires_at <= now or session.issued_at > now + CLOCK_SKEW_SECONDS:
             return None
         if session.expires_at - session.issued_at > MAX_SESSION_TTL_SECONDS:
+            return None
+        if session.issued_at < self.session_not_before:  # Bulk revocation cut-off.
             return None
         return session
 
@@ -1015,6 +1356,9 @@ def render_login_gate_html(
       if (Date.now() > deadline) { status.textContent = "Code expired. Request a new one."; start.disabled = false; return; }
       const [pr, pd] = await postJson("/auth/device/token", {device_handle: d.device_handle});
       if (pr.ok && pd.status === "authorized") { window.location.assign("/"); return; }
+      if (pr.status === 429) {
+        setTimeout(poll, Math.max(interval, Number(pr.headers.get("Retry-After")) || interval) * 1000); return;
+      }
       if (pr.ok && (pd.status === "pending" || pd.status === "slow_down")) {
         if (pd.interval) interval = Math.max(interval, Number(pd.interval) || interval);
         setTimeout(poll, interval * 1000); return;
