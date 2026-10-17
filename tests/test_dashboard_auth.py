@@ -2242,9 +2242,11 @@ class GlobalAdminTests(unittest.TestCase):
         self.assertEqual(dashboard_auth.parse_global_admins(None), frozenset({("swackhamer", 619624)}))
         self.assertEqual(dashboard_auth.parse_global_admins(""), frozenset({("swackhamer", 619624)}))
         self.assertEqual(dashboard_auth.parse_global_admins("none"), frozenset())
-        self.assertEqual(dashboard_auth.parse_global_admins("Swackhamer:619624, other:5"),
-                         frozenset({("swackhamer", 619624), ("other", 5)}))
-        for bad in ("swackhamer", "swackhamer:abc", "swackhamer:0", "bad login:1"):
+        self.assertEqual(dashboard_auth.parse_global_admins("Swackhamer:619624"),
+                         frozenset({("swackhamer", 619624)}))
+        # Only the identity that can sign in at all may be listed (PR review).
+        for bad in ("swackhamer", "swackhamer:abc", "swackhamer:0", "bad login:1", "alice:123",
+                    "swackhamer:1", "swackhamer:619624, alice:123"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 dashboard_auth.parse_global_admins(bad)
         env = {"GITHUB_OAUTH_CLIENT_ID": CLIENT_ID, "GITHUB_OAUTH_CLIENT_SECRET": "x", "DASHBOARD_SESSION_SECRET": SECRET}
@@ -2265,8 +2267,12 @@ class GlobalAdminTests(unittest.TestCase):
         decision = mgr.authorize("tok", targets)
         self.assertTrue(decision.authorized, decision.message)
         self.assertEqual(fake2.api_paths(), ["/user"])  # no per-target GitHub calls
+        self.assertEqual(decision.verified_targets, [])  # skipped checks are never certified
         session = mgr.issue_session(decision)
         self.assertEqual(mgr.check_session(session, targets + ["swack-tools"]).status, "ok")
+        # Policy changes to "none": the same session is now held to target coverage and refused.
+        strict = make_manager(fake2, global_admins=[])
+        self.assertEqual(strict.check_session(session, targets).status, "forbidden")
 
     def test_uid_pinning(self):
         fake = FakeGitHub()

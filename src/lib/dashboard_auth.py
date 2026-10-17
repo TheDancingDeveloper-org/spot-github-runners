@@ -253,6 +253,11 @@ def parse_global_admins(raw: str | None) -> frozenset[tuple[str, int]]:
         login, sep, uid = item.partition(":")
         if not sep or not _LOGIN_RE.match(login) or not uid.isdigit() or int(uid) <= 0:
             raise ValueError(f"{ENV_GLOBAL_ADMINS} entries must be login:numeric_id, got {item!r}")
+        if not is_allowed_identity(login, int(uid)):
+            # Only the hardcoded identity can sign in at all (dashboard and edge Worker); an entry for
+            # anyone else could never take effect, so refuse it instead of accepting a dead setting.
+            raise ValueError(f"{ENV_GLOBAL_ADMINS} may only list the dashboard administrator "
+                             f"{ALLOWED_ADMIN_LOGIN}:{ALLOWED_ADMIN_ID}, got {item!r}")
         out.add((login.lower(), int(uid)))
     return frozenset(out)
 
@@ -1273,9 +1278,11 @@ class GitHubOAuthManager:
         login = ALLOWED_ADMIN_LOGIN
         if self.is_global_admin(login, uid):
             # Configured exception: a global administrator is not required to administer every target.
+            # No target was checked, so none is recorded as verified: if the policy later stops treating
+            # this identity as global, its existing session no longer passes the target coverage check.
             return AuthorizationDecision(
                 True, 200, f"Authorized global administrator '{login}' (per-target admin checks not required)",
-                user_login=login, user_id=uid, controlled_targets=names, verified_targets=list(names),
+                user_login=login, user_id=uid, controlled_targets=names, verified_targets=[],
             )
         checks = [self.check_target_admin(token, login, uid, t, use_cache=use_cache) for t in targets]
         verified = [c.target for c in checks if c.is_admin]
