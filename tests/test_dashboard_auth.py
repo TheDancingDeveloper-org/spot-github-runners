@@ -1908,6 +1908,15 @@ class StoreTargetPolicyTests(unittest.TestCase):
     def backups(self):
         return sorted(p for p in self.path.parent.iterdir() if ".corrupt-" in p.name)
 
+    def marker(self):
+        return self.path.parent / "state.json.recovery-pending"
+
+    def operator_repaired(self):
+        """What an operator does after inspecting a backup: remove it and the recovery hold."""
+        for old in self.backups():
+            old.unlink()
+        self.marker().unlink(missing_ok=True)
+
     def assert_fails_closed(self, store):
         self.assertTrue(store.recovery_pending)
         self.assertFalse(store.hydrated)
@@ -1931,8 +1940,7 @@ class StoreTargetPolicyTests(unittest.TestCase):
     def test_inaccessible_state_file_is_kept_aside_and_fails_closed(self):
         for exc in (PermissionError(13, "Permission denied"), IsADirectoryError(21, "Is a directory"),
                     OSError(5, "Input/output error")):
-            for old in self.backups():
-                old.unlink()
+            self.operator_repaired()
             original = self.seeded()
             # Path.exists() also "lies" (False) when stat fails with EACCES; the store must not rely on it.
             with mock.patch.object(Path, "read_text", side_effect=exc), \
@@ -1997,8 +2005,7 @@ class StoreTargetPolicyTests(unittest.TestCase):
         self.seeded()
         for corrupt in (self.path.read_bytes()[:-5], b"\xff\xfe not utf-8", b"[1, 2]", b'"text"',
                         b'{"controlled_targets": "not-a-list"}'):
-            for old in self.backups():
-                old.unlink()
+            self.operator_repaired()
             self.path.write_bytes(corrupt)
             store = self.open_store()
             with self.subTest(corrupt=corrupt[:20]):
@@ -2098,6 +2105,105 @@ class StoreTargetPolicyTests(unittest.TestCase):
         self.assertEqual(store.get_controlled_targets(), ["imported/repo"])
         self.assertEqual(json.loads(self.path.read_text())["controlled_targets"], ["imported/repo"])
         self.assertEqual(self.backups()[0].read_bytes(), b"{broken")
+
+    # -- Codex round 7 P1: a durable recovery hold survives a restart between the rename and the recovery --
+
+    def test_hold_is_durable_before_the_rename(self):
+        self.path.write_text("{broken", encoding="utf-8")
+        real_rename = os.rename
+        seen = []
+
+        def rename(src, dst):
+            seen.append(os.path.lexists(self.marker()))  # the hold must already be on disk
+            return real_rename(src, dst)
+
+        with mock.patch("lib.dashboard_server.os.rename", side_effect=rename):
+            store = self.open_store()
+        self.assertEqual(seen, [True])
+        self.assertEqual(self.marker().stat().st_mode & 0o777, 0o600)
+        recorded = json.loads(self.marker().read_text(encoding="utf-8"))
+        self.assertEqual(recorded["backup"], str(store.state_backup_path))
+        self.assertIn("could not be loaded", recorded["reason"])
+
+    def test_restart_after_rename_without_kv_stays_closed(self):
+        self.seeded()
+        self.path.write_text("{broken", encoding="utf-8")
+        first = self.open_store()
+        backup = first.state_backup_path
+        self.assertFalse(self.path.exists())
+        # The container restarts: the state path is now empty, which must NOT mean "start from defaults".
+        for _ in range(2):
+            with self.assertLogs("spot_dashboard", "ERROR"):
+                again = DashboardStore(state_path=self.path)
+            health = self.assert_fails_closed(again)
+            self.assertIn("still pending", health["reason"])
+            self.assertEqual(health["state_backup"], str(backup))
+            again.start()  # no KV: nothing verified to recover from
+            self.assertFalse(again.hydrated)
+            self.assertFalse(self.path.exists())
+        self.assertEqual(backup.read_text(encoding="utf-8"), "{broken")
+
+    def test_restart_after_rename_with_kv_recovers_and_releases_the_hold(self):
+        self.path.write_text("{broken", encoding="utf-8")
+        self.open_store(kv=True)  # moved aside; KV had nothing yet
+        with self.assertLogs("spot_dashboard", "ERROR"):
+            restarted = DashboardStore(state_path=self.path, control_slot="a", kv=make_kv(self.kv_fake),
+                                       sleep=lambda _s: None)
+        self.assertEqual(restarted.hydrate(), "unavailable")  # KV still empty: closed, not defaults
+        self.assertTrue(self.marker().exists())
+        self.kv_put_snapshot(8, ["kv/repo"])
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.assertEqual(restarted.hydrate(), "kv-recovery")
+        self.assertFalse(self.marker().exists())  # released only after the recovered state is on disk
+        self.assertEqual(json.loads(self.path.read_text())["controlled_targets"], ["kv/repo"])
+        normal = DashboardStore(state_path=self.path)
+        self.assertEqual((normal.recovery_pending, normal.get_controlled_targets()), (False, ["kv/repo"]))
+
+    def test_hold_with_a_file_back_at_the_state_path_preserves_it(self):
+        self.path.write_text("{broken", encoding="utf-8")
+        self.open_store()
+        self.path.write_text(json.dumps({"controlled_targets": ["hand/placed"]}), encoding="utf-8")
+        with self.assertLogs("spot_dashboard", "ERROR"):
+            store = DashboardStore(state_path=self.path)
+        self.assert_fails_closed(store)  # the hold wins over a readable file
+        self.assertEqual(len(self.backups()), 2)
+        self.assertTrue(any("hand/placed" in b.read_text(encoding="utf-8") for b in self.backups()))
+        self.assertFalse(self.path.exists())
+
+    def test_no_rename_without_a_durable_hold(self):
+        self.path.write_text("{broken", encoding="utf-8")
+        with mock.patch.object(DashboardStore, "_write_private_durably", side_effect=OSError(28, "No space left")):
+            store = self.open_store()
+        health = self.assert_fails_closed(store)
+        self.assertIn("could not record the recovery hold", health["reason"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "{broken")  # left in place
+        self.assertEqual(self.backups(), [])
+        with self.assertRaises(OSError):
+            store.import_snapshot(DashboardStore(state_path=None, control_slot="a").snapshot_envelope())
+
+    def test_failed_write_of_recovered_state_keeps_the_hold(self):
+        self.path.write_text("{broken", encoding="utf-8")
+        self.kv_put_snapshot(3, ["kv/repo"])
+        store = self.open_store(kv=True)
+        with mock.patch.object(DashboardStore, "_persist", side_effect=OSError(5, "I/O error")), \
+                self.assertLogs("spot_dashboard", "ERROR"):
+            self.assertEqual(store.hydrate(), "unavailable")
+        self.assertTrue(store.recovery_pending)
+        self.assertTrue(self.marker().exists())
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.assertEqual(store.hydrate(), "kv-recovery")
+        self.assertFalse(self.marker().exists())
+
+    def test_import_during_a_hold_releases_it(self):
+        self.path.write_text("{broken", encoding="utf-8")
+        self.open_store(control_slot="a")
+        with self.assertLogs("spot_dashboard", "ERROR"):
+            store = DashboardStore(state_path=self.path, control_slot="a")
+        source = DashboardStore(state_path=None, control_slot="a")
+        source.set_controlled_targets(["imported/repo"])
+        store.import_snapshot(source.snapshot_envelope())
+        self.assertFalse(self.marker().exists())
+        self.assertEqual(DashboardStore(state_path=self.path).get_controlled_targets(), ["imported/repo"])
 
     def test_history_is_bounded_and_cas(self):
         store = DashboardStore(state_path=None)

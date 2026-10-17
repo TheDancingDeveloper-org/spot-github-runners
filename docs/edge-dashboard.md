@@ -75,8 +75,11 @@ That check skips the cache of earlier administrator checks.
 
 ### Unreadable state file
 
-If `/var/lib/spot-dashboard/state.json` exists but can't be read or parsed, the dashboard renames it to
-`state.json.corrupt-<UTC time>` with mode 0600 and never deletes it. It then recovers from the latest KV
+If `/var/lib/spot-dashboard/state.json` exists but can't be read or parsed, the dashboard first writes the
+recovery hold `state.json.recovery-pending` (mode 0600, flushed to disk). It then renames the state file to
+`state.json.corrupt-<UTC time>` with mode 0600 and never deletes it. While the hold exists, every start fails
+closed, even when the state path is empty after a restart. The dashboard removes the hold only after the
+recovered state is written to disk. It then recovers from the latest KV
 snapshot that passes the same checks as a normal start, or from a control-plane import, and keeps that
 snapshot's `state_version`.
 
@@ -169,6 +172,9 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
     commit outright while the branch still holds no commit.
   - Results marked for a same-key retry (`"retry_same_key": true`, or the pending 202) are never stored
     as final. A retry with the same key runs again and reconciles; final results are stored and replayed.
+  - The browser retries such a result automatically up to three times with the same key, after 2, 5,
+    and 10 seconds. If you click **Save** again for the same change, the panel reuses that key until a
+    final result arrives. A changed manifest gets a new key.
   - A hot-patch retry classifies each host again from its receipt and recorded patch. Hosts already at
     the patch report `noop` and aren't patched again.
 - A retry with the same `Idempotency-Key` while the first request still runs gets HTTP 202 with

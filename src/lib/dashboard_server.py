@@ -157,6 +157,10 @@ ENV_CONFIG_REPO = "SPOT_CONFIG_REPO"
 CONFIG_REPO_NAME = "spot-runners-config"
 _CONFIG_REPO_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}")
 FREEZE_MARKER_SUFFIX = ".frozen"
+# Durable recovery hold: written (0600, fsynced) BEFORE an unreadable state file is moved aside and removed only
+# after verified state is restored and persisted. While it exists every start fails closed, even when the
+# state path is empty, so a restart in between can never fall back to defaults.
+RECOVERY_MARKER_SUFFIX = ".recovery-pending"
 # How long a freeze waits for in-flight external changes (pull requests, hot-patches) to finish and persist
 # their idempotency records; kept under the control VM manager's 60-second control-call timeout.
 FREEZE_EXTERNAL_DRAIN_SECONDS = 45.0
@@ -1082,19 +1086,35 @@ class DashboardStore:
         self.recovery_pending = False
         self.recovery_detail = ""
         self.state_backup_path: Path | None = None
+        # True when nothing of the unreadable state is left at the state path, so recovery may write there.
+        self._state_path_clear = False
+        self.recovery_marker_path = (
+            state_path.parent / f"{state_path.name}{RECOVERY_MARKER_SUFFIX}" if state_path else None
+        )
+        held = self.recovery_marker_path is not None and os.path.lexists(self.recovery_marker_path)
         # Read the file directly: Path.exists() also reports False when stat fails (for example EACCES
         # on a parent directory), which would silently load an empty, fail-open policy. Only a genuinely
         # absent file starts from defaults (or KV).
         raw_state: str | None = None
         read_error: Exception | None = None
-        if state_path:
+        if state_path and not held:
             try:
                 raw_state = state_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 raw_state = None
             except (OSError, ValueError) as exc:
                 read_error = exc
-        if raw_state is not None or read_error is not None:
+        if held:
+            # An earlier start found the state unreadable and recovery never finished: stay closed, whatever is
+            # (or is not) at the state path now.
+            original = self._marker_field("reason")
+            self._enter_recovery(
+                f"Dashboard state recovery is still pending (marker {self.recovery_marker_path})"
+                + (f"; first failure: {original}" if original else "")
+                + "; the dynamic controlled-target policy is unavailable until verified state is restored",
+                marker_present=True,
+            )
+        elif raw_state is not None or read_error is not None:
             try:
                 if read_error is not None:
                     raise read_error
@@ -1102,25 +1122,11 @@ class DashboardStore:
                 self._apply_loaded_state(loaded)
             except (OSError, ValueError, TypeError) as exc:
                 # Fail closed: keep the unreadable file aside and recover only from a verified snapshot.
-                self.controlled_targets_error = (
+                self._enter_recovery(
                     f"Dashboard state file {state_path} could not be loaded ({type(exc).__name__}); "
-                    "the dynamic controlled-target policy is unavailable until state is recovered"
+                    "the dynamic controlled-target policy is unavailable until state is recovered",
+                    marker_present=False,
                 )
-                self.recovery_pending = True
-                LOG.error("%s", self.controlled_targets_error)
-                self.state = default_dashboard_state(project=project, org=org)
-                self._sync_fleet_telemetry()
-                self.state_backup_path = self._preserve_unreadable_state()
-                if self.state_backup_path is None:
-                    self.recovery_detail = (
-                        "the unreadable state file could not be moved aside, so it is left in place and nothing "
-                        "will replace it; repair or move it by hand and restart"
-                    )
-                else:
-                    self.recovery_detail = (
-                        f"kept the unreadable file as {self.state_backup_path}; waiting for a verified KV snapshot"
-                    )
-                LOG.error("Dashboard state recovery: %s", self.recovery_detail)
             else:
                 self.loaded_from_file = True
                 try:
@@ -1144,6 +1150,107 @@ class DashboardStore:
                 pass
 
     # -- durability: load, version, hydration, KV write-behind, freeze/import, idempotency --
+
+    def _enter_recovery(self, reason: str, *, marker_present: bool) -> None:
+        """Fail closed and prepare recovery: durable hold marker first, then move anything at the state path aside."""
+        assert self.state_path is not None and self.recovery_marker_path is not None
+        self.controlled_targets_error = reason
+        self.recovery_pending = True
+        LOG.error("%s", reason)
+        self.state = default_dashboard_state(project=self.project, org=self.org)
+        self._sync_fleet_telemetry()
+        previous_backup = self._marker_backup() if marker_present else None
+        if not marker_present:
+            try:
+                self._write_private_durably(self.recovery_marker_path, {"reason": reason, "since": self._clock()})
+            except OSError as exc:
+                # Without a durable hold a restart after the rename could start from defaults: leave the file.
+                self.recovery_detail = (f"could not record the recovery hold ({exc}), so the unreadable state file "
+                                        "is left in place and nothing will replace it; repair it and restart")
+                LOG.error("Dashboard state recovery: %s", self.recovery_detail)
+                return
+        if os.path.lexists(self.state_path):
+            self.state_backup_path = self._preserve_unreadable_state()
+            if self.state_backup_path is None:
+                self.recovery_detail = (
+                    "the state file could not be moved aside, so it is left in place and nothing will replace it; "
+                    "repair or move it by hand and restart"
+                )
+                LOG.error("Dashboard state recovery: %s", self.recovery_detail)
+                return
+            try:
+                self._write_private_durably(self.recovery_marker_path, {
+                    "reason": (self._marker_field("reason") or reason) if marker_present else reason,
+                    "since": self._clock(), "backup": str(self.state_backup_path)})
+            except OSError as exc:
+                LOG.warning("Could not note the backup path in %s: %s", self.recovery_marker_path, exc)
+        else:
+            self.state_backup_path = previous_backup
+        self._state_path_clear = True
+        kept = f"kept the unreadable state as {self.state_backup_path}" if self.state_backup_path else "state moved aside"
+        self.recovery_detail = f"{kept}; waiting for a verified KV snapshot"
+        LOG.error("Dashboard state recovery: %s", self.recovery_detail)
+
+    def _marker_field(self, name: str) -> str:
+        try:
+            raw = json.loads(self.recovery_marker_path.read_text(encoding="utf-8"))  # type: ignore[union-attr]
+        except (OSError, ValueError):
+            return ""
+        value = raw.get(name) if isinstance(raw, dict) else None
+        return value[:500] if isinstance(value, str) else ""
+
+    def _marker_backup(self) -> Path | None:
+        backup = self._marker_field("backup")
+        return Path(backup) if backup else None
+
+    def _write_private_durably(self, path: Path, payload: dict[str, Any]) -> None:
+        """Atomically write a 0600 JSON file next to the state file and fsync it and its directory. Raises OSError."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise OSError(f"Refusing symlinked path: {path}")
+        tmp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                os.chmod(tmp, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, allow_nan=False))
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp.replace(path)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        self._fsync_dir(path.parent)
+
+    @staticmethod
+    def _fsync_dir(directory: Path) -> None:
+        try:
+            fd = os.open(str(directory), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _clear_recovery_marker(self) -> None:
+        """Release the hold once verified state is durably on disk. A failure only keeps the hold (fail-closed)."""
+        if self.recovery_marker_path is None:
+            return
+        try:
+            self.recovery_marker_path.unlink(missing_ok=True)
+            self._fsync_dir(self.recovery_marker_path.parent)
+        except OSError as exc:
+            LOG.error("Could not remove the recovery hold %s (the next start stays closed and recovers again): %s",
+                      self.recovery_marker_path, exc)
 
     def _preserve_unreadable_state(self) -> Path | None:
         """Rename the unreadable state path to ``<name>.corrupt-<UTC>`` (0600). Returns it, or None on failure.
@@ -1201,7 +1308,7 @@ class DashboardStore:
 
     def _recover_unreadable_state(self) -> str:
         """Recover from the latest verified KV snapshot after an unreadable state file was moved aside."""
-        if self.state_backup_path is None:
+        if not self._state_path_clear:
             return "unavailable"
         if self.kv is None:
             self.recovery_detail = (
@@ -1221,7 +1328,13 @@ class DashboardStore:
         with self._lock:
             if not self.recovery_pending:
                 return self.hydration_source  # A control-plane import recovered meanwhile.
-            if not self._adopt_recovered_snapshot(snapshot, require_persist=False):
+            try:
+                # Durable or nothing: the hold is released only once the recovered state is on disk.
+                if not self._adopt_recovered_snapshot(snapshot, require_persist=True):
+                    return "unavailable"
+            except OSError as exc:
+                self.recovery_detail = f"could not write the recovered state ({exc}); retrying"
+                LOG.error("Dashboard state recovery: %s", self.recovery_detail)
                 return "unavailable"
             self.hydration_source = "kv-recovery"
             self.hydrated = True
@@ -1247,6 +1360,7 @@ class DashboardStore:
             self.controlled_targets_error = error
             raise
         self.recovery_pending = False
+        self._clear_recovery_marker()
         self.recovery_detail = f"recovered from a verified snapshot; the unreadable file is kept as {self.state_backup_path}"
         return True
 
@@ -1486,7 +1600,7 @@ class DashboardStore:
             raise ValueError("Invalid dashboard snapshot envelope")
         with self._lock:
             if self.recovery_pending:
-                if self.state_backup_path is None:
+                if not self._state_path_clear:
                     raise OSError("the unreadable dashboard state file is still in place; refusing to overwrite it")
                 # A verified snapshot from the control plane recovers the store like a KV snapshot would.
                 self._adopt_recovered_snapshot(snapshot, require_persist=True)

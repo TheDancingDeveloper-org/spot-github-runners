@@ -902,8 +902,10 @@ class PatchApiTests(unittest.TestCase):
 
 _UI_HARNESS = r"""
 const cfg = JSON.parse(process.argv[1]);
-const out = {posts: [], gets: []};
+const out = {posts: [], gets: [], keys: []};
 const nodes = {};
+let keyCounter = 0;
+globalThis.newIdempotencyKey = () => `key-${++keyCounter}`;
 function makeNode(tag) {
   return {tag, children: [], textContent: "", value: "", disabled: false, checked: false, href: "", target: "",
     rel: "", className: "", listeners: {},
@@ -922,8 +924,10 @@ const replies = cfg.replies;
 globalThis.fetch = async (url, init) => {
   const method = (init && init.method) || "GET";
   const key = url.split("?")[0];
-  if (method === "POST") out.posts.push([key, JSON.parse(init.body)]); else out.gets.push(url);
-  const r = replies[key] || {status: 404, body: {error: "missing"}};
+  if (method === "POST") { out.posts.push([key, JSON.parse(init.body)]);
+    out.keys.push([key, (init.headers || {})["Idempotency-Key"] || null]); } else out.gets.push(url);
+  const queued = cfg.sequence && cfg.sequence[key];
+  const r = (queued && queued.length ? queued.shift() : null) || replies[key] || {status: 404, body: {error: "missing"}};
   return {ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body};
 };
 """ + "\n"
@@ -1074,6 +1078,84 @@ const NATIVE_FETCH = async (url, init) => {
         self.assertEqual(len(set(out["keys"][:3])), 1)  # the same Idempotency-Key for every poll of the save
         self.assertEqual(out["waits"], [3000, 3000])
         self.assertEqual(out["other"], [202, "reauth_required", 101])  # not a pending change: returned once
+
+    def test_save_keeps_its_key_until_a_final_result(self):
+        retry = {"status": 424, "body": {"error": "GitHub did not confirm whether it could open the pull request",
+                                         "retry_same_key": True}}
+        final = {"status": 200, "body": {"status": "pull_request_opened", "branch": "spot-dashboard/x",
+                                         "pull_request": {"number": 7, "url": f"https://github.com/{REPO}/pull/7"}}}
+        driver = r"""
+(async () => {
+  const RP = window.RunnerPatches;
+  RP.init();
+  await RP.refresh();
+  await RP.load(cfg.path);
+  await RP.save();                       // ambiguous: 424 retry_same_key
+  out.status1 = nodes["rp-status"].textContent;
+  await RP.save();                       // the user clicks Save again: same payload, same key
+  await RP.save();                       // final result arrived before: a new save gets a new key
+  nodes["rp-editor"].value = "changed";  // a different payload always gets its own key
+  await RP.save();
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { process.stdout.write(JSON.stringify({crash: String(e)})); });
+"""
+        program = _UI_HARNESS + _ui_block() + driver
+        cfg = {"replies": self.replies(), "path": OXIDEX_PATH,
+               "sequence": {"/api/patches/save": [retry, final, final, retry]}}
+        proc = subprocess.run(["node", "-e", program, json.dumps(cfg)], capture_output=True, text=True, timeout=30,
+                              check=True)
+        out = json.loads(proc.stdout)
+        self.assertNotIn("crash", out, out)
+        keys = [k for path, k in out["keys"] if path == "/api/patches/save"]
+        self.assertEqual(len(keys), 4)
+        self.assertIsNotNone(keys[0])
+        self.assertEqual(keys[0], keys[1])     # reused for the manual retry of the same pending save
+        self.assertNotEqual(keys[1], keys[2])  # a final result releases the key
+        self.assertNotEqual(keys[2], keys[3])  # a changed payload never reuses a key
+        self.assertIn("Click Save again", out["status1"])
+
+    def test_fetch_wrapper_retries_unconfirmed_changes_with_the_same_key_and_gives_up(self):
+        from lib.dashboard_ui_assets import render_dashboard_html
+
+        html = render_dashboard_html()
+        script = html[html.index("<script>") + len("<script>"):html.rindex("</script>")]
+        block = script[script.index("    function getDashboardAuthToken()"):script.index("    function showToast(msg)")]
+        program = r"""
+const AUTH_STORAGE_KEY = "dashboard_auth_token";
+const cfg = JSON.parse(process.argv[1]);
+const out = {keys: [], waits: []};
+globalThis.sessionStorage = {getItem: () => null, setItem() {}, removeItem() {}};
+globalThis.localStorage = globalThis.sessionStorage;
+globalThis.setTimeout = (fn, ms) => { out.waits.push(ms); fn(); return 0; };
+globalThis.document = {getElementById: () => null, createElement: () => ({setAttribute() {}, style: {}}),
+  body: {appendChild() {}}};
+globalThis.window = {crypto: globalThis.crypto, location: {assign() {}}, prompt: undefined};
+const json = (status, body) => new Response(JSON.stringify(body), {status, headers: {"Content-Type": "application/json"}});
+let calls = 0;
+const NATIVE_FETCH = async (url, init) => {
+  out.keys.push(init.headers.get("Idempotency-Key"));
+  calls += 1;
+  if (calls <= cfg.unconfirmed) return json(424, {error: "unconfirmed", retry_same_key: true});
+  return json(200, {status: "pull_request_opened"});
+};
+""" + block + r"""
+(async () => {
+  const res = await window.fetch("/api/patches/save", {method: "POST", body: "{}"});
+  out.final = res.status;
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+        def run(unconfirmed):
+            proc = subprocess.run(["node", "-e", program, json.dumps({"unconfirmed": unconfirmed})],
+                                  capture_output=True, text=True, timeout=30, check=True)
+            return json.loads(proc.stdout)
+
+        recovered = run(2)
+        self.assertEqual((recovered["final"], len(recovered["keys"]), len(set(recovered["keys"]))), (200, 3, 1))
+        self.assertEqual(recovered["waits"], [2000, 5000])
+        exhausted = run(99)  # bounded: after three same-key retries the 424 goes back to the caller
+        self.assertEqual((exhausted["final"], len(exhausted["keys"]), len(set(exhausted["keys"]))), (424, 4, 1))
+        self.assertEqual(exhausted["waits"], [2000, 5000, 10000])
 
     def test_save_conflict_and_untrusted_links(self):
         out = self.run_ui(self.replies(save={"status": 409, "body": {"error": "main moved; reload"}}))

@@ -1715,8 +1715,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    // Delays (seconds) between automatic retries of a change whose outcome GitHub did not confirm.
+    const SAME_KEY_RETRY_DELAYS = [2, 5, 10];
+
+    async function sameKeyRetryRequested(res) {
+      if (!res || res.status !== 424) return false;
+      try {
+        const data = await res.clone().json();
+        return Boolean(data && data.retry_same_key === true);
+      } catch (_err) {
+        return false;
+      }
+    }
+
     async function fetchWithControlVmRetry(input, reqInit) {
       // Retries the SAME request (same Idempotency-Key) after the control VM comes back.
+      let sameKeyRetries = 0;
       for (;;) {
         let res;
         try {
@@ -1737,6 +1751,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           // A change with this Idempotency-Key is still running (for example the edge timed out a long save or
           // hot-patch): keep asking with the same key until the stored result comes back.
           await new Promise(resolve => setTimeout(resolve, pendingSeconds * 1000));
+          continue;
+        }
+        if (sameKeyRetries < SAME_KEY_RETRY_DELAYS.length && reqInit && reqInit.headers &&
+            reqInit.headers.has && reqInit.headers.has("Idempotency-Key") && await sameKeyRetryRequested(res)) {
+          // GitHub did not confirm the outcome: the same key lets the dashboard reconcile instead of repeating.
+          await new Promise(resolve => setTimeout(resolve, SAME_KEY_RETRY_DELAYS[sameKeyRetries] * 1000));
+          sameKeyRetries += 1;
           continue;
         }
         return res;
@@ -3154,7 +3175,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     // Renders server data with textContent and createElement only (no HTML parsing). Requests go through the
     // dashboard fetch wrapper, so every POST carries an Idempotency-Key and waits out control VM restarts.
     const RunnerPatches = (function () {
-      const S = { list: null, current: null, preview: null, dirty: false };
+      const S = { list: null, current: null, preview: null, dirty: false, pendingExternal: null };
       function el(id) { return document.getElementById(id); }
       function node(tag, text) {
         const n = document.createElement(tag);
@@ -3169,8 +3190,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         try { data = await res.json(); } catch (_e) { data = {}; }
         return [res, data || {}];
       }
-      function postJson(url, body) {
-        return api(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      function postJson(url, body, extraHeaders) {
+        return api(url, { method: "POST", headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
+                          body: JSON.stringify(body) });
+      }
+      // One Idempotency-Key per pending external change: reused for the same payload (also when the user clicks
+      // again) until a final result arrives, so the dashboard can reconcile instead of opening a second PR.
+      async function postExternal(url, body) {
+        const fingerprint = url + "\n" + JSON.stringify(body);
+        if (!S.pendingExternal || S.pendingExternal.fingerprint !== fingerprint) {
+          S.pendingExternal = { fingerprint, key: newIdempotencyKey() };
+        }
+        const result = await postJson(url, body, { "Idempotency-Key": S.pendingExternal.key });
+        const [res, d] = result;
+        if (!(d && (d.retry_same_key === true || d.pending_retry === true)) && res.status !== 0) {
+          S.pendingExternal = null;  // a final answer: the next change gets a new key
+        }
+        return result;
       }
       function renderErrors(errors) {
         const box = el("rp-errors");
@@ -3260,10 +3296,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
       async function save() {
         if (!S.current) return;
-        const [res, d] = await postJson("/api/patches/save", {
+        const [res, d] = await postExternal("/api/patches/save", {
           path: S.current.path, content: el("rp-editor").value, base_sha: S.current.base_sha,
           message: el("rp-message").value,
         });
+        if (d.retry_same_key === true) {
+          setStatus((d.error || "GitHub did not confirm the save.") + " Click Save again to finish it safely.");
+          return;
+        }
         if (res.status === 409) { setStatus(d.error || "The config repository changed; reload the manifest."); return; }
         if (!res.ok) { renderErrors(d.errors); setStatus(d.error || `Save failed (HTTP ${res.status})`); return; }
         renderErrors([]);
@@ -3281,7 +3321,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         updateHotPatchButton();
         if (el("rp-hotpatch").disabled || !S.preview) return;
         el("rp-hotpatch").disabled = true;
-        const [res, d] = await postJson("/api/patches/hot-patch", {
+        const [res, d] = await postExternal("/api/patches/hot-patch", {
           repository: S.preview.repository, patch_sha256: S.preview.patch_sha256, confirm: true,
         });
         el("rp-confirm").checked = false;
