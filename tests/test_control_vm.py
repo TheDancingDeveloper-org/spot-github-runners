@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from decimal import Decimal
@@ -1119,6 +1120,20 @@ class CreateCommandTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cv.metadata_items(config(public_url="https://a,b"), "a")
 
+    def test_session_not_before_travels_as_metadata(self):
+        self.assertNotIn("dashboard-session-not-before", cv.metadata_items(config(), "a"))
+        now = int(time.time())
+        items = cv.metadata_items(config(session_not_before=str(now - 10)), "a")
+        self.assertEqual(items["dashboard-session-not-before"], str(now - 10))
+        command = cv.create_command(config(session_not_before=str(now - 10)), "a", offer(), "/s")
+        self.assertIn(f"dashboard-session-not-before={now - 10}", next(a for a in command if a.startswith("--metadata=")))
+        cfg = cv.ControlConfig.from_env("proj", {"DASHBOARD_SESSION_NOT_BEFORE": f" {now} "}, dashboard_image=IMAGE)
+        self.assertEqual(cfg.session_not_before, str(now))
+        for bad in ("soon", "-5", "1.5", str(now + 3600), "1" * 16):
+            with self.assertRaises(ValueError, msg=bad):
+                cv.create_command(config(session_not_before=bad), "a", offer(), "/s")
+        self.assertEqual(cv.session_not_before_problems(str(now + 30), now=now), [])
+
     def test_config_from_env(self):
         env = {"SPOT_CONTROL_REGIONS": "us-west1, us-east4", "SPOT_CONTROL_EXTERNAL_IP": "0",
                "SPOT_CONTROL_MAX_DAILY_USD": "0.25", "CLOUDFLARE_ACCOUNT_ID": "acc", "CF_ACCESS_CLIENT_ID": "i",
@@ -1314,6 +1329,16 @@ class StartupScriptTests(unittest.TestCase):
     def _run_function(self, name, value):
         return subprocess.run(["bash", "-c", self._bash_function(name) + f'\n{name} "$1"', "check", value],
                               capture_output=True, text=True, timeout=30)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_session_not_before_check_matches_create_problems(self):
+        self.assertIn('SESSION_NOT_BEFORE="$(metadata_attr dashboard-session-not-before)"', self.text)
+        self.assertIn('session_not_before_ok "$SESSION_NOT_BEFORE"', self.text)
+        self.assertIn("printf 'DASHBOARD_SESSION_NOT_BEFORE=%s\\n' \"$SESSION_NOT_BEFORE\"", self.text)
+        now = int(time.time())
+        for value in ("", str(now - 100), str(now), "0", "0099", "soon", "-1", "1.5", str(now + 3600), "1" * 16, "1 2"):
+            expected = not cv.session_not_before_problems(value)
+            self.assertEqual(self._run_function("session_not_before_ok", value).returncode == 0, expected, value)
 
     @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
     def test_cloudflared_pin_check_accepts_what_create_problems_accepts(self):

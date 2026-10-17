@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import ssl
+import stat
 import sys
 import threading
 import time
@@ -51,6 +52,7 @@ from .dashboard_auth import (
     ENV_DEVICE_FLOW,
     ENV_REDIRECT_URI,
 )
+from .patch_console import PatchConsole, PatchConsoleError, executor_from_env
 from .edge_state import (
     CONTROL_OPS,
     CONTROL_SLOTS,
@@ -129,7 +131,11 @@ KV_STALE_REFUSAL_BACKOFF_SECONDS = 30.0
 
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # POST endpoints that compute a response without changing dashboard state; they skip idempotency storage.
-NON_MUTATING_POST_PATHS = frozenset({"/api/qualify", "/api/cloud-init/parse", "/api/ip-intel"})
+NON_MUTATING_POST_PATHS = frozenset({"/api/qualify", "/api/cloud-init/parse", "/api/ip-intel",
+                                     "/api/patches/validate", "/api/patches/preview"})
+# POST endpoints whose side effect is outside dashboard state (a GitHub pull request, live runner hosts): they
+# need an Idempotency-Key and run through DashboardStore.run_external.
+EXTERNAL_MUTATION_PATHS = frozenset({"/api/patches/save", "/api/patches/hot-patch"})
 # The edge Worker sets this header to the browser's IP (from Cloudflare's CF-Connecting-IP) and strips any
 # client-supplied X-Spot-* header. It is trusted only from a loopback peer (the local cloudflared), and
 # only for rate-limit bucketing.
@@ -983,8 +989,11 @@ class DashboardStore:
     """Thread-safe controller store backing the Web UI Dashboard API.
 
     If the state file exists but cannot be read or parsed (including PermissionError and
-    IsADirectoryError), ``controlled_targets_error`` is set: OAuth access fails closed, target changes
-    are refused, and the unreadable file is never overwritten, so an operator can inspect and repair it.
+    IsADirectoryError), it is renamed aside to ``<state>.corrupt-<UTC time>`` (0600, never deleted) and the
+    store recovers from the latest verified Cloudflare KV snapshot through the normal hydration path (or a
+    control-plane import). Until then it stays unhydrated and fails closed: ``/api/health`` answers 503 with
+    ``"status": "state_unavailable"`` and a ``reason``, every other request gets the wait response, and
+    nothing is written to the state path. If the file cannot be moved aside, nothing ever replaces it.
     """
 
     def __init__(
@@ -1022,6 +1031,11 @@ class DashboardStore:
         # True when the last successful read of origin:active named the other slot: a Worker with a cached
         # origin may still send requests here, but changes would never reach the active dashboard.
         self.known_inactive = False
+        # Ownership of origin:active as last positively read from KV: "active", "inactive", or "unknown"
+        # (never read, or the record is unreadable). With KV configured, mutations need "active".
+        self.ownership = "unknown"
+        # Why hydration or reconciliation is blocked (reported as the health "reason"); empty when fine.
+        self.hydrate_problem = ""
         self.hydration_source = ""
         self._writer_checked_at: float | None = None
         self._kv_dirty = False
@@ -1036,6 +1050,7 @@ class DashboardStore:
         # with KV before it accepts a change or publishes.
         self._writer_synced = False
         self._defer: dict[str, Any] | None = None
+        self._external_inflight: set[str] = set()
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
         # A freeze survives container and VM restarts: the marker sits next to the state file until an
@@ -1049,6 +1064,10 @@ class DashboardStore:
             LOG.warning("Dashboard starts frozen: freeze marker %s is present", self.freeze_marker_path)
         self.loaded_from_file = False
         self.controlled_targets_error = ""
+        # Set when the state file was unreadable: the store must recover from a verified snapshot first.
+        self.recovery_pending = False
+        self.recovery_detail = ""
+        self.state_backup_path: Path | None = None
         # Read the file directly: Path.exists() also reports False when stat fails (for example EACCES
         # on a parent directory), which would silently load an empty, fail-open policy. Only a genuinely
         # absent file starts from defaults (or KV).
@@ -1068,14 +1087,26 @@ class DashboardStore:
                 loaded = json.loads(raw_state)
                 self._apply_loaded_state(loaded)
             except (OSError, ValueError, TypeError) as exc:
-                # Fail closed for the access policy, and never rewrite the unreadable file.
+                # Fail closed: keep the unreadable file aside and recover only from a verified snapshot.
                 self.controlled_targets_error = (
                     f"Dashboard state file {state_path} could not be loaded ({type(exc).__name__}); "
-                    "the dynamic controlled-target policy is unavailable. Repair or restore the file and restart."
+                    "the dynamic controlled-target policy is unavailable until state is recovered"
                 )
+                self.recovery_pending = True
                 LOG.error("%s", self.controlled_targets_error)
                 self.state = default_dashboard_state(project=project, org=org)
                 self._sync_fleet_telemetry()
+                self.state_backup_path = self._preserve_unreadable_state()
+                if self.state_backup_path is None:
+                    self.recovery_detail = (
+                        "the unreadable state file could not be moved aside, so it is left in place and nothing "
+                        "will replace it; repair or move it by hand and restart"
+                    )
+                else:
+                    self.recovery_detail = (
+                        f"kept the unreadable file as {self.state_backup_path}; waiting for a verified KV snapshot"
+                    )
+                LOG.error("Dashboard state recovery: %s", self.recovery_detail)
             else:
                 self.loaded_from_file = True
                 try:
@@ -1099,6 +1130,111 @@ class DashboardStore:
                 pass
 
     # -- durability: load, version, hydration, KV write-behind, freeze/import, idempotency --
+
+    def _preserve_unreadable_state(self) -> Path | None:
+        """Rename the unreadable state path to ``<name>.corrupt-<UTC>`` (0600). Returns it, or None on failure.
+
+        A rename keeps the exact bytes (or directory) and never deletes anything; an existing backup name is
+        never reused.
+        """
+        assert self.state_path is not None
+        stamp = datetime.fromtimestamp(self._clock(), timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        base = f"{self.state_path.name}.corrupt-{stamp}"
+        target = self.state_path.parent / base
+        counter = 1
+        while os.path.lexists(target):
+            target = self.state_path.parent / f"{base}.{counter}"
+            counter += 1
+        try:
+            os.rename(self.state_path, target)
+        except OSError as exc:
+            LOG.error("Could not move the unreadable dashboard state file %s aside: %s", self.state_path, exc)
+            return None
+        try:
+            mode = os.lstat(target).st_mode
+            if stat.S_ISDIR(mode):
+                os.chmod(target, 0o700)
+            elif stat.S_ISREG(mode):
+                os.chmod(target, 0o600)
+        except OSError as exc:
+            LOG.warning("Could not restrict permissions on %s: %s", target, exc)
+        try:
+            fd = os.open(str(target.parent), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        return target
+
+    def _read_kv_snapshot_verified(self) -> tuple[dict[str, Any] | None, str]:
+        """Return (verified snapshot or None, outcome) with outcome ok, missing, invalid, or unreachable."""
+        assert self.kv is not None
+        attempts = len(self.hydrate_retry_delays) + 1
+        for attempt in range(attempts):
+            if self._stop_event.is_set():
+                break
+            try:
+                raw = self.kv.get(KV_STATE_KEY)
+            except KvError as exc:
+                LOG.warning("Dashboard KV snapshot read %d/%d failed: %s", attempt + 1, attempts, exc)
+                if attempt < attempts - 1:
+                    self._sleep(self.hydrate_retry_delays[attempt])
+                continue
+            return self._classify_kv_snapshot(raw)
+        return None, "unreachable"
+
+    def _recover_unreadable_state(self) -> str:
+        """Recover from the latest verified KV snapshot after an unreadable state file was moved aside."""
+        if self.state_backup_path is None:
+            return "unavailable"
+        if self.kv is None:
+            self.recovery_detail = (
+                f"kept the unreadable file as {self.state_backup_path}; no Cloudflare KV snapshot source is "
+                "configured, so restore the file (or import a snapshot) and restart"
+            )
+            return "unavailable"
+        snapshot, outcome = self._read_kv_snapshot_verified()
+        if snapshot is None:
+            why = {"missing": "Cloudflare KV holds no dashboard snapshot",
+                   "invalid": "the Cloudflare KV snapshot failed verification",
+                   "unreachable": "Cloudflare KV is unreachable"}.get(outcome, outcome)
+            self.recovery_detail = f"kept the unreadable file as {self.state_backup_path}; {why}; retrying"
+            LOG.error("Dashboard state recovery waiting: %s", self.recovery_detail)
+            return "unavailable"
+        self.refresh_writer()
+        with self._lock:
+            if not self.recovery_pending:
+                return self.hydration_source  # A control-plane import recovered meanwhile.
+            if not self._adopt_recovered_snapshot(snapshot, require_persist=False):
+                return "unavailable"
+            self.hydration_source = "kv-recovery"
+            self.hydrated = True
+            self.reconciled = True
+            self._writer_synced = bool(self.kv_writer)
+        LOG.warning("Dashboard state recovered from the verified KV snapshot at state_version %d; the unreadable "
+                    "file is kept as %s", self.state_version(), self.state_backup_path)
+        return "kv-recovery"
+
+    def _adopt_recovered_snapshot(self, snapshot: dict[str, Any], *, require_persist: bool) -> bool:
+        """Adopt a verified snapshot in place of the unreadable state (caller holds the lock)."""
+        error = self.controlled_targets_error
+        self.controlled_targets_error = ""
+        try:
+            self._adopt_snapshot(snapshot, require_persist=require_persist)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            self.controlled_targets_error = error
+            self.recovery_detail = (f"kept the unreadable file as {self.state_backup_path}; the KV snapshot failed "
+                                    f"validation ({type(exc).__name__}); retrying")
+            LOG.error("Dashboard state recovery: %s", self.recovery_detail)
+            return False
+        except BaseException:
+            self.controlled_targets_error = error
+            raise
+        self.recovery_pending = False
+        self.recovery_detail = f"recovered from a verified snapshot; the unreadable file is kept as {self.state_backup_path}"
+        return True
 
     def _apply_loaded_state(self, loaded: Any) -> None:
         """Validate and normalize a loaded state dict through the standard load path (atomic on failure)."""
@@ -1166,39 +1302,37 @@ class DashboardStore:
                 LOG.exception("Dashboard KV write-behind iteration failed")
             self._stop_event.wait(KV_LOOP_INTERVAL_SECONDS)
 
-    def _read_kv_snapshot(self) -> tuple[dict[str, Any] | None, bool]:
-        """Return (snapshot or None, kv_reachable). Tries 3 times over roughly 10 seconds."""
-        assert self.kv is not None
-        attempts = len(self.hydrate_retry_delays) + 1
-        for attempt in range(attempts):
-            if self._stop_event.is_set():
-                break
-            try:
-                raw = self.kv.get(KV_STATE_KEY)
-            except KvError as exc:
-                LOG.warning("Dashboard KV snapshot read %d/%d failed: %s", attempt + 1, attempts, exc)
-                if attempt < attempts - 1:
-                    self._sleep(self.hydrate_retry_delays[attempt])
-                continue
-            if raw is None:
-                return None, True
-            snapshot = parse_snapshot(raw)
-            if snapshot is None:
-                LOG.warning("Ignoring malformed dashboard KV snapshot")
-            return snapshot, True
-        return None, False
+    @staticmethod
+    def _classify_kv_snapshot(raw: str | None) -> tuple[dict[str, Any] | None, str]:
+        """(snapshot, outcome): ``ok``; ``missing`` only when KV positively has no key; else ``invalid``."""
+        if raw is None:
+            return None, "missing"
+        snapshot = parse_snapshot(raw)
+        return (snapshot, "ok") if snapshot is not None else (None, "invalid")
 
     def hydrate(self) -> str:
         """Choose the newer of the local state file and the KV snapshot (tie: local), then mark hydrated.
 
-        Returns the chosen source: ``local``, ``kv``, or ``default``, or ``unavailable`` (still unhydrated)
-        when there is no local state and KV is configured but unreachable. Defaults are used only when KV
-        is not configured or positively reports that no snapshot exists.
+        Returns the chosen source: ``local``, ``kv``, ``kv-recovery``, or ``default``, or ``unavailable``
+        (still unhydrated) when there is no local state and KV is configured but unreachable. Defaults are
+        used only when KV is not configured or positively reports that no snapshot exists, and never after
+        an unreadable state file: that case recovers only from a verified KV snapshot.
         """
+        if self.recovery_pending:
+            return self._recover_unreadable_state()
         snapshot: dict[str, Any] | None = None
         reachable = True
+        outcome = "missing"
         if self.kv is not None:
-            snapshot, reachable = self._read_kv_snapshot()
+            snapshot, outcome = self._read_kv_snapshot_verified()
+            reachable = outcome != "unreachable"
+            if outcome == "invalid" and not self.loaded_from_file:
+                # An existing snapshot that fails verification is not "no snapshot": starting from defaults
+                # would drop the saved policy and let later writes replace the real snapshot.
+                self.hydrate_problem = ("the Cloudflare KV dashboard snapshot exists but failed verification; "
+                                        "refusing to start from defaults; retrying")
+                LOG.error("Dashboard stays unhydrated: %s", self.hydrate_problem)
+                return "unavailable"
             if not reachable:
                 if not self.loaded_from_file:
                     LOG.error("Cloudflare KV unreachable and no local dashboard state; staying unhydrated "
@@ -1214,6 +1348,7 @@ class DashboardStore:
             if not reachable:
                 self._mark_unreconciled()
             source = "local" if self.loaded_from_file else "default"
+            kv_unusable = outcome == "invalid"
             if snapshot is not None:
                 newer = snapshot["state_version"] > self.state_version()
                 if newer or not self.loaded_from_file:
@@ -1221,14 +1356,29 @@ class DashboardStore:
                         self._adopt_snapshot(snapshot)
                         source = "kv"
                     except (ValueError, TypeError, KeyError, AttributeError) as exc:
-                        LOG.warning("Ignoring invalid dashboard KV snapshot: %s", exc)
-            if source == "local" and reachable and (snapshot is None or snapshot["state_version"] < self.state_version()):
+                        if not self.loaded_from_file:
+                            self.hydrate_problem = (f"the Cloudflare KV dashboard snapshot failed validation "
+                                                    f"({type(exc).__name__}); refusing to start from defaults; retrying")
+                            LOG.error("Dashboard stays unhydrated: %s", self.hydrate_problem)
+                            return "unavailable"
+                        kv_unusable = True
+            if kv_unusable:
+                # Local state is served read-only: a KV copy that cannot be verified may be newer, so changes wait
+                # until reconciliation can compare the two.
+                self.hydrate_problem = ("the Cloudflare KV dashboard snapshot failed verification; serving local "
+                                        "state read-only until KV holds a verifiable snapshot")
+                LOG.error("%s", self.hydrate_problem)
+                self._mark_unreconciled()
+            if source == "local" and reachable and not kv_unusable and (
+                    snapshot is None or snapshot["state_version"] < self.state_version()):
                 # The local file is ahead of KV (for example a preemption interrupted write-behind after a
                 # successful local save): publish it once this VM is the writer.
                 self._mark_kv_dirty()
             self.hydration_source = source
             self.hydrated = True
-            self._writer_synced = bool(reachable and self.kv_writer)
+            if not kv_unusable:
+                self.hydrate_problem = ""
+            self._writer_synced = bool(reachable and not kv_unusable and self.kv_writer)
         LOG.info("Dashboard hydrated from %s at state_version %d", source, self.state_version())
         return source
 
@@ -1274,7 +1424,12 @@ class DashboardStore:
         except KvError as exc:
             LOG.warning("Dashboard still unreconciled; KV unreachable: %s", exc)
             return False
-        snapshot = parse_snapshot(raw) if raw is not None else None
+        snapshot, outcome = self._classify_kv_snapshot(raw)
+        if outcome == "invalid":
+            self.hydrate_problem = ("the Cloudflare KV dashboard snapshot failed verification; serving local state "
+                                    "read-only until KV holds a verifiable snapshot")
+            LOG.error("Dashboard stays unreconciled: %s", self.hydrate_problem)
+            return False
         base = self._unreconciled_base_version or 0
         if snapshot is not None and snapshot["state_version"] >= base:
             with self._lock:
@@ -1302,6 +1457,7 @@ class DashboardStore:
     def _finish_reconcile(self, source: str) -> None:
         self.reconciled = True
         self._unreconciled_base_version = None
+        self.hydrate_problem = ""
         LOG.warning("Dashboard reconciled with KV using the %s copy at state_version %d", source,
                     self.state_version())
 
@@ -1315,6 +1471,23 @@ class DashboardStore:
         if snapshot is None:
             raise ValueError("Invalid dashboard snapshot envelope")
         with self._lock:
+            if self.recovery_pending:
+                if self.state_backup_path is None:
+                    raise OSError("the unreadable dashboard state file is still in place; refusing to overwrite it")
+                # A verified snapshot from the control plane recovers the store like a KV snapshot would.
+                self._adopt_recovered_snapshot(snapshot, require_persist=True)
+                if self.recovery_pending:
+                    raise ValueError("the imported snapshot failed validation")
+                self._mark_kv_dirty()
+                imported = True
+                self.hydration_source = "import"
+                if self.frozen or (self.freeze_marker_path is not None and os.path.lexists(self.freeze_marker_path)):
+                    self._clear_freeze_marker()
+                    self.frozen = False
+                self.hydrated = True
+                self.reconciled = True
+                self._unreconciled_base_version = None
+                return {"state_version": self.state_version(), "imported": imported}
             imported = snapshot["state_version"] >= self.state_version()
             if imported:
                 # A failed local write raises OSError (state unchanged, not hydrated): the caller gets a
@@ -1329,6 +1502,7 @@ class DashboardStore:
             self.reconciled = True
             self._unreconciled_base_version = None
             self.hydration_source = "import" if imported else self.hydration_source
+            self.hydrate_problem = ""
             return {"state_version": self.state_version(), "imported": imported}
 
     def snapshot_envelope(self) -> dict[str, Any]:
@@ -1355,10 +1529,12 @@ class DashboardStore:
         if raw is None:
             writer = True
             self.known_inactive = False
+            self.ownership = "active"
         else:
             record = OriginRecord.from_json(raw)
             writer = record is not None and record.slot == self.control_slot
             self.known_inactive = record is not None and record.slot != self.control_slot
+            self.ownership = "active" if writer else ("inactive" if self.known_inactive else "unknown")
         if not writer:
             self._writer_synced = False
         self.kv_writer = writer
@@ -1380,9 +1556,12 @@ class DashboardStore:
         if self._writer_synced:
             return True
         try:
-            snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY))
+            snapshot, outcome = self._classify_kv_snapshot(self.kv.get(KV_STATE_KEY))
         except KvError as exc:
             LOG.warning("Became the KV writer but could not read the KV snapshot: %s", exc)
+            return False
+        if outcome == "invalid":
+            LOG.error("Became the KV writer but the KV snapshot failed verification; refusing changes")
             return False
         with self._lock:
             if snapshot is not None and snapshot["state_version"] > self.state_version():
@@ -1448,13 +1627,21 @@ class DashboardStore:
                         self.kv_writer = False
                         self._writer_synced = False
                         self.known_inactive = record is not None
+                        self.ownership = "inactive" if record is not None else "unknown"
                         self._writer_checked_at = self._clock()
                         LOG.warning("Skipping dashboard KV write: origin:active names slot %s, not %s",
                                     record.slot if record else None, self.control_slot)
                         if captured:
                             self._restore_kv_dirty()
                         return None
-                current = parse_snapshot(self.kv.get(KV_STATE_KEY))
+                raw_current = self.kv.get(KV_STATE_KEY)
+                current, outcome = self._classify_kv_snapshot(raw_current)
+                if outcome == "invalid":
+                    LOG.error("REFUSING to overwrite a KV dashboard snapshot that failed verification; it may "
+                              "be newer than this VM's state")
+                    if captured:
+                        self._restore_kv_dirty()
+                    return None
                 if current is not None and current["state_version"] > version:
                     LOG.error("REFUSING to overwrite the KV dashboard snapshot at state_version %d (slot %s) with "
                               "local state_version %d; this VM's state is stale",
@@ -1592,13 +1779,34 @@ class DashboardStore:
     def health(self) -> dict[str, Any]:
         with self._lock:
             hydrated, frozen, reconciled = bool(self.hydrated), bool(self.frozen), bool(self.reconciled)
+            if self.recovery_pending:
+                # Not ready (hydrated false, HTTP 503): the control-VM controller treats this VM as unhealthy and
+                # replaces it after its grace period; the reason tells the operator what happened.
+                return {
+                    "status": "state_unavailable",
+                    "hydrated": False,
+                    "frozen": frozen,
+                    "reconciled": reconciled,
+                    "active": not self.known_inactive,
+                    "ownership": self.ownership,
+                    "state_version": self.state_version(),
+                    "slot": self.control_slot,
+                    "kv_writer": bool(self.kv_writer),
+                    "reason": f"{self.controlled_targets_error}; {self.recovery_detail}",
+                    "state_backup": str(self.state_backup_path) if self.state_backup_path else None,
+                }
             status = "frozen" if frozen else ("ok" if hydrated and reconciled else "starting")
+            if self.hydrate_problem and not hydrated:
+                status = "state_unavailable"
+            extra = {"reason": self.hydrate_problem} if self.hydrate_problem else {}
             return {
+                **extra,
                 "status": status,
                 "hydrated": hydrated,
                 "frozen": frozen,
                 "reconciled": reconciled,
                 "active": not self.known_inactive,
+                "ownership": self.ownership,
                 "state_version": self.state_version(),
                 "slot": self.control_slot,
                 "kv_writer": bool(self.kv_writer),
@@ -1624,17 +1832,9 @@ class DashboardStore:
         if not mutating:
             status, body = fn()
             return status, body, False
-        if self.hydrated and not self.frozen and not self.sync_with_kv_as_writer():
-            raise DashboardFrozenError("Dashboard became the active slot but cannot read Cloudflare KV yet")
-        if self.known_inactive:
-            # sync_with_kv_as_writer re-read origin:active just now (unless KV is unreachable, in which case
-            # the last successful read stands).
-            raise DashboardFrozenError("This control VM is not the active slot; changes go to the active one")
+        self._mutation_preflight()
         with self._lock:
-            if self.frozen:
-                raise DashboardFrozenError("Dashboard is frozen for a control VM handover")
-            if not self.reconciled:
-                raise DashboardFrozenError("Dashboard state is not yet reconciled with Cloudflare KV")
+            self._mutation_locked_checks()
             if not key:
                 status, body = fn()
                 return status, body, False
@@ -1659,21 +1859,9 @@ class DashboardStore:
                 self.state = snapshot
             if status >= 500:
                 return status, body, False
-            try:
-                # Store an independent copy: the response may share objects with live state that later
-                # requests change.
-                serialized = json.dumps(body, allow_nan=False)
-                if len(serialized) > IDEMPOTENCY_MAX_BODY_BYTES:
-                    stored_body = {
-                        "status": "ok" if status < 400 else "error",
-                        "detail": "The original response was too large to store for replay; reload to see current state.",
-                    }
-                else:
-                    stored_body = json.loads(serialized)
-            except (TypeError, ValueError):
-                stored_body = {"status": "ok" if status < 400 else "error"}
             records = self._prune_idempotency(
-                {**records, key: {"m": method, "p": path, "s": int(status), "b": stored_body, "t": now}}, now
+                {**records, key: {"m": method, "p": path, "s": int(status), "b": self._replay_copy(status, body),
+                                  "t": now}}, now
             )
             self.state[IDEMPOTENCY_STATE_KEY] = records
             try:
@@ -1682,6 +1870,88 @@ class DashboardStore:
                 self.state = snapshot
                 LOG.exception("Failed to persist dashboard state for an idempotent request")
                 return 500, {"error": "Failed to persist dashboard state; retry the request"}, False
+            return status, body, False
+
+    def _mutation_preflight(self) -> None:
+        """Gates every change shares (outside the lock): writer sync, active slot, confirmed ownership."""
+        if self.hydrated and not self.frozen and not self.sync_with_kv_as_writer():
+            raise DashboardFrozenError("Dashboard became the active slot but cannot read Cloudflare KV yet")
+        if self.known_inactive:
+            # sync_with_kv_as_writer re-read origin:active just now (unless KV is unreachable, in which case
+            # the last successful read stands).
+            raise DashboardFrozenError("This control VM is not the active slot; changes go to the active one")
+        if self.kv is not None and self.ownership != "active":
+            # Ownership must be positively established: a Worker with a cached origin may route here.
+            raise DashboardFrozenError("This control VM has not confirmed that it is the active slot yet")
+
+    def _mutation_locked_checks(self) -> None:
+        if not self.hydrated:
+            raise DashboardFrozenError("Dashboard state is not hydrated yet")
+        if self.frozen:
+            raise DashboardFrozenError("Dashboard is frozen for a control VM handover")
+        if not self.reconciled:
+            raise DashboardFrozenError("Dashboard state is not yet reconciled with Cloudflare KV")
+
+    @staticmethod
+    def _replay_copy(status: int, body: Any) -> Any:
+        # Store an independent copy: the response may share objects with live state that later requests change.
+        try:
+            serialized = json.dumps(body, allow_nan=False)
+            if len(serialized) > IDEMPOTENCY_MAX_BODY_BYTES:
+                return {
+                    "status": "ok" if status < 400 else "error",
+                    "detail": "The original response was too large to store for replay; reload to see current state.",
+                }
+            return json.loads(serialized)
+        except (TypeError, ValueError):
+            return {"status": "ok" if status < 400 else "error"}
+
+    def run_external(self, key: str, method: str, path: str, fn: Any) -> tuple[int, Any, bool]:
+        """Run a change whose side effect is outside dashboard state (GitHub, runner hosts) exactly once per key.
+
+        The same gates as :meth:`run_request` apply (raises DashboardFrozenError), but ``fn`` runs WITHOUT the
+        store lock, because it makes slow network calls. A concurrent request with the same key gets 409, a
+        later one replays the stored response (``replayed`` True). Responses below 500 are stored.
+        """
+        if not key:
+            raise ValueError("an Idempotency-Key is required")
+        self._mutation_preflight()
+        with self._lock:
+            self._mutation_locked_checks()
+            now = self._clock()
+            raw_records = self.state.get(IDEMPOTENCY_STATE_KEY)
+            records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, now)
+            existing = records.get(key)
+            if existing is not None:
+                if existing.get("m") != method or existing.get("p") != path:
+                    return 422, {"error": "Idempotency-Key was already used for a different request"}, False
+                return int(existing.get("s", 200)), copy.deepcopy(existing.get("b")), True
+            if key in self._external_inflight:
+                return 409, {"error": "A request with this Idempotency-Key is still running"}, False
+            self._external_inflight.add(key)
+        try:
+            status, body = fn()
+        except BaseException:
+            with self._lock:
+                self._external_inflight.discard(key)
+            raise
+        with self._lock:
+            self._external_inflight.discard(key)
+            if status >= 500:
+                return status, body, False
+            raw_records = self.state.get(IDEMPOTENCY_STATE_KEY)
+            records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, self._clock())
+            records[key] = {"m": method, "p": path, "s": int(status), "b": self._replay_copy(status, body),
+                            "t": self._clock()}
+            previous = self.state.get(IDEMPOTENCY_STATE_KEY)
+            self.state[IDEMPOTENCY_STATE_KEY] = self._prune_idempotency(records, self._clock())
+            try:
+                self._persist()
+            except Exception:  # noqa: BLE001 - the side effect already happened; report it, warn about replay
+                self.state[IDEMPOTENCY_STATE_KEY] = previous
+                LOG.exception("Could not persist the idempotency record for %s %s", method, path)
+                if isinstance(body, dict):
+                    body = {**body, "warning": "The result could not be saved for replay; do not resubmit blindly."}
             return status, body, False
 
     def _normalize_project_derived_fields(self) -> None:
@@ -4280,6 +4550,7 @@ def make_handler(
     config_targets_provider: Any = None,
     control_secret: str | None = None,
     public_origin: str | None = None,
+    patch_console: PatchConsole | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create the HTTP handler bound to a DashboardStore instance.
 
@@ -5175,6 +5446,10 @@ def make_handler(
                 self._send_targets()
                 return
 
+            if path in ("/api/patches", "/api/patches/manifest"):
+                self._patches_get(path, qs)
+                return
+
             try:
                 if path == "/api/overview":
                     include_deleted = qs.get("include_deleted", ["true"])[0].lower() != "false"
@@ -5399,11 +5674,79 @@ def make_handler(
             if key is not None and not _IDEMPOTENCY_KEY_RE.fullmatch(key):
                 self._send_json({"error": "Invalid Idempotency-Key header"}, status=HTTPStatus.BAD_REQUEST)
                 return
+            if path.startswith("/api/patches/"):
+                self._patches_post(path, payload, key)
+                return
             try:
                 status, body, replayed = store.run_request(
                     key, "POST", path, lambda: self._dispatch_post(path, payload),
                     mutating=path not in NON_MUTATING_POST_PATHS,
                 )
+            except DashboardFrozenError:
+                self._send_unavailable()
+                return
+            self._send_json(body, status=status, extra_headers={"Idempotent-Replay": "true"} if replayed else None)
+
+        # -- runner patch console (/api/patches) --
+
+        def _send_patch_error(self, exc: PatchConsoleError) -> None:
+            self._send_json({"error": str(exc), **exc.body}, status=exc.status)
+
+        def _fleet_instances(self) -> list[dict[str, Any]]:
+            with store._lock:
+                return copy.deepcopy([i for i in store.state.get("instances", []) if isinstance(i, dict)])
+
+        def _patches_get(self, path: str, qs: dict[str, list[str]]) -> None:
+            if patch_console is None:
+                self._send_json({"error": "The runner patch console is not configured"}, status=HTTPStatus.NOT_FOUND)
+                return
+            try:
+                if path == "/api/patches":
+                    self._send_json(patch_console.list_manifests())
+                else:
+                    self._send_json(patch_console.load_manifest(qs.get("path", [""])[0]))
+            except PatchConsoleError as exc:
+                self._send_patch_error(exc)
+
+        def _patches_post(self, path: str, payload: dict[str, Any], key: str | None) -> None:
+            if patch_console is None:
+                self._send_json({"error": "The runner patch console is not configured"}, status=HTTPStatus.NOT_FOUND)
+                return
+            try:
+                if path == "/api/patches/validate":
+                    self._send_json(patch_console.validate(str(payload.get("path") or ""), payload.get("content")))
+                    return
+                if path == "/api/patches/preview":
+                    self._send_json(patch_console.preview(str(payload.get("repository") or ""),
+                                                          self._fleet_instances(), payload.get("content")))
+                    return
+            except PatchConsoleError as exc:
+                self._send_patch_error(exc)
+                return
+            if path not in EXTERNAL_MUTATION_PATHS:
+                self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
+                return
+            if key is None:
+                self._send_json({"error": "This change needs an Idempotency-Key header"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if path == "/api/patches/hot-patch" and payload.get("confirm") is not True:
+                self._send_json({"error": "Hot-patching running hosts needs \"confirm\": true"},
+                                status=HTTPStatus.BAD_REQUEST)
+                return
+
+            def run() -> tuple[int, Any]:
+                try:
+                    if path == "/api/patches/save":
+                        return HTTPStatus.OK, patch_console.save(
+                            str(payload.get("path") or ""), payload.get("content"), payload.get("base_sha"),
+                            payload.get("message"))
+                    return patch_console.hot_patch(str(payload.get("repository") or ""),
+                                                   payload.get("patch_sha256"), self._fleet_instances())
+                except PatchConsoleError as exc:
+                    return exc.status, {"error": str(exc), **exc.body}
+
+            try:
+                status, body, replayed = store.run_external(key, "POST", path, run)
             except DashboardFrozenError:
                 self._send_unavailable()
                 return
@@ -5462,6 +5805,7 @@ def create_dashboard_server(
     kv: CloudflareKv | None = None,
     public_origin: str | None = None,
     config_repo: str | None = None,
+    patch_console: PatchConsole | None = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
     """Instantiate the ThreadingHTTPServer and DashboardStore, then start hydration.
 
@@ -5540,6 +5884,8 @@ def create_dashboard_server(
         config_targets_provider=config_targets_provider,
         control_secret=control_secret,
         public_origin=resolved_public_origin,
+        patch_console=patch_console if patch_console is not None else PatchConsole(
+            resolve_config_repo(config_repo, org=org), executor=executor_from_env(project)),
     )
     server = DashboardThreadingHTTPServer((host, port), handler)
     server.dashboard_store = store

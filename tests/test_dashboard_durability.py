@@ -820,8 +820,8 @@ class HealthAndGateTests(ServerHarness):
         self.start()
         status, msg, body = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
-        self.assertEqual(set(body), {"status", "hydrated", "frozen", "reconciled", "active", "state_version",
-                                     "slot", "kv_writer"})
+        self.assertEqual(set(body), {"status", "hydrated", "frozen", "reconciled", "active", "ownership",
+                                     "state_version", "slot", "kv_writer"})
         self.assertTrue(body["active"])
         self.assertTrue(body["reconciled"])
         self.assertEqual((body["status"], body["hydrated"], body["frozen"], body["slot"], body["kv_writer"]),
@@ -927,6 +927,137 @@ class InactiveSlotTests(unittest.TestCase):
         self.fake.fail = True
         with self.assertRaises(DashboardFrozenError):
             self.change()
+
+
+class OwnershipTriStateTests(unittest.TestCase):
+    """P1-a: with KV configured, a VM must positively confirm it owns origin:active before any change."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = FakeKvRequester()
+        self.path = Path(self.tmp.name) / "state.json"
+
+    def store(self):
+        return DashboardStore(self.path, control_slot="a", kv=make_kv(self.fake), clock=FakeClock(),
+                              sleep=lambda _s: None)
+
+    def change(self, store):
+        return store.run_request("k" * 16, "POST", "/api/targets",
+                                 lambda: (200, {"t": store.set_controlled_targets(["o/x"])}))
+
+    def test_origin_reads_failing_after_hydration_reject_changes(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(3, ["kv/repo"])
+        store = self.store()
+        real = self.fake.__call__
+
+        def origin_down(method, url, headers, body, timeout):
+            if url.endswith("/values/" + urllib.parse.quote(KV_ORIGIN_KEY, safe="")):
+                raise KvError("origin read failed")
+            return real(method, url, headers, body, timeout)
+
+        store.kv.requester = origin_down
+        self.assertEqual(store.hydrate(), "kv")
+        self.assertEqual((store.ownership, store.known_inactive, store.kv_writer), ("unknown", False, False))
+        self.assertEqual(store.health()["ownership"], "unknown")
+        with self.assertRaises(DashboardFrozenError):
+            self.change(store)
+        self.assertEqual(store.get_controlled_targets(), ["kv/repo"])
+        self.assertEqual(store.state_version(), 3)
+        store.kv.requester = real  # origin:active readable again (unset: bootstrap, this VM may write)
+        self.assertEqual(self.change(store)[0], 200)
+        self.assertEqual(store.ownership, "active")
+
+    def test_malformed_origin_record_is_unknown_not_active(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        self.fake.values[KV_ORIGIN_KEY] = "garbage"
+        store = self.store()
+        store.hydrate()
+        self.assertEqual(store.ownership, "unknown")
+        with self.assertRaises(DashboardFrozenError):
+            self.change(store)
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=1).to_json()
+        store.refresh_writer()
+        self.assertEqual(store.ownership, "inactive")
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=2).to_json()
+        self.assertEqual(self.change(store)[0], 200)
+        self.assertEqual(store.ownership, "active")
+
+
+class StrictSnapshotClassificationTests(unittest.TestCase):
+    """P1-b: an existing KV snapshot that fails verification is never treated as "no snapshot"."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = FakeKvRequester()
+        self.path = Path(self.tmp.name) / "state.json"
+
+    def store(self):
+        return DashboardStore(self.path, control_slot="a", kv=make_kv(self.fake), clock=FakeClock(),
+                              sleep=lambda _s: None)
+
+    BAD = {
+        "malformed": "{not json",
+        "wrong_schema": json.dumps({"schema": "other", "state_version": 4, "state": {}}),
+        "invalid_state": json.dumps(build_snapshot({"controlled_targets": "not-a-list"}, 4, "a", now=1)),
+    }
+
+    def test_new_vm_never_starts_from_defaults_over_an_invalid_snapshot(self):
+        for name, raw in self.BAD.items():
+            self.fake.values[KV_STATE_KEY] = raw
+            store = self.store()
+            with self.subTest(name):
+                self.assertEqual(store.hydrate(), "unavailable")
+                self.assertFalse(store.hydrated)
+                health = store.health()
+                self.assertEqual(health["status"], "state_unavailable")
+                self.assertIn("refusing to start from defaults", health["reason"])
+                self.assertFalse(self.path.exists())
+                self.assertEqual(self.fake.values[KV_STATE_KEY], raw)  # the real snapshot is untouched
+        # Only a positive "key does not exist" allows defaults.
+        self.fake.values.pop(KV_STATE_KEY)
+        store = self.store()
+        self.assertEqual(store.hydrate(), "default")
+        self.assertTrue(store.hydrated)
+        self.assertNotIn("reason", store.health())
+
+    def test_local_state_with_invalid_kv_snapshot_serves_reads_but_refuses_changes(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        write_state(self.path, 2, ["local/repo"])
+        self.fake.values[KV_STATE_KEY] = self.BAD["invalid_state"]
+        store = self.store()
+        self.assertEqual(store.hydrate(), "local")
+        self.assertTrue(store.hydrated)
+        self.assertFalse(store.reconciled)
+        self.assertIn("failed verification", store.health()["reason"])
+        with self.assertRaises(DashboardFrozenError):
+            store.run_request("k" * 16, "POST", "/api/targets",
+                              lambda: (200, {"t": store.set_controlled_targets(["o/x"])}))
+        for name, raw in self.BAD.items():
+            self.fake.values[KV_STATE_KEY] = raw
+            with self.subTest(name), mock.patch.object(store, "_publish_snapshot",
+                                                       side_effect=AssertionError("must not publish")):
+                self.assertFalse(store.reconcile())  # still not verifiable: KV is never overwritten
+                self.assertEqual(self.fake.values[KV_STATE_KEY], raw)
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(5, ["kv/repo"])
+        self.assertTrue(store.reconcile())
+        self.assertEqual(store.get_controlled_targets(), ["kv/repo"])
+        self.assertNotIn("reason", store.health())
+
+    def test_writer_never_overwrites_an_invalid_snapshot(self):
+        store = self.store()
+        self.assertEqual(store.hydrate(), "default")
+        store.set_controlled_targets(["o/x"])
+        self.fake.values[KV_STATE_KEY] = self.BAD["malformed"]
+        self.assertIsNone(store._publish_snapshot())
+        self.assertEqual(self.fake.values[KV_STATE_KEY], self.BAD["malformed"])
+        store._writer_synced = False
+        self.assertFalse(store.sync_with_kv_as_writer())
 
 
 class InactiveSlotServerTests(ServerHarness):

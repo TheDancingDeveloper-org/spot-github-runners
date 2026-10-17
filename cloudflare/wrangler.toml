@@ -27,12 +27,13 @@ kv_namespaces = [
   { binding = "SPOT_KV", id = "REPLACE_WITH_SPOT_KV_NAMESPACE_ID" },
 ]
 
-# Optional bulk sign-out: add SESSION_NOT_BEFORE = "<unix time>" here (and DASHBOARD_SESSION_NOT_BEFORE on
-# the control VM) to reject every session issued before that time.
 [vars]
 ALLOWED_ADMIN_LOGIN = "swackhamer"
 ALLOWED_ADMIN_ID = "619624"
 ORIGIN_HOST_SUFFIX = ".swacktech.com"
+# Bulk sign-out: Unix time; sessions issued before it are rejected. Empty means none. Set the same value as
+# DASHBOARD_SESSION_NOT_BEFORE for the control VM (see docs/edge-dashboard.md), then deploy.
+SESSION_NOT_BEFORE = ""
 
 [observability]
 enabled = true

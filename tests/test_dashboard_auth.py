@@ -46,6 +46,10 @@ from lib.dashboard_auth import (
     sign_token,
     target_list_digest,
 )
+try:
+    from test_edge_state import FakeKvRequester, make_kv
+except ImportError:  # pragma: no cover - when run as a package module
+    from tests.test_edge_state import FakeKvRequester, make_kv
 from lib.dashboard_server import (
     DashboardFrozenError,
     DashboardStore,
@@ -1658,31 +1662,47 @@ class OAuthServerIntegrationTests(unittest.TestCase):
 
     # -- ported hardening: fail closed on unreadable state --
 
-    def test_corrupt_state_fails_closed(self):
+    def test_corrupt_state_fails_closed_and_reports_unhealthy(self):
         path = Path(self.tmp.name) / "state.json"
         corrupt = '{"controlled_targets": ["swack-tools/oxidex"'
         path.write_text(corrupt, encoding="utf-8")
         with self.assertLogs("spot_dashboard", "ERROR"):
-            self.start(auth_token=self.LEGACY_TOKEN)
+            store = self.start(auth_token=self.LEGACY_TOKEN)
+        status, _, raw = self.request("GET", "/api/health")
+        health = json.loads(raw)
+        # The control-VM controller and the Worker treat a non-200 / status != "ok" health as not ready.
+        self.assertEqual((status, health["status"], health["hydrated"]), (503, "state_unavailable", False))
+        self.assertIn("could not be loaded", health["reason"])
+        self.assertIn("no Cloudflare KV snapshot source", health["reason"])
+        self.assertEqual(Path(health["state_backup"]).read_text(encoding="utf-8"), corrupt)
         session = self.mgr.create_session_cookie_value("swackhamer", 600, user_id=ADMIN_ID)
-        cookie = {"Cookie": f"{SESSION_COOKIE_NAME}={session}"}
-        status, _, raw = self.request("GET", "/api/overview", headers=cookie)
-        # 500, not 503: the edge Worker would turn a 503 into an endless control-VM wait.
+        calls = len(self.fake.calls)
+        for method, route, headers in (("GET", "/api/overview", {"Cookie": f"{SESSION_COOKIE_NAME}={session}"}),
+                                       ("GET", "/api/overview", {"Authorization": f"Bearer {self.LEGACY_TOKEN}"}),
+                                       ("POST", "/auth/device/code", {}),
+                                       ("GET", "/auth/github/login", {"Host": "spot.example"})):
+            status, _, raw = self.request(method, route, headers=headers, body={} if method == "POST" else None)
+            self.assertEqual((status, json.loads(raw)["error"]), (503, "control_vm_unavailable"), route)
+        self.assertEqual(len(self.fake.calls), calls)  # GitHub never contacted
+        self.assertFalse(path.exists())  # nothing written at the state path before recovery
+        self.assertTrue(store.recovery_pending)
+
+    def test_policy_unavailable_answers_500_not_503(self):
+        # Defense in depth: if the policy error is ever set on a hydrated store, OAuth fails closed with 500
+        # (a 503 would be turned into an endless control-VM wait by the edge Worker).
+        store = self.start(auth_token=self.LEGACY_TOKEN)
+        pair = self.login_cookie()
+        store.controlled_targets_error = "simulated policy failure"
+        status, _, raw = self.request("GET", "/api/overview", headers={"Cookie": pair})
         self.assertEqual((status, json.loads(raw)["code"]), (500, "controlled_targets_unavailable"))
-        self.assertEqual(self.request("GET", "/", headers=cookie)[0], 500)
+        self.assertEqual(self.request("GET", "/", headers={"Cookie": pair})[0], 500)
         calls = len(self.fake.calls)
         self.assertEqual(self.request("POST", "/auth/device/code", body={})[0], 500)
         self.assertEqual(self.request("GET", "/auth/github/login", headers={"Host": "spot.example"})[0], 500)
-        self.assertEqual(len(self.fake.calls), calls)  # GitHub never contacted
+        self.assertEqual(len(self.fake.calls), calls)
         bearer = {"Authorization": f"Bearer {self.LEGACY_TOKEN}"}
-        self.assertEqual(self.request("GET", "/api/overview", headers=bearer)[0], 200)  # loopback break-glass
         status, _, raw = self.request("GET", "/api/auth/targets", headers=bearer)
-        self.assertIn("could not be loaded", json.loads(raw)["error"])
-        with self.assertLogs("spot_dashboard", "ERROR"):
-            status, _, _ = self.request("POST", "/api/budget", headers={**bearer, "Idempotency-Key": "k" * 16},
-                                        body={"target": "global", "daily_cap_usd": 5})
-        self.assertEqual(status, 500)  # no write may replace the unreadable file
-        self.assertEqual(path.read_text(encoding="utf-8"), corrupt)
+        self.assertIn("simulated policy failure", json.loads(raw)["error"])
 
     # -- ported hardening: unauthenticated amplification --
 
@@ -1873,13 +1893,24 @@ class StoreTargetPolicyTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "state.json"
+        self.kv_fake = FakeKvRequester()
 
-    def seeded(self):
+    def seeded(self, targets=("swack-tools/oxidex",)):
         store = DashboardStore(state_path=self.path)
-        store.set_controlled_targets(["swack-tools/oxidex"])
+        store.set_controlled_targets(list(targets))
         return self.path.read_bytes()
 
+    def open_store(self, *, kv=False, **kwargs):
+        with self.assertLogs("spot_dashboard", "ERROR"):
+            return DashboardStore(state_path=self.path, control_slot="a" if kv else kwargs.pop("control_slot", None),
+                                  kv=make_kv(self.kv_fake) if kv else None, sleep=lambda _s: None, **kwargs)
+
+    def backups(self):
+        return sorted(p for p in self.path.parent.iterdir() if ".corrupt-" in p.name)
+
     def assert_fails_closed(self, store):
+        self.assertTrue(store.recovery_pending)
+        self.assertFalse(store.hydrated)
         self.assertIn("could not be loaded", store.controlled_targets_error)
         self.assertEqual(store.get_controlled_targets(), ["!unavailable-controlled-targets"])
         session = make_manager().create_session_cookie_value("swackhamer", 600, user_id=ADMIN_ID)
@@ -1887,75 +1918,186 @@ class StoreTargetPolicyTests(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             store.set_controlled_targets([])
         self.assertEqual(type(ctx.exception).__name__, "ControlledTargetsUnavailableError")
+        health = store.health()
+        self.assertEqual((health["status"], health["hydrated"]), ("state_unavailable", False))
+        self.assertIn("could not be loaded", health["reason"])
+        return health
 
-    def test_inaccessible_state_file_fails_closed(self):
-        original = self.seeded()
+    def kv_put_snapshot(self, version, targets):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        self.kv_fake.values[KV_STATE_KEY] = json.dumps(
+            build_snapshot({"controlled_targets": list(targets)}, version, "a", now=1))
+
+    def test_inaccessible_state_file_is_kept_aside_and_fails_closed(self):
         for exc in (PermissionError(13, "Permission denied"), IsADirectoryError(21, "Is a directory"),
                     OSError(5, "Input/output error")):
+            for old in self.backups():
+                old.unlink()
+            original = self.seeded()
             # Path.exists() also "lies" (False) when stat fails with EACCES; the store must not rely on it.
             with mock.patch.object(Path, "read_text", side_effect=exc), \
                     mock.patch.object(Path, "exists", return_value=False):
-                with self.assertLogs("spot_dashboard", "ERROR"):
-                    store = DashboardStore(state_path=self.path)
+                store = self.open_store()
             with self.subTest(exc=type(exc).__name__):
-                self.assert_fails_closed(store)
-                self.assertEqual(self.path.read_bytes(), original)  # never rewritten
+                health = self.assert_fails_closed(store)
+                [backup] = self.backups()
+                self.assertEqual(backup.read_bytes(), original)  # kept, byte for byte
+                self.assertEqual(health["state_backup"], str(backup))
+                self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+                self.assertFalse(self.path.exists())
+
+    def test_unpreservable_state_is_never_replaced(self):
+        DashboardStore(state_path=self.path).set_controlled_targets(["swack-tools/oxidex"])
+        self.kv_put_snapshot(9, ["kv/repo"])
+        # The file is unreadable AND cannot be renamed aside (the directory itself stays writable).
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "Permission denied")), \
+                mock.patch("lib.dashboard_server.os.rename", side_effect=OSError(16, "Device or resource busy")):
+            store = self.open_store(kv=True)
+        health = self.assert_fails_closed(store)
+        self.assertIsNone(health["state_backup"])
+        self.assertIn("could not be moved aside", health["reason"])
+        self.assertEqual(store.hydrate(), "unavailable")  # even a verified KV snapshot cannot replace it
+        envelope = DashboardStore(state_path=None, control_slot="a").snapshot_envelope()
+        with self.assertRaises(OSError):
+            store.import_snapshot(envelope)
+        self.assertTrue(store.recovery_pending)
+        self.assertIn("swack-tools/oxidex", self.path.read_text(encoding="utf-8"))
+        self.assertEqual(self.backups(), [])
 
     @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
-    def test_unreadable_state_directory_fails_closed(self):
+    def test_unwritable_state_directory_fails_closed(self):
         locked = Path(self.tmp.name) / "locked"
         locked.mkdir()
-        path = locked / "state.json"
-        DashboardStore(state_path=path).set_controlled_targets(["swack-tools/oxidex"])
-        locked.chmod(0)
+        self.path = locked / "state.json"
+        DashboardStore(state_path=self.path).set_controlled_targets(["swack-tools/oxidex"])
+        locked.chmod(0o500)  # readable path components, but no rename inside the directory
         self.addCleanup(locked.chmod, 0o700)
-        with self.assertLogs("spot_dashboard", "ERROR"):
-            store = DashboardStore(state_path=path)
-        self.assert_fails_closed(store)
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "Permission denied")):
+            store = self.open_store(kv=True)
+        self.assertIsNone(self.assert_fails_closed(store)["state_backup"])
+        locked.chmod(0o700)
+        self.assertIn("swack-tools/oxidex", self.path.read_text(encoding="utf-8"))
 
-    def test_state_path_that_is_a_directory_fails_closed(self):
+    def test_state_path_that_is_a_directory_is_moved_aside(self):
         self.path.mkdir()
-        with self.assertLogs("spot_dashboard", "ERROR"):
-            store = DashboardStore(state_path=self.path)
+        (self.path / "inside").write_text("x", encoding="utf-8")
+        store = self.open_store()
         self.assert_fails_closed(store)
-        self.assertTrue(self.path.is_dir())
+        [backup] = self.backups()
+        self.assertTrue(backup.is_dir())
+        self.assertEqual((backup / "inside").read_text(encoding="utf-8"), "x")
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
 
     def test_missing_state_file_starts_from_defaults(self):
         store = DashboardStore(state_path=Path(self.tmp.name) / "new" / "state.json")
         self.assertEqual((store.controlled_targets_error, store.get_controlled_targets()), ("", []))
+        self.assertFalse(store.recovery_pending)
 
-    def test_corrupt_state_file_fails_closed_and_is_preserved(self):
+    def test_corrupt_state_file_is_kept_and_never_overwritten_before_recovery(self):
         self.seeded()
         for corrupt in (self.path.read_bytes()[:-5], b"\xff\xfe not utf-8", b"[1, 2]", b'"text"',
                         b'{"controlled_targets": "not-a-list"}'):
+            for old in self.backups():
+                old.unlink()
             self.path.write_bytes(corrupt)
-            with self.assertLogs("spot_dashboard", "ERROR"):
-                store = DashboardStore(state_path=self.path)
+            store = self.open_store()
             with self.subTest(corrupt=corrupt[:20]):
                 self.assert_fails_closed(store)
                 with self.assertRaises(OSError):
                     store.update_budget({"target": "global", "daily_cap_usd": 5})
-                with self.assertLogs("spot_dashboard", "ERROR"):
-                    status, _, _ = store.run_request("k" * 16, "POST", "/api/budget",
-                                                     lambda: (200, store.update_budget({"target": "global"})))
-                self.assertEqual(status, 500)
-                self.assertEqual(self.path.read_bytes(), corrupt)  # never rewritten
+                from lib.dashboard_server import DashboardFrozenError
 
-    def test_unreadable_state_is_never_snapshotted_or_frozen(self):
+                with self.assertRaises(DashboardFrozenError):  # unhydrated: every change waits
+                    store.run_request("k" * 16, "POST", "/api/budget",
+                                      lambda: (200, store.update_budget({"target": "global"})))
+                self.assertEqual(store.hydrate(), "unavailable")  # no KV: no verified snapshot to recover from
+                self.assertFalse(self.path.exists())
+                [backup] = self.backups()
+                self.assertEqual(backup.read_bytes(), corrupt)
+
+    def test_backup_names_are_never_reused(self):
+        clock = FakeClock()
+        stamp = "20270115T080000Z"  # FakeClock() default time
+        existing = self.path.parent / f"state.json.corrupt-{stamp}"
+        existing.write_text("older backup", encoding="utf-8")
+        self.path.write_text("{broken", encoding="utf-8")
+        store = self.open_store(clock=clock)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "older backup")
+        self.assertEqual(store.state_backup_path, self.path.parent / f"state.json.corrupt-{stamp}.1")
+        self.assertEqual(store.state_backup_path.read_text(encoding="utf-8"), "{broken")
+
+    def test_corrupt_state_recovers_from_verified_kv_snapshot(self):
+        self.path.write_text("{broken", encoding="utf-8")
+        self.kv_put_snapshot(12, ["kv/repo"])
+        store = self.open_store(kv=True)
+        self.assert_fails_closed(store)
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.assertEqual(store.hydrate(), "kv-recovery")
+        self.assertTrue(store.hydrated)
+        self.assertFalse(store.recovery_pending)
+        self.assertEqual(store.controlled_targets_error, "")
+        self.assertEqual(store.get_controlled_targets(), ["kv/repo"])
+        self.assertEqual(store.state_version(), 12)  # the verified snapshot's version, no bump
+        self.assertEqual(json.loads(self.path.read_text())["state_version"], 12)
+        self.assertEqual(store.health()["status"], "ok")
+        [backup] = self.backups()
+        self.assertEqual(backup.read_text(encoding="utf-8"), "{broken")
+        store.set_controlled_targets(["kv/repo", "o/r"])  # normal operation resumes
+        self.assertEqual(store.state_version(), 13)
+
+    def test_corrupt_state_with_kv_unavailable_or_invalid_stays_closed(self):
+        from lib.edge_state import KV_STATE_KEY
+        self.path.write_text("{broken", encoding="utf-8")
+        store = self.open_store(kv=True)
+        cases = (("unreachable", "unreachable"), ("missing", "holds no dashboard snapshot"),
+                 ("invalid", "failed verification"), ("wrong-schema", "failed verification"))
+        for case, reason in cases:
+            self.kv_fake.fail = case == "unreachable"
+            self.kv_fake.values.pop(KV_STATE_KEY, None)
+            if case == "invalid":
+                self.kv_fake.values[KV_STATE_KEY] = "{not json"
+            if case == "wrong-schema":
+                self.kv_fake.values[KV_STATE_KEY] = json.dumps({"schema": "other", "state_version": 3, "state": {}})
+            with self.subTest(case), self.assertLogs("spot_dashboard", "WARNING"):
+                self.assertEqual(store.hydrate(), "unavailable")
+                health = self.assert_fails_closed(store)
+                self.assertIn(reason, health["reason"])
+                self.assertEqual(store.state["controlled_targets"], [])  # never served as a loosened policy
+                self.assertFalse(self.path.exists())
+        self.kv_fake.fail = False
+        self.kv_put_snapshot(4, ["kv/repo"])
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.assertEqual(store.hydrate(), "kv-recovery")
+        self.assertEqual(store.get_controlled_targets(), ["kv/repo"])
+
+    def test_snapshot_with_invalid_state_is_rejected_during_recovery(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        self.path.write_text("{broken", encoding="utf-8")
+        self.kv_fake.values[KV_STATE_KEY] = json.dumps(build_snapshot({"instances": "not-a-list"}, 5, "a", now=1))
+        store = self.open_store(kv=True)
+        with self.assertLogs("spot_dashboard", "ERROR"):
+            self.assertEqual(store.hydrate(), "unavailable")
+        self.assertIn("failed validation", self.assert_fails_closed(store)["reason"])
+        self.assertFalse(self.path.exists())
+
+    def test_unreadable_state_is_never_snapshotted_or_frozen_but_import_recovers(self):
         self.seeded()
         self.path.write_bytes(b"{broken")
-        with self.assertLogs("spot_dashboard", "ERROR"):
-            store = DashboardStore(state_path=self.path, control_slot="a")
+        store = self.open_store(control_slot="a")
         with self.assertRaises(ValueError):
             store.snapshot_envelope()
         with self.assertRaises(ValueError):
             store.freeze()
         self.assertFalse(store.frozen)
         self.assertFalse(os.path.lexists(store.freeze_marker_path))
-        envelope = DashboardStore(state_path=None, control_slot="a").snapshot_envelope()
-        with self.assertRaises(OSError):
-            store.import_snapshot(envelope)
-        self.assertEqual(self.path.read_bytes(), b"{broken")
+        source = DashboardStore(state_path=None, control_slot="a")
+        source.set_controlled_targets(["imported/repo"])
+        self.assertEqual(store.import_snapshot(source.snapshot_envelope())["imported"], True)
+        self.assertTrue(store.hydrated)
+        self.assertFalse(store.recovery_pending)
+        self.assertEqual(store.get_controlled_targets(), ["imported/repo"])
+        self.assertEqual(json.loads(self.path.read_text())["controlled_targets"], ["imported/repo"])
+        self.assertEqual(self.backups()[0].read_bytes(), b"{broken")
 
     def test_history_is_bounded_and_cas(self):
         store = DashboardStore(state_path=None)

@@ -34,12 +34,24 @@ every control VM share that secret, so sessions survive VM replacement. The `__H
 reject the cookie unless it is `Secure`, has `Path=/`, and has no `Domain`, so another `swacktech.com`
 subdomain can't set or shadow it. The sign-in `state` cookie is `__Host-spot_oauth_state`.
 
-To sign everyone out of the control VM dashboard, rotate `spot-dashboard-session-secret` and the Worker's
-`SESSION_SECRET` together. The startup script rewrites the dashboard environment file at every boot, so it
-doesn't keep a hand-set value. A dashboard that you run with your own environment can instead set
-`DASHBOARD_SESSION_NOT_BEFORE` to the current Unix time, with the same value in the Worker's optional
-`SESSION_NOT_BEFORE` variable. A session can't be revoked on its own, and a lost GitHub administrator
-permission takes effect at the next sign-in.
+A session can't be revoked on its own, and a lost GitHub administrator permission takes effect at the
+next sign-in. To sign everyone out, set a cut-off time that rejects every session issued before it:
+
+1. Choose the cut-off, for example `NOW="$(date +%s)"`. It can't be in the future.
+2. Set `SESSION_NOT_BEFORE = "<NOW>"` in `cloudflare/wrangler.toml` and deploy the Worker.
+3. Set `DASHBOARD_SESSION_NOT_BEFORE=<NOW>` in the autoscaler's environment file. Control VMs that the
+   autoscaler creates from then on get it as the `dashboard-session-not-before` instance metadata value.
+4. Add the same metadata value to the running control VM, then reboot it. The startup script reads the
+   value at every boot and writes `DASHBOARD_SESSION_NOT_BEFORE` to the dashboard environment file:
+
+   ```bash
+   gcloud compute instances add-metadata spot-control-a --zone=ZONE \
+     --metadata=dashboard-session-not-before="$NOW"
+   ```
+
+The startup script stops with an error when the value isn't Unix seconds or is in the future, because the
+dashboard would refuse to start. Rotating `spot-dashboard-session-secret` together with the Worker's
+`SESSION_SECRET` also signs everyone out.
 
 Sign-in routes are rate limited per browser IP and globally, and answer HTTP 429 with `Retry-After` when
 over the limit. The Worker passes the browser IP in `X-Spot-Client-Ip` and drops any copy that the
@@ -63,10 +75,67 @@ That check skips the cache of earlier administrator checks.
 
 ### Unreadable state file
 
-If `/var/lib/spot-dashboard/state.json` exists but can't be read or parsed, GitHub sign-in fails closed
-with HTTP 500 and `"code": "controlled_targets_unavailable"`. The dashboard never overwrites that file and
-refuses freeze, snapshot, and import calls, so it can't hand an incomplete target list to another VM.
-Repair or restore the file, then restart the dashboard container.
+If `/var/lib/spot-dashboard/state.json` exists but can't be read or parsed, the dashboard renames it to
+`state.json.corrupt-<UTC time>` with mode 0600 and never deletes it. It then recovers from the latest KV
+snapshot that passes the same checks as a normal start, or from a control-plane import, and keeps that
+snapshot's `state_version`.
+
+Until then the dashboard fails closed:
+
+- `/api/health` returns 503 with `"status": "state_unavailable"`, `"hydrated": false`, a `reason`, and
+  the backup path in `state_backup`. The autoscaler treats the VM as unhealthy and replaces it after
+  its grace period, and the Worker shows the waiting page.
+- Every other request gets the wait response, nothing is written to the state path, and freeze and
+  snapshot calls are refused.
+- If the file can't be renamed, it stays in place and nothing replaces it. Repair or move it by hand,
+  then restart the dashboard container.
+- Without KV, or when KV has no snapshot or one that fails verification, the dashboard keeps
+  retrying and never starts from defaults.
+
+### Snapshot and active slot checks
+
+- A new VM without local state starts from defaults only when KV positively reports that no snapshot
+  exists. A snapshot that exists but fails verification, or whose state fails validation, keeps the
+  dashboard unhydrated with a `reason` in `/api/health`.
+- With local state and an unverifiable KV snapshot, the dashboard serves local state read-only. It
+  never overwrites that KV value, because it may be newer.
+- A VM accepts changes only after it reads `origin:active` and confirms that the record names its slot,
+  or that no record exists yet. `/api/health` reports `ownership` as `active`, `inactive`, or `unknown`.
+  Until ownership is `active`, changes get the wait response.
+
+### Runner patches
+
+The **Runner Patches** tab and `/api/patches` edit the `spot-runner-patch-v1` manifests in the config
+repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml` for each repository.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/patches` | Lists the manifests at the default branch HEAD. |
+| `GET /api/patches/manifest?path=...` | Returns a manifest, its blob and base commit, and the effective patch with its sha256. |
+| `POST /api/patches/validate` | Returns field errors such as `host.apt_packages`. A repository manifest is also checked merged with `defaults.yaml`. |
+| `POST /api/patches/preview` | Classifies each runner host as `noop`, `hot_patch`, `recreate_containers`, or `replace_vm`. |
+| `POST /api/patches/save` | Opens a pull request. Needs an `Idempotency-Key`. |
+| `POST /api/patches/hot-patch` | Hot-patches the recorded runner hosts. Needs `"confirm": true` and an `Idempotency-Key`. |
+
+- Saving creates a `spot-dashboard/...` branch from the `base_sha` that the editor loaded, commits the
+  file there, and opens a pull request. It never writes to the default branch. If the default branch
+  moved, or GitHub reports that the file changed, the dashboard answers HTTP 409. The token in
+  `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` needs contents and pull-request write access to the config
+  repository.
+- The preview covers running `cicd_runner` instances whose `patch_target` names the repository. The
+  current patch comes from the host, or from a recorded `patch_manifest` field. Otherwise the host is
+  `unknown`.
+- Hot-patching applies the saved effective patch, never a draft. It runs only when every host is
+  `hot_patch` or `noop` and the `patch_sha256` from the preview is still current. It reports a result per
+  host. A repeated request with the same `Idempotency-Key` returns the stored result without touching
+  the hosts again. Like every change, it gets the wait response while the dashboard is frozen,
+  unhydrated, or not the active slot.
+- The control VM can't reach runner hosts. Its image has no `gcloud` and no SSH access, so hot-patching
+  there answers HTTP 501 with `"code": "hot_patch_unavailable"`. Run
+  `src/spot_runner_manager.py --patch-repo OWNER/REPO --patch-live` from an operator workstation instead. A
+  dashboard that runs where `gcloud` and operator credentials exist can set
+  `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`. Each host record then needs `name`, `zone`, `machine_type`,
+  `runner_prefix`, and `runners_count`.
 
 When `GITHUB_OAUTH_DEVICE_FLOW=1`, the Worker also passes `/auth/device/code` and `/auth/device/token`
 through without a session cookie. The dashboard still refuses them unless device login is enabled. The
@@ -87,7 +156,7 @@ startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` 
 - At startup the dashboard loads the newer of the local file and the KV snapshot, then reports
   `hydrated`. A new VM with no local file waits while KV is unreachable: `/api/health` returns 503 and
   the dashboard retries with backoff. It starts from defaults only when KV reports that no snapshot
-  exists.
+  exists, never when a snapshot exists but fails verification.
 - A VM that starts from its local file while KV is unreachable serves pages but answers changes with
   the wait response, and `/api/health` reports `starting` with `"reconciled": false`. When KV answers, a
   KV snapshot whose version is equal to or higher than the starting version replaces the local copy. Otherwise the dashboard

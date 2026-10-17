@@ -105,6 +105,16 @@ public_origin_of() {
   printf 'https://%s' "$rest"
 }
 
+# An optional DASHBOARD_SESSION_NOT_BEFORE value: empty, or Unix seconds that are not in the future (the
+# dashboard refuses a future cut-off). Mirrors session_not_before_problems() in src/lib/control_vm.py.
+session_not_before_ok() {
+  local value="$1" now
+  [[ -z "$value" ]] && return 0
+  [[ "$value" =~ ^[0-9]{1,15}$ ]] || return 1
+  now="$(date +%s)"
+  ((10#$value <= now + 60))
+}
+
 install_packages() {
   local missing=()
   command -v docker >/dev/null 2>&1 || missing+=(docker.io)
@@ -190,6 +200,10 @@ write_dashboard_env() {
     # differs from the upstream Host; the dashboard accepts POSTs from this origin as same-origin.
     printf 'DASHBOARD_PUBLIC_ORIGIN=%s\n' "$PUBLIC_ORIGIN"
     printf 'DASHBOARD_SESSION_SECRET=%s\n' "$session_secret"
+    if [[ -n "$SESSION_NOT_BEFORE" ]]; then
+      # Bulk sign-out: sessions issued before this Unix time are rejected (metadata, re-read every boot).
+      printf 'DASHBOARD_SESSION_NOT_BEFORE=%s\n' "$SESSION_NOT_BEFORE"
+    fi
     printf 'DASHBOARD_CONTROL_SECRET=%s\n' "$control_secret"
     printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$CLOUDFLARE_ACCOUNT_ID"
     printf 'CLOUDFLARE_KV_NAMESPACE_ID=%s\n' "$CLOUDFLARE_KV_NAMESPACE_ID"
@@ -248,6 +262,7 @@ main() {
   CLOUDFLARE_ACCOUNT_ID="$(metadata_required cloudflare-account-id)"
   CLOUDFLARE_KV_NAMESPACE_ID="$(metadata_required cloudflare-kv-namespace-id)"
   CLOUDFLARED_IMAGE="$(metadata_required cloudflared-image)"
+  SESSION_NOT_BEFORE="$(metadata_attr dashboard-session-not-before)"
 
   [[ "$SLOT" == a || "$SLOT" == b ]] || fail "spot-control-slot must be a or b"
   [[ "$PUBLIC_URL" == https://* ]] || fail "dashboard-public-url must be https"
@@ -255,6 +270,8 @@ main() {
   [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[A-Za-z0-9]+$ ]] || fail "cloudflare-account-id is malformed"
   [[ "$CLOUDFLARE_KV_NAMESPACE_ID" =~ ^[A-Za-z0-9]+$ ]] || fail "cloudflare-kv-namespace-id is malformed"
   image_ref_pinned "$CLOUDFLARED_IMAGE" || fail "cloudflared-image must be pinned to a version tag or digest"
+  session_not_before_ok "$SESSION_NOT_BEFORE" \
+    || fail "dashboard-session-not-before must be Unix seconds that are not in the future"
   PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url has a malformed host"
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     [[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"

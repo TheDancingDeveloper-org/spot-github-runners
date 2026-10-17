@@ -97,6 +97,8 @@ class WranglerConfigTests(unittest.TestCase):
         self.assertIn('binding = "SPOT_KV", id = "REPLACE_WITH_SPOT_KV_NAMESPACE_ID"', self.text)
         self.assertRegex(self.text, r'(?m)^ALLOWED_ADMIN_LOGIN = "swackhamer"$')
         self.assertRegex(self.text, r'(?m)^ALLOWED_ADMIN_ID = "619624"$')
+        # Optional bulk sign-out cut-off: empty (none) or Unix seconds, read by worker.js sessionNotBefore().
+        self.assertRegex(self.text, r'(?m)^SESSION_NOT_BEFORE = "([0-9]{1,15})?"$')
         date = re.search(r'(?m)^compatibility_date = "(\d{4}-\d{2}-\d{2})"$', self.text)
         self.assertIsNotNone(date)
         self.assertLessEqual(date.group(1), "2026-08-01")

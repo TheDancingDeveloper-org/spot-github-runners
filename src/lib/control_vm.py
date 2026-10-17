@@ -33,6 +33,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -103,7 +104,13 @@ METADATA_KEYS = (
     "cloudflare-account-id",
     "cloudflare-kv-namespace-id",
     "cloudflared-image",
+    "dashboard-session-not-before",
 )
+# Optional bulk sign-out cut-off (Unix seconds). Not a secret, so it travels as instance metadata; the
+# startup script writes it to the dashboard env file as DASHBOARD_SESSION_NOT_BEFORE on every boot.
+ENV_SESSION_NOT_BEFORE = "DASHBOARD_SESSION_NOT_BEFORE"
+_UNIX_SECONDS_RE = re.compile(r"^[0-9]{1,15}$")
+SESSION_NOT_BEFORE_SKEW_SECONDS = 60
 
 STATE_KEY = "control_vm"
 
@@ -167,6 +174,7 @@ class ControlConfig:
     access_client_id: str = field(default="", repr=False)
     access_client_secret: str = field(default="", repr=False)
     control_secret: str = field(default="", repr=False)
+    session_not_before: str = ""
 
     @classmethod
     def from_env(cls, project: str, env: Mapping[str, str] | None = None, **overrides: Any) -> ControlConfig:
@@ -190,6 +198,7 @@ class ControlConfig:
             access_client_id=env.get("CF_ACCESS_CLIENT_ID", ""),
             access_client_secret=env.get("CF_ACCESS_CLIENT_SECRET", ""),
             control_secret=env.get(edge_state.ENV_CONTROL_SECRET, ""),
+            session_not_before=str(env.get(ENV_SESSION_NOT_BEFORE, "") or "").strip(),
         )
         values.update({key: value for key, value in overrides.items() if value is not None})
         if isinstance(values["regions"], str):
@@ -228,7 +237,24 @@ class ControlConfig:
             problems.append("cloudflared image must be pinned to a version tag or digest")
         if self.service_account and not re.match(r"^[^\s,@]+@[^\s,@]+$", self.service_account):
             problems.append("control VM service account must be an e-mail address")
+        problems.extend(session_not_before_problems(self.session_not_before))
         return problems
+
+
+def session_not_before_problems(value: str, now: float | None = None) -> list[str]:
+    """Problems with an optional DASHBOARD_SESSION_NOT_BEFORE value (empty means unset).
+
+    The dashboard refuses a cut-off in the future (it would also reject every new session), so a VM created
+    with one would never come up; reject it before creating anything. Mirrors ``session_not_before_ok`` in
+    cloud-init/control-vm-startup.sh.
+    """
+    if not value:
+        return []
+    if not _UNIX_SECONDS_RE.match(value):
+        return [f"{ENV_SESSION_NOT_BEFORE} must be a Unix timestamp in seconds"]
+    if int(value) > (time.time() if now is None else now) + SESSION_NOT_BEFORE_SKEW_SECONDS:
+        return [f"{ENV_SESSION_NOT_BEFORE} must not be in the future"]
+    return []
 
 
 def metadata_items(config: ControlConfig, slot: str) -> dict[str, str]:
@@ -243,6 +269,7 @@ def metadata_items(config: ControlConfig, slot: str) -> dict[str, str]:
         "cloudflare-account-id": config.cloudflare_account_id,
         "cloudflare-kv-namespace-id": config.cloudflare_kv_namespace_id,
         "cloudflared-image": config.cloudflared_image,
+        "dashboard-session-not-before": config.session_not_before,
     }
     items = {key: value for key, value in items.items() if value}
     for key, value in items.items():
