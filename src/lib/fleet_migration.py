@@ -629,10 +629,11 @@ def guard_staged_retirement(vms,runners,args,state,state_path):
             controller.write_scale_state(state_path,state)
         safe=retirement_safe
     try:
-        current_vms=controller.list_gcloud_vms(args.project,name_prefix='oxidex-runners-')
+        current_vms=controller.scope_fleet_to_target(
+            controller.list_gcloud_vms(args.project,name_prefix='oxidex-runners-'),args,state)
         controller.observe_vms(current_vms,state)
         record_missing_sources(current_vms,state)
-        fresh=controller.list_github_runners(args.org)
+        fresh=controller.list_github_runners(controller._active_target(args))
         state['runner_inventory_observed_at']=time.time()
         controller.protected_heavy_routes(current_vms,fresh,state)
         from .tier_controller import evidence_for

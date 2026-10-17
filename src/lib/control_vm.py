@@ -113,6 +113,7 @@ START_RETRY_SECONDS = 120          # Minimum spacing between start requests for 
 UNHEALTHY_GRACE_SECONDS = 900      # Active VM RUNNING but unhealthy this long -> create the other slot.
 HEALTH_TIMEOUT_SECONDS = 1200      # New VM must report healthy within this (first boot may build).
 PROPAGATION_SECONDS = 90           # KV propagation wait between cutover and deleting the old VM.
+REPLACEMENT_READY_GRACE_SECONDS = 300  # Replacement unready this long after cutover -> fall back to old.
 ROTATION_COOLDOWN_SECONDS = 6 * 3600
 PRICE_CHECK_INTERVAL_SECONDS = 3600
 MIN_SAVINGS_FRACTION = Decimal("0.30")
@@ -315,6 +316,7 @@ class HealthResult:
     frozen: bool = False
     hydrated: bool = False
     detail: str = ""
+    slot: str | None = None
 
     @classmethod
     def unknown(cls, detail: str = "not probed") -> HealthResult:
@@ -618,10 +620,12 @@ def probe_health(requester: edge_state.Requester, config: ControlConfig, slot: s
     version = data.get("state_version")
     version = version if isinstance(version, int) and not isinstance(version, bool) else None
     hydrated, frozen = data.get("hydrated") is True, data.get("frozen") is True
+    reported_slot = data.get("slot") if data.get("slot") in edge_state.CONTROL_SLOTS else None
     ok = status == 200 and data.get("status") == "ok" and hydrated and not frozen
     return HealthResult(ok, status, version, frozen, hydrated,
                         detail="healthy" if ok else f"HTTP {status} status={data.get('status')!r} "
-                                                     f"hydrated={hydrated} frozen={frozen}")
+                                                     f"hydrated={hydrated} frozen={frozen}",
+                        slot=reported_slot)
 
 
 def _access_headers(config: ControlConfig) -> dict[str, str]:
@@ -1120,12 +1124,85 @@ class ControlVmManager:
             return "wait"
         old = obs.vm(t["old_slot"])
         if old is not None:
+            ready, detail = self._replacement_ready(t, obs)
+            if not ready:
+                return self._replacement_not_ready(t, obs, detail)
+            t.pop("replacement_unready_since", None)
             result = self.gcloud(delete_command(old, self.config.project))
             if result.returncode != 0:
                 self._fail_attempt(t, f"delete failed: {(result.stderr or '').strip()[:300]}", limit=10**9)
                 return "wait"
             self._note("deleted old control VM %s", old.name)
         return self._finish(t)
+
+    def _replacement_ready(self, t: dict, obs: Observation) -> tuple[bool, str]:
+        """Fresh check that the replacement is RUNNING, healthy, and answers as its own slot."""
+        new = obs.vm(t["new_slot"])
+        if new is None:
+            return False, f"replacement slot {t['new_slot']} VM is missing"
+        if new.status != "RUNNING":
+            return False, f"replacement {new.name} is {new.status}"
+        result = probe_health(self.requester, self.config, t["new_slot"])
+        if not result.ok:
+            return False, f"replacement {new.name} is not healthy: {result.detail}"
+        if result.slot != t["new_slot"]:
+            return False, f"replacement hostname answered as slot {result.slot!r}, expected {t['new_slot']!r}"
+        return True, "ready"
+
+    def _replacement_not_ready(self, t: dict, obs: Observation, detail: str) -> str:
+        """Never delete the old VM for an unready replacement: wait a bounded time, then fall back.
+
+        The fallback is the regular abort path, which unfreezes the old VM, restores ``origin:active`` to
+        it with a verified write, and deletes the replacement only once the origin no longer names it.
+        Without a running old VM to fall back to, the transition keeps waiting (nothing is deleted).
+        """
+        now = self.clock()
+        since = t.setdefault("replacement_unready_since", now)
+        t["error"] = f"{detail}; refusing to delete slot {t['old_slot']}"
+        t["updated_at"] = now
+        self.save()
+        self._note(t["error"], level=logging.WARNING)
+        new = obs.vm(t["new_slot"])
+        old = obs.vm(t["old_slot"])
+        if new is None:
+            return self._abort(t, f"replacement disappeared after cutover: {detail}")
+        if new.status in STOPPED_STATES:
+            last = self.cstate.get("last_start_at", {}).get(new.slot) or 0
+            if now - last >= START_RETRY_SECONDS:
+                self._start(new)
+        if now - since >= REPLACEMENT_READY_GRACE_SECONDS:
+            if old is not None and old.running:
+                if not self._carry_back_newer_state(t):
+                    return "wait"
+                return self._abort(t, f"replacement not ready {int(now - since)}s after cutover: {detail}")
+            self._note("replacement still not ready and old slot %s is %s; waiting", t["old_slot"],
+                       old.status if old else "missing", level=logging.ERROR)
+        return "wait"
+
+    def _carry_back_newer_state(self, t: dict) -> bool:
+        """Before falling back after cutover, import into the old VM any newer snapshot the replacement
+        wrote to KV, so changes accepted after cutover are not lost. True when the fallback may proceed."""
+        if t.get("fallback_import_done"):
+            return True
+        floor = t.get("frozen_version") or 0
+        try:
+            snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
+        except KvError as exc:
+            return self._fail_attempt(t, f"KV snapshot unreadable before fallback: {exc}")
+        if snapshot is None or snapshot["state_version"] <= floor:
+            t["fallback_import_done"] = True
+            self.save()
+            return True
+        status, body = self._control(t["old_slot"], "import", "POST", snapshot)
+        version = body.get("state_version") if isinstance(body, dict) else None
+        if status == 200 and isinstance(version, int) and not isinstance(version, bool) \
+                and version >= snapshot["state_version"]:
+            t["fallback_import_done"] = True
+            self.save()
+            self._note("carried state_version %d back to old slot %s", version, t["old_slot"])
+            return True
+        # Give up after the retry limit: a reachable old VM with slightly older state beats no dashboard.
+        return self._fail_attempt(t, f"fallback import into slot {t['old_slot']} returned {status}")
 
     def _step_abort(self, t: dict, obs: Observation) -> str:
         old = obs.vm(t.get("old_slot"))

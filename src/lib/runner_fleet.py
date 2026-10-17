@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 from .log_format import error_detail
+from .target_config import TARGET_LABEL_KEY
 
 LOG = logging.getLogger("spot_runner_autoscaler")
 
@@ -54,6 +55,8 @@ class GceVm:
     specs_last_known: bool = False
     cpu_platform: str = ""
     requested_cpu_platform: str = ""
+    # Value of the GCE ``spot-target`` label; empty for hosts launched before target labels.
+    target_label: str = ""
 
     @property
     def running(self) -> bool:
@@ -254,6 +257,8 @@ def list_gcloud_vms(
                 instance_id=str(item.get("id", "")),
                 cpu_platform=str(item.get("cpuPlatform", "")),
                 requested_cpu_platform=str(item.get("minCpuPlatform", "")),
+                target_label=str((item.get("labels") or {}).get(TARGET_LABEL_KEY, "")
+                                 if isinstance(item.get("labels"), dict) else ""),
             )
         )
     return tuple(vms)

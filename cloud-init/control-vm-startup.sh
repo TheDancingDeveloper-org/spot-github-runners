@@ -88,6 +88,23 @@ write_private_file() {
   mv -f "$temp" "$target"
 }
 
+# Accept the same pinned image references as ControlConfig.create_problems() in src/lib/control_vm.py:
+# name:tag, name@sha256:<64 hex>, or name:tag@sha256:<64 hex>. A bare name or a :latest tag is refused.
+image_ref_pinned() {
+  local ref="$1"
+  [[ "$ref" =~ ^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?(@sha256:[0-9a-f]{64})?$ ]] || return 1
+  [[ "$ref" == *:* ]] || return 1
+  [[ "$ref" != *:latest ]] || return 1
+}
+
+# Scheme and host of the public dashboard URL (https://host[:port]), with any path removed.
+public_origin_of() {
+  local rest="${1#https://}"
+  rest="${rest%%/*}"
+  [[ "$rest" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || return 1
+  printf 'https://%s' "$rest"
+}
+
 install_packages() {
   local missing=()
   command -v docker >/dev/null 2>&1 || missing+=(docker.io)
@@ -167,6 +184,9 @@ write_dashboard_env() {
     printf 'GITHUB_OAUTH_CLIENT_ID=%s\n' "$oauth_id"
     printf 'GITHUB_OAUTH_CLIENT_SECRET=%s\n' "$oauth_secret"
     printf 'GITHUB_OAUTH_REDIRECT_URI=%s\n' "${PUBLIC_URL%/}/auth/github/callback"
+    # The Worker reaches this VM through its tunnel hostname, so the browser Origin (the public URL)
+    # differs from the upstream Host; the dashboard accepts POSTs from this origin as same-origin.
+    printf 'DASHBOARD_PUBLIC_ORIGIN=%s\n' "$PUBLIC_ORIGIN"
     printf 'DASHBOARD_SESSION_SECRET=%s\n' "$session_secret"
     printf 'DASHBOARD_CONTROL_SECRET=%s\n' "$control_secret"
     printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$CLOUDFLARE_ACCOUNT_ID"
@@ -231,8 +251,8 @@ main() {
   [[ "$DASHBOARD_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "dashboard-repo must be owner/name"
   [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[A-Za-z0-9]+$ ]] || fail "cloudflare-account-id is malformed"
   [[ "$CLOUDFLARE_KV_NAMESPACE_ID" =~ ^[A-Za-z0-9]+$ ]] || fail "cloudflare-kv-namespace-id is malformed"
-  [[ "$CLOUDFLARED_IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+|@sha256:[0-9a-f]{64})$ ]] \
-    || fail "cloudflared-image must be pinned"
+  image_ref_pinned "$CLOUDFLARED_IMAGE" || fail "cloudflared-image must be pinned to a version tag or digest"
+  PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url has a malformed host"
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     [[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"
   else

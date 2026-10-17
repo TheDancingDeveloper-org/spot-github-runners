@@ -29,12 +29,17 @@ def target_api_prefix(target: Any) -> str:
     return f"repos/{name}" if is_repo_target(target) else f"orgs/{name}"
 
 
-def resolve_target(operation: dict[str, Any], args: Any) -> str:
-    """Resolve target name from operation or args, defaulting to 'swack-tools'."""
+def resolve_target(operation: dict[str, Any], args: Any, default: str | None = None) -> str:
+    """Resolve the target from the operation, then args, then the caller's default.
+
+    'swack-tools' is used only when no operation target, args target/org, or default exists.
+    """
     return (
         operation.get("target")
         or getattr(args, "target", None)
-        or getattr(args, "org", "swack-tools")
+        or getattr(args, "org", None)
+        or default
+        or "swack-tools"
     )
 
 
@@ -186,7 +191,7 @@ def drain_runners(operation, vm, args, state, save, assigned, mutation_guard=Non
 
 
 def cleanup_group(operation, org, mutation_guard=None):
-    target = resolve_target(operation, None) or org
+    target = resolve_target(operation, None, org)
     if is_repo_target(target):
         return
     request=lambda *a,**kw:guarded_api(mutation_guard,*a,**kw)

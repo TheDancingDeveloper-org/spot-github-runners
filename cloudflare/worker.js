@@ -34,9 +34,13 @@ const MAX_ERROR_BODY_BYTES = 65_536;
 const CONTROL_SLOTS = new Set(["a", "b"]);
 
 // Reachable without a session cookie. "/" is public for GET/HEAD only (it renders the login gate).
+// The device-flow routes are sign-in steps, so a signed-out browser must reach them; the backend still
+// refuses them unless GITHUB_OAUTH_DEVICE_FLOW=1 and authorizes the resulting session itself.
 export const PUBLIC_PATHS = new Set([
   "/auth/github/login",
   "/auth/github/callback",
+  "/auth/device/code",
+  "/auth/device/token",
   "/auth/status",
   "/api/auth/status",
   "/auth/logout",

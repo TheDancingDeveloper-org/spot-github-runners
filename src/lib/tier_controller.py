@@ -185,8 +185,8 @@ def dry_run(args,saved):
     from . import spot_runner_autoscaler as controller
     from .job_recovery import JobRecovery,utc_now
     state=copy.deepcopy(saved)
-    vms=controller.list_gcloud_vms(args.project,name_prefix='oxidex-runners-')
-    runners=controller.list_github_runners(args.org)
+    vms=controller.scope_fleet_to_target(controller.list_gcloud_vms(args.project,name_prefix='oxidex-runners-'),args,state)
+    runners=controller.list_github_runners(controller._active_target(args))
     # Read job endpoints only. Never invoke recovery polling or a POST rerun.
     tracker=JobRecovery(state,lambda:None,args.job_repository or [args.org+'/oxidex'])
     for repo in tracker.repositories:

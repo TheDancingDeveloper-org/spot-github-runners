@@ -285,6 +285,100 @@ class WriteBehindTests(unittest.TestCase):
         self.assertEqual(target.state_version(), result["state_version"])
 
 
+class DurableFreezeTests(unittest.TestCase):
+    """A freeze must survive a container restart until an explicit unfreeze or a successful import."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "state.json"
+        self.marker = Path(self.tmp.name) / "state.json.frozen"
+        self.fake = FakeKvRequester()
+
+    def store(self) -> DashboardStore:
+        store = DashboardStore(self.path, control_slot="a", kv=make_kv(self.fake), clock=FakeClock(),
+                               sleep=lambda _s: None)
+        store.hydrate()
+        return store
+
+    def test_restart_while_frozen_stays_frozen_until_unfreeze(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        first = self.store()
+        first.set_controlled_targets(["o/before"])
+        result = first.freeze()
+        self.assertTrue(self.marker.exists())
+        self.assertEqual(self.marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(self.marker.read_text())["state_version"], result["state_version"])
+        self.assertEqual(list(Path(self.tmp.name).glob(".state.json.frozen.*.tmp")), [])
+
+        restarted = self.store()  # container restart before cutover
+        self.assertTrue(restarted.frozen)
+        self.assertEqual((restarted.health()["status"], restarted.health()["frozen"]), ("frozen", True))
+        with self.assertRaises(DashboardFrozenError):
+            restarted.run_request("k" * 16, "POST", "/api/targets", lambda: (200, {}))
+        self.assertEqual(restarted.state_version(), result["state_version"])  # no write was accepted
+        self.assertEqual(restarted.get_controlled_targets(), ["o/before"])
+        restarted._mark_kv_dirty()
+        self.assertFalse(restarted.kv_tick())
+
+        self.assertEqual(restarted.unfreeze(), {"frozen": False})
+        self.assertFalse(self.marker.exists())
+        self.assertFalse(self.store().frozen)
+
+    def test_import_clears_durable_freeze(self):
+        first = self.store()
+        frozen = first.freeze()
+        restarted = self.store()
+        self.assertTrue(restarted.frozen)
+        newer = build_snapshot({"controlled_targets": ["o/newer"]}, frozen["state_version"] + 2, "b")
+        self.assertTrue(restarted.import_snapshot(newer)["imported"])
+        self.assertFalse(restarted.frozen)
+        self.assertFalse(self.marker.exists())
+        self.assertFalse(self.store().frozen)
+        self.assertEqual(restarted.health()["status"], "ok")
+
+    def test_failed_import_keeps_freeze(self):
+        self.store().freeze()
+        restarted = self.store()
+        with self.assertRaises(ValueError):
+            restarted.import_snapshot({"schema": "nope"})
+        self.assertTrue(restarted.frozen)
+        self.assertTrue(self.marker.exists())
+
+    def test_marker_write_failure_fails_freeze_but_stays_frozen(self):
+        store = self.store()
+        with mock.patch.object(DashboardStore, "_write_freeze_marker", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                store.freeze()
+        self.assertTrue(store.frozen)
+
+    def test_marker_removal_failure_keeps_freeze(self):
+        store = self.store()
+        store.freeze()
+        with mock.patch.object(Path, "unlink", side_effect=OSError("read-only")):
+            with self.assertRaises(OSError):
+                store.unfreeze()
+        self.assertTrue(store.frozen)
+        self.assertTrue(self.marker.exists())
+
+    def test_symlinked_marker_counts_as_frozen_and_is_not_followed(self):
+        target = Path(self.tmp.name) / "elsewhere"
+        self.marker.symlink_to(target)
+        store = self.store()
+        self.assertTrue(store.frozen)
+        with self.assertRaises(OSError):
+            store.freeze()
+        self.assertFalse(target.exists())
+
+    def test_in_memory_store_freezes_without_marker(self):
+        store = DashboardStore(None, control_slot="a")
+        store.hydrate()
+        store.freeze()
+        self.assertTrue(store.frozen)
+        self.assertEqual(store.unfreeze(), {"frozen": False})
+
+
 class ServerHarness(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -531,6 +625,34 @@ class ControlEndpointTests(ServerHarness):
         self.assertEqual((status, body["imported"]), (200, False))
         status, _, _ = self.request("POST", "/api/control/import", headers=self.auth("import"), body={"x": 1})
         self.assertEqual(status, 400)
+
+    def test_restart_while_frozen_through_server(self):
+        store = self.start(control_slot="a", control_secret=CONTROL_SECRET)
+        store.set_controlled_targets(["o/before"])
+        status, _, frozen = self.request("POST", "/api/control/freeze", headers=self.auth("freeze"))
+        self.assertEqual(status, 200)
+
+        restarted = self.start(control_slot="a", control_secret=CONTROL_SECRET)  # same state file
+        self.assertTrue(restarted.frozen)
+        status, msg, payload = self.request("GET", "/api/health")
+        self.assert_wait_response(status, msg, payload)
+        self.assertEqual((payload["status"], payload["frozen"], payload["hydrated"]), ("frozen", True, True))
+        status, msg, payload = self.request("POST", "/api/targets", body={"targets": ["o/after"]})
+        self.assert_wait_response(status, msg, payload)
+        self.assertEqual(restarted.get_controlled_targets(), ["o/before"])
+        self.assertEqual(restarted.state_version(), frozen["state_version"])
+
+        status, _, body = self.request("POST", "/api/control/unfreeze", headers=self.auth("unfreeze"))
+        self.assertEqual((status, body), (200, {"frozen": False}))
+        self.assertEqual(self.request("GET", "/api/health")[0], 200)
+
+    def test_freeze_reports_500_when_marker_cannot_be_written(self):
+        store = self.start(control_slot="a", control_secret=CONTROL_SECRET)
+        with mock.patch.object(DashboardStore, "_write_freeze_marker", side_effect=OSError("disk full")):
+            status, _, body = self.request("POST", "/api/control/freeze", headers=self.auth("freeze"))
+        self.assertEqual(status, 500)
+        self.assertIn("freeze marker", body["error"])
+        self.assertTrue(store.frozen)
 
     def test_import_hydrates_unhydrated_store(self):
         store = self.start(control_slot="b", control_secret=CONTROL_SECRET)

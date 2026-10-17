@@ -45,6 +45,7 @@ from .dashboard_auth import (
     safe_return_path,
     ENV_CONTROLLED_TARGETS,
     ENV_DEVICE_FLOW,
+    ENV_REDIRECT_URI,
 )
 from .edge_state import (
     CONTROL_OPS,
@@ -122,6 +123,11 @@ MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # POST endpoints that compute a response without changing dashboard state; they skip idempotency storage.
 NON_MUTATING_POST_PATHS = frozenset({"/api/qualify", "/api/cloud-init/parse", "/api/ip-intel"})
 FORWARDED_CLIENT_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "X-Forwarded-For")
+# Public browser origin (for example https://spot.swacktech.com) when a proxy such as the Cloudflare
+# Worker reaches this server under a different Host (the tunnel hostname). Defaults to the origin of
+# GITHUB_OAUTH_REDIRECT_URI.
+ENV_PUBLIC_ORIGIN = "DASHBOARD_PUBLIC_ORIGIN"
+FREEZE_MARKER_SUFFIX = ".frozen"
 
 LOG = logging.getLogger("spot_dashboard")
 
@@ -981,6 +987,15 @@ class DashboardStore:
         self._defer: dict[str, Any] | None = None
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
+        # A freeze survives container and VM restarts: the marker sits next to the state file until an
+        # explicit unfreeze or a successful import, so a restarted old VM never accepts writes that the
+        # replacement did not import.
+        self.freeze_marker_path = (
+            state_path.parent / f"{state_path.name}{FREEZE_MARKER_SUFFIX}" if state_path else None
+        )
+        if self.freeze_marker_path is not None and os.path.lexists(self.freeze_marker_path):
+            self.frozen = True
+            LOG.warning("Dashboard starts frozen: freeze marker %s is present", self.freeze_marker_path)
         self.loaded_from_file = False
         if state_path and state_path.exists():
             try:
@@ -1124,7 +1139,11 @@ class DashboardStore:
             LOG.warning("Could not write adopted dashboard snapshot to the local state file: %s", exc)
 
     def import_snapshot(self, envelope: Any) -> dict[str, Any]:
-        """Import a snapshot envelope when its state_version >= local; always marks the store hydrated."""
+        """Import a snapshot envelope when its state_version >= local; always marks the store hydrated.
+
+        Only the control plane's handover target receives an import, so a successful import also clears
+        any freeze (in memory and the durable marker): this VM is about to become the active slot.
+        """
         snapshot = parse_snapshot(envelope)
         if snapshot is None:
             raise ValueError("Invalid dashboard snapshot envelope")
@@ -1133,6 +1152,10 @@ class DashboardStore:
             if imported:
                 self._adopt_snapshot(snapshot)
                 self._mark_kv_dirty()
+            if self.frozen or (self.freeze_marker_path is not None and os.path.lexists(self.freeze_marker_path)):
+                self._clear_freeze_marker()
+                self.frozen = False
+                LOG.info("Import cleared the dashboard freeze")
             self.hydrated = True
             self.hydration_source = "import" if imported else self.hydration_source
             return {"state_version": self.state_version(), "imported": imported}
@@ -1211,10 +1234,65 @@ class DashboardStore:
             return False
         return True
 
+    def _fsync_state_dir(self) -> None:
+        assert self.freeze_marker_path is not None
+        try:
+            fd = os.open(str(self.freeze_marker_path.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _write_freeze_marker(self, state_version: int) -> None:
+        """Atomically write the 0600 freeze marker next to the state file. Raises OSError."""
+        if self.freeze_marker_path is None:
+            return
+        marker = self.freeze_marker_path
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        if marker.is_symlink():
+            raise OSError(f"Refusing symlinked freeze marker path: {marker}")
+        payload = json.dumps({"frozen": True, "state_version": state_version, "slot": self.control_slot,
+                              "frozen_at": self._clock()}, allow_nan=False)
+        tmp = marker.parent / f".{marker.name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                os.chmod(tmp, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp.replace(marker)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        self._fsync_state_dir()
+
+    def _clear_freeze_marker(self) -> None:
+        """Remove the freeze marker (durably). Raises OSError when it cannot be removed."""
+        if self.freeze_marker_path is None or not os.path.lexists(self.freeze_marker_path):
+            return
+        self.freeze_marker_path.unlink()
+        self._fsync_state_dir()
+
     def freeze(self) -> dict[str, Any]:
-        """Stop accepting mutations and synchronously flush the snapshot to KV (when this VM is the writer)."""
+        """Stop accepting mutations, persist the freeze marker, and synchronously flush the snapshot to KV.
+
+        Raises OSError (the store stays frozen in memory) when the durable marker cannot be written, so the
+        caller reports failure instead of a freeze that a restart would silently undo.
+        """
         with self._lock:
             self.frozen = True
+            self._write_freeze_marker(self.state_version())
             envelope = self.snapshot_envelope()
         flushed = False
         if self.kv is not None and self.refresh_writer():
@@ -1230,7 +1308,9 @@ class DashboardStore:
         return {"state_version": envelope["state_version"], "snapshot": envelope, "kv_flushed": flushed}
 
     def unfreeze(self) -> dict[str, Any]:
+        """Accept mutations again. Raises OSError (and stays frozen) when the marker cannot be removed."""
         with self._lock:
+            self._clear_freeze_marker()
             self.frozen = False
         return {"frozen": False}
 
@@ -3767,6 +3847,63 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _origin_key(value: str) -> tuple[str, str, int] | None:
+    """(scheme, lowercase host, port) of an http(s) origin or URL, or None when it is not one."""
+    try:
+        parsed = urlparse(str(value or "").strip())
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if scheme not in ("http", "https") or not host or parsed.username or parsed.password:
+        return None
+    return scheme, host, port if port is not None else (443 if scheme == "https" else 80)
+
+
+def normalize_public_origin(value: str | None) -> str | None:
+    """Validate a configured public origin (``scheme://host[:port]``, no path, query, or credentials).
+
+    Returns the canonical lowercase origin, None for an empty value, and raises ValueError otherwise.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urlparse(text)
+    except ValueError as exc:
+        raise ValueError(f"{ENV_PUBLIC_ORIGIN} is not a valid URL: {exc}") from exc
+    origin = origin_of_url(text)
+    if origin is None or parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.params:
+        raise ValueError(f"{ENV_PUBLIC_ORIGIN} must be an http(s) origin such as https://spot.example.com")
+    return origin
+
+
+def origin_of_url(url: str | None) -> str | None:
+    """Origin (``scheme://host[:port]``) of an absolute http(s) URL, or None."""
+    key = _origin_key(url or "")
+    if key is None:
+        return None
+    scheme, host, port = key
+    shown_host = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{shown_host}" + ("" if port == (443 if scheme == "https" else 80) else f":{port}")
+
+
+def resolve_public_origin(explicit: str | None = None, *, redirect_uri: str | None = None,
+                          environ: Any = None) -> str | None:
+    """Public browser origin: the explicit value, else DASHBOARD_PUBLIC_ORIGIN, else the redirect URI's origin."""
+    env = os.environ if environ is None else environ
+    for candidate in (explicit, env.get(ENV_PUBLIC_ORIGIN)):
+        normalized = normalize_public_origin(candidate)
+        if normalized:
+            return normalized
+    for candidate in (redirect_uri, env.get(ENV_REDIRECT_URI)):
+        derived = origin_of_url(candidate)
+        if derived:
+            return derived
+    return None
+
+
 _HOST_HEADER_RE = re.compile(r"[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?|\[[0-9A-Fa-f:.]{2,45}\](?::[0-9]{1,5})?")
 
 
@@ -3779,6 +3916,7 @@ def make_handler(
     controlled_targets: list[str] | tuple[str, ...] | None = None,
     config_targets_provider: Any = None,
     control_secret: str | None = None,
+    public_origin: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create the HTTP handler bound to a DashboardStore instance.
 
@@ -3789,11 +3927,17 @@ def make_handler(
     which must be signed, unexpired, for the hardcoded administrator, and verified for every controlled
     target (static, stored, and config-repo targets; otherwise 403). ``/api/health`` is public and
     ``/api/control/*`` uses short-lived control tokens instead.
+
+    Browser POSTs must come from this server's own Host origin or from ``public_origin`` (the URL users
+    open when a proxy such as the Cloudflare Worker forwards to a different Host). ``X-Forwarded-Host``
+    is never trusted for this check.
     """
     from .dashboard_ui_assets import render_dashboard_html
 
     static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
     control_secret_value = str(control_secret or "").strip()
+    public_origin_value = normalize_public_origin(public_origin)
+    public_origin_key = _origin_key(public_origin_value) if public_origin_value else None
     auth_required = bool(str(auth_token).strip() if auth_token else "") or oauth_manager is not None
     unauthorized_message = (
         "Unauthorized: sign in with GitHub or provide a valid dashboard token"
@@ -4046,6 +4190,10 @@ def make_handler(
                 self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             except (ValueError, TypeError) as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except OSError as exc:
+                LOG.error("Control %s could not update the durable freeze marker: %s", op, exc)
+                self._send_json({"error": f"Could not update the durable freeze marker: {exc}"},
+                                status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
         def _send_forbidden(self, info: dict[str, Any]) -> None:
             self._send_json(
@@ -4062,6 +4210,8 @@ def make_handler(
                 return None
             if oauth_manager.redirect_uri:
                 return oauth_manager.redirect_uri
+            if public_origin_value:
+                return f"{public_origin_value}/auth/github/callback"
             host = (self.headers.get("Host") or "").strip()
             if not _HOST_HEADER_RE.fullmatch(host):
                 return None
@@ -4288,8 +4438,13 @@ def make_handler(
                 parsed_origin = urlparse(origin)
                 req_host = (self.headers.get("Host") or "").strip().lower()
                 origin_host = parsed_origin.netloc.lower()
+                matches_public = (
+                    public_origin_key is not None
+                    and parsed_origin.path == ""
+                    and _origin_key(origin) == public_origin_key
+                )
                 if parsed_origin.scheme not in ("http", "https") or (
-                    req_host and origin_host != req_host
+                    req_host and origin_host != req_host and not matches_public
                 ):
                     return (
                         False,
@@ -4686,6 +4841,7 @@ def create_dashboard_server(
     control_slot: str | None = None,
     control_secret: str | None = None,
     kv: CloudflareKv | None = None,
+    public_origin: str | None = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
     """Instantiate the ThreadingHTTPServer and DashboardStore, then start hydration.
 
@@ -4694,7 +4850,9 @@ def create_dashboard_server(
     addition to the dynamic list stored in dashboard state and every repository in the private config
     repo (``config_targets_provider``; defaults to :class:`ConfigRepoTargets` when OAuth is enabled).
     ``control_slot``/``kv`` enable Cloudflare KV hydration and write-behind; ``control_secret`` enables
-    ``/api/control/*``. Nothing is read from Cloudflare unless ``kv`` is passed.
+    ``/api/control/*``. Nothing is read from Cloudflare unless ``kv`` is passed. ``public_origin``
+    (else ``DASHBOARD_PUBLIC_ORIGIN``, else the OAuth redirect URI's origin) is the browser-facing origin
+    accepted on POSTs in addition to the request's own Host.
     """
     resolved_token = (
         auth_token
@@ -4744,6 +4902,9 @@ def create_dashboard_server(
                 "--allow-insecure-non-loopback (DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1) if a trusted network proxy terminates TLS."
             )
     static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
+    resolved_public_origin = resolve_public_origin(
+        public_origin, redirect_uri=oauth_manager.redirect_uri if oauth_manager is not None else None
+    )
     if oauth_manager is not None and config_targets_provider is None:
         config_targets_provider = ConfigRepoTargets()
     store = DashboardStore(state_path=state_path, project=project, org=org, control_slot=control_slot, kv=kv)
@@ -4755,6 +4916,7 @@ def create_dashboard_server(
         controlled_targets=static_targets,
         config_targets_provider=config_targets_provider,
         control_secret=control_secret,
+        public_origin=resolved_public_origin,
     )
     server = DashboardThreadingHTTPServer((host, port), handler)
     server.dashboard_store = store
@@ -4849,6 +5011,15 @@ def args_parser():
         help="Absolute GitHub OAuth callback URL, for example https://spot.example.com/auth/github/callback (or set GITHUB_OAUTH_REDIRECT_URI; default: derived from the Host header)",
     )
     parser.add_argument(
+        "--public-origin",
+        default=None,
+        help=(
+            f"Browser-facing origin, for example https://spot.example.com, accepted on POSTs when a proxy "
+            f"forwards under a different Host (or set {ENV_PUBLIC_ORIGIN}; default: the origin of the OAuth "
+            "redirect URI)"
+        ),
+    )
+    parser.add_argument(
         "--state-file",
         type=Path,
         default=None,
@@ -4895,6 +5066,7 @@ def main(argv: list[str] | None = None) -> int:
         control_slot=args.control_slot,
         control_secret=os.environ.get(ENV_CONTROL_SECRET) or None,
         kv=kv,
+        public_origin=args.public_origin,
     )
     actual_host, actual_port = server.server_address[:2]
     scheme = "https" if isinstance(server.socket, ssl.SSLSocket) else "http"

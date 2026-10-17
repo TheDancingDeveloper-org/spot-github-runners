@@ -373,6 +373,8 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             zones=("asia-east2-a",),
             cpu_platform="Intel Emerald Rapids",
         )
+        # Fresh evidence that the replacement is RUNNING with its runner online.
+        self.replacement_runner = GitHubRunner(500, "gha-oxidex-runners-new-1", "online", False, ("spot",))
         self.args = SimpleNamespace(
             project="homelab-424523",
             org="swack-tools",
@@ -463,7 +465,8 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                     patch("urllib.request.urlopen") as mock_urlopen, \
                     patch("lib.runner_drain.isolated_group", return_value="orgs/swack-tools/actions/runner-groups/7"), \
                     patch("lib.runner_drain.api", return_value={}):
-                step_price_rotation([self.outgoing_vm, self.replacement_vm], [], self.args, state, path)
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [self.replacement_runner],
+                                    self.args, state, path)
             recovered = read_scale_state(path)["price_rotation"]
             self.assertEqual(recovered["phase"], "cordon_drain")
             self.assertEqual(recovered["readiness"], {"runners_online": True})
@@ -667,7 +670,8 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             with patch("lib.runner_drain.jobs_finished", return_value=False), \
                     patch("lib.spot_runner_autoscaler.now", return_value=2000000010.0), \
                     patch("lib.spot_runner_autoscaler.delete_overpriced_vm") as mock_delete:
-                step_price_rotation([self.outgoing_vm], [busy_runner], self.args, state, path)
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [busy_runner, self.replacement_runner],
+                                    self.args, state, path)
                 mock_delete.assert_not_called()
                 recovered = read_scale_state(path)
                 self.assertEqual(recovered["price_rotation"]["phase"], "cordon_drain")
@@ -693,16 +697,17 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                     patch("lib.runner_drain.api") as mock_api, \
                     patch("lib.runner_drain.subprocess.run") as mock_delete_cmd:
                 # Step 1: Drain finishes -> advances to deregister
-                step_price_rotation([self.outgoing_vm], [idle_runner], self.args, state, path)
+                live = [self.outgoing_vm, self.replacement_vm]
+                step_price_rotation(live, [idle_runner, self.replacement_runner], self.args, state, path)
                 self.assertEqual(read_scale_state(path)["price_rotation"]["phase"], "deregister")
 
                 # Step 2: Deregister runner -> advances to delete
-                step_price_rotation([self.outgoing_vm], [idle_runner], self.args, state, path)
+                step_price_rotation(live, [idle_runner, self.replacement_runner], self.args, state, path)
                 mock_api.assert_called_with("xbmc4lyfe/newznab-tmux", "DELETE", "repos/xbmc4lyfe/newznab-tmux/actions/runners/99")
                 self.assertEqual(read_scale_state(path)["price_rotation"]["phase"], "delete")
 
                 # Step 3: Deletes old VM and all attached disks
-                step_price_rotation([self.outgoing_vm], [], self.args, state, path)
+                step_price_rotation(live, [self.replacement_runner], self.args, state, path)
                 mock_delete_cmd.assert_called_once_with([
                     "gcloud", "compute", "instances", "delete", "oxidex-runners-old",
                     "--zone=asia-east2-a", "--project=homelab-424523", "--delete-disks=all", "--quiet",
@@ -862,7 +867,8 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             path = Path(tmpdir) / "state.json"
             with patch("lib.runner_drain.api", side_effect=subprocess.CalledProcessError(1, ["gh", "api"], stderr="403 Forbidden")), \
                  patch("lib.spot_runner_autoscaler.now", return_value=1010.0):
-                step_price_rotation([self.outgoing_vm], [runner], self.args, state, path)
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [runner, self.replacement_runner],
+                                    self.args, state, path)
                 recovered = read_scale_state(path)
                 self.assertFalse(recovered["price_rotation"].get("cordon_complete", False))
                 self.assertEqual(recovered["price_rotation"]["phase"], "cordon_drain")
@@ -876,7 +882,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 "target": "swack-tools",
                 "target_type": "org",
                 "outgoing_vm": {"name": "vm-1", "zone": "asia-east2-a", "instance_id": "id-vm-1"},
-                "replacement_vm": {"name": "vm-repl", "zone": "asia-east2-a", "instance_id": "id-repl"},
+                "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
                 "cordon_complete": False,
                 "drain_started_at": 1000.0,
                 "phase_started_at": 1000.0,
@@ -886,7 +892,8 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             path = Path(tmp) / "state.json"
             with patch("lib.runner_drain.isolated_group", side_effect=RuntimeError("Group quota reached")), \
                  patch("lib.runner_drain.api", return_value={}):
-                res = step_price_rotation([out_vm], [runner], self.args, state, path)
+                res = step_price_rotation([out_vm, self.replacement_vm], [runner, self.replacement_runner],
+                                          self.args, state, path)
                 self.assertTrue(res)
                 recovered = read_scale_state(path)
                 self.assertTrue(recovered["price_rotation"]["cordon_complete"])
@@ -976,6 +983,349 @@ class RunnerFleetListingTargetTests(unittest.TestCase):
             mock_list.assert_called_once_with("xbmc4lyfe/newznab-tmux", gh_binary="gh")
 
 
+
+class TargetOwnershipTests(unittest.TestCase):
+    """Finding 1: a controller only scales, recovers, or rotates hosts owned by its target."""
+
+    def setUp(self):
+        from lib.target_config import target_label_value
+        self.repo_label = target_label_value("xbmc4lyfe/newznab-tmux")
+        self.org_label = target_label_value("swack-tools")
+        self.org_host = GceVm("oxidex-runners-org", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                              instance_id="org-1")
+        self.labeled_org_host = GceVm("oxidex-runners-org2", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                                      instance_id="org-2", target_label=self.org_label)
+        self.repo_host = GceVm("oxidex-runners-repo", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                               instance_id="repo-1", target_label=self.repo_label)
+        self.repo_args = SimpleNamespace(org="swack-tools", target="xbmc4lyfe/newznab-tmux")
+        self.org_args = SimpleNamespace(org="swack-tools", target=None)
+
+    def test_label_value_is_gce_safe_case_insensitive_and_distinct(self):
+        from lib.target_config import target_label_value
+        values = {target_label_value(name) for name in
+                  ("swack-tools", "xbmc4lyfe/newznab-tmux", "owner/re.po", "owner/re_po", "owner--re/po")}
+        self.assertEqual(len(values), 5)
+        for value in values | {target_label_value("a" * 39 + "/" + "b" * 100)}:
+            self.assertLessEqual(len(value), 63)
+            self.assertRegex(value, r"^[a-z0-9_-]+$")
+        self.assertEqual(target_label_value("XBMC4lyfe/NewzNab-tmux"), self.repo_label)
+
+    def test_unlabeled_hosts_belong_only_to_the_default_org_target(self):
+        from lib.target_config import target_owns_vm_label
+        self.assertTrue(target_owns_vm_label("", "swack-tools", "swack-tools"))
+        self.assertFalse(target_owns_vm_label("", "xbmc4lyfe/newznab-tmux", "swack-tools"))
+        self.assertFalse(target_owns_vm_label("", "other-org", "swack-tools"))
+        self.assertTrue(target_owns_vm_label(self.repo_label, "xbmc4lyfe/newznab-tmux"))
+        self.assertFalse(target_owns_vm_label(self.repo_label, "swack-tools"))
+        self.assertFalse(target_owns_vm_label(self.org_label, "xbmc4lyfe/newznab-tmux"))
+
+    def test_list_gcloud_vms_reads_target_label(self):
+        from lib import runner_fleet
+        rows = [{"name": "oxidex-runners-repo", "zone": "zones/asia-east2-a", "status": "RUNNING",
+                 "machineType": "machineTypes/n4-highcpu-16", "id": "1",
+                 "scheduling": {"provisioningModel": "SPOT"}, "labels": {"spot-target": self.repo_label}},
+                {"name": "oxidex-runners-old", "zone": "zones/asia-east2-a", "status": "RUNNING",
+                 "machineType": "machineTypes/n4-highcpu-16", "id": "2",
+                 "scheduling": {"provisioningModel": "SPOT"}}]
+        responses = {"instances": rows, "disks": [], "machine-types": {"guestCpus": 16, "memoryMb": 32768}}
+        with patch("lib.runner_fleet._command_json", side_effect=lambda args: responses[args[2]]):
+            vms = runner_fleet.list_gcloud_vms("p", name_prefix="oxidex-runners-")
+        self.assertEqual([vm.target_label for vm in vms], [self.repo_label, ""])
+
+    def test_repo_controller_scopes_out_org_hosts(self):
+        from lib.spot_runner_autoscaler import scope_fleet_to_target
+        vms = [self.org_host, self.labeled_org_host, self.repo_host]
+        self.assertEqual(scope_fleet_to_target(vms, self.repo_args), (self.repo_host,))
+        self.assertEqual(scope_fleet_to_target(vms, self.org_args), (self.org_host, self.labeled_org_host))
+        explicit_org = SimpleNamespace(org="swack-tools", target="swack-tools")
+        self.assertEqual(scope_fleet_to_target(vms, explicit_org), (self.org_host, self.labeled_org_host))
+
+    def test_scoping_forgets_foreign_observations_so_they_are_never_recovered(self):
+        from lib.fleet_logging import observe_vms
+        from lib.spot_runner_autoscaler import scope_fleet_to_target
+        state = {}
+        observe_vms([self.org_host, self.repo_host], state)  # pre-upgrade unscoped observation
+        self.assertIn("asia-east2-a/oxidex-runners-org", state["observed_vms"])
+        owned = scope_fleet_to_target([self.org_host, self.repo_host], self.repo_args, state)
+        observe_vms(owned, state)
+        self.assertEqual(state["pending_vm_recovery"], {})
+        self.assertEqual(list(state["observed_vms"]), ["asia-east2-a/oxidex-runners-repo"])
+
+    def test_scoping_abandons_rotation_of_a_foreign_outgoing_host(self):
+        from lib.spot_runner_autoscaler import scope_fleet_to_target
+        state = {"price_rotation": {"phase": "cordon_drain", "target": "xbmc4lyfe/newznab-tmux",
+                                    "outgoing_vm": {"name": "oxidex-runners-org", "zone": "asia-east2-a",
+                                                    "instance_id": "org-1"}}}
+        scope_fleet_to_target([self.org_host, self.repo_host], self.repo_args, state)
+        self.assertNotIn("price_rotation", state)
+
+    def test_repo_controller_loop_never_rotates_an_org_host(self):
+        from contextlib import ExitStack
+        from lib import spot_runner_autoscaler as controller
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            args = controller.args_parser().parse_args(
+                ["--once", "--target", "xbmc4lyfe/newznab-tmux", "--make-before-break",
+                 "--state-file", str(Path(directory) / "state.json")])
+            for name, value in [("clear_catalog_cache", None), ("load_cpu_platform_map", {}),
+                                ("list_github_runners", []),
+                                ("list_gcloud_vms", (self.org_host, self.repo_host)),
+                                ("log_hourly_spend", None), ("read_utilization", None)]:
+                stack.enter_context(patch.object(controller, name, return_value=value))
+            stack.enter_context(patch.object(controller, "JobRecovery"))
+            prices = stack.enter_context(patch.object(controller, "check_running_prices", return_value=[]))
+            controller._run_controller(args)
+            checked = prices.call_args[0][0]
+            self.assertEqual([vm.name for vm in checked], ["oxidex-runners-repo"])
+
+    def test_runner_manager_labels_new_hosts_with_their_target(self):
+        from lib.runner_manager import apply_startup, args_parser as manager_parser, select_sizing
+        from lib.target_config import target_label_value
+        for options, expected in ((["--target", "xbmc4lyfe/newznab-tmux"], self.repo_label),
+                                  ([], target_label_value("swack-tools"))):
+            with self.subTest(options=options):
+                args = manager_parser().parse_args(["--max-cost", ".2", "--instance-type", "n2-standard-32",
+                                                    "--ram", "128", "--instance-name", "test-vm", *options])
+                select_sizing(args)
+                calls = []
+
+                def cloud(command, **kwargs):
+                    calls.append(command)
+                    return "[]" if command[:3] == ["compute", "disks", "list"] else ""
+                missing = SimpleNamespace(returncode=1, stdout="")
+                with patch("lib.runner_manager.subprocess.run", side_effect=[missing, missing]), \
+                        patch("lib.runner_manager.gcloud", side_effect=cloud):
+                    apply_startup(args, "zone-a", "safe-test-script")
+                create = next(c for c in calls if c[:3] == ["compute", "instances", "create"])
+                self.assertIn(f"--labels=spot-target={expected}", create)
+
+
+def replace_vm(vm, **changes):
+    from dataclasses import replace
+    return replace(vm, **changes)
+
+
+class ReplacementEvidenceTests(unittest.TestCase):
+    """Finding 2: every retirement step needs fresh proof the replacement is live."""
+
+    def setUp(self):
+        self.outgoing_vm = GceVm("oxidex-runners-old", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                                 instance_id="old-123")
+        self.replacement_vm = GceVm("oxidex-runners-new", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                                    instance_id="new-456")
+        self.old_runner = GitHubRunner(99, "gha-oxidex-runners-old-1", "online", False, ("self-hosted", "X64"))
+        self.new_runner = GitHubRunner(500, "gha-oxidex-runners-new-1", "online", False, ("spot",))
+        self.args = SimpleNamespace(project="homelab-424523", org="swack-tools", target="xbmc4lyfe/newznab-tmux",
+                                    max_daily_usd=Decimal("4.00"), maximum_hosts=5)
+
+    def state(self, phase, target="xbmc4lyfe/newznab-tmux", target_type="repo", **extra):
+        rotation = {
+            "phase": phase, "target": target, "target_type": target_type,
+            "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
+            "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+            "expected_runner_count": 1, "readiness": {"runners_online": True},
+            "cordon_complete": True, "drain_started_at": 1000.0, "phase_started_at": 1000.0,
+            "cordoned_runners": {"99": {"name": "gha-oxidex-runners-old-1", "labels": ["spot", "x64-16"]}},
+        }
+        rotation.update(extra)
+        return {"price_rotation": rotation}
+
+    def step(self, state, vms, runners, api=None):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            api_kwargs = {"side_effect": api} if api is not None else {"return_value": {}}
+            with patch("lib.runner_drain.api", **api_kwargs) as mock_api, \
+                    patch("lib.runner_drain.jobs_finished", return_value=True), \
+                    patch("lib.spot_runner_autoscaler.delete_overpriced_vm") as delete_old, \
+                    patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete_new, \
+                    patch("lib.spot_runner_autoscaler.now", return_value=1010.0):
+                step_price_rotation(vms, runners, self.args, state, path)
+            saved = read_scale_state(path) if path.exists() else {}
+        return mock_api, delete_old, delete_new, saved
+
+    def test_preempted_replacement_stops_drain_uncordons_and_aborts(self):
+        terminated = replace_vm(self.replacement_vm, status="TERMINATED")
+        state = self.state("cordon_drain")
+        mock_api, delete_old, delete_new, saved = self.step(
+            state, [self.outgoing_vm, terminated], [self.old_runner])
+        delete_old.assert_not_called()
+        mock_api.assert_called_once_with("xbmc4lyfe/newznab-tmux", "PUT",
+                                         "repos/xbmc4lyfe/newznab-tmux/actions/runners/99/labels",
+                                         {"labels": ["spot", "x64-16"]})
+        delete_new.assert_called_once_with(terminated, "homelab-424523")
+        self.assertNotIn("price_rotation", saved)
+
+    def test_deregister_requires_replacement_runners_still_online(self):
+        offline = GitHubRunner(500, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
+        state = self.state("deregister")
+        mock_api, delete_old, _, saved = self.step(
+            state, [self.outgoing_vm, self.replacement_vm], [self.old_runner, offline])
+        self.assertNotIn(("xbmc4lyfe/newznab-tmux", "DELETE", "repos/xbmc4lyfe/newznab-tmux/actions/runners/99"),
+                         [c.args for c in mock_api.call_args_list])
+        delete_old.assert_not_called()
+        self.assertNotIn("price_rotation", saved)
+
+    def test_delete_requires_replacement_with_recorded_instance_id(self):
+        impostor = replace_vm(self.replacement_vm, instance_id="someone-else")
+        state = self.state("delete")
+        _, delete_old, delete_new, saved = self.step(state, [self.outgoing_vm, impostor], [self.new_runner])
+        delete_old.assert_not_called()
+        delete_new.assert_not_called()  # Never delete a VM that is not this rotation's replacement.
+        self.assertNotIn("price_rotation", saved)
+
+    def test_missing_replacement_blocks_delete(self):
+        state = self.state("delete")
+        _, delete_old, _, _ = self.step(state, [self.outgoing_vm], [self.new_runner])
+        delete_old.assert_not_called()
+
+    def test_failed_uncordon_holds_recovery_and_retries(self):
+        def failing(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
+        state = self.state("cordon_drain")
+        _, delete_old, delete_new, saved = self.step(state, [self.outgoing_vm], [self.old_runner], api=failing)
+        delete_old.assert_not_called()
+        delete_new.assert_not_called()
+        self.assertIn("absent", saved["price_rotation"]["recovering"])
+        # A recovered replacement does not resume retirement once recovery started.
+        mock_api, delete_old, _, saved = self.step(
+            saved, [self.outgoing_vm, self.replacement_vm], [self.old_runner, self.new_runner])
+        delete_old.assert_not_called()
+        self.assertEqual(mock_api.call_args[0][1], "PUT")
+        self.assertNotIn("price_rotation", saved)
+
+    def test_org_recovery_restores_original_runner_group(self):
+        state = self.state("cordon_drain", target="swack-tools", target_type="org", drain_group_id=77,
+                           cordoned_runners={"99": {"name": "gha-oxidex-runners-old-1", "labels": ["spot"],
+                                                    "group_id": 10}})
+        self.args.target = "swack-tools"
+        mock_api, delete_old, _, _ = self.step(state, [self.outgoing_vm], [self.old_runner])
+        calls = [c.args for c in mock_api.call_args_list]
+        self.assertEqual(calls, [
+            ("swack-tools", "PUT", "orgs/swack-tools/actions/runner-groups/10/runners/99"),
+            ("swack-tools", "PUT", "orgs/swack-tools/actions/runners/99/labels", {"labels": ["spot"]}),
+            ("swack-tools", "DELETE", "orgs/swack-tools/actions/runner-groups/77"),
+        ])
+        delete_old.assert_not_called()
+
+    def test_busy_replacement_is_kept_when_rotation_aborts(self):
+        busy_offline_peer = [GitHubRunner(500, "gha-oxidex-runners-new-1", "online", True, ("spot",)),
+                             GitHubRunner(501, "gha-oxidex-runners-new-2", "offline", False, ("spot",))]
+        state = self.state("cordon_drain", expected_runner_count=2)
+        _, delete_old, delete_new, saved = self.step(
+            state, [self.outgoing_vm, self.replacement_vm], [self.old_runner, *busy_offline_peer])
+        delete_old.assert_not_called()
+        delete_new.assert_not_called()
+        self.assertNotIn("price_rotation", saved)
+
+    def test_cordon_records_labels_before_stripping(self):
+        labeled = GitHubRunner(99, "gha-oxidex-runners-old-1", "online", False, ("self-hosted", "X64", "spot"))
+        state = self.state("cordon_drain", cordon_complete=False, cordoned_runners={})
+        mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm], [labeled, self.new_runner])
+        mock_api.assert_called_once_with("xbmc4lyfe/newznab-tmux", "DELETE",
+                                         "repos/xbmc4lyfe/newznab-tmux/actions/runners/99/labels")
+        self.assertEqual(saved["price_rotation"]["cordoned_runners"],
+                         {"99": {"name": "gha-oxidex-runners-old-1", "labels": ["spot"]}})
+        self.assertTrue(saved["price_rotation"]["cordon_complete"])
+
+    def test_org_cordon_records_original_group_before_isolation(self):
+        state = self.state("cordon_drain", target="swack-tools", target_type="org",
+                           cordon_complete=False, cordoned_runners={})
+        self.args.target = "swack-tools"
+        labeled = GitHubRunner(99, "gha-oxidex-runners-old-1", "online", False, ("self-hosted", "spot"))
+
+        def api(target, method, path, body=None, paginate=False):
+            return {"id": 99, "runner_group_id": 10} if method == "GET" else {}
+        with patch("lib.runner_drain.isolated_group", return_value="orgs/swack-tools/actions/runner-groups/77"):
+            mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                              [labeled, self.new_runner], api=api)
+        self.assertEqual(saved["price_rotation"]["cordoned_runners"]["99"]["group_id"], 10)
+        self.assertEqual(saved["price_rotation"]["cordon_mode"], "isolated_group")
+        self.assertEqual([c.args[1] for c in mock_api.call_args_list], ["GET", "DELETE", "PUT"])
+
+    def test_delete_never_targets_a_same_named_vm_with_another_identity(self):
+        reused = replace_vm(self.outgoing_vm, instance_id="reused-999")
+        state = self.state("delete")
+        _, delete_old, _, saved = self.step(state, [reused, self.replacement_vm], [self.new_runner])
+        delete_old.assert_not_called()
+        self.assertNotIn("price_rotation", saved)
+
+
+class LaunchAgentArgumentTests(unittest.TestCase):
+    """Finding 3: the LaunchAgent restarts the controller with the same target and rotation mode."""
+
+    def program_arguments(self, argv):
+        import plistlib
+        from lib import spot_runner_autoscaler as controller
+        with tempfile.TemporaryDirectory() as directory:
+            args = controller.args_parser().parse_args(argv)
+            with patch.object(Path, "home", return_value=Path(directory)), \
+                    patch.object(controller.subprocess, "run") as run:
+                path = controller.install_launch_agent(args)
+                run.assert_called_once()  # launchctl is mocked, never executed.
+            return plistlib.loads(path.read_bytes())["ProgramArguments"]
+
+    def test_target_and_make_before_break_are_serialized(self):
+        arguments = self.program_arguments(["--target", "xbmc4lyfe/newznab-tmux", "--make-before-break",
+                                            "--manage-control-vm"])
+        self.assertEqual(arguments[arguments.index("--target") + 1], "xbmc4lyfe/newznab-tmux")
+        self.assertIn("--make-before-break", arguments)
+        self.assertIn("--manage-control-vm", arguments)
+
+    def test_defaults_omit_target_and_rotation_flags(self):
+        arguments = self.program_arguments([])
+        self.assertNotIn("--target", arguments)
+        self.assertNotIn("--make-before-break", arguments)
+
+
+class DrainTargetFallbackTests(unittest.TestCase):
+    """Finding 4: drain helpers fall back to the caller's effective target, not 'swack-tools'."""
+
+    def test_resolve_target_uses_caller_default(self):
+        self.assertEqual(runner_drain.resolve_target({}, None, "other-org"), "other-org")
+        self.assertEqual(runner_drain.resolve_target({"target": "a/b"}, None, "other-org"), "a/b")
+        self.assertEqual(runner_drain.resolve_target({}, None), "swack-tools")
+
+    def test_cleanup_group_without_stored_target_uses_caller_org(self):
+        operation = {"drain_group_id": 7, "drain_group_name": "spot-drain-x"}
+        responses = [{"name": "spot-drain-x"}, [{"runners": []}], {}]
+        with patch("lib.runner_drain.api", side_effect=responses) as mock_api:
+            runner_drain.cleanup_group(operation, "other-org")
+        self.assertEqual([c.args[2] for c in mock_api.call_args_list],
+                         ["orgs/other-org/actions/runner-groups/7",
+                          "orgs/other-org/actions/runner-groups/7/runners",
+                          "orgs/other-org/actions/runner-groups/7"])
+
+    def test_cleanup_group_skips_repo_fallback_target(self):
+        with patch("lib.runner_drain.api") as mock_api:
+            runner_drain.cleanup_group({"drain_group_id": 7, "drain_group_name": "g"}, "xbmc4lyfe/newznab-tmux")
+        mock_api.assert_not_called()
+
+    def test_terminate_deregisters_through_the_effective_target(self):
+        from lib import spot_runner_autoscaler as controller
+        vm = GceVm("oxidex-runners-a", "z", "RUNNING", "n4-highcpu-16", True, instance_id="1")
+        runner = GitHubRunner(5, "gha-oxidex-runners-a-1", "online", False, ("spot",))
+        with patch.object(controller.subprocess, "run") as run:
+            controller.terminate_spot_vm(vm, "p", "xbmc4lyfe/newznab-tmux", [runner], [vm])
+        self.assertEqual(run.call_args_list[-1].args[0],
+                         ["gh", "api", "-X", "DELETE", "repos/xbmc4lyfe/newznab-tmux/actions/runners/5"])
+
+    def test_controller_passes_effective_target_to_group_cleanup(self):
+        from lib import spot_runner_autoscaler as controller
+        args = SimpleNamespace(org="swack-tools", target="other-org", project="p", scaling_mode="legacy",
+                               max_daily_usd=Decimal("4"))
+        state = {"host_operation": {"kind": "delete", "vm": {"name": "oxidex-runners-gone", "zone": "z",
+                                                             "status": "RUNNING", "machine_type": "n4-highcpu-16",
+                                                             "spot": True, "instance_id": "9"},
+                                    "runner_ids": [], "drain_group_id": 3,
+                                    "drain_group_name": "spot-drain-oxidex-runners-gone-9"}}
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("lib.spot_runner_autoscaler.runner_inventory_stale", return_value=False), \
+                patch("lib.spot_runner_autoscaler.import_deployment_receipt"), \
+                patch("lib.runner_drain.cleanup_group") as cleanup, \
+                patch("lib.fleet_migration.confirm_migration_source_drives", return_value=True), \
+                patch("lib.fleet_migration.record_retirement_completion"):
+            controller.reconcile_host_operation([], [], args, state, Path(tmpdir) / "state.json")
+        self.assertEqual(cleanup.call_args.args[1], "other-org")
+
+
 if __name__ == "__main__":
     unittest.main()
-

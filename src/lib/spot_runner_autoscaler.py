@@ -31,6 +31,7 @@ from .log_format import configure_logging, error_detail
 from .vm_recovery import reconcile_lost_vms
 from .price_guard import check_running_prices, delete_overpriced_vm
 from .runner_drain import delete_vm_and_disks, is_repo_target, target_api_prefix
+from .runner_labels import DEFAULT_RUNNER_LABELS
 from .project_costs import log_project_costs
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
@@ -39,6 +40,7 @@ from .billing_catalog import catalog_skus, clear_catalog_cache, monthly_to_daily
 from .launch_candidates import LaunchInventory, candidate_key, launchable_candidates
 from .spot_pricing import parse_component_rates
 from .runner_tiers import tier_for_shape
+from .target_config import DEFAULT_ORG, target_owns_vm_label
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = logging.getLogger("spot_runner_autoscaler")
@@ -56,6 +58,59 @@ def now() -> float:
 def _active_target(args: Any) -> str:
     """Return configured target or fallback to org."""
     return getattr(args, "target", None) or getattr(args, "org", "swack-tools")
+
+
+def owns_vm(vm: GceVm, args: Any) -> bool:
+    """Return whether this controller's GitHub target owns a runner host (via its GCE label)."""
+    return target_owns_vm_label(getattr(vm, "target_label", ""), _active_target(args),
+                                getattr(args, "org", None) or DEFAULT_ORG)
+
+
+def scope_fleet_to_target(vms, args: Any, state: dict | None = None) -> tuple[GceVm, ...]:
+    """Return only the hosts owned by this controller's target.
+
+    GitHub inventory is scoped to one target, but GCE inventory lists every ``oxidex-runners-*``
+    host in the project. Scaling, recovery, and rotation must never act on another target's
+    hosts, whose runners are invisible to this controller's drain checks. When ``state`` is
+    given, saved observations of live foreign hosts are forgotten so their absence from the
+    scoped inventory is never mistaken for a loss.
+    """
+    owned = tuple(vm for vm in vms if owns_vm(vm, args))
+    foreign = [vm for vm in vms if not owns_vm(vm, args)]
+    if state is not None and foreign:
+        forget_foreign_hosts(foreign, state)
+    return owned
+
+
+def forget_foreign_hosts(foreign, state: dict) -> None:
+    """Drop controller state that refers to live hosts owned by another target."""
+    def matches(record, vm):
+        return (isinstance(record, dict) and record.get("name") == vm.name
+                and record.get("zone") == vm.zone
+                and (not record.get("instance_id") or not vm.instance_id
+                     or record.get("instance_id") == vm.instance_id))
+    observed = state.get("observed_vms")
+    pending = state.get("pending_vm_recovery")
+    operation = state.get("host_operation") or {}
+    for vm in foreign:
+        key = f"{vm.zone}/{vm.name}"
+        if isinstance(observed, dict) and key in observed:
+            observed.pop(key)
+            LOG.warning("Forgetting host owned by another target (label %r): %s",
+                        vm.target_label or "<none>", vm_details(vm))
+        if isinstance(pending, dict):
+            for pending_key in [k for k, record in pending.items()
+                                if matches(record, vm) and not record.get("_cleanup_complete")
+                                and operation.get("recovery_key") != k]:
+                pending.pop(pending_key)
+                LOG.warning("Dropping loss recovery for host owned by another target: %s", vm_details(vm))
+    rotation = state.get("price_rotation")
+    if isinstance(rotation, dict) and any(matches(rotation.get("outgoing_vm"), vm) for vm in foreign):
+        # The outgoing host's runners are registered to another target, so this controller can
+        # neither cordon nor drain them. Keep any replacement as ordinary owned capacity.
+        LOG.error("Abandoning price rotation: outgoing host %s belongs to another target",
+                  rotation["outgoing_vm"].get("name"))
+        state.pop("price_rotation", None)
 
 
 def count_online_runners(org: str, label: str) -> int:
@@ -268,7 +323,7 @@ def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRun
     LOG.info("Deleted idle Spot VM %s and its attached disks", vm_details(vm))
     for runner in assigned:
         subprocess.run(["gh", "api", "-X", "DELETE",
-                        f"orgs/{org}/actions/runners/{runner.runner_id}"],
+                        f"{target_api_prefix(org)}/actions/runners/{runner.runner_id}"],
                        check=True, text=True, capture_output=True)
 
 
@@ -403,10 +458,12 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
             and not operation.get("price_eviction") and not operation.get("drained")):
         operation.update(kind="drain", runner_names={str(r.runner_id): r.name for r in assigned},
                          drain_mode="label_only")
+        operation.setdefault("target", _active_target(args))
         write_scale_state(state_path, state)
     if operation["kind"] == "drain":
         if (getattr(args, 'scaling_mode', 'legacy') in ('resource','tiered')
-                and operation.get('drain_mode') == 'label_only'):
+                and operation.get('drain_mode') == 'label_only'
+                and not is_repo_target(operation.get('target') or _active_target(args))):
             operation.update(drain_mode='isolated_group', runners_isolated=False)
             operation.setdefault('drain_group_name', f'spot-drain-{vm.name}-{vm.instance_id}')
             write_scale_state(state_path, state)
@@ -560,7 +617,8 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                         return True
                     delete_drained_vm(vm, args,lambda:guard_fleet_mutation(state,vm))
                 else:
-                    terminate_spot_vm(current, args.project, args.org, runners, vms,lambda:guard_fleet_mutation(state,current))
+                    terminate_spot_vm(current, args.project, operation.get('target') or _active_target(args),
+                                      runners, vms,lambda:guard_fleet_mutation(state,current))
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             clear_rejected_deletion(vm, exc, state, state_path)
             LOG.warning("Deletion remains pending for %s: %s", vm_details(vm), error_detail(exc))
@@ -573,7 +631,8 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
     if stale:
         for runner in stale:
             try:
-                subprocess.run(["gh", "api", "-X", "DELETE", f"orgs/{args.org}/actions/runners/{runner.runner_id}"],
+                subprocess.run(["gh", "api", "-X", "DELETE",
+                                f"{target_api_prefix(operation.get('target') or _active_target(args))}/actions/runners/{runner.runner_id}"],
                                check=True, text=True, capture_output=True, timeout=60)
             except (OSError, subprocess.SubprocessError) as exc:
                 LOG.warning("Deregistration pending for %s: %s", runner.name, error_detail(exc))
@@ -590,7 +649,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
     if operation.get("drain_group_id"):
         from .runner_drain import cleanup_group
         try:
-            cleanup_group(operation, args.org,mutation_guard=lambda:guard_inventory_fresh(state))
+            cleanup_group(operation, _active_target(args),mutation_guard=lambda:guard_inventory_fresh(state))
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning("Drain group cleanup remains pending: %s", error_detail(exc))
             return True
@@ -912,6 +971,7 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
         return 0
     assigned = host_runners(vm, runners, vms)
     begin_host_operation("drain", vm, runners, vms, state, state_path,
+                         target=_active_target(args),
                          runner_names={str(runner.runner_id): runner.name for runner in assigned},
                          drain_group_name=f'spot-drain-{vm.name}-{vm.instance_id}',
                          drain_mode=('isolated_group' if getattr(args, 'scaling_mode', 'legacy') == 'resource'
@@ -980,6 +1040,10 @@ RUNNER_ROTATION_PHASES = ("select", "provision", "boot", "verify_readiness", "co
 # Phases written by the earlier dashboard-coupled rotation map onto the runner-only sequence so a
 # saved transaction resumes without probing a dashboard or writing the edge origin.
 LEGACY_ROTATION_PHASES = {"boot_hydrate": "boot", "origin_cutover": "cordon_drain"}
+# Phases that act on the outgoing host; each step first requires fresh replacement evidence.
+RETIREMENT_PHASES = ("cordon_drain", "deregister", "delete")
+# Controller-launched org hosts register into runner_manager's default ``--runner-group-id``.
+DEFAULT_RUNNER_GROUP_ID = 10
 
 
 def _offer_record(offer) -> dict:
@@ -1143,6 +1207,12 @@ def step_price_rotation(vms: list[GceVm], runners: list[GitHubRunner],
         phase = mapped
     LOG.debug("Stepping make-before-break rotation for %s: phase=%s", rotation["outgoing_vm"]["name"], phase)
 
+    if rotation.get("recovering") or phase in RETIREMENT_PHASES:
+        # Saved readiness is history; a preempted replacement must stop retirement every step.
+        failure = rotation.get("recovering") or _replacement_live_failure(vms, runners, rotation)
+        if failure:
+            return _recover_failed_replacement(vms, runners, args, state, state_path, rotation, failure)
+
     steps = {
         "select": _step_rotation_select,
         "provision": _step_rotation_provision,
@@ -1285,6 +1355,111 @@ def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str) 
     return True
 
 
+def _replacement_runners(runners, name: str):
+    return [r for r in runners if name and r.name.startswith(f"gha-{name}-")]
+
+
+def _replacement_live_failure(vms, runners, rotation) -> str | None:
+    """Return why fresh inventory does not prove the replacement live, or None when it does.
+
+    The replacement must be present with its recorded name, zone, and instance ID, be RUNNING,
+    and have at least the expected number of its own runners online in this check's inventory.
+    """
+    repl = rotation.get("replacement_vm") or {}
+    name, zone, instance_id = repl.get("name"), repl.get("zone"), repl.get("instance_id")
+    if not name or not instance_id:
+        return "replacement identity (name and instance ID) is not recorded"
+    vm = next((v for v in vms if v.name == name and (not zone or v.zone == zone)), None)
+    if vm is None:
+        return f"replacement {name} is absent from fresh inventory"
+    if vm.instance_id != instance_id:
+        return f"replacement {name} has instance ID {vm.instance_id or 'unknown'}, expected {instance_id}"
+    if not vm.running:
+        return f"replacement {name} is {vm.status}"
+    expected = max(1, int(rotation.get("expected_runner_count", 1) or 1))
+    online = sum(1 for r in _replacement_runners(runners, name) if r.online)
+    if online < expected:
+        return f"replacement {name} has {online}/{expected} runners online"
+    return None
+
+
+def _record_cordon(rotation, runner, state, state_path, group_id=None) -> None:
+    """Persist a runner's pre-cordon labels (and group) once, before any cordon API call."""
+    records = rotation.setdefault("cordoned_runners", {})
+    key = str(runner.runner_id)
+    if key in records:
+        if group_id is not None and "group_id" not in records[key]:
+            records[key]["group_id"] = group_id
+            write_scale_state(state_path, state)
+        return
+    records[key] = {"name": runner.name,
+                    "labels": sorted(set(runner.labels) - DEFAULT_RUNNER_LABELS)}
+    if group_id is not None:
+        records[key]["group_id"] = group_id
+    write_scale_state(state_path, state)
+
+
+def _uncordon_outgoing(rotation, runners, state, state_path) -> bool:
+    """Restore the outgoing host's runner labels and group; return True when nothing remains."""
+    from .runner_drain import api
+    records = rotation.get("cordoned_runners") or {}
+    target = rotation["target"]
+    prefix = target_api_prefix(target)
+    present = {runner.runner_id: runner for runner in runners}
+    for key, record in records.items():
+        if record.get("restored"):
+            continue
+        runner = present.get(int(key))
+        if runner is None or runner.name != record.get("name"):
+            record["restored"] = "absent"
+            write_scale_state(state_path, state)
+            continue
+        try:
+            if record.get("group_id") and not is_repo_target(target):
+                api(target, "PUT", f"orgs/{target}/actions/runner-groups/{record['group_id']}/runners/{runner.runner_id}")
+            if record.get("labels"):
+                api(target, "PUT", f"{prefix}/actions/runners/{runner.runner_id}/labels",
+                    {"labels": record["labels"]})
+        except Exception as exc:
+            LOG.warning("Could not uncordon outgoing runner %s: %s", runner.name, error_detail(exc))
+            write_scale_state(state_path, state)
+            return False
+        record["restored"] = True
+        write_scale_state(state_path, state)
+        LOG.info("Uncordoned outgoing runner %s", runner.name)
+    drain_group_id = rotation.get("drain_group_id")
+    if drain_group_id and not is_repo_target(target):
+        try:
+            api(target, "DELETE", f"orgs/{target}/actions/runner-groups/{drain_group_id}")
+            rotation["drain_group_id"] = None
+            write_scale_state(state_path, state)
+        except Exception as exc:
+            LOG.warning("Drain group cleanup pending after uncordon: %s", error_detail(exc))
+    return True
+
+
+def _recover_failed_replacement(vms, runners, args, state, state_path, rotation, reason: str) -> bool:
+    """Stop retiring the outgoing host, restore its scheduling, then abort the rotation."""
+    out_name = rotation["outgoing_vm"]["name"]
+    if not rotation.get("recovering"):
+        rotation["recovering"] = reason
+        rotation["readiness"] = {"runners_online": False}
+        write_scale_state(state_path, state)
+        LOG.error("Retirement of %s stopped: %s; restoring the outgoing host", out_name, reason)
+    if not _uncordon_outgoing(rotation, runners, state, state_path):
+        LOG.warning("Rotation recovery waits to uncordon %s; retrying next loop", out_name)
+        return True
+    repl = rotation.get("replacement_vm") or {}
+    if any(r.busy for r in _replacement_runners(runners, repl.get("name", ""))):
+        # Never kill jobs that already landed on a partially healthy replacement.
+        LOG.warning("Keeping replacement %s: it is running jobs; rotation aborted", repl.get("name"))
+        state.pop("price_rotation", None)
+        write_scale_state(state_path, state)
+        return True
+    return _abort_runner_rotation(rotation, vms, args, state, state_path,
+                                  f"Rotation for {out_name} aborted: {rotation['recovering']}")
+
+
 def _step_rotation_boot(vms, runners, args, state, state_path, rotation):
     """Phase 3: Wait for the replacement this rotation launched to reach RUNNING."""
     repl = rotation.get("replacement_vm")
@@ -1322,7 +1497,7 @@ def _step_rotation_verify_readiness(vms, runners, args, state, state_path, rotat
     readiness = rotation.setdefault("readiness", {"runners_online": False})
 
     repl_name = repl["name"] if repl else ""
-    assigned = [r for r in runners if repl_name and r.name.startswith(f"gha-{repl_name}-")]
+    assigned = _replacement_runners(runners, repl_name)
     expected_count = rotation.get("expected_runner_count", 1)
     online_count = sum(1 for r in assigned if r.online)
     readiness["runners_online"] = bool(repl_name) and online_count >= expected_count
@@ -1360,6 +1535,7 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
         if target_type == "repo":
             for runner in assigned:
                 try:
+                    _record_cordon(rotation, runner, state, state_path)
                     api(target, "DELETE", f"repos/{target}/actions/runners/{runner.runner_id}/labels")
                 except Exception as exc:
                     cordon_success = False
@@ -1371,8 +1547,15 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
             try:
                 group_path = isolated_group(operation, target, lambda: None)
                 rotation["drain_group_id"] = operation.get("drain_group_id")
+                write_scale_state(state_path, state)
                 for runner in assigned:
                     try:
+                        if str(runner.runner_id) not in rotation.get("cordoned_runners", {}):
+                            current = api(target, "GET", f"orgs/{target}/actions/runners/{runner.runner_id}") or {}
+                            group_id = current.get("runner_group_id")
+                            if type(group_id) is not int or group_id == rotation.get("drain_group_id"):
+                                group_id = DEFAULT_RUNNER_GROUP_ID
+                            _record_cordon(rotation, runner, state, state_path, group_id)
                         api(target, "DELETE", f"orgs/{target}/actions/runners/{runner.runner_id}/labels")
                         api(target, "PUT", f"{group_path}/runners/{runner.runner_id}")
                     except Exception as exc:
@@ -1384,6 +1567,7 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
                 LOG.warning("Could not set up isolated drain group: %s; stripping labels", error_detail(exc))
                 for runner in assigned:
                     try:
+                        _record_cordon(rotation, runner, state, state_path)
                         api(target, "DELETE", f"orgs/{target}/actions/runners/{runner.runner_id}/labels")
                     except Exception as e2:
                         cordon_success = False
@@ -1452,7 +1636,9 @@ def _step_rotation_delete(vms, runners, args, state, state_path, rotation):
     out_dict = rotation["outgoing_vm"]
     repl_dict = rotation.get("replacement_vm")
     out_name = out_dict["name"]
-    out_vm = next((v for v in vms if v.name == out_name), None)
+    out_id = out_dict.get("instance_id", "")
+    out_vm = next((v for v in vms if v.name == out_name and v.zone == out_dict["zone"]
+                   and (not out_id or v.instance_id == out_id)), None)
 
     protected = state.setdefault("protected_heavy_routes", {})
     if out_dict.get("instance_id") in protected and repl_dict:
@@ -1466,14 +1652,18 @@ def _step_rotation_delete(vms, runners, args, state, state_path, rotation):
     state.setdefault("intentional_deletion_ids", {})[key] = out_dict.get("instance_id", "")
     write_scale_state(state_path, state)
 
-    vm_to_delete = out_vm or GceVm(out_dict["name"], out_dict["zone"], "RUNNING", out_dict.get("machine_type", "n4-highcpu-16"), True, instance_id=out_dict.get("instance_id", ""))
-    try:
-        guard_fleet_mutation(state, vm_to_delete, is_rotation=True)
-        delete_overpriced_vm(vm_to_delete, args.project)
-        LOG.info("Deleted old Spot VM %s and its attached disks", out_dict["name"])
-    except Exception as exc:
-        LOG.error("Failed to delete old VM %s: %s; retrying next loop", out_dict["name"], error_detail(exc))
-        return True
+    if out_vm is None:
+        # Fresh inventory has no VM with the recorded identity; never delete by name alone.
+        LOG.warning("Outgoing VM %s with instance ID %s is already absent; skipping deletion",
+                    out_name, out_id or "unknown")
+    else:
+        try:
+            guard_fleet_mutation(state, out_vm, is_rotation=True)
+            delete_overpriced_vm(out_vm, args.project)
+            LOG.info("Deleted old Spot VM %s and its attached disks", out_dict["name"])
+        except Exception as exc:
+            LOG.error("Failed to delete old VM %s: %s; retrying next loop", out_dict["name"], error_detail(exc))
+            return True
 
     drain_group_id = rotation.get("drain_group_id")
     if drain_group_id and rotation.get("target_type") == "org":
@@ -1988,6 +2178,10 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
         plist['ProgramArguments'].extend(['--billing-export-table', args.billing_export_table])
     if getattr(args, 'manage_control_vm', False):
         plist['ProgramArguments'].append('--manage-control-vm')
+    if getattr(args, 'target', None):
+        plist['ProgramArguments'].extend(['--target', args.target])
+    if getattr(args, 'make_before_break', False):
+        plist['ProgramArguments'].append('--make-before-break')
     plist_path.write_bytes(plistlib.dumps(plist))
     subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], check=False)
     return plist_path
@@ -2116,7 +2310,7 @@ def _run_controller(args: argparse.Namespace) -> int:
                 LOG.error('CPU platform map unavailable; capacity launches paused until fresh inventory succeeds: %s', error_detail(exc))
         runners = list_github_runners(_active_target(args))
         state['runner_inventory_observed_at']=time.time()
-        vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+        vms = scope_fleet_to_target(list_gcloud_vms(args.project, name_prefix="oxidex-runners-"), args, state)
         reconcile_deletion_identities(vms, state)
         jobs.poll(vms)
         observe_vms(vms, state)

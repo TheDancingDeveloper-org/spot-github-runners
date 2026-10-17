@@ -148,6 +148,26 @@ test("route table", () => {
   assert.equal(classifyRoute("GET", "/api/overview"), "protected");
   assert.equal(classifyRoute("GET", "/api/health/extra"), "protected");
   assert.equal(classifyRoute("POST", "/api/control/freeze"), "control");
+  for (const p of ["/auth/device/code", "/auth/device/token"]) {
+    assert.equal(classifyRoute("POST", p), "public", p);
+  }
+  for (const p of ["/auth/device", "/auth/device/code/extra", "/auth/device/tokens", "/api/auth/device/code"]) {
+    assert.equal(classifyRoute("POST", p), "protected", p);
+  }
+});
+
+test("signed-out device-flow sign-in reaches the backend with the browser Origin intact", async () => {
+  for (const path of ["/auth/device/code", "/auth/device/token"]) {
+    const f = okFetch();
+    const res = await handleRequest(req(path, { method: "POST", body: "{}",
+      headers: { "Content-Type": "application/json", Origin: "https://spot.swacktech.com" } }),
+    makeEnv(), { fetch: f, now: NOW });
+    assert.equal(res.status, 200, path);
+    assert.equal(f.calls.length, 1, path);
+    assert.equal(f.calls[0].url, `https://spot-origin-a.swacktech.com${path}`);
+    // The backend accepts this Origin through DASHBOARD_PUBLIC_ORIGIN, not X-Forwarded-Host.
+    assert.equal(f.calls[0].init.headers.get("Origin"), "https://spot.swacktech.com");
+  }
 });
 
 test("control path block resists encoding and case tricks", () => {

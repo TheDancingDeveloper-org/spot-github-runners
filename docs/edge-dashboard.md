@@ -31,6 +31,15 @@ when all of these are true:
 The session cookie is HMAC-signed with `DASHBOARD_SESSION_SECRET`. The Worker and every control VM share
 that secret, so sessions survive VM replacement.
 
+When `GITHUB_OAUTH_DEVICE_FLOW=1`, the Worker also passes `/auth/device/code` and `/auth/device/token`
+through without a session cookie. The dashboard still refuses them unless device login is enabled.
+
+The Worker reaches the control VM through its tunnel hostname, so the request `Host` differs from the
+browser `Origin`. The dashboard accepts a `POST` only when `Origin` matches its own `Host` or its public
+origin, and it never trusts `X-Forwarded-Host` for this check. The public origin comes from
+`--public-origin`, then `DASHBOARD_PUBLIC_ORIGIN`, then the origin of `GITHUB_OAUTH_REDIRECT_URI`. The
+startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` metadata value.
+
 ## State durability
 
 - The dashboard writes state atomically to `/var/lib/spot-dashboard/state.json` on the boot disk.
@@ -40,6 +49,9 @@ that secret, so sessions survive VM replacement.
   `hydrated`.
 - The browser sends an `Idempotency-Key` header with every change. The dashboard stores the response in
   the same atomic save as the change, so a retried request never applies twice.
+- A freeze writes the marker file `state.json.frozen` next to the state file. If the container restarts
+  while frozen, the dashboard starts frozen and `/api/health` reports `frozen`. The marker stays until an
+  explicit unfreeze or a successful import.
 
 ## Outages and recovery
 
@@ -55,6 +67,11 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
 - **Price rotation**: the autoscaler creates the other slot, waits for health, freezes the old VM, copies
   its snapshot into the new VM, writes `origin:active` with read-back verification, waits for KV to
   propagate, then deletes the old VM. A failed origin write unfreezes the old VM and deletes the new one.
+- **Replacement check before deletion**: the autoscaler deletes the old VM only after a fresh check shows
+  the new VM is `RUNNING`, healthy, and reporting its own slot. If the new VM disappears, or stays unready
+  for 5 minutes while the old VM still runs, the autoscaler copies any newer KV snapshot into the old VM,
+  unfreezes it, points `origin:active` back at it, and deletes the new VM if it still exists. Without a
+  running old VM, it waits and deletes nothing.
 
 Recovery depends on the autoscaler running. If the workstation that runs it is off, the dashboard stays
 down until the autoscaler runs again.

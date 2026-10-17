@@ -667,6 +667,81 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.assertEqual(h.events, [("delete", "spot-control-a")])
         self.assertIsNone(h.transition)
 
+    def test_delete_old_waits_for_unhealthy_replacement_then_falls_back(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0, freeze_requested=True,
+                                frozen_version=7)
+        h.kv.set_origin("b")
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        h.tick()
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertEqual(h.transition["step"], "delete_old")
+        self.assertIn("not healthy", h.transition["error"])
+        self.assertEqual(h.kv.origin_slot(), "b")
+        h.clock[0] += cv.REPLACEMENT_READY_GRACE_SECONDS - 1
+        h.tick()
+        self.assertEqual(h.gcloud.mutating(), [])
+        h.clock[0] += 2
+        h.tick()
+        self.assertEqual(h.mutations(), [("unfreeze", "a"), ("origin", "a"), ("delete", "spot-control-b")])
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.state[cv.STATE_KEY]["history"][-1]["result"], "aborted")
+
+    def test_fallback_carries_newer_kv_state_back_to_old_vm(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0, freeze_requested=True,
+                                frozen_version=7, replacement_unready_since=1.0)
+        h.kv.set_origin("b")
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({"targets": ["after-cutover"]}, 9, "b", now=1))
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        h.tick()
+        self.assertEqual(h.mutations(), [("import", "a"), ("unfreeze", "a"), ("origin", "a"),
+                                         ("delete", "spot-control-b")])
+        self.assertEqual(h.http.versions["a"], 9)
+
+    def test_delete_old_restores_origin_when_replacement_is_gone(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0, freeze_requested=True,
+                                frozen_version=7)
+        h.kv.set_origin("b")
+        h.tick()
+        self.assertEqual(h.mutations(), [("unfreeze", "a"), ("origin", "a")])
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        self.assertIsNone(h.transition)
+
+    def test_delete_old_starts_stopped_replacement_and_keeps_old(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0, freeze_requested=True)
+        h.kv.set_origin("b")
+        self.with_new_vm(h, status="TERMINATED", healthy=False)
+        h.tick()
+        self.assertEqual(h.mutations(), [("start", "spot-control-b")])
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        self.assertEqual(h.transition["step"], "delete_old")
+
+    def test_delete_old_requires_replacement_to_answer_as_its_own_slot(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0)
+        h.kv.set_origin("b")
+        self.with_new_vm(h)
+        h.http.health["b"][1]["slot"] = "a"  # tunnel hostname routed to the wrong VM
+        h.tick()
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertIn("answered as slot 'a'", h.transition["error"])
+
+    def test_no_fallback_without_a_running_old_vm(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0, import_skipped=True,
+                                mode=cv.MODE_RECOVER, replacement_unready_since=1.0)
+        h.gcloud.status("a", "TERMINATED")
+        h.kv.set_origin("b")
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        h.tick()
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertEqual(h.mutations(), [])
+        self.assertEqual(h.kv.origin_slot(), "b")
+        self.assertEqual(h.transition["step"], "delete_old")
+
     def test_delete_old_refuses_while_origin_points_at_old(self):
         h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0)
         self.with_new_vm(h)
@@ -922,6 +997,41 @@ class StartupScriptTests(unittest.TestCase):
         self.assertIn("tunnel --no-autoupdate run", self.text)
         self.assertIn("readonly CONTAINER_UID=10001", self.text)
         self.assertIn('install -d -m 0750 -o "$CONTAINER_UID" -g "$CONTAINER_UID" "$STATE_DIR"', self.text)
+
+    def _bash_function(self, name):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", self.text, re.S | re.M)
+        self.assertIsNotNone(match, name)
+        return match.group(0)
+
+    def _run_function(self, name, value):
+        return subprocess.run(["bash", "-c", self._bash_function(name) + f'\n{name} "$1"', "check", value],
+                              capture_output=True, text=True, timeout=30)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_cloudflared_pin_check_accepts_what_create_problems_accepts(self):
+        self.assertIn('image_ref_pinned "$CLOUDFLARED_IMAGE" || fail', self.text)
+        digest = "@sha256:" + "0" * 64
+        accepted = [cv.DEFAULT_CLOUDFLARED_IMAGE, "cloudflare/cloudflared:2026.9.3",
+                    "cloudflare/cloudflared" + digest, "cloudflare/cloudflared:latest" + digest]
+        rejected = ["cloudflare/cloudflared", "cloudflare/cloudflared:latest", "Cloudflare/cloudflared:1",
+                    "cloudflare/cloudflared:1 x", "cloudflare/cloudflared@sha256:abc", "registry:5000/cf:1", ""]
+        for image in accepted + rejected:
+            expected = image in accepted
+            config_ok = not any("cloudflared" in problem for problem in config(cloudflared_image=image).create_problems())
+            self.assertEqual(config_ok, expected, image)
+            self.assertEqual(self._run_function("image_ref_pinned", image).returncode == 0, expected, image)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_public_origin_written_to_env_file(self):
+        self.assertIn("printf 'DASHBOARD_PUBLIC_ORIGIN=%s\\n' \"$PUBLIC_ORIGIN\"", self.text)
+        self.assertIn('PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail', self.text)
+        for url, origin in (("https://spot.swacktech.com", "https://spot.swacktech.com"),
+                            ("https://spot.swacktech.com/", "https://spot.swacktech.com"),
+                            ("https://spot.swacktech.com:8443/app", "https://spot.swacktech.com:8443")):
+            result = self._run_function("public_origin_of", url)
+            self.assertEqual((result.returncode, result.stdout), (0, origin), url)
+        for url in ("https://bad host", "https://user@spot.swacktech.com", "https://"):
+            self.assertNotEqual(self._run_function("public_origin_of", url).returncode, 0, url)
 
     def test_image_paths(self):
         self.assertIn("docker login ghcr.io", self.text)
