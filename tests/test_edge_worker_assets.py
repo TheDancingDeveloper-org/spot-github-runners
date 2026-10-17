@@ -11,7 +11,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from lib import edge_state
+from lib import dashboard_auth, dashboard_server, edge_state
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "cloudflare" / "worker.js"
@@ -49,7 +49,9 @@ class WorkerSourceTests(unittest.TestCase):
         vector = json.loads(VECTOR.read_text(encoding="utf-8"))
         self.assertEqual(_js_string_constant(self.source, "SESSION_PURPOSE_LABEL"), vector["purpose_label"])
         self.assertEqual(_js_string_constant(self.source, "SESSION_PURPOSE_LABEL"), "spot-dashboard/session/v1")
-        self.assertEqual(_js_string_constant(self.source, "SESSION_COOKIE_NAME"), "spot_session")
+        self.assertEqual(_js_string_constant(self.source, "SESSION_COOKIE_NAME"), vector["cookie_name"])
+        self.assertEqual(_js_string_constant(self.source, "SESSION_COOKIE_NAME"), dashboard_auth.SESSION_COOKIE_NAME)
+        self.assertEqual(_js_string_constant(self.source, "CLIENT_IP_HEADER"), dashboard_server.CLIENT_IP_HEADER)
         self.assertEqual(_js_string_constant(self.source, "KV_ORIGIN_KEY"), edge_state.KV_ORIGIN_KEY)
         self.assertEqual(_js_string_constant(self.source, "DEFAULT_ORIGIN_HOST_SUFFIX"),
                          "." + edge_state.DEFAULT_ORIGIN_DOMAIN)

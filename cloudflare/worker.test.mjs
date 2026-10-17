@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import worker, {
+  CLIENT_IP_HEADER,
+  SESSION_COOKIE_NAME,
   SESSION_PURPOSE_LABEL,
   UNAVAILABLE_ERROR,
   UNAVAILABLE_MESSAGE,
@@ -18,6 +20,7 @@ import worker, {
   isControlPath,
   parseCookies,
   parseOriginRecord,
+  sessionNotBefore,
   verifySession,
   verifyTokenSignature,
 } from "./worker.js";
@@ -71,7 +74,7 @@ function req(path, { method = "GET", cookie, headers = {}, body } = {}) {
   return new Request(`https://spot.swacktech.com${path}`, { method, headers: h, body });
 }
 
-const authed = (path, opts = {}) => req(path, { ...opts, cookie: `spot_session=${TOKEN}` });
+const authed = (path, opts = {}) => req(path, { ...opts, cookie: `${SESSION_COOKIE_NAME}=${TOKEN}` });
 const htmlNav = { Accept: "text/html,application/xhtml+xml", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" };
 
 async function signPayload(payload, secret = vector.secret) {
@@ -85,8 +88,10 @@ async function signPayload(payload, secret = vector.secret) {
 
 // --- Session ---------------------------------------------------------------------------------------
 
-test("purpose label and wait strings match the Python contract", () => {
+test("purpose label, cookie name, and wait strings match the Python contract", () => {
   assert.equal(SESSION_PURPOSE_LABEL, vector.purpose_label);
+  assert.equal(SESSION_COOKIE_NAME, vector.cookie_name);
+  assert.equal(SESSION_COOKIE_NAME, "__Host-spot_session");
   assert.equal(UNAVAILABLE_ERROR, "control_vm_unavailable");
   assert.match(UNAVAILABLE_MESSAGE, /control VM is restarting or being replaced/);
 });
@@ -131,8 +136,28 @@ test("missing bindings fail closed", async () => {
 });
 
 test("cookie parsing takes the first occurrence", () => {
-  const c = parseCookies(`a=1; spot_session=first; spot_session=second`);
-  assert.equal(c.get("spot_session"), "first");
+  const c = parseCookies(`a=1; __Host-spot_session=first; __Host-spot_session=second`);
+  assert.equal(c.get("__Host-spot_session"), "first");
+});
+
+test("an unprefixed spot_session cookie is not a session", async () => {
+  const f = okFetch();
+  const res = await handleRequest(req("/api/overview", { cookie: `spot_session=${TOKEN}` }), makeEnv(),
+    { fetch: f, now: NOW });
+  assert.equal(res.status, 401);
+  assert.equal(f.calls.length, 0);
+});
+
+test("SESSION_NOT_BEFORE revokes older sessions and fails closed when malformed", async () => {
+  const iat = vector.valid_session.payload.iat;
+  assert.equal(sessionNotBefore(makeEnv()), 0);
+  assert.equal(sessionNotBefore(makeEnv({ SESSION_NOT_BEFORE: "" })), 0);
+  assert.ok(await verifySession(TOKEN, makeEnv({ SESSION_NOT_BEFORE: String(iat) }), NOW));
+  assert.equal(await verifySession(TOKEN, makeEnv({ SESSION_NOT_BEFORE: String(iat + 1) }), NOW), null);
+  for (const bad of ["soon", "-1", "1.5", "1e9"]) {
+    assert.equal(sessionNotBefore(makeEnv({ SESSION_NOT_BEFORE: bad })), null, bad);
+    assert.equal(await verifySession(TOKEN, makeEnv({ SESSION_NOT_BEFORE: bad }), NOW), null, bad);
+  }
 });
 
 // --- Routing ---------------------------------------------------------------------------------------
@@ -200,7 +225,7 @@ test("unauthenticated: 401 JSON for API and non-GET, 302 to / for HTML GET", asy
   res = await handleRequest(req("/settings", { headers: htmlNav }), env, { fetch: f, now: NOW });
   assert.equal(res.status, 302);
   assert.equal(res.headers.get("Location"), "/");
-  res = await handleRequest(req("/api/overview", { cookie: `spot_session=${vector.tampered_session_token}` }), env,
+  res = await handleRequest(req("/api/overview", { cookie: `${SESSION_COOKIE_NAME}=${vector.tampered_session_token}` }), env,
     { fetch: f, now: NOW });
   assert.equal(res.status, 401);
   assert.equal(f.calls.length, 0);
@@ -224,6 +249,8 @@ test("Access headers added; client CF-Access-* and X-Spot-* stripped; Authorizat
       "cf-access-client-secret": "evil",
       "CF-Access-Jwt-Assertion": "evil",
       "X-Spot-Internal": "1",
+      "X-Spot-Client-Ip": "198.51.100.66",
+      "CF-Connecting-IP": "203.0.113.7",
       "X-Forwarded-Host": "evil.example",
       Authorization: "Bearer user-supplied",
     },
@@ -237,10 +264,12 @@ test("Access headers added; client CF-Access-* and X-Spot-* stripped; Authorizat
   assert.equal(h.get("CF-Access-Client-Secret"), "access-secret-example");
   assert.equal(h.get("CF-Access-Jwt-Assertion"), null);
   assert.equal(h.get("X-Spot-Internal"), null);
+  // The client IP comes from Cloudflare's CF-Connecting-IP, never from a client-supplied X-Spot-* header.
+  assert.equal(h.get(CLIENT_IP_HEADER), "203.0.113.7");
   assert.equal(h.get("X-Forwarded-Host"), "spot.swacktech.com");
   assert.equal(h.get("X-Forwarded-Proto"), "https");
   assert.equal(h.get("Authorization"), "Bearer user-supplied");
-  assert.match(h.get("Cookie"), /spot_session=/);
+  assert.match(h.get("Cookie"), /__Host-spot_session=/);
   assert.equal(init.redirect, "manual");
   assert.equal(init.cache, "no-store");
   assert.ok(init.signal);

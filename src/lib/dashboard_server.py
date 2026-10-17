@@ -27,8 +27,10 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 
 from .dashboard_auth import (
+    MAX_DYNAMIC_CONTROLLED_TARGETS,
     OAUTH_STATE_COOKIE_NAME,
     SESSION_COOKIE_NAME,
+    AuthCapacityError,
     ConfigRepoTargets,
     ConfigTargetsError,
     GitHubApiError,
@@ -43,6 +45,8 @@ from .dashboard_auth import (
     parse_cookie_header,
     render_login_gate_html,
     safe_return_path,
+    target_list_digest,
+    TargetChange,
     ENV_CONTROLLED_TARGETS,
     ENV_DEVICE_FLOW,
     ENV_REDIRECT_URI,
@@ -126,7 +130,16 @@ KV_STALE_REFUSAL_BACKOFF_SECONDS = 30.0
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # POST endpoints that compute a response without changing dashboard state; they skip idempotency storage.
 NON_MUTATING_POST_PATHS = frozenset({"/api/qualify", "/api/cloud-init/parse", "/api/ip-intel"})
-FORWARDED_CLIENT_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "X-Forwarded-For")
+# The edge Worker sets this header to the browser's IP (from Cloudflare's CF-Connecting-IP) and strips any
+# client-supplied X-Spot-* header. It is trusted only from a loopback peer (the local cloudflared), and
+# only for rate-limit bucketing.
+CLIENT_IP_HEADER = "X-Spot-Client-Ip"
+FORWARDED_CLIENT_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "X-Forwarded-For", CLIENT_IP_HEADER)
+MAX_CONTROLLED_TARGETS_HISTORY = 50
+SESSION_TOO_LARGE_ERROR = (
+    "Controlled target list is too long to fit in a session cookie; use fewer or shorter targets"
+)
+POLICY_UNAVAILABLE_ERROR = "controlled_targets_unavailable"
 # Public browser origin (for example https://spot.swacktech.com) when a proxy such as the Cloudflare
 # Worker reaches this server under a different Host (the tunnel hostname). Defaults to the origin of
 # GITHUB_OAUTH_REDIRECT_URI.
@@ -146,6 +159,14 @@ class _PayloadTooLargeError(ValueError):
 
 class DashboardFrozenError(RuntimeError):
     """Raised when a state mutation is attempted while the control VM is frozen for a handover."""
+
+
+class ControlledTargetsUnavailableError(RuntimeError):
+    """The dynamic controlled-target policy could not be loaded; OAuth access fails closed."""
+
+
+class ControlledTargetsConflictError(RuntimeError):
+    """A pending controlled-target change was based on a list that has since changed."""
 
 
 
@@ -953,11 +974,18 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         "rust_builds": rust_builds,
         # Dynamic GitHub OAuth controlled targets (empty by default); see dashboard_auth.
         "controlled_targets": [],
+        # Bounded audit history of committed controlled-target changes.
+        "controlled_targets_history": [],
     }
 
 
 class DashboardStore:
-    """Thread-safe controller store backing the Web UI Dashboard API."""
+    """Thread-safe controller store backing the Web UI Dashboard API.
+
+    If the state file exists but cannot be read or parsed (including PermissionError and
+    IsADirectoryError), ``controlled_targets_error`` is set: OAuth access fails closed, target changes
+    are refused, and the unreadable file is never overwritten, so an operator can inspect and repair it.
+    """
 
     def __init__(
         self,
@@ -1020,11 +1048,32 @@ class DashboardStore:
             self.frozen = True
             LOG.warning("Dashboard starts frozen: freeze marker %s is present", self.freeze_marker_path)
         self.loaded_from_file = False
-        if state_path and state_path.exists():
+        self.controlled_targets_error = ""
+        # Read the file directly: Path.exists() also reports False when stat fails (for example EACCES
+        # on a parent directory), which would silently load an empty, fail-open policy. Only a genuinely
+        # absent file starts from defaults (or KV).
+        raw_state: str | None = None
+        read_error: Exception | None = None
+        if state_path:
             try:
-                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                raw_state = state_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                raw_state = None
+            except (OSError, ValueError) as exc:
+                read_error = exc
+        if raw_state is not None or read_error is not None:
+            try:
+                if read_error is not None:
+                    raise read_error
+                loaded = json.loads(raw_state)
                 self._apply_loaded_state(loaded)
-            except (OSError, ValueError, TypeError):
+            except (OSError, ValueError, TypeError) as exc:
+                # Fail closed for the access policy, and never rewrite the unreadable file.
+                self.controlled_targets_error = (
+                    f"Dashboard state file {state_path} could not be loaded ({type(exc).__name__}); "
+                    "the dynamic controlled-target policy is unavailable. Repair or restore the file and restart."
+                )
+                LOG.error("%s", self.controlled_targets_error)
                 self.state = default_dashboard_state(project=project, org=org)
                 self._sync_fleet_telemetry()
             else:
@@ -1285,6 +1334,10 @@ class DashboardStore:
     def snapshot_envelope(self) -> dict[str, Any]:
         if self.control_slot is None:
             raise ValueError("Snapshots require --control-slot")
+        if self.controlled_targets_error:
+            # The in-memory state is not the unreadable file's content; publishing it would hand the next
+            # VM (through KV or an import) a policy that silently lost its controlled targets.
+            raise ValueError(f"Refusing to snapshot dashboard state: {self.controlled_targets_error}")
         with self._lock:
             return build_snapshot(copy.deepcopy(self.state), self.state_version(), self.control_slot,
                                   now=self._clock())
@@ -1509,6 +1562,8 @@ class DashboardStore:
         Raises OSError (the store stays frozen in memory) when the durable marker cannot be written, so the
         caller reports failure instead of a freeze that a restart would silently undo.
         """
+        if self.controlled_targets_error:
+            raise ValueError(f"Refusing to freeze for a handover: {self.controlled_targets_error}")
         with self._lock:
             self.frozen = True
             self._write_freeze_marker(self.state_version())
@@ -2064,6 +2119,10 @@ class DashboardStore:
             defer["dirty"] = True
             self.state["updated_at"] = new_updated_at
             return
+        if self.state_path and self.controlled_targets_error:
+            # Never replace an unreadable state file: writing defaults (or a KV copy) over it would turn a
+            # fail-closed access policy into a silently changed one after the next restart.
+            raise OSError(f"Refusing to overwrite the unreadable dashboard state file: {self.controlled_targets_error}")
         new_version = self.state_version() + (1 if bump else 0)
         candidate_state = {**self.state, "updated_at": new_updated_at, "state_version": new_version}
         serialized = json.dumps(candidate_state, indent=2, allow_nan=False)
@@ -3018,27 +3077,88 @@ class DashboardStore:
             }
 
     def get_controlled_targets(self) -> list[str]:
-        """Return the dynamic controlled target names (orgs and owner/repo) stored in dashboard state."""
+        """Return the dynamic controlled target names (orgs and owner/repo) stored in dashboard state.
+
+        Callers that make access decisions check ``controlled_targets_error`` first; as defense in depth an
+        unloadable policy also yields an unparseable sentinel, so any authorization check that consumes it
+        denies access.
+        """
         with self._lock:
+            if self.controlled_targets_error:
+                return ["!unavailable-controlled-targets"]
             raw = self.state.get("controlled_targets", [])
             if not isinstance(raw, list):
                 # Fail closed: an unparseable entry makes every OAuth authorization check deny access.
                 return ["!invalid-controlled-targets"]
             return [t if isinstance(t, str) else "!invalid-controlled-target" for t in raw]
 
-    def set_controlled_targets(self, targets: Any) -> list[str]:
-        """Validate and replace the dynamic controlled target list; raises ValueError on any invalid entry."""
+    def get_controlled_targets_history(self) -> list[dict[str, Any]]:
+        with self._lock:
+            raw = self.state.get("controlled_targets_history", [])
+            return copy.deepcopy([e for e in raw if isinstance(e, dict)]) if isinstance(raw, list) else []
+
+    @staticmethod
+    def validate_controlled_targets(targets: Any) -> list[str]:
+        """Validate a proposed dynamic target list and return canonical names; raises ValueError."""
         if not isinstance(targets, list):
             raise ValueError("targets must be a JSON array of organization or owner/repo names")
         names = [t.name for t in parse_controlled_targets(targets)]
+        if len(names) > MAX_DYNAMIC_CONTROLLED_TARGETS:
+            raise ValueError(f"At most {MAX_DYNAMIC_CONTROLLED_TARGETS} dynamic controlled targets are supported")
+        return names
+
+    def set_controlled_targets(
+        self,
+        targets: Any,
+        *,
+        actor: str = "internal",
+        actor_uid: int | None = None,
+        method: str = "internal",
+        expected_digest: str | None = None,
+    ) -> list[str]:
+        """Validate, replace, persist, and audit the dynamic controlled target list.
+
+        Raises ValueError on any invalid entry, ControlledTargetsUnavailableError when the stored policy
+        could not be loaded, and ControlledTargetsConflictError when ``expected_digest`` (see
+        ``target_list_digest``) no longer matches the stored list. Every committed change is logged and
+        appended to the bounded ``controlled_targets_history``.
+        """
+        names = self.validate_controlled_targets(targets)
         with self._lock:
+            if self.controlled_targets_error:
+                raise ControlledTargetsUnavailableError(self.controlled_targets_error)
+            previous_names = self.get_controlled_targets()
+            if expected_digest is not None and not hmac.compare_digest(
+                expected_digest, target_list_digest(previous_names)
+            ):
+                raise ControlledTargetsConflictError(
+                    "Controlled targets changed after this change was requested; review and submit it again"
+                )
             previous = copy.deepcopy(self.state.get("controlled_targets", []))
+            previous_history = copy.deepcopy(self.state.get("controlled_targets_history", []))
+            now = self._clock()
+            entry = {
+                "at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "epoch": int(now),
+                "actor": str(actor),
+                "actor_uid": actor_uid,
+                "method": str(method),
+                "previous": previous_names,
+                "targets": list(names),
+            }
+            history = previous_history if isinstance(previous_history, list) else []
             self.state["controlled_targets"] = names
+            self.state["controlled_targets_history"] = (history + [entry])[-MAX_CONTROLLED_TARGETS_HISTORY:]
             try:
                 self._persist()
             except Exception:
                 self.state["controlled_targets"] = previous
+                self.state["controlled_targets_history"] = previous_history
                 raise
+            LOG.info(
+                "Controlled targets changed by %s (uid=%s, method=%s): %s -> %s",
+                entry["actor"], actor_uid, entry["method"], json.dumps(previous_names), json.dumps(names),
+            )
             return list(names)
 
     def update_regions(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4166,10 +4286,17 @@ def make_handler(
     Authentication precedence for protected routes: the legacy ``auth_token`` (an explicit
     ``Authorization``/``X-Dashboard-Token`` header, then the ``dashboard_session`` cookie) is considered
     only when the TCP peer is loopback and no ``Cf-Connecting-Ip``/``Cf-Ray``/``X-Forwarded-For`` header is
-    present (a wrong explicit token is rejected with 401); then the GitHub OAuth ``spot_session`` cookie,
-    which must be signed, unexpired, for the hardcoded administrator, and verified for every controlled
-    target (static, stored, and config-repo targets; otherwise 403). ``/api/health`` is public and
-    ``/api/control/*`` uses short-lived control tokens instead.
+    present (a wrong explicit token is rejected with 401); then the GitHub OAuth ``__Host-spot_session``
+    cookie, which must be signed, unexpired, issued after ``DASHBOARD_SESSION_NOT_BEFORE``, for the
+    hardcoded administrator, and verified for every controlled target (static, stored, and config-repo
+    targets; otherwise 403). When the stored controlled-target policy could not be loaded, OAuth sessions
+    and sign-ins are refused with HTTP 500 ``controlled_targets_unavailable`` (not 503, which the edge
+    Worker would turn into an endless wait). ``/api/health`` is public and ``/api/control/*`` uses
+    short-lived control tokens instead.
+
+    Unauthenticated sign-in routes are rate limited per client IP and globally (429 with ``Retry-After``).
+    The client IP is the ``X-Spot-Client-Ip`` header from a loopback peer (the edge Worker sets it and
+    strips any client copy), else the TCP peer.
 
     Browser POSTs must come from this server's own Host origin or from ``public_origin`` (the URL users
     open when a proxy such as the Cloudflare Worker forwards to a different Host). ``X-Forwarded-Host``
@@ -4317,8 +4444,54 @@ def make_handler(
                 combined += self._config_targets()
             return combined
 
+        def _client_ip(self) -> str:
+            peer = str((self.client_address or ("",))[0] or "")
+            if peer.startswith("::ffff:"):
+                peer = peer[len("::ffff:"):]
+            forwarded = (self.headers.get(CLIENT_IP_HEADER) or "").strip()
+            if forwarded and _is_loopback_host(peer):
+                try:
+                    return str(ipaddress.ip_address(forwarded))
+                except ValueError:
+                    pass
+            return peer
+
+        def _send_too_many(self, retry_after: float, message: str) -> None:
+            seconds = max(1, int(math.ceil(retry_after)))
+            self._send_json(
+                {"error": message, "retry_after": seconds},
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+                extra_headers={"Retry-After": str(seconds)},
+            )
+
+        def _rate_limited(self, group: str) -> bool:
+            """Count this request against a sign-in rate limiter; respond 429 and return True when over."""
+            if oauth_manager is None:
+                return False
+            limiter = oauth_manager.rate_limiters.get(group)
+            if limiter is None:
+                return False
+            retry_after = limiter.check(self._client_ip())
+            if retry_after <= 0:
+                return False
+            self._send_too_many(retry_after, "Too many sign-in requests; try again later")
+            return True
+
+        def _policy_unavailable_body(self) -> dict[str, Any]:
+            return {
+                "status": "unavailable",
+                "error": "GitHub sign-in is disabled because the controlled-target policy could not be loaded",
+                "code": POLICY_UNAVAILABLE_ERROR,
+                "detail": store.controlled_targets_error,
+            }
+
+        def _send_policy_unavailable(self) -> None:
+            # 500, not 503: the edge Worker turns origin 503s into the control-VM wait response, and waiting
+            # does not repair an unreadable state file.
+            self._send_json(self._policy_unavailable_body(), status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
         def _evaluate_auth(self) -> tuple[str, dict[str, Any]]:
-            """Classify the request as ("ok" | "unauthenticated" | "forbidden", details) without responding."""
+            """Classify the request as ("ok" | "unauthenticated" | "forbidden" | "unavailable", details)."""
             if not auth_required:
                 return "ok", {"method": "none"}
             cookies = parse_cookie_header(self.headers.get("Cookie"))
@@ -4344,6 +4517,14 @@ def make_handler(
                             "message": identity.message,
                             "missing_targets": [],
                         }
+                    if identity.status == "ok" and identity.session is not None and store.controlled_targets_error:
+                        # Fail closed: without a trustworthy target policy no OAuth session is honoured.
+                        return "unavailable", {
+                            "method": "github_oauth",
+                            "user": identity.session.user_login,
+                            "uid": identity.session.user_id,
+                            "message": self._policy_unavailable_body()["error"],
+                        }
                     if identity.status == "ok" and identity.session is not None:
                         try:
                             targets = self._effective_controlled_targets()
@@ -4356,7 +4537,11 @@ def make_handler(
                             }
                         check = oauth_manager.check_session(oauth_cookie, targets)
                         if check.status == "ok" and check.session is not None:
-                            return "ok", {"method": "github_oauth", "user": check.session.user_login}
+                            return "ok", {
+                                "method": "github_oauth",
+                                "user": check.session.user_login,
+                                "uid": check.session.user_id,
+                            }
                         if check.session is not None:
                             return "forbidden", {
                                 "method": "github_oauth",
@@ -4512,12 +4697,22 @@ def make_handler(
                     status=HTTPStatus.NOT_FOUND,
                 )
                 return True
+            if self._rate_limited("start" if path == "/auth/github/login" else "complete"):
+                return True
             redirect_uri = self._oauth_redirect_uri()
             if not redirect_uri:
                 self._send_json({"error": "Cannot determine OAuth redirect URI"}, status=HTTPStatus.BAD_REQUEST)
                 return True
             if path == "/auth/github/login":
-                state = oauth_manager.create_state(safe_return_path(qs.get("next", ["/"])[0]))
+                if store.controlled_targets_error:
+                    self._login_gate(message=self._policy_unavailable_body()["error"],
+                                     status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return True
+                try:
+                    state = oauth_manager.create_state(safe_return_path(qs.get("next", ["/"])[0]))
+                except AuthCapacityError as exc:
+                    self._send_too_many(exc.retry_after, str(exc))
+                    return True
                 self._send_redirect(
                     oauth_manager.create_authorize_url(redirect_uri, state),
                     cookies=[format_state_cookie(state)],
@@ -4530,8 +4725,8 @@ def make_handler(
                                  cookies=clear_state)
                 return True
             cookie_state = parse_cookie_header(self.headers.get("Cookie")).get(OAUTH_STATE_COOKIE_NAME, "")
-            ok_state, return_to = oauth_manager.validate_state(qs.get("state", [""])[0], cookie_state)
-            if not ok_state:
+            result = oauth_manager.consume_state(qs.get("state", [""])[0], cookie_state)
+            if not result.ok:
                 self._login_gate(message="Sign-in request expired or is invalid. Please try again.",
                                  status=HTTPStatus.BAD_REQUEST, cookies=clear_state)
                 return True
@@ -4543,19 +4738,102 @@ def make_handler(
                 audit_login("", None, "denied", "code exchange failed")
                 self._login_gate(message="GitHub sign-in failed.", status=HTTPStatus.FORBIDDEN, cookies=clear_state)
                 return True
+            status, body, cookies = self._finish_oauth_login(token, result.target_change)
+            if status != HTTPStatus.OK:
+                self._login_gate(message=str(body.get("message") or body.get("error") or "Sign-in failed"),
+                                 status=status, cookies=clear_state)
+                return True
+            self._send_redirect(result.return_to, cookies=clear_state + cookies)
+            return True
+
+        def _finish_oauth_login(
+            self, access_token: str, change: TargetChange | None
+        ) -> tuple[int, dict[str, Any], list[str]]:
+            """Authorize a fresh GitHub token, commit a bound target change, and issue a session.
+
+            Without a change, the token must satisfy the current policy (positive cache allowed). With a
+            change, the token must belong to the requesting GitHub id and pass a FRESH (uncached) admin
+            check on the static, config-repo, current, and proposed targets, so the change can neither
+            loosen a target the user no longer administers nor lock the user out. The change commits
+            through the store's durability gates (writer, frozen, reconciled) and only if the stored list
+            still matches the one it was based on (compare-and-swap).
+            """
+            assert oauth_manager is not None
+            if store.controlled_targets_error:
+                return HTTPStatus.INTERNAL_SERVER_ERROR, self._policy_unavailable_body(), []
             try:
-                targets = self._effective_controlled_targets()
+                config_targets = self._config_targets()
             except ConfigTargetsError as exc:
                 audit_login("", None, "denied", "config repo targets unavailable")
-                self._login_gate(message=f"Forbidden: {exc}", status=HTTPStatus.FORBIDDEN, cookies=clear_state)
-                return True
-            decision = oauth_manager.authorize(token, targets)
+                message = f"Forbidden: {exc}"
+                return HTTPStatus.FORBIDDEN, {"status": "forbidden", "error": message, "message": message,
+                                              "user": "", "missing_targets": []}, []
+            if change is None:
+                decision = oauth_manager.authorize(
+                    access_token, static_targets + store.get_controlled_targets() + config_targets
+                )
+            else:
+                current = store.get_controlled_targets()
+                if not hmac.compare_digest(change.base, target_list_digest(current)):
+                    return HTTPStatus.CONFLICT, {
+                        "status": "conflict",
+                        "error": "Controlled targets changed after this change was requested; review and submit it again",
+                    }, []
+                decision = oauth_manager.authorize(
+                    access_token,
+                    static_targets + config_targets + current + list(change.targets),
+                    use_cache=False,
+                    expected_uid=change.uid,
+                )
             if not decision.authorized:
-                self._login_gate(message=decision.message, status=HTTPStatus.FORBIDDEN, cookies=clear_state)
-                return True
-            session_cookie = format_session_cookie(oauth_manager.issue_session(decision), oauth_manager.session_ttl_seconds)
-            self._send_redirect(return_to, cookies=clear_state + [session_cookie])
-            return True
+                return HTTPStatus.FORBIDDEN, {
+                    "status": "forbidden",
+                    "error": decision.message,
+                    "message": decision.message,
+                    "user": decision.user_login,
+                    "missing_targets": decision.missing_targets,
+                }, []
+            if not oauth_manager.session_fits(decision.verified_targets):
+                audit_login(decision.user_login, decision.user_id, "denied", "session cookie would be too large")
+                return HTTPStatus.BAD_REQUEST, {"status": "error", "error": SESSION_TOO_LARGE_ERROR}, []
+            body: dict[str, Any] = {"status": "authorized", "user": decision.user_login}
+            if change is not None:
+                def commit() -> tuple[int, Any]:
+                    store.set_controlled_targets(
+                        list(change.targets),
+                        actor=decision.user_login,
+                        actor_uid=decision.user_id,
+                        method="github_oauth",
+                        expected_digest=change.base,
+                    )
+                    return HTTPStatus.OK, {}
+
+                try:
+                    store.run_request(None, "POST", "/api/auth/targets", commit)
+                except DashboardFrozenError:
+                    return HTTPStatus.CONFLICT, {
+                        "status": "not_accepting_changes",
+                        "error": "The dashboard is not accepting changes right now (a control VM handover may be "
+                        "in progress). The change was not applied; submit it again.",
+                    }, []
+                except ControlledTargetsConflictError as exc:
+                    return HTTPStatus.CONFLICT, {"status": "conflict", "error": str(exc)}, []
+                except ControlledTargetsUnavailableError:
+                    return HTTPStatus.INTERNAL_SERVER_ERROR, self._policy_unavailable_body(), []
+                except ValueError as exc:
+                    return HTTPStatus.BAD_REQUEST, {"status": "error", "error": str(exc)}, []
+                except Exception as exc:  # noqa: BLE001
+                    LOG.exception("Could not save controlled targets")
+                    return HTTPStatus.INTERNAL_SERVER_ERROR, {
+                        "status": "error",
+                        "error": f"Could not save controlled targets ({type(exc).__name__})",
+                    }, []
+                try:
+                    body["target_change"] = {"committed": True, **self._targets_body()}
+                except ConfigTargetsError:
+                    body["target_change"] = {"committed": True}
+            cookies = [format_session_cookie(oauth_manager.issue_session(decision), oauth_manager.session_ttl_seconds)]
+            return HTTPStatus.OK, body, cookies
 
         def _handle_oauth_post(self, path: str) -> bool:
             """Serve public OAuth POST routes (already same-origin/JSON validated). Returns True when handled."""
@@ -4580,29 +4858,30 @@ def make_handler(
                                 status=HTTPStatus.NOT_FOUND)
                 return True
             if path == "/auth/device/code":
+                if self._rate_limited("start"):
+                    return True
+                if store.controlled_targets_error:
+                    self._send_policy_unavailable()
+                    return True
                 try:
-                    started = oauth_manager.start_device_flow()
+                    started = oauth_manager.begin_device_login()
+                except AuthCapacityError as exc:
+                    self._send_too_many(exc.retry_after, str(exc))
+                    return True
                 except GitHubApiError:
                     self._send_json({"error": "GitHub device authorization is unavailable"}, status=HTTPStatus.BAD_GATEWAY)
                     return True
-                self._send_json(
-                    {
-                        "user_code": started["user_code"],
-                        "verification_uri": started["verification_uri"],
-                        "expires_in": started["expires_in"],
-                        "interval": started["interval"],
-                        "device_handle": oauth_manager.seal_device_code(started["device_code"], started["expires_in"]),
-                    }
-                )
+                self._send_json(started)
                 return True
             # /auth/device/token
-            device_code = oauth_manager.open_device_handle(payload.get("device_handle"))
-            if device_code is None:
+            if self._rate_limited("complete"):
+                return True
+            polled = oauth_manager.poll_device_login(payload.get("device_handle"))
+            result = polled.get("status")
+            if result == "invalid":
                 self._send_json({"status": "invalid", "error": "Invalid or expired device handle"},
                                 status=HTTPStatus.BAD_REQUEST)
                 return True
-            polled = oauth_manager.poll_device_token(device_code)
-            result = polled.get("status")
             if result in ("pending", "slow_down"):
                 body: dict[str, Any] = {"status": result}
                 if result == "slow_down":
@@ -4616,44 +4895,130 @@ def make_handler(
                 self._send_json({"status": "denied", "error": "GitHub authorization was denied"},
                                 status=HTTPStatus.FORBIDDEN)
                 return True
+            if result == "error" and polled.get("error") == "github_unavailable":
+                # The handshake is kept: tell the browser to keep polling the same code until it expires.
+                self._send_json({"status": "retry", "retryable": True, "error": "GitHub is temporarily unreachable"},
+                                status=HTTPStatus.SERVICE_UNAVAILABLE, extra_headers={"Retry-After": "10"})
+                return True
             if result != "success":
                 self._send_json({"status": "error", "error": "GitHub device token request failed"},
                                 status=HTTPStatus.BAD_GATEWAY)
                 return True
-            try:
-                targets = self._effective_controlled_targets()
-            except ConfigTargetsError as exc:
-                audit_login("", None, "denied", "config repo targets unavailable")
-                self._send_json({"status": "forbidden", "error": f"Forbidden: {exc}", "message": f"Forbidden: {exc}",
-                                 "user": "", "missing_targets": []}, status=HTTPStatus.FORBIDDEN)
-                return True
-            decision = oauth_manager.authorize(str(polled.get("access_token", "")), targets)
-            if not decision.authorized:
-                self._send_json(
-                    {
-                        "status": "forbidden",
-                        "error": decision.message,
-                        "message": decision.message,
-                        "user": decision.user_login,
-                        "missing_targets": decision.missing_targets,
-                    },
-                    status=HTTPStatus.FORBIDDEN,
-                )
-                return True
-            self._send_json(
-                {"status": "authorized", "user": decision.user_login},
-                cookies=[format_session_cookie(oauth_manager.issue_session(decision), oauth_manager.session_ttl_seconds)],
+            status, body, cookies = self._finish_oauth_login(
+                str(polled.get("access_token", "")), polled.get("target_change")
             )
+            self._send_json(body, status=status, cookies=cookies)
             return True
+
+        def _handle_targets_post(self, info: dict[str, Any]) -> None:
+            """Request a change of the dynamic controlled-target list (OAuth sessions only).
+
+            Nothing commits here. The response (202 ``reauth_required``) starts a fresh GitHub sign-in (web
+            ``authorize_url`` with a state cookie, or a device code) bound to the proposed list; the change
+            commits when that sign-in proves admin rights on every static, config-repo, current, and proposed
+            target. An unchanged list answers 200 ``unchanged``.
+            """
+            assert oauth_manager is not None
+            try:
+                payload = self._read_json(max_bytes=MAX_JSON_BODY_BYTES)
+            except _PayloadTooLargeError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                names = store.validate_controlled_targets(payload.get("targets"))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if store.controlled_targets_error:
+                self._send_policy_unavailable()
+                return
+            try:
+                body = self._targets_body()
+                config_targets = self._config_targets()
+            except ConfigTargetsError as exc:
+                self._send_json({"error": f"Forbidden: {exc}"}, status=HTTPStatus.FORBIDDEN)
+                return
+            current = store.get_controlled_targets()
+            if names == current:
+                self._send_json({"status": "unchanged", **body})
+                return
+            try:
+                verify = [t.name for t in parse_controlled_targets(static_targets + config_targets + current + names)]
+            except ValueError as exc:
+                self._send_json({"error": f"Stored controlled targets are invalid ({exc})"},
+                                status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            # The session issued after this change carries every verified target in its cookie.
+            if not oauth_manager.session_fits(verify):
+                self._send_json({"error": SESSION_TOO_LARGE_ERROR}, status=HTTPStatus.BAD_REQUEST)
+                return
+            uid, login = info.get("uid"), info.get("user")
+            if not isinstance(uid, int) or isinstance(uid, bool) or not isinstance(login, str):
+                self._send_json({"error": "Session identity is incomplete; sign in again"},
+                                status=HTTPStatus.UNAUTHORIZED)
+                return
+            default_flow = "web" if oauth_manager.web_flow_enabled else "device"
+            flow = str(payload.get("flow") or default_flow).lower()
+            if flow not in ("web", "device"):
+                self._send_json({"error": "flow must be 'web' or 'device'"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if self._rate_limited("start"):
+                return
+            change = TargetChange(tuple(names), target_list_digest(current), uid, login)
+            reply: dict[str, Any] = {
+                "status": "reauth_required",
+                "message": "Confirm this change by signing in with GitHub again; it is applied only after "
+                "GitHub confirms you administer every listed target.",
+                "flow": flow,
+                "current_targets": current,
+                "proposed_targets": names,
+                "verify_targets": verify,
+            }
+            if flow == "web":
+                redirect_uri = self._oauth_redirect_uri() if oauth_manager.web_flow_enabled else None
+                if not redirect_uri:
+                    self._send_json({"error": "GitHub web sign-in is not available"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    state = oauth_manager.create_state(safe_return_path(payload.get("next") or "/"),
+                                                       target_change=change)
+                except AuthCapacityError as exc:
+                    self._send_too_many(exc.retry_after, str(exc))
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                reply["authorize_url"] = oauth_manager.create_authorize_url(redirect_uri, state)
+                self._send_json(reply, status=HTTPStatus.ACCEPTED, cookies=[format_state_cookie(state)])
+                return
+            if not oauth_manager.device_flow_enabled:
+                self._send_json({"error": f"GitHub device login is disabled (set {ENV_DEVICE_FLOW}=1)"},
+                                status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                reply["device"] = oauth_manager.begin_device_login(target_change=change)
+            except AuthCapacityError as exc:
+                self._send_too_many(exc.retry_after, str(exc))
+                return
+            except GitHubApiError:
+                self._send_json({"error": "GitHub device authorization is unavailable"}, status=HTTPStatus.BAD_GATEWAY)
+                return
+            self._send_json(reply, status=HTTPStatus.ACCEPTED)
 
         def _check_auth(self, *, allow_html_shell: bool = False,
                         evaluated: tuple[str, dict[str, Any]] | None = None) -> bool:
-            """Verify credentials for a protected route; respond 401 (unauthenticated) or 403 (unauthorized)."""
+            """Verify credentials for a protected route; respond 401, 403, or 500 (policy unavailable)."""
             status, info = evaluated if evaluated is not None else self._evaluate_auth()
             if status == "ok":
                 return True
             if status == "forbidden":
                 self._send_forbidden(info)
+                return False
+            if status == "unavailable":
+                self._send_policy_unavailable()
                 return False
             if allow_html_shell and not info.get("explicit_token_rejected"):
                 return True
@@ -4768,11 +5133,13 @@ def make_handler(
                         if gate_info.get("explicit_token_rejected"):
                             self._check_auth()
                             return
-                        if gate_status == "forbidden":
+                        if gate_status in ("forbidden", "unavailable"):
                             self._login_gate(
                                 message=str(gate_info.get("message", "")),
                                 user=str(gate_info.get("user", "")),
-                                status=HTTPStatus.FORBIDDEN,
+                                status=HTTPStatus.FORBIDDEN
+                                if gate_status == "forbidden"
+                                else HTTPStatus.INTERNAL_SERVER_ERROR,
                             )
                         else:
                             self._login_gate()
@@ -4874,20 +5241,21 @@ def make_handler(
 
         def _targets_body(self) -> dict[str, Any]:
             config_targets = self._config_targets() if oauth_manager is not None else []
-            return {
+            body: dict[str, Any] = {
                 "static_targets": list(static_targets),
                 "dynamic_targets": store.get_controlled_targets(),
                 "config_targets": config_targets,
                 "locked_targets": sorted(set(static_targets + config_targets), key=str.lower),
                 "controlled_targets": self._effective_controlled_targets(),
+                "history": store.get_controlled_targets_history()[-10:],
             }
+            if store.controlled_targets_error:
+                body["error"] = store.controlled_targets_error
+            return body
 
         def _dispatch_post(self, path: str, payload: dict[str, Any]) -> tuple[int, Any]:
             """Run one protected POST route and return (status, JSON body) without writing the response."""
             try:
-                if path == "/api/auth/targets":
-                    store.set_controlled_targets(payload.get("targets"))
-                    return HTTPStatus.OK, self._targets_body()
                 if path == "/api/budget":
                     return HTTPStatus.OK, store.update_budget(payload)
                 if path == "/api/profile/cicd_runner":
@@ -5008,11 +5376,16 @@ def make_handler(
             auth_status, auth_info = self._evaluate_auth()
             if not self._check_auth(evaluated=(auth_status, auth_info)):
                 return
-            if path == "/api/auth/targets" and auth_info.get("method") != "github_oauth":
-                self._send_json(
-                    {"error": "Changing controlled targets requires a GitHub OAuth session"},
-                    status=HTTPStatus.FORBIDDEN,
-                )
+            if path == "/api/auth/targets":
+                if auth_info.get("method") != "github_oauth" or oauth_manager is None:
+                    self._send_json(
+                        {"error": "Changing controlled targets requires a GitHub OAuth session"},
+                        status=HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                # Not an idempotent mutation: it only starts a bound re-verification; the commit happens
+                # in the OAuth callback or device poll, through the store's durability gates.
+                self._handle_targets_post(auth_info)
                 return
             try:
                 payload = self._read_json(max_bytes=MAX_JSON_BODY_BYTES)
@@ -5150,6 +5523,8 @@ def create_dashboard_server(
                 "--allow-insecure-non-loopback (DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1) if a trusted network proxy terminates TLS."
             )
     static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
+    if oauth_manager is not None and not oauth_manager.session_fits(static_targets):
+        raise ValueError(SESSION_TOO_LARGE_ERROR.replace("Controlled target list", "Static controlled target list"))
     resolved_public_origin = resolve_public_origin(
         public_origin, redirect_uri=oauth_manager.redirect_uri if oauth_manager is not None else None
     )

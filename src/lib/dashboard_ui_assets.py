@@ -1643,11 +1643,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
     }
 
-    async function oauthLoginEnabled() {
+    async function oauthSignInNeeded() {
+      // True when GitHub sign-in is enabled and this browser has no usable session: an expired session
+      // (401) or one that a target-policy change no longer covers (403). Waits out a control VM outage.
       try {
-        const res = await NATIVE_FETCH("/api/auth/status", { cache: "no-store", credentials: "same-origin" });
-        const data = await res.json();
-        return Boolean(data && data.oauth && data.oauth.enabled);
+        const res = await fetchWithControlVmRetry("/api/auth/status", { cache: "no-store", credentials: "same-origin" });
+        const data = res.ok ? await res.json() : {};
+        return Boolean(data && data.oauth && data.oauth.enabled && !data.authenticated);
       } catch (_err) {
         return false;
       }
@@ -1690,11 +1692,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
       reqInit.headers = headers;
       let res = await fetchWithControlVmRetry(input, reqInit);
+      if (res.status === 401 && token && !new Headers(init.headers || {}).has("Authorization")) {
+        // A stored bearer token is checked before the session cookie, so a stale one masks a valid
+        // GitHub or token session: drop it and retry once (same Idempotency-Key) with the cookie alone.
+        storeDashboardAuthToken("");
+        const cookieOnly = new Headers(headers);
+        cookieOnly.delete("Authorization");
+        cookieOnly.delete("X-Dashboard-Token");
+        res = await fetchWithControlVmRetry(input, { ...reqInit, headers: cookieOnly });
+      }
+      if ((res.status === 401 || res.status === 403) && await oauthSignInNeeded()) {
+        // The login gate at "/" offers every sign-in method (including the dashboard token).
+        window.location.assign("/");
+        return res;
+      }
       if (res.status === 401) {
-        if (await oauthLoginEnabled()) {
-          window.location.assign("/");
-          return res;
-        }
         if (typeof window.prompt === "function") {
           const prompted = window.prompt("Dashboard authentication required. Enter your dashboard token:");
           if (prompted && prompted.trim()) {

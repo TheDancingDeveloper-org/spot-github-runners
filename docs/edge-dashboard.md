@@ -29,11 +29,49 @@ when all of these are true:
   then `<org>/spot-runners-config` with the organization from `--org` (default `swack-tools`).
 - The dashboard can list the config repository. If the listing fails, sign-in fails closed with a 403.
 
-The session cookie is HMAC-signed with `DASHBOARD_SESSION_SECRET`. The Worker and every control VM share
-that secret, so sessions survive VM replacement.
+The session cookie `__Host-spot_session` is HMAC-signed with `DASHBOARD_SESSION_SECRET`. The Worker and
+every control VM share that secret, so sessions survive VM replacement. The `__Host-` prefix makes browsers
+reject the cookie unless it is `Secure`, has `Path=/`, and has no `Domain`, so another `swacktech.com`
+subdomain can't set or shadow it. The sign-in `state` cookie is `__Host-spot_oauth_state`.
+
+To sign everyone out of the control VM dashboard, rotate `spot-dashboard-session-secret` and the Worker's
+`SESSION_SECRET` together. The startup script rewrites the dashboard environment file at every boot, so it
+doesn't keep a hand-set value. A dashboard that you run with your own environment can instead set
+`DASHBOARD_SESSION_NOT_BEFORE` to the current Unix time, with the same value in the Worker's optional
+`SESSION_NOT_BEFORE` variable. A session can't be revoked on its own, and a lost GitHub administrator
+permission takes effect at the next sign-in.
+
+Sign-in routes are rate limited per browser IP and globally, and answer HTTP 429 with `Retry-After` when
+over the limit. The Worker passes the browser IP in `X-Spot-Client-Ip` and drops any copy that the
+browser sends. The dashboard trusts that header only from a loopback peer, the local `cloudflared`.
+
+### Controlled target changes
+
+`POST /api/auth/targets` changes the targets saved in the dashboard, and only a GitHub session can call
+it. The request doesn't change anything yet. It answers HTTP 202 with `"status": "reauth_required"` and
+either an `authorize_url` or a device code. The change commits only after that new GitHub sign-in shows
+that the same GitHub account administers every static, config repository, current, and proposed target.
+That check skips the cache of earlier administrator checks.
+
+- A change can't remove a target that you no longer administer, and it can't add one that you don't.
+- The change commits only if the saved list still matches the list it started from. Otherwise the
+  dashboard answers HTTP 409 and you submit it again.
+- The commit goes through the same freeze, reconcile, and active-slot checks as every other change.
+- Each committed change is logged and kept in a history of the last 50 changes.
+- A list whose session cookie would exceed browser limits is refused with HTTP 400. At most 32
+  targets can be saved.
+
+### Unreadable state file
+
+If `/var/lib/spot-dashboard/state.json` exists but can't be read or parsed, GitHub sign-in fails closed
+with HTTP 500 and `"code": "controlled_targets_unavailable"`. The dashboard never overwrites that file and
+refuses freeze, snapshot, and import calls, so it can't hand an incomplete target list to another VM.
+Repair or restore the file, then restart the dashboard container.
 
 When `GITHUB_OAUTH_DEVICE_FLOW=1`, the Worker also passes `/auth/device/code` and `/auth/device/token`
-through without a session cookie. The dashboard still refuses them unless device login is enabled.
+through without a session cookie. The dashboard still refuses them unless device login is enabled. The
+GitHub device code stays on the control VM behind a random handle, and the dashboard enforces the polling
+interval. A VM replacement ends a device sign-in in progress, so request a new code.
 
 The Worker reaches the control VM through its tunnel hostname, so the request `Host` differs from the
 browser `Origin`. The dashboard accepts a `POST` only when `Origin` matches its own `Host` or its public

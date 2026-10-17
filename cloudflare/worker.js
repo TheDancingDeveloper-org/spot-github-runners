@@ -16,8 +16,15 @@
 //   ALLOWED_ADMIN_LOGIN      Var; the only GitHub login allowed through (swackhamer).
 //   ALLOWED_ADMIN_ID         Var; that login's numeric GitHub id (619624).
 //   ORIGIN_HOST_SUFFIX       Optional var; origin hostnames must end with it (default ".swacktech.com").
+//   SESSION_NOT_BEFORE       Optional var; Unix time. Sessions issued before it are rejected (bulk sign-out,
+//                            same meaning as DASHBOARD_SESSION_NOT_BEFORE on the control VM).
 
-export const SESSION_COOKIE_NAME = "spot_session";
+// The __Host- prefix makes browsers refuse the cookie unless it is Secure, Path=/, and has no Domain, so a
+// sibling subdomain cannot set or shadow it. Matches dashboard_auth.SESSION_COOKIE_NAME.
+export const SESSION_COOKIE_NAME = "__Host-spot_session";
+// Set on every proxied request from the browser's CF-Connecting-IP (any client copy is stripped with the
+// other x-spot-* headers). The dashboard uses it only to rate-limit sign-in routes per client.
+export const CLIENT_IP_HEADER = "X-Spot-Client-Ip";
 export const SESSION_PURPOSE_LABEL = "spot-dashboard/session/v1";
 export const KV_ORIGIN_KEY = "origin:active";
 export const UNAVAILABLE_ERROR = "control_vm_unavailable";
@@ -149,13 +156,24 @@ function isInt(value) {
   return typeof value === "number" && Number.isSafeInteger(value);
 }
 
-// Full session check: signature, v == 1, iat - 60 <= now < exp, bounded TTL, and the single allowed
-// admin (login AND numeric id). Fails closed when any binding is missing.
+// Optional bulk revocation cut-off. Unset or empty means 0; any other non-integer fails closed (null).
+export function sessionNotBefore(env) {
+  const raw = env && env.SESSION_NOT_BEFORE;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return 0;
+  const text = String(raw).trim();
+  if (!/^[0-9]{1,15}$/.test(text)) return null;
+  return Number(text);
+}
+
+// Full session check: signature, v == 1, iat - 60 <= now < exp, bounded TTL, iat >= SESSION_NOT_BEFORE,
+// and the single allowed admin (login AND numeric id). Fails closed when any binding is missing.
 export async function verifySession(token, env, nowSeconds = Math.floor(Date.now() / 1000)) {
   const secret = env && env.SESSION_SECRET;
   const login = env && env.ALLOWED_ADMIN_LOGIN;
   const adminId = env && Number(env.ALLOWED_ADMIN_ID);
   if (!secret || !login || !isInt(adminId) || adminId <= 0) return null;
+  const notBefore = sessionNotBefore(env);
+  if (notBefore === null) return null;
   let payload;
   try {
     payload = await verifyTokenSignature(await deriveSessionKey(secret), token);
@@ -166,6 +184,7 @@ export async function verifySession(token, env, nowSeconds = Math.floor(Date.now
   const { sub, uid, iat, exp, tgt } = payload;
   if (!isInt(iat) || !isInt(exp) || exp <= iat || exp - iat > MAX_SESSION_TTL_SECONDS) return null;
   if (!(iat - CLOCK_SKEW_SECONDS <= nowSeconds && nowSeconds < exp)) return null;
+  if (iat < notBefore) return null;
   if (typeof sub !== "string" || sub !== login) return null;
   if (!isInt(uid) || uid !== adminId) return null;
   if (tgt !== undefined && (!Array.isArray(tgt) || !tgt.every((t) => typeof t === "string"))) return null;
@@ -283,6 +302,8 @@ export function buildOriginHeaders(request, env) {
   if (env.CF_ACCESS_CLIENT_SECRET) headers.set("CF-Access-Client-Secret", env.CF_ACCESS_CLIENT_SECRET);
   headers.set("X-Forwarded-Host", incoming.host);
   headers.set("X-Forwarded-Proto", "https");
+  const clientIp = request.headers.get("CF-Connecting-IP");
+  if (clientIp && /^[0-9A-Fa-f:.]{2,45}$/.test(clientIp)) headers.set(CLIENT_IP_HEADER, clientIp);
   return headers;
 }
 

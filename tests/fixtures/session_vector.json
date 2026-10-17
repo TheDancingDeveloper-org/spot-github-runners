@@ -1,6 +1,7 @@
 {
   "secret": "test-vector-secret-not-for-production-0123456789abcdef",
   "purpose_label": "spot-dashboard/session/v1",
+  "cookie_name": "__Host-spot_session",
   "valid_session": {
     "token": "eyJleHAiOjE3OTIwNDMyMDAsImlhdCI6MTc5MjAwMDAwMCwic3ViIjoic3dhY2toYW1lciIsInRndCI6WyJzd2Fjay10b29scy9veGlkZXgiXSwidWlkIjo2MTk2MjQsInYiOjF9.8bdb3cded7569ea20047397d097b233bd994d33a71a54a50e27da3bc37702caa",
     "payload": {
