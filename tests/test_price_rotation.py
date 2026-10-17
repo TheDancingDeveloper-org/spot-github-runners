@@ -2310,3 +2310,33 @@ class ControllerTargetBindingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "separate --state-file"):
                     controller._run_controller(args)
                 runners.assert_not_called()
+
+
+class ReplacementListenerMatchingTests(unittest.TestCase):
+    """Codex M4 round 16: replacement listeners match the complete host name."""
+
+    def test_extended_host_names_are_not_claimed(self):
+        from lib.spot_runner_autoscaler import _replacement_runners
+        own = GitHubRunner(1, "gha-oxidex-runners-new-1", "online", False, ("spot",))
+        own2 = GitHubRunner(2, "gha-oxidex-runners-new-12", "online", False, ("spot",))
+        extended = GitHubRunner(3, "gha-oxidex-runners-new-extra-1", "online", False, ("spot",))
+        other = GitHubRunner(4, "gha-x-oxidex-runners-new-1", "online", False, ("spot",))
+        self.assertEqual(_replacement_runners([own, own2, extended, other], "oxidex-runners-new"), [own, own2])
+        self.assertEqual(_replacement_runners([own], ""), [])
+
+    def test_cleanup_never_deregisters_extended_hosts_listeners(self):
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups, write_scale_state
+        repl = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new")
+        extended = GitHubRunner(3, "gha-oxidex-runners-new-extra-1", "online", False, ("spot",))
+        state = {"runner_inventory_observed_at": __import__("time").time(),
+                 "replacement_cleanups": {"z/oxidex-runners-new": {
+                     "name": "oxidex-runners-new", "zone": "z", "instance_id": "new", "target": "swack-tools",
+                     "drain": True, "runners": {}}}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            write_scale_state(path, state)
+            with patch("lib.runner_drain.api", return_value={"name": extended.name, "busy": False}) as api, \
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True), \
+                    patch("lib.spot_runner_autoscaler.delete_vm_and_disks"):
+                reconcile_replacement_cleanups([repl], [extended], SimpleNamespace(project="p"), state, path)
+            self.assertNotIn("DELETE", [c.args[1] for c in api.call_args_list])

@@ -1705,7 +1705,15 @@ def identity_matches(row, name, zone, instance_id) -> bool:
 
 
 def _replacement_runners(runners, name: str):
-    return [r for r in runners if name and r.name.startswith(f"gha-{name}-")]
+    """Listeners of exactly this replacement host: ``gha-<name>-<n>``.
+
+    A plain prefix match would also claim ``gha-<name>-extra-1`` from a host whose name extends
+    this one, reporting false readiness or deregistering another host's idle listeners.
+    """
+    if not name:
+        return []
+    pattern = re.compile(r"gha-" + re.escape(name) + r"-\d+")
+    return [r for r in runners if pattern.fullmatch(r.name)]
 
 
 def _replacement_live_failure(vms, runners, rotation) -> str | None:
