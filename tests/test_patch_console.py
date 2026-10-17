@@ -168,20 +168,24 @@ class LossyGitHub:
         self.fake = fake
         self.rules: list[tuple[str, str, str]] = []
 
-    def lose(self, method, route_suffix, mode):
-        self.rules.append((method, route_suffix, mode))
+    def lose(self, method, route_suffix, mode, skip=0):
+        """Fail the matching call after letting ``skip`` matching calls through."""
+        self.rules.append([method, route_suffix, mode, skip])
 
     def __call__(self, method, url, headers, body, timeout):
         route = url.split("?", 1)[0]
         for rule in list(self.rules):
-            m, suffix, mode = rule
+            m, suffix, mode, skip = rule
             if m == method and route.endswith(suffix):
+                if skip:
+                    rule[3] -= 1
+                    break
                 self.rules.remove(rule)
                 if mode == "before":
                     raise TimeoutError("simulated timeout before GitHub applied the call")
-                if mode == "status":
+                if mode == "status" or mode.isdigit():
                     self.fake.calls.append((method, url, None))
-                    return 502, b'{"message": "Server Error"}'
+                    return (502 if mode == "status" else int(mode)), b'{"message": "Server Error"}'
                 self.fake(method, url, headers, body, timeout)
                 raise TimeoutError("simulated lost response after GitHub applied the call")
         return self.fake(method, url, headers, body, timeout)
@@ -274,6 +278,85 @@ class LostResponseSaveTests(unittest.TestCase):
         with self.assertRaises(pc.GitHubRestError):
             console(forbidden).save(OXIDEX_PATH, self.NEW, HEAD, idempotency_key="lost-0002")
         self.assertEqual(set(fake.branches), {"main"})  # GitHub confirmed nothing was committed
+
+
+class SaveExitAuditTests(unittest.TestCase):
+    """Codex round 9: every unsettled exit of a save is retryable with the same key; definite answers stay final."""
+
+    NEW = OXIDEX.replace("ripgrep", "fd-find")
+
+    def attempt(self, lossy, key="audit-0001"):
+        try:
+            return console(lossy).save(OXIDEX_PATH, self.NEW, HEAD, "Add fd", idempotency_key=key), None
+        except pc.PatchConsoleError as exc:
+            return None, exc
+
+    def assert_retryable(self, exc):
+        self.assertIsInstance(exc, pc.GitHubRestError)
+        self.assertIs(exc.body.get("retry_same_key"), True, exc)
+
+    def committed_without_pr(self, key):
+        fake = FakeGitHubRepo()
+        console(fake).save(OXIDEX_PATH, self.NEW, HEAD, idempotency_key=key)
+        fake.prs.clear()  # as if the PR creation never happened after the commit
+        return fake
+
+    def test_every_lookup_or_lost_answer_is_retryable(self):
+        branch = pc.PatchConsole.branch_for(OXIDEX_PATH, "audit-0001").split("/", 1)[1]
+        cases = [
+            ("resolve lost", lambda: FakeGitHubRepo(), [("GET", f"repos/{REPO}", "status")]),
+            ("initial branch lookup", lambda: FakeGitHubRepo(), [("GET", branch, "before")]),
+            ("defaults read", lambda: FakeGitHubRepo(), [("GET", "contents/defaults.yaml", "status")]),
+            ("base file read", lambda: FakeGitHubRepo(), [("GET", f"contents/{OXIDEX_PATH}", "before")]),
+            ("lookup after a lost branch create", lambda: FakeGitHubRepo(),
+             [("POST", "/git/refs", "after"), ("GET", branch, "before", 1)]),  # skip the initial lookup
+            ("lookup after a lost commit", lambda: FakeGitHubRepo(),
+             [("PUT", f"contents/{OXIDEX_PATH}", "after"), ("GET", branch, "before", 1)]),
+            ("reconcile file read", lambda: self.committed_without_pr("audit-0001"),
+             [("GET", f"contents/{OXIDEX_PATH}", "before")]),
+            ("reconcile PR lookup", lambda: self.committed_without_pr("audit-0001"), [("GET", "/pulls", "before")]),
+            ("reconcile PR open lost", lambda: self.committed_without_pr("audit-0001"),
+             [("POST", "/pulls", "before")]),
+            # A 4xx on a reconciliation lookup is still not an answer about the earlier attempt.
+            ("PR lookup 403 after a lost create", lambda: FakeGitHubRepo(),
+             [("POST", "/pulls", "after"), ("GET", "/pulls", "403")]),
+            ("branch lookup 403", lambda: FakeGitHubRepo(), [("GET", branch, "403")]),
+            ("reconcile file read 403", lambda: self.committed_without_pr("audit-0001"),
+             [("GET", f"contents/{OXIDEX_PATH}", "403")]),
+            ("reconcile PR lookup 403", lambda: self.committed_without_pr("audit-0001"), [("GET", "/pulls", "403")]),
+            ("lookup 403 after a lost branch create", lambda: FakeGitHubRepo(),
+             [("POST", "/git/refs", "after"), ("GET", branch, "403", 1)]),
+            ("lookup 403 after a lost commit", lambda: FakeGitHubRepo(),
+             [("PUT", f"contents/{OXIDEX_PATH}", "after"), ("GET", branch, "403", 1)]),
+        ]
+        for name, make, rules in cases:
+            fake = make()
+            lossy = LossyGitHub(fake)
+            for rule in rules:
+                lossy.lose(*rule)
+            with self.subTest(name):
+                result, exc = self.attempt(lossy)
+                self.assertEqual(lossy.rules, [])  # every injected failure actually happened
+                self.assertIsNone(result)
+                self.assert_retryable(exc)
+                self.assertEqual([c for c in fake.calls if c[0] == "DELETE"], [])
+                result, exc = self.attempt(lossy)  # the same key finishes the job, with exactly one PR
+                self.assertIsNone(exc, exc)
+                self.assertEqual(result["pull_request"]["number"], 1)
+                self.assertEqual(len(fake.prs), 1)
+
+    def test_definite_answers_stay_final(self):
+        fake = FakeGitHubRepo()
+        fake.fail[("GET", f"repos/{REPO}")] = 403  # no permission: a definite answer
+        _, exc = self.attempt(fake)
+        self.assertNotIn("retry_same_key", exc.body)
+        fake = FakeGitHubRepo()
+        fake.fail[("PUT", f"repos/{REPO}/contents/")] = 403  # a definite rejection of the commit
+        _, exc = self.attempt(fake, key="audit-0002")
+        self.assertNotIn("retry_same_key", exc.body)
+        for bad in ("", "not-a-sha"):
+            with self.assertRaises(pc.InvalidRequestError):
+                console(FakeGitHubRepo()).save(OXIDEX_PATH, self.NEW, bad, idempotency_key="audit-0003")
 
 
 class ValidationTests(unittest.TestCase):
@@ -880,6 +963,23 @@ class PatchApiTests(unittest.TestCase):
         self.assertEqual(store.run_external("retry-key-0001", "POST", "/api/patches/save", fn, fingerprint="f"),
                          (200, {"status": "done"}, True))
         self.assertEqual(len(calls), 3)
+
+    def test_lost_pr_create_then_failed_lookup_is_retryable_and_reconciles(self):
+        lossy = LossyGitHub(self.fake)
+        lossy.lose("POST", "/pulls", "after")   # GitHub creates the PR; its answer is lost
+        lossy.lose("GET", "/pulls", "before")   # and the reconciliation lookup fails too
+        self.start(requester=lossy)
+        body = {"path": OXIDEX_PATH, "content": OXIDEX.replace("ripgrep", "fd-find"), "base_sha": HEAD}
+        status, msg, first = self.request("POST", "/api/patches/save", body, key="lookup-key-0001")
+        self.assertEqual((status, first["retry_same_key"]), (424, True))
+        self.assertIsNone(msg.get("Idempotent-Replay"))
+        self.assertEqual(len(self.fake.prs), 1)  # it exists on GitHub already
+        status, msg, second = self.request("POST", "/api/patches/save", body, key="lookup-key-0001")
+        self.assertEqual((status, second["reconciled"], second["pull_request"]["number"]), (200, True, 1))
+        self.assertIsNone(msg.get("Idempotent-Replay"))  # ran again (not a cached 424)
+        status, msg, third = self.request("POST", "/api/patches/save", body, key="lookup-key-0001")
+        self.assertEqual((status, third, msg.get("Idempotent-Replay")), (200, second, "true"))
+        self.assertEqual(len(self.fake.prs), 1)
 
     def test_save_survives_losing_the_stored_result(self):
         store = self.start()

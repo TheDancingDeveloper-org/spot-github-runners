@@ -174,6 +174,9 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
     the branch, its commit, and any pull request first. If GitHub didn't confirm the step, the save
     answers HTTP 424 with `"retry_same_key": true`. It deletes the branch only after GitHub rejects the
     commit outright while the branch still holds no commit.
+  - Any failed lookup while the save reconciles an earlier attempt, and any lost or 5xx GitHub answer
+    during a save, answers HTTP 424 with `"retry_same_key": true`. Only definite answers are final:
+    validation errors, conflicts, and a GitHub 4xx rejection of a plain read or of a write.
   - Results marked for a same-key retry (`"retry_same_key": true`, or the pending 202) are never stored
     as final. A retry with the same key runs again and reconciles; final results are stored and replayed.
   - The browser retries such a result automatically up to three times with the same key, after 2, 5,

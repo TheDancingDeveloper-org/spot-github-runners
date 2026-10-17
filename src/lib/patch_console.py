@@ -816,6 +816,29 @@ class PatchConsole:
 
     def save(self, path: str, content: Any, base_sha: Any, message: Any = None,
              idempotency_key: str | None = None) -> dict[str, Any]:
+        """Open a pull request for ``content`` (see :meth:`_save`).
+
+        Every outcome that is not settled is retryable with the same key (``retry_same_key``, never stored as
+        final): any failed reconciliation lookup, and any lost or 5xx GitHub answer anywhere in the save. Only
+        definite answers are final: validation and conflicts, and GitHub 4xx rejections of a read or a write.
+        """
+        try:
+            return self._save(path, content, base_sha, message, idempotency_key)
+        except GitHubRestError as exc:
+            if exc.body.get("retry_same_key") is True or not _ambiguous(exc):
+                raise
+            raise _retry_error("finish the save", exc) from exc
+
+    @staticmethod
+    def _lookup(step: str, fn: Callable[..., Any], *args: Any) -> Any:
+        """A reconciliation lookup: the earlier outcome stays unknown when it fails, so any failure is retryable."""
+        try:
+            return fn(*args)
+        except PatchConsoleError as exc:
+            raise _retry_error(step, exc) from exc
+
+    def _save(self, path: str, content: Any, base_sha: Any, message: Any,
+              idempotency_key: str | None) -> dict[str, Any]:
         repository = repository_for_path(path)
         if not isinstance(base_sha, str) or not _SHA_RE.match(base_sha):
             raise InvalidRequestError("base_sha must be the 40-hex commit the manifest was loaded from")
@@ -826,9 +849,10 @@ class PatchConsole:
             raise InvalidRequestError("Refusing to write to the default branch")
         title = str(message or "").strip()[:200] or f"Update {path} from the Spot dashboard"
         # Reconcile first: an earlier attempt with this key may have created the branch, the commit, or the PR.
-        existing_head = client.branch_head_or_none(new_branch) if idempotency_key else None
+        existing_head = (self._lookup("check for an earlier attempt", client.branch_head_or_none, new_branch)
+                         if idempotency_key else None)
         if existing_head is not None and existing_head != base_sha:
-            on_branch = client.read_file(path, new_branch)
+            on_branch = self._lookup("read the earlier attempt's commit", client.read_file, path, new_branch)
             if on_branch is None or on_branch[0] != content:
                 raise IdempotencyMismatchError(
                     "This Idempotency-Key was already used for a different change to this file")
@@ -836,7 +860,8 @@ class PatchConsole:
             patch, errors, _ = validate_manifest(content, path=path, defaults=defaults)
             if patch is None:
                 raise InvalidRequestError("The manifest is invalid", body={"errors": errors})
-            pr = client.find_pull_request(new_branch) or client.open_pull_request(
+            pr = self._lookup("find the earlier attempt's pull request", client.find_pull_request,
+                              new_branch) or client.open_pull_request(
                 new_branch, branch, title,
                 f"Edited in the Spot dashboard from {branch}@{base_sha[:12]}.\n\n"
                 f"Effective patch sha256: `{patch.patch_sha256}`")
@@ -865,7 +890,7 @@ class PatchConsole:
                 # A lost response may hide a branch that was created; only GitHub's own answer settles it.
                 if not _ambiguous(exc) and exc.http_status != 422:
                     raise
-                if client.branch_head_or_none(new_branch) is None:
+                if self._lookup("check whether the branch was created", client.branch_head_or_none, new_branch) is None:
                     raise _retry_error("create the branch", exc) from exc
         try:
             commit = client.put_file(path, new_branch, content, title, blob)
@@ -878,8 +903,9 @@ class PatchConsole:
             if not _ambiguous(exc):
                 self._delete_untouched_branch(client, new_branch, base_sha)
                 raise
-            head_now = client.branch_head_or_none(new_branch)  # a lookup failure propagates: nothing deleted
-            on_branch = client.read_file(path, new_branch) if head_now not in (None, base_sha) else None
+            head_now = self._lookup("check whether the commit landed", client.branch_head_or_none, new_branch)
+            on_branch = (self._lookup("check whether the commit landed", client.read_file, path, new_branch)
+                         if head_now not in (None, base_sha) else None)
             if on_branch is None or on_branch[0] != content:
                 raise _retry_error("commit the manifest", exc) from exc
             commit = head_now or ""
@@ -888,7 +914,7 @@ class PatchConsole:
         except GitHubRestError as exc:
             # Created, or never created? Ask GitHub before deciding anything; the branch always stays, so a retry
             # with the same key can finish the job.
-            pr = client.find_pull_request(new_branch)
+            pr = self._lookup("check whether the pull request was opened", client.find_pull_request, new_branch)
             if pr is None:
                 raise _retry_error("open the pull request", exc) if _ambiguous(exc) else exc
         return {
