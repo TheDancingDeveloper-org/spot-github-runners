@@ -1129,7 +1129,39 @@ class ControlVmManager:
             return self._abort(t, "new VM did not import the frozen snapshot")
         return "wait"
 
+    def _catch_up_with_kv(self, t: dict) -> bool:
+        """Recovery without an import: push the latest KV snapshot into the replacement before cutover.
+
+        The replacement hydrated from KV when it booted, but the old VM may have written newer versions
+        before it died. The import applies only when it is >= the replacement's version; the replacement
+        must then report at least the KV version. True when the cutover may proceed.
+        """
+        if t.get("kv_caught_up"):
+            return True
+        try:
+            snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
+        except KvError as exc:
+            t["error"] = f"KV snapshot unreadable before recovery cutover: {exc}"
+            self.save()
+            return False
+        if snapshot is not None:
+            status, body = self._control(t["new_slot"], "import", "POST", snapshot)
+            version = body.get("state_version") if isinstance(body, dict) else None
+            if not (status == 200 and isinstance(version, int) and not isinstance(version, bool)
+                    and version >= snapshot["state_version"]):
+                self._fail_attempt(t, f"replacement did not reach KV state_version {snapshot['state_version']} "
+                                      f"(import returned {status}, state_version={version})", limit=10**9)
+                return False
+            self._note("slot %s caught up with KV at state_version %d before cutover", t["new_slot"], version)
+        t["kv_caught_up"] = True
+        self.save()
+        return True
+
     def _step_cutover(self, t: dict, obs: Observation) -> str:
+        if t["mode"] == MODE_RECOVER and t.get("import_skipped") and not self._catch_up_with_kv(t):
+            if self._old_back(t, obs):
+                return self._abort(t, "old VM is healthy again; keeping it")
+            return "wait"
         t["cutover_attempted"] = True
         self.save()
         record = OriginRecord.for_slot(t["new_slot"], domain=self.config.origin_domain, now=self.clock())

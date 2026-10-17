@@ -415,6 +415,12 @@ def import_deployment_receipt(state, state_path,current=None):
         if not tier or tier.name != record['tier'] or not 1 <= record.get('expected_runner_count',0) <= tier.maximum_slots:
             raise RuntimeError('Deployment receipt contains unsafe tier/slot settings')
         operation['expected_runner_count']=record['expected_runner_count']
+        rotation=state.get('price_rotation')
+        if isinstance(rotation,dict) and any(
+                isinstance(row,dict) and row.get('name')==actual.name and row.get('zone')==actual.zone
+                for row in (rotation.get('pending_replacement'),rotation.get('replacement_vm'))):
+            rotation['expected_runner_count']=record['expected_runner_count']
+            rotation['expected_runner_count_source']='deployment_receipt'
         state.setdefault('host_deployments',{})[f'{actual.zone}/{actual.instance_id}']={
             key:record.get(key) for key in ('tier','expected_runner_count','admission_work_gib','runner_memory_gib','price')}
     operation["vm"] = asdict(actual)
@@ -1181,7 +1187,8 @@ def begin_price_rotation(outgoing_vm: GceVm, vms: list[GceVm], runners: list[Git
         # Set only from the name this rotation's own launch persisted; never inferred from inventory.
         "pending_replacement": None,
         "replacement_vm": None,
-        "expected_runner_count": getattr(args, "runner_count", 1),
+        "expected_runner_count": launch_slot_count(offer, args),
+        "expected_runner_count_source": "launch_sizing",
         "readiness": {"runners_online": False},
         "cordon_mode": cordon_mode,
         "cordon_complete": False,
@@ -1352,6 +1359,23 @@ def _replacement_from_inventory(vms, repl: dict | None) -> GceVm | None:
     return None
 
 
+def _delete_replacement(repl_vm, args, state, state_path) -> None:
+    """Delete a rotation replacement after persisting it as an intentional deletion.
+
+    Without the record, the next observation would treat the replacement's disappearance as an
+    unexpected loss and request another billable restoration host.
+    """
+    key = f"{repl_vm.zone}/{repl_vm.name}"
+    if key not in state.setdefault("intentional_deletions", []):
+        state["intentional_deletions"].append(key)
+    state.setdefault("intentional_deletion_ids", {})[key] = repl_vm.instance_id
+    write_scale_state(state_path, state)
+    try:
+        delete_vm_and_disks(repl_vm, args.project)
+    except Exception as exc:
+        LOG.error("Failed to delete replacement VM %s: %s", repl_vm.name, error_detail(exc))
+
+
 def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, runners=()) -> bool:
     repl_vm = _replacement_from_inventory(vms, rotation.get("replacement_vm"))
     if _outgoing_capacity_lost(rotation):
@@ -1359,21 +1383,31 @@ def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, 
         # no usable capacity. Keep it pending and try another fresh replacement instead.
         LOG.error("%s; outgoing listeners were removed, so the rotation keeps provisioning capacity", reason)
         if repl_vm and not any(r.online for r in _replacement_runners(runners, repl_vm.name)):
-            try:
-                delete_vm_and_disks(repl_vm, args.project)
-            except Exception as exc:
-                LOG.error("Failed to delete replacement VM %s: %s", repl_vm.name, error_detail(exc))
+            _delete_replacement(repl_vm, args, state, state_path)
         _restart_replacement(rotation, state, state_path)
         return True
     LOG.error("%s; aborting replacement to preserve old capacity", reason)
     if repl_vm:
-        try:
-            delete_vm_and_disks(repl_vm, args.project)
-        except Exception as exc:
-            LOG.error("Failed to delete replacement VM %s: %s", repl_vm.name, error_detail(exc))
+        _delete_replacement(repl_vm, args, state, state_path)
     state.pop("price_rotation", None)
     write_scale_state(state_path, state)
     return True
+
+
+def _expected_replacement_listeners(rotation, args=None) -> int:
+    """Return how many replacement listeners must be online before retirement.
+
+    Rotations saved before the count was derived from launch sizing recorded a placeholder of 1;
+    for those, recompute from the saved replacement offer with launch_offer's own sizing.
+    """
+    count = int(rotation.get("expected_runner_count", 0) or 0)
+    if not rotation.get("expected_runner_count_source"):
+        offer = rotation.get("replacement_offer") or {}
+        if offer.get("vcpu") and offer.get("ram_gib"):
+            count = max(count, launch_slot_count(SimpleNamespace(**offer), args))
+        else:
+            count = max(count, 8)
+    return max(1, count)
 
 
 def _replacement_runners(runners, name: str):
@@ -1397,7 +1431,7 @@ def _replacement_live_failure(vms, runners, rotation) -> str | None:
         return f"replacement {name} has instance ID {vm.instance_id or 'unknown'}, expected {instance_id}"
     if not vm.running:
         return f"replacement {name} is {vm.status}"
-    expected = max(1, int(rotation.get("expected_runner_count", 1) or 1))
+    expected = _expected_replacement_listeners(rotation)
     online = sum(1 for r in _replacement_runners(runners, name) if r.online)
     if online < expected:
         return f"replacement {name} has {online}/{expected} runners online"
@@ -1582,7 +1616,7 @@ def _step_rotation_verify_readiness(vms, runners, args, state, state_path, rotat
 
     repl_name = repl["name"] if repl else ""
     assigned = _replacement_runners(runners, repl_name)
-    expected_count = rotation.get("expected_runner_count", 1)
+    expected_count = _expected_replacement_listeners(rotation, args)
     online_count = sum(1 for r in assigned if r.online)
     readiness["runners_online"] = bool(repl_name) and online_count >= expected_count
 
@@ -1993,6 +2027,15 @@ def runner_capacity(vcpu: int) -> int:
     return vcpu // 4
 
 
+def launch_slot_count(offer, args) -> int:
+    """Return the runner listener count ``launch_offer`` provisions for ``offer``."""
+    if getattr(args, 'scaling_mode', 'resource') == 'tiered':
+        tier = tier_for_shape(offer.vcpu, offer.ram_gib)
+        if tier:
+            return int(getattr(args, 'launch_slots', tier.initial_slots))
+    return 8
+
+
 def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -> GceVm:
     """Try each zone until the manager confirms a complete runner deployment; return the launched VM."""
     state_path = state_path or args.state_file.expanduser()
@@ -2022,7 +2065,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         if not isfinite(job_memory) or job_memory<=0:
             raise RuntimeError('Tier job memory must be finite and positive')
     daily_limit = tier.max_daily_usd if tier else args.max_daily_usd
-    slots = getattr(args,'launch_slots',tier.initial_slots) if tier else 8
+    slots = launch_slot_count(offer, args)
     hourly_limit = daily_limit / Decimal(24)
     preflighted_zone = getattr(offer, 'zone', '')
     if preflighted_zone:
@@ -2105,7 +2148,11 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         if isinstance(rotation, dict) and rotation.get("phase") == "provision":
             # Persist this launch's identity in the same write as the provider intent so the
             # rotation can only ever adopt the VM it created, even across a controller crash.
-            rotation["pending_replacement"] = {"name": instance_name, "zone": zone}
+            rotation["pending_replacement"] = {"name": instance_name, "zone": zone,
+                                               "expected_runner_count": slots}
+            # Retirement requires every listener this launch provisions to be online.
+            rotation["expected_runner_count"] = slots
+            rotation["expected_runner_count_source"] = "launch_sizing"
         begin_host_operation("launch", vm, [], [], state, state_path,
                              requested_cpu_platform=cpu_platform, deployment_receipt=str(receipt),
                              candidate_key=f"{zone}/{offer.machine_type}/{cpu_platform}",

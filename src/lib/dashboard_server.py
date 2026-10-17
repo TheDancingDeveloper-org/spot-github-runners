@@ -1000,6 +1000,10 @@ class DashboardStore:
         self.kv_last_written_version: int | None = None
         # Every KV snapshot write (background write-behind and freeze) runs under this lock, in version order.
         self._kv_write_lock = threading.Lock()
+        # True once this VM, as the KV writer, has compared its state with the KV snapshot (and adopted a
+        # newer one). Reset whenever it is not the writer, so a VM that becomes active by cutover catches up
+        # with KV before it accepts a change or publishes.
+        self._writer_synced = False
         self._defer: dict[str, Any] | None = None
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -1172,6 +1176,7 @@ class DashboardStore:
                 self._mark_kv_dirty()
             self.hydration_source = source
             self.hydrated = True
+            self._writer_synced = bool(reachable and self.kv_writer)
         LOG.info("Dashboard hydrated from %s at state_version %d", source, self.state_version())
         return source
 
@@ -1296,9 +1301,43 @@ class DashboardStore:
         else:
             record = OriginRecord.from_json(raw)
             writer = record is not None and record.slot == self.control_slot
+        if not writer:
+            self._writer_synced = False
         self.kv_writer = writer
         self._writer_checked_at = self._clock()
         return writer
+
+    def sync_with_kv_as_writer(self) -> bool:
+        """When this VM is (or just became) the writer, adopt a newer KV snapshot before going further.
+
+        Returns True when it is safe to accept a change or publish: not the writer, or the writer and
+        already compared with KV. Returns False when KV could not be read after becoming the writer.
+        """
+        if self.kv is None:
+            return True
+        if self.kv_writer and self._writer_synced:
+            return True
+        if not self.refresh_writer():
+            return True
+        if self._writer_synced:
+            return True
+        try:
+            snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY))
+        except KvError as exc:
+            LOG.warning("Became the KV writer but could not read the KV snapshot: %s", exc)
+            return False
+        with self._lock:
+            if snapshot is not None and snapshot["state_version"] > self.state_version():
+                try:
+                    self._adopt_snapshot(snapshot)
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    LOG.error("Became the KV writer but the newer KV snapshot is invalid: %s", exc)
+                    return False
+                self._kv_dirty = False  # Local state now equals the KV copy.
+                LOG.warning("Became the KV writer; adopted newer KV snapshot at state_version %d",
+                            snapshot["state_version"])
+            self._writer_synced = True
+        return True
 
     def _mark_kv_dirty(self) -> None:
         if self.kv is None:
@@ -1349,6 +1388,7 @@ class DashboardStore:
                     record = OriginRecord.from_json(raw_origin)
                     if record is None or record.slot != self.control_slot:
                         self.kv_writer = False
+                        self._writer_synced = False
                         self._writer_checked_at = self._clock()
                         LOG.warning("Skipping dashboard KV write: origin:active names slot %s, not %s",
                                     record.slot if record else None, self.control_slot)
@@ -1387,6 +1427,9 @@ class DashboardStore:
             return False
         if self._writer_checked_at is None or now - self._writer_checked_at >= KV_WRITER_RECHECK_SECONDS:
             self.refresh_writer()
+        if self.hydrated and self.kv_writer and not self._writer_synced and not self.sync_with_kv_as_writer():
+            self._kv_next_attempt_at = now + KV_RETRY_BACKOFF_SECONDS
+            return False
         if not (self.hydrated and not self.frozen and self.kv_writer and self._kv_dirty):
             return False
         quiet = now - self._kv_dirty_last_at >= KV_WRITE_DEBOUNCE_SECONDS
@@ -1519,6 +1562,8 @@ class DashboardStore:
         if not mutating:
             status, body = fn()
             return status, body, False
+        if self.hydrated and not self.frozen and not self.sync_with_kv_as_writer():
+            raise DashboardFrozenError("Dashboard became the active slot but cannot read Cloudflare KV yet")
         with self._lock:
             if self.frozen:
                 raise DashboardFrozenError("Dashboard is frozen for a control VM handover")
@@ -1534,7 +1579,7 @@ class DashboardStore:
             if existing is not None:
                 if existing.get("m") != method or existing.get("p") != path:
                     return 422, {"error": "Idempotency-Key was already used for a different request"}, False
-                return int(existing.get("s", 200)), existing.get("b"), True
+                return int(existing.get("s", 200)), copy.deepcopy(existing.get("b")), True
             snapshot = copy.deepcopy(self.state)
             self._defer = {"thread": threading.get_ident(), "dirty": False}
             try:
@@ -1548,13 +1593,17 @@ class DashboardStore:
                 self.state = snapshot
             if status >= 500:
                 return status, body, False
-            stored_body = body
             try:
-                if len(json.dumps(body, allow_nan=False)) > IDEMPOTENCY_MAX_BODY_BYTES:
+                # Store an independent copy: the response may share objects with live state that later
+                # requests change.
+                serialized = json.dumps(body, allow_nan=False)
+                if len(serialized) > IDEMPOTENCY_MAX_BODY_BYTES:
                     stored_body = {
                         "status": "ok" if status < 400 else "error",
                         "detail": "The original response was too large to store for replay; reload to see current state.",
                     }
+                else:
+                    stored_body = json.loads(serialized)
             except (TypeError, ValueError):
                 stored_body = {"status": "ok" if status < 400 else "error"}
             records = self._prune_idempotency(

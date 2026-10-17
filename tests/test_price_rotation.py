@@ -415,6 +415,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 "target_type": "org",
                 "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
                 "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+                "expected_runner_count_source": "launch_sizing",
                 "expected_runner_count": 1,
                 "readiness": {"runners_online": False},
                 "phase_started_at": 2000000000.0,
@@ -627,6 +628,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             "target": "swack-tools",
             "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a"},
             "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+            "expected_runner_count": 1, "expected_runner_count_source": "launch_sizing",
             "phase_started_at": 1000.0,
         }
         state = {"price_rotation": rotation}
@@ -660,6 +662,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 "target_type": "org",
                 "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
                 "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+                "expected_runner_count": 1, "expected_runner_count_source": "launch_sizing",
                 "cordon_complete": True,
                 "drain_started_at": 2000000000.0,
                 "phase_started_at": 2000000000.0,
@@ -685,6 +688,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 "target_type": "repo",
                 "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
                 "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+                "expected_runner_count": 1, "expected_runner_count_source": "launch_sizing",
                 "cordon_complete": True,
                 "drain_started_at": 2000000000.0,
                 "phase_started_at": 2000000000.0,
@@ -861,6 +865,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 "target_type": "repo",
                 "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
                 "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+                "expected_runner_count": 1, "expected_runner_count_source": "launch_sizing",
                 "cordon_complete": False,
                 "drain_started_at": 1000.0,
                 "phase_started_at": 1000.0,
@@ -886,6 +891,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 "target_type": "org",
                 "outgoing_vm": {"name": "vm-1", "zone": "asia-east2-a", "instance_id": "id-vm-1"},
                 "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+                "expected_runner_count": 1, "expected_runner_count_source": "launch_sizing",
                 "cordon_complete": False,
                 "drain_started_at": 1000.0,
                 "phase_started_at": 1000.0,
@@ -1126,6 +1132,7 @@ class RotationHarness:
             "phase": phase, "target": target, "target_type": target_type,
             "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
             "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+            "expected_runner_count_source": "launch_sizing",
             "expected_runner_count": 1, "readiness": {"runners_online": True},
             "cordon_complete": True, "drain_started_at": 1000.0, "phase_started_at": 1000.0,
             "cordoned_runners": {"99": {"name": "gha-oxidex-runners-old-1", "labels": ["spot", "x64-16"]}},
@@ -1435,6 +1442,107 @@ class TrackedJobRepositoryTests(unittest.TestCase):
                 restarted = controller.args_parser().parse_args(program[2:])
                 self.assertEqual(controller.tracked_job_repositories(restarted),
                                  controller.tracked_job_repositories(args))
+
+
+class AbortIntentionalDeletionTests(RotationHarness, unittest.TestCase):
+    """Round 5: deleting a replacement during abort is never mistaken for a loss."""
+
+    def run_abort(self, state, runners=()):
+        from lib.fleet_logging import observe_vms
+        from lib.spot_runner_autoscaler import _abort_runner_rotation
+        stuck = replace_vm(self.replacement_vm, status="PROVISIONING")
+        observe_vms([self.outgoing_vm, stuck], state)  # The replacement was already observed.
+        seen = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+
+            def deleting(vm, project):
+                seen.update(read_scale_state(path))  # What was durable when the delete was sent.
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks", side_effect=deleting):
+                _abort_runner_rotation(state["price_rotation"], [self.outgoing_vm, stuck], self.args,
+                                       state, path, "Boot timed out", list(runners))
+        key = "asia-east2-a/oxidex-runners-new"
+        self.assertIn(key, seen["intentional_deletions"])
+        self.assertEqual(seen["intentional_deletion_ids"][key], "new-456")
+        observe_vms([self.outgoing_vm], state)  # Next poll: the replacement is gone.
+        self.assertEqual(state["pending_vm_recovery"], {})
+        return state
+
+    def test_abort_records_intentional_deletion_before_deleting(self):
+        state = self.run_abort(self.state("boot"))
+        self.assertNotIn("price_rotation", state)
+
+    def test_lost_capacity_restart_records_intentional_deletion(self):
+        state = self.run_abort(self.state("boot", capacity_lost=True))
+        self.assertEqual(state["price_rotation"]["phase"], "select")
+
+
+class ExpectedListenerCountTests(unittest.TestCase):
+    """Round 5: retirement waits for every listener the replacement launch provisions."""
+
+    def setUp(self):
+        self.outgoing_vm = GceVm("oxidex-runners-old", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                                 vcpu=16, ram_gib=32.0, instance_id="old-123")
+        self.replacement_vm = GceVm("oxidex-runners-new", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                                    instance_id="new-456")
+        self.offer = SimpleNamespace(region="asia-east2", machine_type="n4-highcpu-16", vcpu=16, ram_gib=32.0,
+                                     hourly_usd=0.15, total_daily_usd=Decimal("3.60"), zone="asia-east2-a",
+                                     cpu_platform="Intel Emerald Rapids")
+
+    def runners(self, online):
+        return [GitHubRunner(500 + i, f"gha-oxidex-runners-new-{i}", "online" if i <= online else "offline",
+                             False, ("spot",)) for i in range(1, 9)]
+
+    def test_production_cli_defaults_require_all_eight_listeners(self):
+        from lib.spot_runner_autoscaler import (_step_rotation_verify_readiness, args_parser,
+                                                launch_slot_count)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            args = args_parser().parse_args(["--make-before-break", "--state-file", str(path)])
+            self.assertFalse(hasattr(args, "runner_count"))
+            self.assertEqual(launch_slot_count(self.offer, args), 8)
+            state = {}
+            launched = GceVm("oxidex-runners-new", "asia-east2-a", "PROVISIONING", "n4-highcpu-16", True,
+                             instance_id="new-456")
+            with patch("lib.spot_runner_autoscaler.launch_offer", return_value=launched), \
+                    patch("lib.spot_runner_autoscaler.guard_fleet_mutation"):
+                begin_price_rotation(self.outgoing_vm, [self.outgoing_vm], [], args, state, path, offer=self.offer)
+            rotation = state["price_rotation"]
+            self.assertEqual(rotation["expected_runner_count"], 8)
+            rotation.update(phase="verify_readiness", phase_started_at=2000000000.0)
+            with patch("lib.spot_runner_autoscaler.now", return_value=2000000010.0):
+                _step_rotation_verify_readiness([self.outgoing_vm, self.replacement_vm], self.runners(1),
+                                                args, state, path, rotation)
+                self.assertEqual(rotation["phase"], "verify_readiness")
+                _step_rotation_verify_readiness([self.outgoing_vm, self.replacement_vm], self.runners(8),
+                                                args, state, path, rotation)
+            self.assertEqual(rotation["phase"], "cordon_drain")
+
+    def test_launch_offer_records_its_own_slot_count_on_the_rotation(self):
+        from lib.spot_runner_autoscaler import args_parser, launch_offer
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            args = args_parser().parse_args(["--state-file", str(path)])
+            state = {"price_rotation": {"phase": "provision", "expected_runner_count": 1}}
+            with patch("lib.spot_runner_autoscaler.guard_fleet_mutation"), \
+                    patch("lib.spot_runner_autoscaler.platform_preferences",
+                          return_value=[(1, "Intel Emerald Rapids")]), \
+                    patch("lib.spot_runner_autoscaler.machine_profile",
+                          return_value=SimpleNamespace(disk_type="pd-standard")), \
+                    patch("lib.spot_runner_autoscaler.subprocess.run",
+                          return_value=SimpleNamespace(returncode=0, stdout="", stderr="")):
+                launch_offer(self.offer, args, state=state, state_path=path)
+            rotation = read_scale_state(path)["price_rotation"]
+            self.assertEqual(rotation["expected_runner_count"], state["host_operation"]["expected_runner_count"])
+            self.assertEqual(rotation["pending_replacement"]["expected_runner_count"], 8)
+
+    def test_legacy_saved_rotation_placeholder_is_recomputed(self):
+        from lib.spot_runner_autoscaler import _replacement_live_failure
+        rotation = {"replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+                    "expected_runner_count": 1,
+                    "replacement_offer": {"machine_type": "n4-highcpu-16", "vcpu": 16, "ram_gib": 32.0}}
+        self.assertIn("1/8", _replacement_live_failure([self.replacement_vm], self.runners(1), rotation))
+        self.assertIsNone(_replacement_live_failure([self.replacement_vm], self.runners(8), rotation))
 
 
 class LaunchAgentArgumentTests(unittest.TestCase):

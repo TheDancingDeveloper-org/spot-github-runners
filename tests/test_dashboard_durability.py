@@ -26,6 +26,7 @@ from lib.dashboard_server import (
 )
 from lib.dashboard_ui_assets import render_dashboard_html
 from lib.edge_state import (
+    KvError,
     KV_ORIGIN_KEY,
     KV_STATE_KEY,
     OriginRecord,
@@ -443,7 +444,7 @@ class HydrationSafetyTests(unittest.TestCase):
         self.assertEqual(store.hydrate(), "import")
         self.assertEqual(store.get_controlled_targets(), ["o/imported"])
 
-    def test_writer_refuses_to_overwrite_newer_kv_snapshot(self):
+    def test_new_writer_adopts_newer_kv_snapshot_instead_of_overwriting(self):
         self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=1).to_json()
         store = self.store()  # slot b, not the writer
         self.assertEqual(store.hydrate(), "default")
@@ -451,11 +452,37 @@ class HydrationSafetyTests(unittest.TestCase):
         self.fake.values[KV_STATE_KEY] = kv_snapshot(9, ["kv/repo"])  # slot a kept writing
         self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=2).to_json()  # b becomes writer
         self.clock.now += 60
-        with self.assertLogs("spot_dashboard", level="ERROR") as logs:
-            self.assertFalse(store.kv_tick())
-        self.assertIn("REFUSING", "\n".join(logs.output))
-        self.assertEqual(parse_snapshot(self.fake.values[KV_STATE_KEY])["state_version"], 9)
+        self.assertFalse(store.kv_tick())
         self.assertEqual(self.fake.count("PUT", KV_STATE_KEY), 0)
+        self.assertEqual((store.state_version(), store.get_controlled_targets()), (9, ["kv/repo"]))
+
+    def test_first_change_after_cutover_catches_up_with_kv(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=1).to_json()
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(7, ["kv/v7"])
+        store = self.store()  # slot b hydrated at v7 while a was active
+        store.hydrate()
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(8, ["kv/v8"])  # a wrote v8 before it died
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=2).to_json()  # cutover to b
+        real_get = store.kv.get
+
+        def snapshot_unreadable(key):
+            if key == KV_STATE_KEY:
+                raise KvError("snapshot read failed")
+            return real_get(key)
+
+        with mock.patch.object(store.kv, "get", side_effect=snapshot_unreadable):
+            with self.assertRaises(DashboardFrozenError):  # new writer cannot confirm KV: refuse the change
+                store.run_request("k" * 16, "POST", "/api/targets",
+                                  lambda: (200, {"targets": store.set_controlled_targets(["o/new"])}))
+        self.assertEqual(store.get_controlled_targets(), ["kv/v7"])
+        status, _body, _ = store.run_request(
+            "k" * 16, "POST", "/api/targets", lambda: (200, {"targets": store.set_controlled_targets(
+                store.get_controlled_targets() + ["o/new"])}))
+        self.assertEqual(status, 200)
+        self.assertEqual(store.get_controlled_targets(), ["kv/v8", "o/new"])
+        self.assertGreater(store.state_version(), 8)
 
     def test_never_writes_older_than_last_written(self):
         store = self.store()
@@ -657,6 +684,35 @@ class LocalAheadOfKvTests(unittest.TestCase):
         clock.now += 10
         self.assertFalse(store.kv_tick())
         self.assertEqual(fake.count("PUT", KV_STATE_KEY), 0)
+
+
+class IdempotencyRecordIsolationTests(unittest.TestCase):
+    def test_stored_response_is_not_changed_by_later_mutations(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "state.json"
+        store = DashboardStore(path)
+        store.hydrate()
+        live = {"min_runners": 2}
+        store.state["shared"] = live
+
+        def set_min(value):
+            def fn():
+                live["min_runners"] = value
+                store._persist()
+                return 200, {"policy": live}  # the response shares an object with live state
+            return fn
+
+        self.assertEqual(store.run_request("key-first-0001", "POST", "/api/scaling", set_min(2))[1],
+                         {"policy": {"min_runners": 2}})
+        store.run_request("key-second-002", "POST", "/api/scaling", set_min(3))
+        status, body, replayed = store.run_request("key-first-0001", "POST", "/api/scaling", set_min(99))
+        self.assertEqual((status, body, replayed), (200, {"policy": {"min_runners": 2}}, True))
+        body["policy"]["min_runners"] = 42  # mutating a replayed body does not touch the record
+        self.assertEqual(store.run_request("key-first-0001", "POST", "/api/scaling", set_min(99))[1],
+                         {"policy": {"min_runners": 2}})
+        on_disk = json.loads(path.read_text())["idempotency"]["key-first-0001"]["b"]
+        self.assertEqual(on_disk, {"policy": {"min_runners": 2}})
 
 
 class BlockingKvRequester(FakeKvRequester):

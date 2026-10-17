@@ -60,6 +60,10 @@ startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` 
   active slot never writes a snapshot older than its last write. Right before each write it checks that
   it isn't frozen, that `origin:active` still names its slot, and that KV doesn't hold a newer
   snapshot. If any check fails, it skips the write.
+- A VM that becomes the active slot compares its state with KV before it accepts its first change or
+  writes to KV, and adopts a newer KV snapshot. If it can't read KV, it answers changes with the wait
+  response.
+- Stored idempotent responses are independent copies, so later changes never alter a replay.
 - When the local file is newer than the KV copy at startup, for example because a preemption cut off a
   write after a local save, the active slot publishes the local copy.
 - The browser sends an `Idempotency-Key` header with every change. The dashboard stores the response in
@@ -80,7 +84,8 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
 - **Preempted VM**: the autoscaler starts it again. If the start keeps failing, it creates the other slot,
   which loads state from KV, then points `origin:active` at it. If the old VM still answers but reports
   `frozen`, the autoscaler freezes it again, or reads its snapshot, and imports that state before the
-  switch.
+  switch. If the old VM is down, the autoscaler imports the latest KV snapshot into the new VM and
+  waits until the new VM reports at least that version before it updates `origin:active`.
 - **Price rotation**: the autoscaler creates the other slot, waits for health, freezes the old VM, copies
   its snapshot into the new VM, writes `origin:active` with read-back verification, waits for KV to
   propagate, then deletes the old VM. A failed origin write unfreezes the old VM and deletes the new one.

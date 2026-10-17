@@ -778,6 +778,42 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.assertEqual(h.mutations()[-2:], [("import", "b"), ("origin", "b")])
         self.assertEqual(h.http.versions["b"], 7)
 
+    def test_recovery_cutover_imports_newer_kv_state_first(self):
+        h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER)
+        h.gcloud.status("a", "TERMINATED")  # preempted before any freeze
+        self.with_new_vm(h)
+        h.http.versions["b"] = 7  # replacement hydrated at v7
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({"k": 8}, 8, "a", now=1))  # old wrote v8, died
+        h.tick()
+        self.assertEqual(h.mutations(), [("import", "b"), ("origin", "b")])
+        self.assertEqual(h.http.versions["b"], 8)
+
+    def test_recovery_cutover_waits_until_replacement_confirms_kv_version(self):
+        h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER)
+        h.gcloud.status("a", "TERMINATED")
+        self.with_new_vm(h)
+        h.http.versions["b"] = 7
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({"k": 8}, 8, "a", now=1))
+        h.http.import_status = 500
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertEqual(h.transition["step"], "cutover")
+        self.assertFalse(h.transition["cutover_attempted"])
+        h.http.import_status = 200
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "b")
+        self.assertEqual(h.http.versions["b"], 8)
+
+    def test_recovery_cutover_waits_while_kv_snapshot_unreadable(self):
+        h = self.setup_rotation("cutover", mode=cv.MODE_RECOVER, import_skipped=True)
+        h.gcloud.status("a", "TERMINATED")
+        self.with_new_vm(h)
+        real_get = h.kv.get
+        h.kv.get = lambda key: (_ for _ in ()).throw(cv.KvError("down")) if key == KV_STATE_KEY else real_get(key)
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertIn("unreadable", h.transition["error"])
+
     def test_recovery_still_skips_import_when_old_vm_is_down(self):
         h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER)
         h.gcloud.status("a", "TERMINATED")
