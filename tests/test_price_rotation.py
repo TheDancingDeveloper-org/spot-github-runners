@@ -1763,6 +1763,44 @@ class RotationLossAccountingTests(unittest.TestCase):
     def test_ordinary_losses_are_unchanged_without_rotation(self):
         self.assertEqual(self.record([self.other, self.replacement], self.outgoing, rotation=False), 3)
 
+    def record_with(self, vms, lost, extra):
+        from dataclasses import asdict
+        from lib.vm_recovery import record_loss_restoration_target
+        state = {"pending_vm_recovery": {f"z/{lost.name}": asdict(lost)}, **extra}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            record_loss_restoration_target(vms, state, Path(tmpdir) / "state.json")
+        return state
+
+    def test_cleanup_owned_replacement_loss_is_not_restored(self):
+        """Codex M4 round 18: an aborted rotation's kept replacement stays temporary overlap."""
+        cleanup = {"replacement_cleanups": {"z/oxidex-runners-new": {
+            "name": "oxidex-runners-new", "zone": "z", "instance_id": "new-1", "drain": True}}}
+        state = self.record_with([self.other, self.outgoing], self.replacement, cleanup)
+        self.assertEqual(state.get("price_replacement_target", 0), 0)
+        self.assertTrue(state["pending_vm_recovery"]["z/oxidex-runners-new"]["_rotation_owned"])
+
+    def test_recently_retired_replacement_loss_is_not_restored(self):
+        import time as _time
+        retired = {"retired_replacements": [{"name": "oxidex-runners-new", "zone": "z", "instance_id": "new-1",
+                                             "retired_at": _time.time()}]}
+        state = self.record_with([self.other, self.outgoing], self.replacement, retired)
+        self.assertEqual(state.get("price_replacement_target", 0), 0)
+        expired = {"retired_replacements": [{"name": "oxidex-runners-new", "zone": "z", "instance_id": "new-1",
+                                             "retired_at": _time.time() - 2 * 24 * 3600}]}
+        state = self.record_with([self.other, self.outgoing], self.replacement, expired)
+        self.assertEqual(state.get("price_replacement_target", 0), 3)  # an ordinary host after expiry
+
+    def test_finished_cleanup_is_remembered(self):
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups, write_scale_state
+        state = {"replacement_cleanups": {"z/oxidex-runners-new": {
+            "name": "oxidex-runners-new", "zone": "z", "instance_id": "new-1"}}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            write_scale_state(path, state)
+            reconcile_replacement_cleanups([self.other], [], SimpleNamespace(project="p"), state, path)
+        self.assertEqual(state["replacement_cleanups"], {})
+        self.assertEqual(state["retired_replacements"][-1]["instance_id"], "new-1")
+
 
 
 class RotationOwnedRecoveryRetirementTests(unittest.TestCase):

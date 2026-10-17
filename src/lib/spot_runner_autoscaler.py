@@ -1602,6 +1602,7 @@ def reconcile_replacement_cleanups(vms, runners, args, state, state_path) -> Non
             if not _deregister_replacement_runners(record, runners, state, state_path, discover=not recreated):
                 continue  # keep the obligation until every registration is confirmed gone
             cleanups.pop(key)
+            _remember_retired_replacement(record, state)
             LOG.info("Confirmed aborted replacement %s is deleted", record.get("name"))
             write_scale_state(state_path, state)
             continue
@@ -1697,16 +1698,42 @@ def _expected_replacement_listeners(rotation, args=None) -> int:
     return max(1, count)
 
 
+RETIRED_REPLACEMENT_TTL_SECONDS = 24 * 3600
+
+
 def rotation_host_identities(state) -> tuple[dict | None, list[dict]]:
-    """Return the active rotation's outgoing host and every replacement identity it owns."""
+    """Return the active rotation's outgoing host and every replacement identity a rotation owns.
+
+    Replacements stay temporary overlap capacity after their rotation ends: those an abort kept
+    under a drain-then-delete obligation (``replacement_cleanups``), and, for a day after that
+    obligation finished, recently retired ones. Their loss must never become restoration capacity.
+    """
     rotation = state.get("price_rotation")
-    if not isinstance(rotation, dict):
-        return None, []
-    replacements = [row for row in (rotation.get("pending_replacement"), rotation.get("replacement_vm"),
-                                    *(rotation.get("failed_replacements") or []))
-                    if isinstance(row, dict) and row.get("name")]
-    outgoing = rotation.get("outgoing_vm") if isinstance(rotation.get("outgoing_vm"), dict) else None
+    replacements = []
+    outgoing = None
+    if isinstance(rotation, dict):
+        replacements += [row for row in (rotation.get("pending_replacement"), rotation.get("replacement_vm"),
+                                         *(rotation.get("failed_replacements") or []))
+                         if isinstance(row, dict) and row.get("name")]
+        outgoing = rotation.get("outgoing_vm") if isinstance(rotation.get("outgoing_vm"), dict) else None
+    cleanups = state.get("replacement_cleanups")
+    if isinstance(cleanups, dict):
+        replacements += [row for row in cleanups.values() if isinstance(row, dict) and row.get("name")]
+    now_ts = time.time()
+    replacements += [row for row in state.get("retired_replacements") or []
+                     if isinstance(row, dict) and row.get("name")
+                     and now_ts - float(row.get("retired_at") or 0) < RETIRED_REPLACEMENT_TTL_SECONDS]
     return outgoing, replacements
+
+
+def _remember_retired_replacement(record, state) -> None:
+    """Keep a finished cleanup's identity briefly so a loss observed in the same pass stays non-restorable."""
+    now_ts = time.time()
+    kept = [row for row in state.get("retired_replacements") or []
+            if isinstance(row, dict) and now_ts - float(row.get("retired_at") or 0) < RETIRED_REPLACEMENT_TTL_SECONDS]
+    kept.append({"name": record.get("name"), "zone": record.get("zone"),
+                 "instance_id": record.get("instance_id"), "retired_at": now_ts})
+    state["retired_replacements"] = kept[-50:]
 
 
 def identity_matches(row, name, zone, instance_id) -> bool:
