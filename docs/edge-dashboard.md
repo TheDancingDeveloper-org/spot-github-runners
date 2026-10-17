@@ -25,7 +25,8 @@ when all of these are true:
 - The GitHub login is `swackhamer` and the numeric user ID is `619624`.
 - The user is a global administrator, or has administrator permission on every controlled target.
   `DASHBOARD_GLOBAL_ADMINS` lists global administrators as `login:numeric_id` entries and defaults to
-  `swackhamer:619624`. A global administrator skips the per-target checks. Set it to `none` to require
+  `swackhamer:619624`. A global administrator skips the per-target checks. On a managed control VM it travels
+  as the `dashboard-global-admins` metadata, like the other target policy settings. Set it to `none` to require
   administrator permission on every target. Targets are the union of
   `DASHBOARD_CONTROLLED_TARGETS`, targets saved in the dashboard, and every `repos/<owner>/<repo>.yaml`
   file in the config repository. The config repository is `--config-repo`, then `SPOT_CONFIG_REPO`,

@@ -154,6 +154,23 @@ controlled_targets_csv() {
   printf '%s' "$joined"
 }
 
+# Print the dashboard-global-admins metadata value as DASHBOARD_GLOBAL_ADMINS: empty stays empty (dashboard
+# default), "none" stays "none", otherwise ;-separated login:numeric_id entries become a comma list.
+# Mirrors global_admins_metadata() in src/lib/control_vm.py.
+global_admins_csv() {
+  local raw="$1" entry joined=""
+  local -a entries=()
+  [[ -z "$raw" ]] && return 0
+  if [[ "$raw" == none ]]; then printf 'none'; return 0; fi
+  [[ "$raw" != *';' ]] || return 1
+  IFS=';' read -r -a entries <<<"$raw"
+  for entry in "${entries[@]}"; do
+    [[ "$entry" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}:[1-9][0-9]{0,15}$ ]] || return 1
+    joined+="${joined:+,}$entry"
+  done
+  printf '%s' "$joined"
+}
+
 install_packages() {
   local missing=()
   command -v docker >/dev/null 2>&1 || missing+=(docker.io)
@@ -251,6 +268,9 @@ write_dashboard_env() {
     if [[ -n "$CONTROLLED_TARGETS" ]]; then
       printf 'DASHBOARD_CONTROLLED_TARGETS=%s\n' "$CONTROLLED_TARGETS"
     fi
+    if [[ -n "$GLOBAL_ADMINS" ]]; then
+      printf 'DASHBOARD_GLOBAL_ADMINS=%s\n' "$GLOBAL_ADMINS"
+    fi
     printf 'DASHBOARD_CONTROL_SECRET=%s\n' "$control_secret"
     printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$CLOUDFLARE_ACCOUNT_ID"
     printf 'CLOUDFLARE_KV_NAMESPACE_ID=%s\n' "$CLOUDFLARE_KV_NAMESPACE_ID"
@@ -314,6 +334,7 @@ main() {
   SESSION_NOT_BEFORE="$(metadata_attr dashboard-session-not-before)"
   CONFIG_REPO="$(metadata_attr dashboard-config-repo)"
   CONTROLLED_TARGETS_METADATA="$(metadata_attr dashboard-controlled-targets)"
+  GLOBAL_ADMINS_METADATA="$(metadata_attr dashboard-global-admins)"
 
   [[ "$SLOT" == a || "$SLOT" == b ]] || fail "spot-control-slot must be a or b"
   [[ "$PUBLIC_URL" == https://* ]] || fail "dashboard-public-url must be https"
@@ -326,6 +347,8 @@ main() {
   config_repo_ok "$CONFIG_REPO" || fail "dashboard-config-repo must be owner/repo"
   CONTROLLED_TARGETS="$(controlled_targets_csv "$CONTROLLED_TARGETS_METADATA")" \
     || fail "dashboard-controlled-targets must be ;-separated organizations or owner/repo targets"
+  GLOBAL_ADMINS="$(global_admins_csv "$GLOBAL_ADMINS_METADATA")" \
+    || fail "dashboard-global-admins must be none or ;-separated login:numeric_id entries"
   PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url must be https://host[:port] without a path, query, or user info"
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     [[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"

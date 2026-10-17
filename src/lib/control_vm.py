@@ -107,12 +107,16 @@ METADATA_KEYS = (
     "dashboard-session-not-before",
     "dashboard-config-repo",
     "dashboard-controlled-targets",
+    "dashboard-global-admins",
 )
 # Dashboard target policy. Neither is a secret, so both travel as instance metadata and the startup script
 # writes them to the dashboard env file on every boot. GCE metadata values can't hold commas in a
 # ``--metadata`` list, so the controlled targets travel ``;``-separated and become a comma list on the VM.
 ENV_CONFIG_REPO = "SPOT_CONFIG_REPO"
 ENV_CONTROLLED_TARGETS = "DASHBOARD_CONTROLLED_TARGETS"
+# Global administrators (login:numeric_id, or "none"); unset keeps the dashboard default. Not a secret, so it
+# travels as ;-separated instance metadata and becomes DASHBOARD_GLOBAL_ADMINS in the dashboard env file.
+ENV_GLOBAL_ADMINS = "DASHBOARD_GLOBAL_ADMINS"
 # Optional bulk sign-out cut-off (Unix seconds). Not a secret, so it travels as instance metadata; the
 # startup script writes it to the dashboard env file as DASHBOARD_SESSION_NOT_BEFORE on every boot.
 ENV_SESSION_NOT_BEFORE = "DASHBOARD_SESSION_NOT_BEFORE"
@@ -185,6 +189,7 @@ class ControlConfig:
     session_not_before: str = ""
     config_repo: str = ""
     controlled_targets: str = ""
+    global_admins: str = ""
 
     @classmethod
     def from_env(cls, project: str, env: Mapping[str, str] | None = None, **overrides: Any) -> ControlConfig:
@@ -211,6 +216,7 @@ class ControlConfig:
             session_not_before=str(env.get(ENV_SESSION_NOT_BEFORE, "") or "").strip(),
             config_repo=str(env.get(ENV_CONFIG_REPO, "") or "").strip(),
             controlled_targets=str(env.get(ENV_CONTROLLED_TARGETS, "") or "").strip(),
+            global_admins=str(env.get(ENV_GLOBAL_ADMINS, "") or "").strip(),
         )
         values.update({key: value for key, value in overrides.items() if value is not None})
         if isinstance(values["regions"], str):
@@ -250,6 +256,10 @@ class ControlConfig:
             problems.append("control VM service account must be an e-mail address")
         problems.extend(session_not_before_problems(self.session_not_before))
         problems.extend(dashboard_target_problems(self.config_repo, self.controlled_targets))
+        try:
+            global_admins_metadata(self.global_admins)
+        except ValueError as exc:
+            problems.append(str(exc))
         return problems
 
 
@@ -361,6 +371,21 @@ def dashboard_target_problems(config_repo: str, controlled_targets: str) -> list
     return problems
 
 
+def global_admins_metadata(value: str) -> str:
+    """Metadata form of DASHBOARD_GLOBAL_ADMINS: "" (dashboard default), "none", or ;-separated login:id.
+
+    Parsed exactly as the dashboard parses it, so an invalid value fails here before any VM is created.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    from .dashboard_auth import parse_global_admins
+    admins = parse_global_admins(text)
+    if not admins:
+        return "none"
+    return ";".join(f"{login}:{uid}" for login, uid in sorted(admins))
+
+
 def metadata_items(config: ControlConfig, slot: str) -> dict[str, str]:
     """Non-secret instance metadata; secrets are fetched from Secret Manager at boot."""
     edge_state.validate_slot(slot)
@@ -376,6 +401,7 @@ def metadata_items(config: ControlConfig, slot: str) -> dict[str, str]:
         "dashboard-session-not-before": config.session_not_before,
         "dashboard-config-repo": config.config_repo,
         "dashboard-controlled-targets": ";".join(controlled_target_names(config.controlled_targets)),
+        "dashboard-global-admins": global_admins_metadata(config.global_admins),
     }
     problems = config_repo_problems(config.config_repo)
     if problems:
@@ -2207,6 +2233,9 @@ def args_parser() -> "argparse.ArgumentParser":
     common.add_argument("--controlled-targets",
                         help=f"Comma-separated orgs and owner/repo targets the dashboard requires admin on "
                              f"(or {ENV_CONTROLLED_TARGETS})")
+    common.add_argument("--global-admins",
+                        help=f"login:numeric_id entries that skip per-target admin checks, or none "
+                             f"(or {ENV_GLOBAL_ADMINS}; default: the dashboard default)")
 
     parser = argparse.ArgumentParser(
         description="Inspect and manage the Spot control VM that hosts the web dashboard. "
@@ -2226,7 +2255,7 @@ def args_parser() -> "argparse.ArgumentParser":
 def _overrides(args: Any) -> dict[str, Any]:
     keys = ("regions", "max_daily_usd", "external_ip", "service_account", "dashboard_image", "dashboard_repo",
             "dashboard_source_ref", "public_url", "cloudflared_image", "origin_domain", "config_repo",
-            "controlled_targets")
+            "controlled_targets", "global_admins")
     return {key: getattr(args, key, None) for key in keys}
 
 

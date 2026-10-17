@@ -2379,6 +2379,26 @@ class StartupScriptTests(unittest.TestCase):
         self.assertFalse(any(line.startswith(("SPOT_CONFIG_REPO=", "DASHBOARD_CONTROLLED_TARGETS=")) for line in lines))
 
     @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_global_admins_round_trip_through_metadata(self):
+        """PR review: DASHBOARD_GLOBAL_ADMINS (including "none") reaches the managed dashboard."""
+        from lib.dashboard_auth import parse_global_admins
+        self.assertIn('GLOBAL_ADMINS_METADATA="$(metadata_attr dashboard-global-admins)"', self.text)
+        self.assertIn("printf 'DASHBOARD_GLOBAL_ADMINS=%s\\n' \"$GLOBAL_ADMINS\"", self.text)
+        for raw in ("", "none", "swackhamer:619624", "Swackhamer:619624, other:5"):
+            metadata = cv.metadata_items(config(global_admins=raw), "a").get("dashboard-global-admins", "")
+            result = self._run_function("global_admins_csv", metadata)
+            self.assertEqual(result.returncode, 0, raw)
+            self.assertEqual(parse_global_admins(result.stdout), parse_global_admins(raw), raw)
+        self.assertEqual(cv.metadata_items(config(global_admins="none"), "a")["dashboard-global-admins"], "none")
+        self.assertNotIn("dashboard-global-admins", cv.metadata_items(config(), "a"))
+        for bad in ("swackhamer", "a:0", "a:x", "a:1;", "a:1;;b:2", "bad login:1"):
+            self.assertNotEqual(self._run_function("global_admins_csv", bad).returncode, 0, bad)
+        problems = config(global_admins="swackhamer").create_problems()
+        self.assertTrue(any("DASHBOARD_GLOBAL_ADMINS" in p for p in problems), problems)
+        env = {"DASHBOARD_GLOBAL_ADMINS": "none"}
+        self.assertEqual(cv.ControlConfig.from_env("proj", env).global_admins, "none")
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
     def test_cloudflared_pin_check_accepts_what_create_problems_accepts(self):
         self.assertIn('image_ref_pinned "$CLOUDFLARED_IMAGE" || fail', self.text)
         digest = "@sha256:" + "0" * 64
