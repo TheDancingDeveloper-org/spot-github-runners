@@ -156,12 +156,15 @@ global.window = {
   get location() { return {href, replace: u => { out.replaced = u; }, assign: u => { out.replaced = u; }}; },
   history: {replaceState: (_s, _t, u) => { out.url = u; href = "https://spot.example" + u; }},
 };
-global.document = {title: "t", getElementById: () => null};
+const msgEl = {textContent: ""};
+global.document = {title: "t", getElementById: id => (id === "msg" ? msgEl : null)};
 global.sessionStorage = session; global.localStorage = local;
 global.fetch = async (url, init) => { out.posts.push([url, JSON.parse(init.body)]);
-  return {ok: cfg.login_ok, status: cfg.login_ok ? 200 : 401, json: async () => ({})}; };
+  if (cfg.login_status === 0) throw new TypeError("Failed to fetch");
+  const status = cfg.login_status || (cfg.login_ok ? 200 : 401);
+  return {ok: status === 200, status, json: async () => ({})}; };
 new Function(script)();
-setTimeout(() => { out.session = session.dump(); out.local = local.dump();
+setTimeout(() => { out.session = session.dump(); out.local = local.dump(); out.msg = msgEl.textContent;
   process.stdout.write(JSON.stringify(out)); }, 50);
 """
 
@@ -240,12 +243,13 @@ def _run_node(harness: str, source: str, cfg: dict) -> dict:
     return json.loads(proc.stdout)
 
 
-def _run_gate_script(script: str, *, stored: str, hash_part: str, login_ok: bool, recent: bool) -> dict:
+def _run_gate_script(script: str, *, stored: str, hash_part: str, login_ok: bool, recent: bool,
+                     login_status: int | None = None) -> dict:
     import time as _time
     session = {"dashboard_auth_token": stored} if stored else {}
     if recent:
         session["dashboard_gate_token_attempt"] = str(int(_time.time() * 1000))
-    cfg = {"session": session, "local": {}, "hash": hash_part, "login_ok": login_ok}
+    cfg = {"session": session, "local": {}, "hash": hash_part, "login_ok": login_ok, "login_status": login_status}
     proc = subprocess.run(["node", "-e", _GATE_HARNESS, script, json.dumps(cfg)],
                           capture_output=True, text=True, timeout=30, check=True)
     return json.loads(proc.stdout)
@@ -1434,6 +1438,18 @@ class OAuthServerIntegrationTests(unittest.TestCase):
                     self.assertNotIn("dashboard_auth_token", result["local"])
                 if name == "fragment_valid":
                     self.assertEqual(result["url"], "/#tab=fleet")  # token stripped from the address bar
+        # Transient failures keep the credential (even one taken from the URL) for a retry on reload.
+        for login_status in (0, 429, 502, 503):
+            for stored, hash_part in ((self.LEGACY_TOKEN, ""), ("", "#token=" + self.LEGACY_TOKEN)):
+                result = _run_gate_script(script, stored=stored, hash_part=hash_part, login_ok=False,
+                                          recent=False, login_status=login_status)
+                with self.subTest(login_status=login_status, from_url=bool(hash_part)):
+                    self.assertEqual(result["session"].get("dashboard_auth_token"), self.LEGACY_TOKEN)
+                    self.assertNotIn("dashboard_gate_token_attempt", result["session"])
+                    self.assertIn("reload to retry", result["msg"])
+        rejected = _run_gate_script(script, stored=self.LEGACY_TOKEN, hash_part="", login_ok=False,
+                                    recent=False, login_status=403)
+        self.assertNotIn("dashboard_auth_token", rejected["session"])
 
     def _gate_script(self):
         _, _, raw = self.request("GET", "/")
@@ -1454,6 +1470,28 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         upstream = _run_node(_DEVICE_HARNESS, script, {"code_fails": False, "poll_failures": 0, "upstream_failures": 2})
         self.assertEqual(upstream["calls"].count("/auth/device/token"), 3)
         self.assertEqual(upstream["assigned"], "/")
+
+    def test_github_5xx_device_poll_keeps_handshake(self):
+        self.start(client_secret="")
+        _, _, raw = self.request("POST", "/auth/device/code", body={})
+        handle = json.loads(raw)["device_handle"]
+        original = self.fake.__call__
+
+        def overloaded(method, url, headers, body, timeout):
+            if "access_token" in url and not overloaded.used:
+                overloaded.used = True
+                return 503, b'{"error": "temporarily_unavailable"}'
+            return original(method, url, headers, body, timeout)
+
+        overloaded.used = False
+        self.mgr._request = overloaded
+        self.clock.now += 5
+        status, _, raw = self.request("POST", "/auth/device/token", body={"device_handle": handle})
+        self.assertEqual((status, json.loads(raw)["retryable"]), (503, True))
+        self.fake.device_polls = [{"access_token": "tok-admin"}]
+        self.clock.now += 10
+        status, _, raw = self.request("POST", "/auth/device/token", body={"device_handle": handle})
+        self.assertEqual((status, json.loads(raw)["status"]), (200, "authorized"))
 
     def test_transient_github_device_poll_failure_is_retryable(self):
         self.start(client_secret="")

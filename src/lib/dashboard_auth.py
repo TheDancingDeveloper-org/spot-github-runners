@@ -882,6 +882,9 @@ class GitHubOAuthManager:
             )
         except GitHubApiError:
             return {"status": "error", "error": "github_unavailable"}
+        if status == 429 or status >= 500:
+            # GitHub is overloaded or failing; the device code may still be valid, so keep the handshake.
+            return {"status": "error", "error": "github_unavailable"}
         err = data.get("error")
         if isinstance(err, str) and err:
             if err == "authorization_pending":
@@ -1401,7 +1404,15 @@ def render_login_gate_html(
       window.location.replace("/");
       return;
     }
-    storage(function () { sessionStorage.removeItem(TOKEN_KEY); localStorage.removeItem(TOKEN_KEY); });
+    if (res.status === 401 || res.status === 403) {
+      // The server rejected the credential: it is stale, so discard it.
+      storage(function () { sessionStorage.removeItem(TOKEN_KEY); localStorage.removeItem(TOKEN_KEY); });
+      return;
+    }
+    // Transient failure (network, 429, 5xx): keep the credential (including one taken from the URL)
+    // so a reload can retry it.
+    storage(function () { sessionStorage.setItem(TOKEN_KEY, candidate); sessionStorage.removeItem(ATTEMPT_KEY); });
+    show("Could not reach the dashboard to use your saved token; reload to retry.");
   })();
   const logout = document.getElementById("logout");
   if (logout) logout.addEventListener("click", async function () {
