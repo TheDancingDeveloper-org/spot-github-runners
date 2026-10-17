@@ -11,7 +11,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from lib import dashboard_auth, dashboard_server, edge_state
+from lib import dashboard_auth, dashboard_server, edge_state, patch_console
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "cloudflare" / "worker.js"
@@ -21,6 +21,14 @@ DOCKERFILE = ROOT / "dashboard" / "Dockerfile"
 DOCKERIGNORE = ROOT / ".dockerignore"
 WORKFLOW = ROOT / ".github" / "workflows" / "dashboard-image.yml"
 VECTOR = ROOT / "tests" / "fixtures" / "session_vector.json"
+
+
+def _js_int_constant(source: str, name: str) -> int:
+    """Read a simple `export const NAME = 262_144;` integer constant from worker.js."""
+    match = re.search(rf"export const {name} = ([0-9_]+);\n", source)
+    if not match:
+        raise AssertionError(f"{name} not found in worker.js")
+    return int(match.group(1).replace("_", ""))
 
 
 def _js_string_constant(source: str, name: str) -> str:
@@ -57,6 +65,23 @@ class WorkerSourceTests(unittest.TestCase):
         self.assertEqual(_js_string_constant(self.source, "KV_ORIGIN_KEY"), edge_state.KV_ORIGIN_KEY)
         self.assertEqual(_js_string_constant(self.source, "DEFAULT_ORIGIN_HOST_SUFFIX"),
                          "." + edge_state.DEFAULT_ORIGIN_DOMAIN)
+
+    def test_request_body_limits_match_the_backend(self) -> None:
+        """Codex round 17 P2: the Worker's body caps track the backend's largest legitimate request bodies."""
+        dashboard = _js_int_constant(self.source, "MAX_DASHBOARD_BODY_BYTES")
+        auth = _js_int_constant(self.source, "MAX_AUTH_BODY_BYTES")
+        self.assertEqual(dashboard, dashboard_server.MAX_JSON_BODY_BYTES)
+        self.assertGreaterEqual(dashboard, patch_console.MAX_MANIFEST_BYTES)  # a patch save's manifest
+        self.assertGreaterEqual(auth, dashboard_server.MAX_LOGIN_BODY_BYTES)
+        self.assertLess(auth, dashboard)
+        # Every body the backend reads through the Worker is bounded by one of these; /api/control (the larger
+        # MAX_CONTROL_BODY_BYTES) is blocked at the edge.
+        server = Path(dashboard_server.__file__).read_text(encoding="utf-8")
+        limits = set(re.findall(r"_read_json\(max_bytes=([A-Z_]+)\)", server))
+        self.assertEqual(limits, {"MAX_JSON_BODY_BYTES", "MAX_LOGIN_BODY_BYTES", "MAX_CONTROL_BODY_BYTES"})
+        self.assertRegex(server, r"def _read_json\(self, \*, max_bytes: int = MAX_JSON_BODY_BYTES\)")
+        self.assertIn("body = await readBoundedBody(request, limit)", self.source)
+        self.assertNotIn("request.arrayBuffer()", self.source)
 
     def test_control_paths_blocked(self) -> None:
         self.assertIn(r"/^\/api\/control(?![a-z0-9_-])/", self.source)

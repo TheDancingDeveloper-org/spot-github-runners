@@ -57,6 +57,13 @@ Sign-in routes are rate limited per browser IP and globally, and answer HTTP 429
 over the limit. The Worker passes the browser IP in `X-Spot-Client-Ip` and drops any copy that the
 browser sends. The dashboard trusts that header only from a loopback peer, the local `cloudflared`.
 
+The Worker reads every request body with a hard cap before it looks up the origin or forwards anything.
+Sign-in routes under `/auth/` and `/api/auth/` allow 16 KiB, and every other route allows 256 KiB, the
+dashboard's `MAX_JSON_BODY_BYTES`. A `Content-Length` over the cap gets HTTP 413 before the body is read.
+A body without a length, such as a chunked upload, is counted as it streams and cut off with HTTP 413
+past the cap. A malformed `Content-Length` gets HTTP 400. The Worker forwards the body it read
+unchanged, so a retry with the same `Idempotency-Key` sends the same bytes.
+
 ### Controlled target changes
 
 `POST /api/auth/targets` changes the targets saved in the dashboard, and only a GitHub session can call

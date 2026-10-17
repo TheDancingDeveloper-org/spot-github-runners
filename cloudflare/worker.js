@@ -42,6 +42,14 @@ export const MAX_SESSION_TTL_SECONDS = 604_800;
 export const CLOCK_SKEW_SECONDS = 60;
 export const DEFAULT_ORIGIN_HOST_SUFFIX = ".swacktech.com";
 const MAX_ERROR_BODY_BYTES = 65_536;
+// Request bodies are read with a hard cap before anything is forwarded, so large (or endless chunked) uploads
+// to public routes can't exhaust the Worker's memory. Sign-in routes take tiny JSON bodies (the backend reads
+// at most dashboard_server.MAX_LOGIN_BODY_BYTES = 4 KiB there).
+export const MAX_AUTH_BODY_BYTES = 16_384;
+// Every other route: the largest body the backend accepts anywhere the Worker forwards, which is
+// dashboard_server.MAX_JSON_BODY_BYTES (patch saves included, whose manifest is at most
+// patch_console.MAX_MANIFEST_BYTES). tests/test_edge_worker_assets.py keeps these in sync.
+export const MAX_DASHBOARD_BODY_BYTES = 262_144;
 const CONTROL_SLOTS = new Set(["a", "b"]);
 
 // Reachable without a session cookie. "/" is public for GET/HEAD only (it renders the login gate).
@@ -233,6 +241,61 @@ export function classifyRoute(method, pathname) {
   if (pathname === "/" && (m === "GET" || m === "HEAD")) return "public";
   if (PUBLIC_PATHS.has(pathname)) return "public";
   return "protected";
+}
+
+// The body cap for a request path: small for sign-in routes, the dashboard's maximum otherwise.
+export function requestBodyLimit(pathname) {
+  const normalized = normalizePathForBlocking(pathname);
+  if (normalized === null) return MAX_AUTH_BODY_BYTES;
+  return normalized === "/auth" || normalized.startsWith("/auth/") || normalized === "/api/auth" ||
+    normalized.startsWith("/api/auth/")
+    ? MAX_AUTH_BODY_BYTES
+    : MAX_DASHBOARD_BODY_BYTES;
+}
+
+export class BodyRejectedError extends Error {
+  constructor(status, error, limit) {
+    super(error);
+    this.status = status;
+    this.error = error;
+    this.limit = limit;
+  }
+}
+
+// Reads the request body into one buffer of at most ``limit`` bytes. A declared Content-Length over the limit
+// is refused before reading; the stream is still counted, because a chunked body has no length and a declared
+// one is not trusted. Throws BodyRejectedError (413, or 400 for a malformed Content-Length).
+export async function readBoundedBody(request, limit) {
+  const declared = request.headers.get("Content-Length");
+  if (declared !== null) {
+    const trimmed = declared.trim();
+    if (!/^[0-9]{1,15}$/.test(trimmed)) throw new BodyRejectedError(400, "invalid_content_length", limit);
+    if (Number(trimmed) > limit) {
+      if (request.body) request.body.cancel().catch(() => {});
+      throw new BodyRejectedError(413, "payload_too_large", limit);
+    }
+  }
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      reader.cancel().catch(() => {});
+      throw new BodyRejectedError(413, "payload_too_large", limit);
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 export function isHtmlNavigation(request) {
@@ -444,6 +507,20 @@ export async function handleRequest(request, env, options = {}) {
     if (!(await verifySession(token, env, nowSeconds))) return unauthorizedResponse(request);
   }
 
+  const method = request.method.toUpperCase();
+  // Bounded before anything else (origin lookup, forwarding): the backend's own size checks run too late to
+  // protect the Worker. The buffered body is forwarded as is, so an Idempotency-Key retry resends it intact.
+  let body = null;
+  if (method !== "GET" && method !== "HEAD") {
+    const limit = requestBodyLimit(url.pathname);
+    try {
+      body = await readBoundedBody(request, limit);
+    } catch (exc) {
+      if (!(exc instanceof BodyRejectedError)) throw exc;
+      return jsonResponse(exc.status, { error: exc.error, max_bytes: exc.limit });
+    }
+  }
+
   let origin;
   try {
     origin = await readOrigin(env);
@@ -452,14 +529,13 @@ export async function handleRequest(request, env, options = {}) {
   }
   if (!origin) return waitResponse(request);
 
-  const method = request.method.toUpperCase();
   const init = {
     method,
     headers: buildOriginHeaders(request, env),
     redirect: "manual",
     cache: "no-store",
   };
-  if (method !== "GET" && method !== "HEAD") init.body = await request.arrayBuffer();
+  if (body !== null) init.body = body;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

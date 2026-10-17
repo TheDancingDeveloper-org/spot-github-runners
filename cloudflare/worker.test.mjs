@@ -8,6 +8,8 @@ import { dirname, join } from "node:path";
 
 import worker, {
   CLIENT_IP_HEADER,
+  MAX_AUTH_BODY_BYTES,
+  MAX_DASHBOARD_BODY_BYTES,
   ORIGIN_MARKER_HEADER,
   ORIGIN_MARKER_VALUE,
   SESSION_COOKIE_NAME,
@@ -22,6 +24,7 @@ import worker, {
   isControlPath,
   parseCookies,
   parseOriginRecord,
+  requestBodyLimit,
   sessionNotBefore,
   verifySession,
   verifyTokenSignature,
@@ -285,6 +288,139 @@ test("mutating requests forward method, body, and Idempotency-Key", async () => 
   assert.equal(init.method, "POST");
   assert.equal(new TextDecoder().decode(init.body), '{"a":1}');
   assert.equal(init.headers.get("Idempotency-Key"), "k-1");
+});
+
+// --- Bounded request bodies -----------------------------------------------------------------------
+
+// An endless (or long) chunked body with no Content-Length; counts how much the Worker pulled.
+function chunkedRequest(path, { chunk = 16_384, total = Infinity, cookie } = {}) {
+  const state = { pulled: 0, cancelled: false };
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (state.pulled >= total) return controller.close();
+      const size = Math.min(chunk, total - state.pulled);
+      state.pulled += size;
+      controller.enqueue(new Uint8Array(size).fill(0x61));
+    },
+    cancel() {
+      state.cancelled = true;
+    },
+  });
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (cookie) headers.set("Cookie", cookie);
+  const request = new Request(`https://spot.swacktech.com${path}`, { method: "POST", headers, body: stream, duplex: "half" });
+  return { request, state };
+}
+
+function countingEnv() {
+  const env = makeEnv();
+  const get = env.SPOT_KV.get.bind(env.SPOT_KV);
+  env.kvReads = 0;
+  env.SPOT_KV.get = async (key) => {
+    env.kvReads += 1;
+    return get(key);
+  };
+  return env;
+}
+
+async function assertTooLarge(res, limit) {
+  assert.equal(res.status, 413);
+  assert.equal(res.headers.get("Cache-Control"), "no-store");
+  assert.deepEqual(await res.json(), { error: "payload_too_large", max_bytes: limit });
+}
+
+test("body limits: small for sign-in routes, the backend's JSON maximum elsewhere", () => {
+  assert.equal(MAX_AUTH_BODY_BYTES, 16_384);
+  assert.equal(MAX_DASHBOARD_BODY_BYTES, 262_144);
+  for (const path of ["/auth/device/code", "/auth/device/token", "/auth/logout", "/api/auth/login", "/api/auth/logout",
+    "/AUTH/device/code", "/auth/%64evice/code", "/api//auth/login"]) {
+    assert.equal(requestBodyLimit(path), MAX_AUTH_BODY_BYTES, path);
+  }
+  for (const path of ["/api/targets", "/api/patches/swack-tools/oxidex", "/api/authx", "/"]) {
+    assert.equal(requestBodyLimit(path), MAX_DASHBOARD_BODY_BYTES, path);
+  }
+});
+
+test("an oversized Content-Length is refused before the body is read or anything is forwarded", { timeout: 10_000 }, async () => {
+  for (const [path, limit, cookie] of [["/auth/device/code", MAX_AUTH_BODY_BYTES, undefined],
+    ["/api/targets", MAX_DASHBOARD_BODY_BYTES, `${SESSION_COOKIE_NAME}=${TOKEN}`]]) {
+    const { request, state } = chunkedRequest(path, { cookie });
+    request.headers.set("Content-Length", String(limit + 1));
+    const f = okFetch();
+    const env = countingEnv();
+    await assertTooLarge(await handleRequest(request, env, { fetch: f, now: NOW }), limit);
+    assert.equal(f.calls.length, 0, path);
+    assert.equal(env.kvReads, 0, path); // refused before the origin lookup
+    assert.ok(state.pulled <= 16_384, `${path} pulled ${state.pulled}`); // at most the stream's first prefetch
+  }
+  const bad = req("/auth/device/code", { method: "POST", body: "{}", headers: { "Content-Length": "12abc" } });
+  const res = await handleRequest(bad, makeEnv(), { fetch: okFetch(), now: NOW });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error, "invalid_content_length");
+});
+
+test("a chunked body with no length is cut off at the limit, not buffered whole", { timeout: 10_000 }, async () => {
+  for (const [path, limit, cookie] of [["/auth/device/code", MAX_AUTH_BODY_BYTES, undefined],
+    ["/api/targets", MAX_DASHBOARD_BODY_BYTES, `${SESSION_COOKIE_NAME}=${TOKEN}`]]) {
+    const { request, state } = chunkedRequest(path, { cookie, chunk: 4096 }); // endless
+    const f = okFetch();
+    await assertTooLarge(await handleRequest(request, makeEnv(), { fetch: f, now: NOW }), limit);
+    assert.equal(f.calls.length, 0, path);
+    assert.ok(state.cancelled, path);
+    assert.ok(state.pulled <= limit + 3 * 4096, `${path} pulled ${state.pulled}`);
+  }
+});
+
+test("a body exactly at the limit is forwarded whole; one byte more is refused", async () => {
+  const cookie = `${SESSION_COOKIE_NAME}=${TOKEN}`;
+  for (const [path, limit, c] of [["/api/targets", MAX_DASHBOARD_BODY_BYTES, cookie],
+    ["/auth/device/code", MAX_AUTH_BODY_BYTES, undefined]]) {
+    const f = okFetch();
+    const { request } = chunkedRequest(path, { cookie: c, chunk: 5000, total: limit });
+    const res = await handleRequest(request, makeEnv(), { fetch: f, now: NOW });
+    assert.equal(res.status, 200, path);
+    assert.equal(f.calls[0].init.body.byteLength, limit, path);
+    const sized = req(path, { method: "POST", cookie: c, body: "a".repeat(limit),
+      headers: { "Content-Length": String(limit) } });
+    assert.equal((await handleRequest(sized, makeEnv(), { fetch: okFetch(), now: NOW })).status, 200, path);
+    const { request: over } = chunkedRequest(path, { cookie: c, chunk: 5000, total: limit + 1 });
+    await assertTooLarge(await handleRequest(over, makeEnv(), { fetch: okFetch(), now: NOW }), limit);
+  }
+});
+
+test("sign-in routes get the small limit even when the dashboard limit would allow the body", async () => {
+  const body = "a".repeat(MAX_AUTH_BODY_BYTES + 1);
+  // Public device-flow routes, and the protected /api/auth/login (which a signed-out POST can't even reach).
+  for (const [path, opts] of [["/auth/device/code", {}], ["/auth/device/token", {}],
+    ["/api/auth/login", { cookie: `${SESSION_COOKIE_NAME}=${TOKEN}` }]]) {
+    const f = okFetch();
+    const res = await handleRequest(req(path, { method: "POST", body, headers: { "Content-Type": "application/json" }, ...opts }),
+      makeEnv(), { fetch: f, now: NOW });
+    await assertTooLarge(res, MAX_AUTH_BODY_BYTES);
+    assert.equal(f.calls.length, 0, path);
+  }
+  const signedOut = await handleRequest(req("/api/auth/login", { method: "POST", body }), makeEnv(),
+    { fetch: okFetch(), now: NOW });
+  assert.equal(signedOut.status, 401); // the session check still comes first
+  const f = okFetch();
+  const res = await handleRequest(authed("/api/targets", { method: "POST", body }), makeEnv(), { fetch: f, now: NOW });
+  assert.equal(res.status, 200);
+  assert.equal(f.calls[0].init.body.byteLength, body.length);
+});
+
+test("an Idempotency-Key retry forwards the same bounded body each time", async () => {
+  const f = okFetch();
+  const body = JSON.stringify({ content: "x".repeat(100_000) });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await handleRequest(authed("/api/patches/swack-tools/oxidex", { method: "POST", body,
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "save-1" } }), makeEnv(), { fetch: f, now: NOW });
+    assert.equal(res.status, 200);
+  }
+  assert.equal(f.calls.length, 2);
+  for (const { init } of f.calls) {
+    assert.equal(init.headers.get("Idempotency-Key"), "save-1");
+    assert.equal(new TextDecoder().decode(init.body), body);
+  }
 });
 
 test("backend redirects and origin cache headers pass through untouched", async () => {
