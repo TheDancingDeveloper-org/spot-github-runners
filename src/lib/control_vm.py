@@ -639,7 +639,10 @@ def create_command(config: ControlConfig, slot: str, offer: ControlOffer, startu
 
 
 def default_gcloud(argv: list[str]) -> Any:
-    return subprocess.run(argv, check=False, text=True, capture_output=True, timeout=600)
+    # Never accept partial Compute results (for example a zone that could not be listed): an omitted
+    # VM would look missing and could be created again, giving two VMs the same slot identity.
+    env = dict(os.environ, CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR="false") if argv[1:2] == ["compute"] else None
+    return subprocess.run(argv, check=False, text=True, capture_output=True, timeout=600, env=env)
 
 
 def default_offer_source(config: ControlConfig, gcloud: Callable[[list[str]], Any]) -> list[ControlOffer]:
@@ -746,6 +749,10 @@ class ControlVmManager:
         result = self.gcloud(list_command(self.config.project))
         if result.returncode != 0:
             raise RuntimeError(f"control VM inventory failed: {(result.stderr or '').strip()[:300]}")
+        if (result.stderr or "").strip():
+            # gcloud can exit 0 with partial results and diagnostics on stderr; completeness is unknown.
+            raise RuntimeError("control VM inventory returned diagnostics; completeness unknown: "
+                               f"{result.stderr.strip()[:300]}")
         vms = parse_control_vms(json.loads(result.stdout or "[]"))
         for problem in duplicate_slot_problems(vms):
             # Split brain risk: never pick one automatically (no origin writes, no deletes); alert and wait.

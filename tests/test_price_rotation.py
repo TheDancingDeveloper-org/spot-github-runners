@@ -1164,6 +1164,56 @@ class RotationHarness:
 class ReplacementEvidenceTests(RotationHarness, unittest.TestCase):
     """Finding 2: every retirement step needs fresh proof the replacement is live."""
 
+    def test_rollback_releases_rotation_owned_builder_drain(self):
+        """Codex M4 round 4: rollback must not leave the outgoing host refusing builds."""
+        terminated = replace_vm(self.replacement_vm, status="TERMINATED")
+        state = self.state("cordon_drain", builder_drain_token="rotation-old-123")
+        with patch("lib.spot_runner_autoscaler.release_remote_builder", return_value=True) as release:
+            _, delete_old, _, saved = self.step(state, [self.outgoing_vm, terminated], [self.old_runner])
+        release.assert_called_once_with(self.outgoing_vm, self.args, "rotation-old-123")
+        delete_old.assert_not_called()
+        self.assertNotIn("price_rotation", saved)
+
+    def test_rollback_waits_until_builder_drain_is_released(self):
+        terminated = replace_vm(self.replacement_vm, status="TERMINATED")
+        state = self.state("cordon_drain", builder_drain_token="rotation-old-123")
+        with patch("lib.spot_runner_autoscaler.release_remote_builder", return_value=False):
+            _, _, delete_new, saved = self.step(state, [self.outgoing_vm, terminated], [self.old_runner])
+        delete_new.assert_not_called()
+        self.assertEqual(saved["price_rotation"]["builder_drain_token"], "rotation-old-123")  # retried next loop
+
+    def test_cordon_drain_records_token_before_quiescing(self):
+        state = self.state("cordon_drain")
+        seen = {}
+
+        def quiesce(vm, args, token=None):
+            seen["token"] = token
+            return True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.runner_drain.api", return_value={}), \
+                    patch("lib.runner_drain.jobs_finished", return_value=True), \
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", side_effect=quiesce), \
+                    patch("lib.spot_runner_autoscaler.now", return_value=self.now):
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [self.old_runner, self.new_runner],
+                                    self.args, state, path)
+        self.assertEqual(seen.get("token"), "rotation-old-123")
+
+    def test_drain_scripts_claim_and_release_only_their_own_marker(self):
+        from lib import spot_runner_autoscaler as controller
+        with patch.object(controller.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            controller.quiesce_remote_builder(self.outgoing_vm, self.args, token="rotation-old-123")
+            claim = run.call_args.args[0][-1]
+            controller.release_remote_builder(self.outgoing_vm, self.args, "rotation-old-123")
+            release = run.call_args.args[0][-1]
+        self.assertIn("test -e /run/oxidex-build-draining || printf %s rotation-old-123", claim)
+        self.assertIn("flock -w 30 -E 75 /run/oxidex-build.lock", release)
+        self.assertIn("old-123", release)  # instance identity is checked first
+        self.assertIn("rotation-old-123", release)
+        self.assertIn("rm -f /run/oxidex-build-draining", release)
+
     def test_preempted_replacement_stops_drain_uncordons_and_aborts(self):
         terminated = replace_vm(self.replacement_vm, status="TERMINATED")
         state = self.state("cordon_drain")

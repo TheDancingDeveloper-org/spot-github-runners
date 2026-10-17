@@ -736,8 +736,12 @@ def delete_drained_vm(vm, args, before_delete=None):
     LOG.info("Deleted drained Spot VM %s and its attached disks", vm_details(vm))
 
 
-def quiesce_remote_builder(vm, args):
-    """Hold new builds off a host only after its running builds have finished."""
+def quiesce_remote_builder(vm, args, token=None):
+    """Hold new builds off a host only after its running builds have finished.
+
+    With ``token`` the drain marker records its owner (only when no drain marker exists yet), so
+    :func:`release_remote_builder` can later remove exactly the drain this caller placed.
+    """
     if not vm.instance_id:return False
     from . import host_admission
     # The source is embedded here because older supported hosts may not have
@@ -750,7 +754,9 @@ def quiesce_remote_builder(vm, args):
     script = ('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
               +shlex.quote(vm.instance_id)+' || exit 75; '
               '/usr/bin/python3 -I -c '+shlex.quote(code)+
-              ' || exit 75; touch /run/oxidex-build-draining')
+              ' || exit 75; '
+              + ('touch /run/oxidex-build-draining' if token is None else
+                 'test -e /run/oxidex-build-draining || printf %s '+shlex.quote(token)+' > /run/oxidex-build-draining'))
     command = 'sudo flock -n -E 75 /run/oxidex-build.lock sh -c ' + shlex.quote(script)
     try:
         result = subprocess.run(['gcloud', 'compute', 'ssh', vm.name, f'--zone={vm.zone}',
@@ -761,6 +767,32 @@ def quiesce_remote_builder(vm, args):
         return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def release_remote_builder(vm, args, token) -> bool:
+    """Remove a builder drain marker this caller placed (matched by ``token``), under the build lock.
+
+    Leaves a marker owned by anyone else in place. Returns True when no marker with this token
+    remains on the expected instance.
+    """
+    if not vm.instance_id or not token:
+        return False
+    script = ('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
+              + shlex.quote(vm.instance_id) + ' || exit 75; '
+              'if [ -e /run/oxidex-build-draining ] && [ "$(cat /run/oxidex-build-draining)" = '
+              + shlex.quote(token) + ' ]; then rm -f /run/oxidex-build-draining; fi')
+    command = 'sudo flock -w 30 -E 75 /run/oxidex-build.lock sh -c ' + shlex.quote(script)
+    try:
+        result = subprocess.run(['gcloud', 'compute', 'ssh', vm.name, f'--zone={vm.zone}',
+                                 f'--project={args.project}', '--quiet', '--command='+command],
+                                text=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _rotation_drain_token(rotation) -> str:
+    return "rotation-" + str((rotation.get("outgoing_vm") or {}).get("instance_id") or "unknown")
 
 
 def builder_ready(vm,args):
@@ -1686,6 +1718,17 @@ def _recover_failed_replacement(vms, runners, args, state, state_path, rotation,
         # Nothing on the outgoing host can take work, so the replacement is the only capacity.
         LOG.error("Outgoing host %s has no online listeners after uncordon", out_name)
         return _recover_lost_capacity(vms, runners, args, state, state_path, rotation)
+    token = rotation.get("builder_drain_token")
+    if token:
+        out_vm = next((vm for vm in vms if vm.name == out_name
+                       and vm.zone == rotation["outgoing_vm"].get("zone")), None)
+        if out_vm is not None and out_vm.running and not release_remote_builder(out_vm, args, token):
+            # Leaving the marker would block builds on this host indefinitely; retry until released.
+            LOG.warning("Rotation recovery waits to release the builder drain on %s; retrying next loop", out_name)
+            return True
+        rotation.pop("builder_drain_token", None)
+        write_scale_state(state_path, state)
+        LOG.info("Released rotation-owned builder drain on %s", out_name)
     # The abort path keeps a busy or building replacement and deletes only an idle, quiesced one.
     return _abort_runner_rotation(rotation, vms, args, state, state_path,
                                   f"Rotation for {out_name} aborted: {rotation['recovering']}", runners)
@@ -1857,7 +1900,12 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
             write_scale_state(state_path, state)
             return True
 
-    if out_vm is not None and not quiesce_remote_builder(out_vm, args):
+    if out_vm is not None:
+        # Record ownership before the marker can exist, so a crash right after placing it still
+        # lets rollback release it.
+        rotation["builder_drain_token"] = _rotation_drain_token(rotation)
+        write_scale_state(state_path, state)
+    if out_vm is not None and not quiesce_remote_builder(out_vm, args, token=rotation["builder_drain_token"]):
         # Idle runners do not prove the host is idle: a remote build may still be running. The
         # drain deadline never overrides this; keep the host until builds finish and new ones stop.
         LOG.info("Rotation waits for remote builds to finish on %s before deregistration", out_dict["name"])

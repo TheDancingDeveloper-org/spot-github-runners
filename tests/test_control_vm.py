@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
@@ -63,6 +64,7 @@ class FakeGcloud:
         self.land_but_fail_zones: set[str] = set()  # create succeeds in GCE but gcloud exits nonzero
         self.describe_error: str | None = None  # ambiguous describe failure (not a 404)
         self.extra_rows: list[dict] = []  # additional inventory rows (for duplicate-name tests)
+        self.list_stderr = ""  # diagnostics gcloud printed while still exiting 0 (partial results)
 
     def add(self, slot, status="RUNNING", zone="us-central1-a", machine="e2-small"):
         name = f"spot-control-{slot}"
@@ -78,7 +80,7 @@ class FakeGcloud:
         verb = argv[2:4]
         if verb == ["instances", "list"]:
             return SimpleNamespace(returncode=0, stdout=json.dumps(list(self.vms.values()) + self.extra_rows),
-                                   stderr="")
+                                   stderr=self.list_stderr)
         if verb == ["machine-types", "list"]:
             return SimpleNamespace(returncode=0, stdout="[]", stderr="")
         name = argv[4]
@@ -1399,3 +1401,25 @@ class StartupScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PartialInventoryTests(unittest.TestCase):
+    """Codex M4 round 4: partial gcloud inventory must never drive lifecycle actions."""
+
+    def test_inventory_diagnostics_block_every_action(self):
+        h = Harness()
+        h.gcloud.add("a", status="TERMINATED")
+        h.kv.set_origin("a")
+        h.state[cv.STATE_KEY] = {"down_since": {"a": 1.0}}
+        h.gcloud.list_stderr = "WARNING: Some requests did not succeed: zone us-east1-b unavailable"
+        with self.assertRaisesRegex(RuntimeError, "completeness unknown"):
+            h.tick()
+        self.assertEqual(h.mutations(), [])
+        self.assertNotIn("spot-control-b", h.gcloud.vms)
+
+    def test_default_gcloud_disables_partial_compute_results(self):
+        with mock.patch.object(cv.subprocess, "run") as run:
+            cv.default_gcloud(["gcloud", "compute", "instances", "list"])
+            self.assertEqual(run.call_args.kwargs["env"]["CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR"], "false")
+            cv.default_gcloud(["gcloud", "secrets", "versions", "access", "latest"])
+            self.assertIsNone(run.call_args.kwargs["env"])
