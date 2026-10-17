@@ -1164,6 +1164,40 @@ class RotationHarness:
 class ReplacementEvidenceTests(RotationHarness, unittest.TestCase):
     """Finding 2: every retirement step needs fresh proof the replacement is live."""
 
+    def test_missing_outgoing_never_claims_similarly_named_host(self):
+        """Codex M4 round 6: 'oxidex-runners-old' must not match 'gha-oxidex-runners-old2-1'."""
+        from lib.spot_runner_autoscaler import _missing_outgoing_runners
+        other_vm = GceVm("oxidex-runners-old2", "asia-east2-a", "RUNNING", "n4-highcpu-16", True, instance_id="o2")
+        other = GitHubRunner(42, "gha-oxidex-runners-old2-1", "online", False, ("spot",))
+        stale = GitHubRunner(98, "gha-oxidex-runners-old-2", "offline", False, ("spot",))
+        rotation = self.state("deregister")["price_rotation"]
+        # Recorded identities win when present.
+        self.assertEqual(_missing_outgoing_runners("oxidex-runners-old", [self.old_runner, stale, other],
+                                                   [other_vm, self.replacement_vm], rotation), [self.old_runner])
+        # Without records, only exact -<vm>-<n> names whose longest VM match is the outgoing host.
+        rotation.pop("cordoned_runners")
+        self.assertEqual(_missing_outgoing_runners("oxidex-runners-old", [self.old_runner, stale, other],
+                                                   [other_vm, self.replacement_vm], rotation),
+                         [self.old_runner, stale])
+
+    def test_deregister_with_missing_outgoing_leaves_other_host_alone(self):
+        other_vm = GceVm("oxidex-runners-old2", "asia-east2-a", "RUNNING", "n4-highcpu-16", True, instance_id="o2")
+        other = GitHubRunner(42, "gha-oxidex-runners-old2-1", "offline", False, ("spot",))  # deletable if claimed
+        state = self.state("deregister")
+        state["price_rotation"].pop("cordoned_runners")  # force the name-based fallback
+        names = {99: self.old_runner.name, 42: other.name}
+
+        def github(target, method, path, body=None, **kwargs):
+            if method == "GET":
+                return {"name": names[int(path.rsplit("/", 1)[1])], "busy": False}
+            return {}
+
+        mock_api, _, _, _ = self.step(state, [self.replacement_vm, other_vm],
+                                      [self.old_runner, other, self.new_runner], api=github)
+        deletes = [c.args[2] for c in mock_api.call_args_list if c.args[1] == "DELETE"]
+        self.assertIn("repos/xbmc4lyfe/newznab-tmux/actions/runners/99", deletes)
+        self.assertNotIn("repos/xbmc4lyfe/newznab-tmux/actions/runners/42", deletes)
+
     def test_rollback_releases_rotation_owned_builder_drain(self):
         """Codex M4 round 4: rollback must not leave the outgoing host refusing builds."""
         terminated = replace_vm(self.replacement_vm, status="TERMINATED")

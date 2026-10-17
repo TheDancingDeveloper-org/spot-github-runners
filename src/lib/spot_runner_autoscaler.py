@@ -171,6 +171,30 @@ def host_runners(vm: GceVm, runners: list[GitHubRunner] | tuple[GitHubRunner, ..
     return assigned
 
 
+def _missing_outgoing_runners(out_name, runners, vms, rotation):
+    """Runners of an outgoing VM that is no longer in inventory, without touching other hosts.
+
+    Prefer the identities recorded when the host was cordoned. Otherwise accept only runners named
+    ``...-<out_name>-<n>`` whose longest matching VM name (among the remaining inventory and the
+    outgoing name) is the outgoing host, so ``oxidex-runners-old`` never claims
+    ``gha-oxidex-runners-old2-1``.
+    """
+    records = rotation.get("cordoned_runners") or {}
+    if records:
+        return [r for r in runners
+                if str(r.runner_id) in records and records[str(r.runner_id)].get("name") == r.name]
+    pattern = re.compile(r"-" + re.escape(out_name) + r"-\d+$")
+    names = [vm.name for vm in vms] + [out_name]
+    assigned = []
+    for runner in runners:
+        if not pattern.search(runner.name):
+            continue
+        matches = [name for name in names if name in runner.name]
+        if max(matches, key=len) == out_name:
+            assigned.append(runner)
+    return assigned
+
+
 def protected_heavy_routes(vms,runners,state):
     """Protect planned/live routes; label absence never clears a root-protected VM."""
     protected=state.get('protected_heavy_routes',{})
@@ -1867,7 +1891,7 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
     target_type = rotation.get("target_type", "org")
     now_ts = now()
 
-    assigned = host_runners(out_vm, runners, vms) if out_vm else [r for r in runners if out_name in r.name]
+    assigned = host_runners(out_vm, runners, vms) if out_vm else _missing_outgoing_runners(out_name, runners, vms, rotation)
 
     if not rotation.get("cordon_complete"):
         from .runner_drain import api, isolated_group
@@ -1988,7 +2012,7 @@ def _step_rotation_deregister(vms, runners, args, state, state_path, rotation):
         return _abandon_recreated_outgoing(rotation, state, state_path)
     target = rotation["target"]
     target_type = rotation.get("target_type", "org")
-    assigned = host_runners(out_vm, runners, vms) if out_vm else [r for r in runners if out_name in r.name]
+    assigned = host_runners(out_vm, runners, vms) if out_vm else _missing_outgoing_runners(out_name, runners, vms, rotation)
 
     from .runner_drain import api
     busy = _outgoing_work_active(out_vm, assigned, state, target)
