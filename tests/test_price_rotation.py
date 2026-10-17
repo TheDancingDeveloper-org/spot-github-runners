@@ -2137,6 +2137,48 @@ class ReplacementCleanupRetryTests(unittest.TestCase):
         self.assertTrue(saved["replacement_cleanups"]["z/oxidex-runners-new"]["drain"])
         self.assertEqual(saved["price_rotation"]["phase"], "select")  # still provisioning fresh capacity
 
+    def _tracked_job_state(self, status="in_progress"):
+        return {"job_tracking": {"jobs": {"j1": {"vm": {"instance_id": "new"}, "repository": "swack-tools/oxidex",
+                                                   "job": {"id": 555, "status": status}}}}}
+
+    def test_abort_keeps_replacement_with_tracked_job_in_progress(self):
+        """Codex M4 round 12: offline/idle listeners do not prove the tracked workflow finished."""
+        from lib.spot_runner_autoscaler import _abort_runner_rotation
+        outgoing = GceVm("oxidex-runners-old", "z", "RUNNING", "n4-highcpu-16", True, instance_id="old")
+        repl = GceVm("oxidex-runners-new", "z", "TERMINATED", "n4-highcpu-16", True, instance_id="new")
+        state = self._tracked_job_state()
+        state["price_rotation"] = {"phase": "verify_readiness", "target": "swack-tools",
+                                   "outgoing_vm": {"name": outgoing.name, "zone": "z", "instance_id": "old"},
+                                   "replacement_vm": {"name": repl.name, "zone": "z", "instance_id": "new"}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            for api_result in ({"status": "in_progress"}, subprocess.CalledProcessError(1, ["gh"])):
+                with self.subTest(api=type(api_result).__name__):
+                    kwargs = {"side_effect": api_result} if isinstance(api_result, Exception) else {"return_value": api_result}
+                    st = json.loads(json.dumps(state))
+                    with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                            patch("lib.runner_drain.api", **kwargs):
+                        _abort_runner_rotation(st["price_rotation"], [outgoing, repl], SimpleNamespace(project="p"),
+                                               st, path, "timeout", [])
+                    delete.assert_not_called()
+                    self.assertTrue(st["replacement_cleanups"]["z/oxidex-runners-new"]["drain"])
+
+    def test_cleanup_retry_waits_for_tracked_job_then_deletes(self):
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups
+        repl = GceVm("oxidex-runners-new", "z", "TERMINATED", "n4-highcpu-16", True, instance_id="new")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key, state, path = self._pending_cleanup(tmpdir, repl)
+            state["replacement_cleanups"][key]["target"] = "swack-tools"
+            state.update(self._tracked_job_state())
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                    patch("lib.runner_drain.api", return_value={"status": "in_progress"}):
+                reconcile_replacement_cleanups([repl], [], SimpleNamespace(project="p"), state, path)
+            delete.assert_not_called()
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                    patch("lib.runner_drain.api", return_value={"status": "completed"}):
+                reconcile_replacement_cleanups([repl], [], SimpleNamespace(project="p"), state, path)
+            delete.assert_called_once_with(repl, "p")
+
     def test_controller_loop_runs_cleanup_each_check(self):
         import inspect
         from lib import spot_runner_autoscaler as controller

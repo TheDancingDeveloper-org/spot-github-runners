@@ -1601,7 +1601,8 @@ def reconcile_replacement_cleanups(vms, runners, args, state, state_path) -> Non
         if any(r.online or r.busy for r in _replacement_runners(runners, current.name)):
             _drain_replacement_listeners(record, current, runners, state, state_path)
             continue
-        if not _replacement_safe_to_delete(current, runners, args, require_offline=True):
+        if not _replacement_safe_to_delete(current, runners, args, require_offline=True,
+                                           state=state, target=record.get("target")):
             LOG.info("Aborted replacement %s waits for remote builds before deletion", current.name)
             continue
         key_ids = state.setdefault("intentional_deletion_ids", {})
@@ -1616,16 +1617,27 @@ def reconcile_replacement_cleanups(vms, runners, args, state, state_path) -> Non
             LOG.warning("Aborted replacement %s still pending deletion: %s", current.name, error_detail(exc))
 
 
-def _replacement_safe_to_delete(repl_vm, runners, args, *, require_offline=False) -> bool:
+def _replacement_safe_to_delete(repl_vm, runners, args, *, require_offline=False, state=None, target=None) -> bool:
     """Return whether an aborted replacement can be deleted without losing work.
 
     A replacement with a busy listener (or, when ``require_offline``, any online listener) is
-    kept. A RUNNING replacement must also pass the same remote-builder quiescence check that
-    ordinary draining uses, so an active build is never deleted.
+    kept. Tracked CI jobs on it must be finished (a listener can look offline or idle while its
+    workflow is still in progress), exactly as for outgoing-host retirement. A RUNNING
+    replacement must also pass the remote-builder quiescence check, so an active build is never
+    deleted.
     """
     assigned = _replacement_runners(runners, repl_vm.name)
     if any(r.busy for r in assigned) or (require_offline and any(r.online for r in assigned)):
         return False
+    if state is not None and target:
+        from .runner_drain import jobs_finished
+        try:
+            if not jobs_finished(repl_vm, state, target):
+                return False
+        except Exception as exc:
+            LOG.warning("Cannot confirm tracked CI jobs on %s finished: %s; keeping it", repl_vm.name,
+                        error_detail(exc))
+            return False
     return not repl_vm.running or quiesce_remote_builder(repl_vm, args)
 
 
@@ -1635,7 +1647,8 @@ def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, 
         # The outgoing host no longer has its listeners, so dropping the transaction would leave
         # no usable capacity. Keep it pending and try another fresh replacement instead.
         LOG.error("%s; outgoing listeners were removed, so the rotation keeps provisioning capacity", reason)
-        if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True):
+        if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True,
+                                                    state=state, target=rotation.get("target")):
             _delete_replacement(repl_vm, args, state, state_path, target=rotation.get("target"), runners=runners)
         elif repl_vm:
             # Partially ready: keep it, but never abandon it as an uncounted surplus host.
@@ -1645,7 +1658,8 @@ def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, 
     LOG.error("%s; aborting replacement to preserve old capacity", reason)
     # Online listeners stay schedulable during the builder check and deletion, so a replacement with
     # any online listener is kept and drained normally rather than deleted with jobs landing on it.
-    if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True):
+    if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True,
+                                                    state=state, target=rotation.get("target")):
         _delete_replacement(repl_vm, args, state, state_path, target=rotation.get("target"), runners=runners)
     elif repl_vm:
         # Online, busy or building: never delete it now. Persist a drain-then-delete obligation so
