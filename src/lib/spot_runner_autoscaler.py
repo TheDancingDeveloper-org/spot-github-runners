@@ -875,6 +875,17 @@ def _rotation_drain_token(rotation) -> str:
     return "rotation-" + str((rotation.get("outgoing_vm") or {}).get("instance_id") or "unknown")
 
 
+def _rotation_needs_host_cordon(rotation, target_type) -> bool:
+    """Whether retirement must first see an idle host job-start cordon.
+
+    Every repository rotation does (its runners keep their built-in labels and have no runner groups). An org
+    rotation does unless its runners were moved into an isolated runner group: ``host`` (group setup failed, so the
+    host was cordoned) and ``labels`` (a label-only cordon recorded before that fallback existed) both leave the
+    built-in labels schedulable.
+    """
+    return target_type == "repo" or rotation.get("cordon_mode") in ("host", "labels")
+
+
 def _rotation_host_cordon(out_vm, assigned, args, state, state_path, rotation) -> str:
     """Ensure the outgoing repository host refuses new jobs at start; return its cordon state.
 
@@ -2185,7 +2196,24 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
                 if cordon_success:
                     cordon_mode = "isolated_group"
             except Exception as exc:
-                LOG.warning("Could not set up isolated drain group: %s; stripping labels", error_detail(exc))
+                # Stripping custom labels alone never isolates: the built-in labels (self-hosted, linux, X64) stay,
+                # so a job selecting only those could still start before deregistration. Without an isolated group,
+                # cordon on the host exactly as for a repository target; a host that cannot refuse jobs at start
+                # keeps its labels and holds the rotation (retried next poll, group first), never label-only.
+                if out_vm is not None:
+                    LOG.warning("Could not set up isolated drain group for %s: %s; cordoning on the host instead",
+                                out_name, error_detail(exc))
+                    host_state = _rotation_host_cordon(out_vm, assigned, args, state, state_path, rotation)
+                    if host_state not in ("placed", "busy", "idle"):
+                        LOG.error("Rotation held for %s: neither an isolated runner group nor a host job-start "
+                                  "cordon isolates its org runners (host cordon %s); labels and registrations are "
+                                  "kept", out_name, host_state)
+                        write_scale_state(state_path, state)
+                        return True
+                else:
+                    # The outgoing VM is gone from the provider inventory: no host remains to run a job.
+                    LOG.warning("Could not set up isolated drain group: %s; outgoing host %s is absent, stripping "
+                                "labels", error_detail(exc), out_name)
                 for runner in assigned:
                     try:
                         _record_cordon(rotation, runner, state, state_path)
@@ -2193,7 +2221,7 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
                     except Exception as e2:
                         cordon_success = False
                         LOG.warning("Could not strip labels from org runner %s: %s", runner.name, error_detail(e2))
-                cordon_mode = "labels"
+                cordon_mode = "host" if out_vm is not None else "labels"
 
         if not cordon_success:
             rotation["cordon_complete"] = False
@@ -2223,7 +2251,7 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
             write_scale_state(state_path, state)
             return True
 
-    if (target_type == "repo" and out_vm is not None
+    if (_rotation_needs_host_cordon(rotation, target_type) and out_vm is not None
             and _rotation_host_cordon(out_vm, assigned, args, state, state_path, rotation) != "idle"):
         # The drain deadline never overrides this: a job running under the cordon must finish first.
         write_scale_state(state_path, state)
@@ -2280,7 +2308,7 @@ def _step_rotation_deregister(vms, runners, args, state, state_path, rotation):
     busy = _outgoing_work_active(out_vm, assigned, state, target)
     if busy:
         return _return_to_drain(rotation, state, state_path, busy)
-    if target_type == "repo" and out_vm is not None and assigned:
+    if _rotation_needs_host_cordon(rotation, target_type) and out_vm is not None and assigned:
         host_state = _rotation_host_cordon(out_vm, assigned, args, state, state_path, rotation)
         if host_state != "idle":
             # Never deregister unless the host already refuses new jobs and runs none.

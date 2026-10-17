@@ -32,6 +32,7 @@ from .runner_patch import (
     HostPatchReceipt,
     RunnerPatch,
     classify_patch_diff,
+    destructive_patch_changes,
     host_capacity_problems,
     merge_patch_dicts,
     parse_manifest_text,
@@ -424,7 +425,10 @@ def pending_patch_reason(pending: str) -> str:
     return (f"pending, unconfirmed: provisioning requested {requested} (spot-runner-patch-pending-sha256), but "
             "the bootstrap has not confirmed it, so the patch this host runs is unknown. It may still be "
             "bootstrapping, or its package install or patch step failed. It stays unknown until "
-            "src/spot_runner_manager.py confirms a completed bootstrap, or until --patch-live applies a patch")
+            "src/spot_runner_manager.py confirms a completed bootstrap, or until --patch-live applies "
+            + ("a patch" if pending == "none" else
+               "the pending patch (any other patch needs a new VM, because the attempt's partial changes are "
+               "unknown)"))
 
 
 def runner_hosts(instances: Iterable[Mapping[str, Any]], repository: str) -> list[dict[str, Any]]:
@@ -556,6 +560,21 @@ class GcloudHotPatchExecutor:
     def apply(self, host: Mapping[str, Any], patch: RunnerPatch) -> dict[str, Any]:
         from . import runner_manager
 
+        outcome = self._with_runner_manager(lambda args: runner_manager.apply_live_patch(args, str(host["zone"])),
+                                            host, patch)
+        return {"result": "applied" if outcome == "hot_patch" else str(outcome)}
+
+    def reconcile_labels(self, host: Mapping[str, Any], patch: RunnerPatch) -> None:
+        """Sync the GitHub labels of a host that is already at ``patch`` (a noop never runs the live script)."""
+        from . import runner_manager
+
+        self._with_runner_manager(lambda args: runner_manager.reconcile_runner_labels(args, str(host["zone"])),
+                                  host, patch)
+
+    def _with_runner_manager(self, action: Callable[[Any], Any], host: Mapping[str, Any], patch: RunnerPatch) -> Any:
+        """Run ``action`` with runner_manager arguments taken only from the host record; refuse incomplete records."""
+        from . import runner_manager
+
         required = ("name", "zone", "machine_type", "runner_prefix", "runners_count", "runner_label",
                     "runner_region", "patch_target", "registration_target")
         missing = [k for k in required if not host.get(k)]
@@ -589,10 +608,9 @@ class GcloudHotPatchExecutor:
             previous = runner_manager.PROJECT
             runner_manager.PROJECT = self.project
             try:
-                outcome = runner_manager.apply_live_patch(args, str(host["zone"]))
+                return action(args)
             finally:
                 runner_manager.PROJECT = previous
-        return {"result": "applied" if outcome == "hot_patch" else str(outcome)}
 
 
 ENV_FLEET_INVENTORY = "DASHBOARD_FLEET_INVENTORY"
@@ -695,13 +713,14 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
             # Never noop: neither the applied record nor a host receipt proves that a pending bootstrap finished.
             out.append(HostClassification(host, "unknown", None, pending_patch_reason(pending)))
             continue
-        proof, receipt_detail = True, ""
+        proof, receipt_detail, receipt_pending = True, "", ""
         try:
             if executor.available:
                 current = executor.read_manifest(host)
                 source = "read from the host"
                 if isinstance(current, HostPatchReceipt):
-                    proof, receipt_detail, current = current.proof, current.detail, current.manifest
+                    proof, receipt_detail, receipt_pending = current.proof, current.detail, current.pending_sha256
+                    current = current.manifest
             elif "patch_manifest" in host:
                 current = host.get("patch_manifest")
                 source = "recorded by the fleet controller"
@@ -713,8 +732,16 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
             if current is not None and not isinstance(current, dict):
                 raise ValueError("recorded patch manifest is not a mapping")
             current_sha = validate_patch_dict(current).patch_sha256 if current is not None else None
-            classification = classify_patch_diff(current, target)
+            classification = classify_patch_diff(current, target, pending_sha256=receipt_pending)
             detail = source if source.startswith(("recorded", "no patch", "sha256")) else f"current patch {source}"
+            dropped = (destructive_patch_changes(validate_patch_dict(current), target)
+                       if current is not None and classification == "replace_vm" else [])
+            if receipt_pending and receipt_pending != target.patch_sha256 and classification == "replace_vm":
+                detail = (f"{detail}; an attempt to apply patch {receipt_pending[:12]} never completed, so its partial "
+                          "changes are unknown and only a new VM removes them")
+            elif dropped:
+                detail = (f"{detail}; the live script cannot undo applied changes ({'; '.join(dropped)}), so a new VM "
+                          "is needed")
             if not proof and classification == "noop":
                 # Only a completion receipt from this boot proves the patch; a live re-apply writes one.
                 classification = "hot_patch"
@@ -1075,9 +1102,22 @@ class PatchConsole:
             entry = h.to_dict()
             if h.classification == "noop":
                 # Re-derived from the host, so a retry after a lost response never re-runs a host that already
-                # applied this patch (its receipt and recorded sha already match).
+                # applied this patch (its receipt and recorded sha already match). Its GitHub labels are still
+                # reconciled when the executor can: a noop is the only step that reaches a host with stale labels.
                 entry["result"] = "noop"
                 entry["detail"] = f"already at this patch ({h.detail})"
+                reconcile = getattr(self.executor, "reconcile_labels", None)
+                if reconcile is not None:
+                    try:
+                        reconcile(h.host, patch)
+                        entry["detail"] += "; GitHub labels reconciled"
+                    except HostRefusedError as exc:
+                        entry["result"] = "refused"
+                        entry["detail"] = f"already at this patch, but its GitHub labels were not reconciled: {exc}"
+                    except Exception as exc:  # noqa: BLE001 - report per host, keep going
+                        entry["result"] = "failed"
+                        entry["detail"] = (f"already at this patch, but reconciling its GitHub labels failed: "
+                                           f"{type(exc).__name__}: {exc}")
             else:
                 try:
                     entry.update(self.executor.apply(h.host, patch))

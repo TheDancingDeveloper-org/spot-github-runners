@@ -60,6 +60,7 @@ from .target_config import (DEFAULT_ORG, TARGET_LABEL_KEY, TargetConfig, resolve
 from .runner_patch import (
     RunnerPatch,
     classify_patch_diff,
+    destructive_patch_changes,
     fetch_patch_from_config_repo,
     host_capacity_problems,
     PATCH_RECEIPT_READ_COMMAND,
@@ -68,6 +69,7 @@ from .runner_patch import (
     parse_patch_receipt,
     render_dockerfile,
     render_live_hot_patch_script,
+    validate_patch_dict,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1004,7 +1006,11 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
         ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={PATCH_RECEIPT_READ_COMMAND}"],
         quiet=True,
     ))
-    action = classify_patch_diff(receipt.manifest, patch)
+    # An unfinished attempt at another patch (the host's pending marker, or provisioning/live pending metadata)
+    # left unknown partial changes behind, which only a new VM removes; one at this patch is simply re-applied.
+    foreign_pending = next((sha for sha in (receipt.pending_sha256, vm.patch_pending_sha256)
+                            if sha and sha not in ("none", patch.patch_sha256)), "")
+    action = classify_patch_diff(receipt.manifest, patch, pending_sha256=foreign_pending)
     pending = bool(vm.patch_pending_sha256)
     if action == "noop" and (pending or not receipt.proof):
         # The host names this patch, but only a completion receipt from this boot (and a confirmed bootstrap)
@@ -1013,12 +1019,15 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
                  "its bootstrap never confirmed it" if pending else receipt.detail)
     elif action == "noop":
         LOG.info("VM %s is already at patch %s", args.instance_name, patch.patch_sha256[:12])
-        # The host's completion receipt confirms the patch: record it (backfills hosts provisioned before recording).
+        # A verified noop still reconciles the GitHub labels (a host may predate label-sync-before-record), and
+        # only then records the patch (backfills hosts provisioned before recording).
+        sync_runner_labels(args)
         record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm))
         return "noop"
     if action == "replace_vm":
         raise RuntimeError(
-            f"Patch {patch.patch_sha256[:12]} changes hardware architecture or CPU ISA requirements; "
+            f"Patch {patch.patch_sha256[:12]} cannot be live-applied to {args.instance_name}: "
+            f"{live_patch_replace_reason(receipt.manifest, patch, foreign_pending)}; "
             "a rolling VM replacement is required instead of --patch-live"
         )
     if action == "recreate_containers":
@@ -1046,11 +1055,40 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     )
     if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
         raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
-    # Only now, after the host confirmed this exact patch in this boot, does the recorded patch change.
-    record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm), clear_pending=True)
+    # The GitHub labels follow before anything is recorded: a failed label sync leaves the host pending (so a retry
+    # re-applies and syncs again), never recorded as current with stale labels. Only after the host confirmed this
+    # exact patch in this boot AND its labels match does the recorded patch change and the pending record go.
     sync_runner_labels(args)
+    record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm), clear_pending=True)
     LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
     return "hot_patch"
+
+
+def reconcile_runner_labels(args: argparse.Namespace, zone: str) -> None:
+    """Sync the GitHub labels of a running host that is already verified at its patch (a hot-patch noop).
+
+    A host whose patch was recorded before label sync had to succeed first can carry stale labels; a noop never
+    runs the live script, so this is the only step that repairs them. Nothing on the host or its metadata changes.
+    """
+    vm = observed_deployment_vm(args, zone)
+    args.deployment_vm = vm  # Strict pools verify cached runner identities against this VM.
+    if not vm.running:
+        raise RuntimeError(f"Cannot reconcile the runner labels of non-running VM: {vm_details(vm)}")
+    sync_runner_labels(args)
+
+
+def live_patch_replace_reason(current_manifest: dict | None, patch: RunnerPatch, foreign_pending: str) -> str:
+    """Why classify_patch_diff answered replace_vm for this host (for the refusal message)."""
+    if foreign_pending:
+        return (f"an attempt to apply patch {foreign_pending[:12]} never completed, so its partial changes "
+                "are unknown")
+    if current_manifest is not None:
+        current = validate_patch_dict(current_manifest)
+        if current.hardware.arch == patch.hardware.arch and not set(patch.hardware.isa) - set(current.hardware.isa):
+            dropped = destructive_patch_changes(current, patch)
+            if dropped:
+                return "the live script cannot undo applied changes (" + "; ".join(dropped) + ")"
+    return "it changes the hardware architecture or CPU ISA requirements"
 
 
 def wait_for_bootstrap(args: argparse.Namespace, zone: str, deployment_id: str) -> None:

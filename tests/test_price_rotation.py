@@ -913,16 +913,54 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 "phase_started_at": 1000.0,
             }
         }
+        order = []
+
+        def cordon(vm, args, token, names, guard=None):
+            order.append(("cordon", token, tuple(names)))
+            return host_state, {"reason": "test"}
+
+        def api(target, method, path, body=None, paginate=False):
+            order.append((method, path))
+            return {}
+
+        # PR #44 round 5 P1: without an isolated group the built-in labels stay schedulable, so label removal alone
+        # is never a cordon. The host is cordoned first, exactly as for a repository target.
+        host_state = "placed"
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
             with patch("lib.runner_drain.isolated_group", side_effect=RuntimeError("Group quota reached")), \
-                 patch("lib.runner_drain.api", return_value={}):
+                 patch("lib.runner_drain.cordon_runner_host", side_effect=cordon), \
+                 patch("lib.runner_drain.subprocess.run", side_effect=AssertionError("no live SSH or gcloud")), \
+                 patch("lib.runner_drain.api", side_effect=api):
                 res = step_price_rotation([out_vm, self.replacement_vm], [runner, self.replacement_runner],
-                                          self.args, state, path)
+                                          self.args, json.loads(json.dumps(state)), path)
                 self.assertTrue(res)
                 recovered = read_scale_state(path)
                 self.assertTrue(recovered["price_rotation"]["cordon_complete"])
-                self.assertEqual(recovered["price_rotation"]["cordon_mode"], "labels")
+                self.assertEqual(recovered["price_rotation"]["cordon_mode"], "host")
+                self.assertEqual(recovered["price_rotation"]["host_cordon_token"], "rotation-cordon-id-vm-1")
+                self.assertEqual(order, [("cordon", "rotation-cordon-id-vm-1", ("gha-vm-1-1",)),
+                                         ("DELETE", "orgs/swack-tools/actions/runners/1/labels")])
+
+        # A host that cannot refuse jobs at start holds the rotation with its labels untouched.
+        for host_state in ("unsupported", "unreachable", "identity"):
+            order.clear()
+            with self.subTest(host_state), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "state.json"
+                with patch("lib.runner_drain.isolated_group", side_effect=RuntimeError("Group quota reached")), \
+                     patch("lib.runner_drain.cordon_runner_host", side_effect=cordon), \
+                     patch("lib.runner_drain.subprocess.run", side_effect=AssertionError("no live SSH or gcloud")), \
+                     patch("lib.runner_drain.api", side_effect=api), \
+                     self.assertLogs("spot_runner_autoscaler", level="ERROR") as logs:
+                    res = step_price_rotation([out_vm, self.replacement_vm], [runner, self.replacement_runner],
+                                              self.args, json.loads(json.dumps(state)), path)
+                self.assertTrue(res)
+                recovered = read_scale_state(path)
+                self.assertFalse(recovered["price_rotation"]["cordon_complete"])
+                self.assertEqual(recovered["price_rotation"]["phase"], "cordon_drain")
+                self.assertEqual([o[0] for o in order], ["cordon"])  # no label removal, no group change
+                self.assertTrue(any("neither an isolated runner group nor a host job-start cordon" in line
+                                    for line in logs.output))
 
 
 class EntrypointParityTests(unittest.TestCase):
@@ -1529,6 +1567,41 @@ class RepositoryHostCordonRotationTests(RotationHarness, unittest.TestCase):
                                    cordon=AssertionError)
         self.host_cordon.assert_not_called()
         self.assertEqual(saved["price_rotation"]["phase"], "deregister")
+
+    def test_org_rotation_cordoned_without_a_group_retires_only_behind_an_idle_host_cordon(self):
+        """PR #44 round 5 P1: an org rotation whose group setup failed (``host``), or one recorded label-only before
+        that fallback (``labels``), drains and deregisters only behind an idle host job-start cordon."""
+        self.args.target = "swack-tools"
+        for mode in ("host", "labels"):
+            for host_state in ("busy", "placed", "unsupported", "unreachable"):
+                with self.subTest(mode=mode, phase="cordon_drain", host_state=host_state):
+                    state = self.state("cordon_drain", target="swack-tools", target_type="org", cordon_mode=mode,
+                                       host_cordon_token="rotation-cordon-old-123")
+                    mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                                      [self.old_runner, self.new_runner], cordon=host_state)
+                    self.assertEqual(saved["price_rotation"]["phase"], "cordon_drain")
+                    mock_api.assert_not_called()
+                with self.subTest(mode=mode, phase="deregister", host_state=host_state):
+                    state = self.state("deregister", target="swack-tools", target_type="org", cordon_mode=mode,
+                                       host_cordon_token="rotation-cordon-old-123")
+                    mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                                      [self.old_runner, self.new_runner],
+                                                      api=DeregisterIdleRecheckTests.idle_get(self), cordon=host_state)
+                    self.assertNotIn("DELETE", [c[1] for c in self.calls(mock_api)])
+                    self.assertEqual(saved["price_rotation"]["phase"], "cordon_drain")
+            with self.subTest(mode=mode, host_state="idle"):
+                state = self.state("cordon_drain", target="swack-tools", target_type="org", cordon_mode=mode)
+                _, _, _, state = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                           [self.old_runner, self.new_runner])
+                self.assertEqual(state["price_rotation"]["phase"], "deregister")
+                self.assertEqual(state["price_rotation"]["host_cordon_token"], "rotation-cordon-old-123")
+                self.assertEqual(self.host_cordon.call_args.args[2], "rotation-cordon-old-123")
+                mock_api, _, _, state = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                                  [self.old_runner, self.new_runner],
+                                                  api=DeregisterIdleRecheckTests.idle_get(self))
+                self.assertIn(("swack-tools", "DELETE", "orgs/swack-tools/actions/runners/99"),
+                              [c[:3] for c in self.calls(mock_api)])
+                self.assertEqual(state["price_rotation"]["phase"], "delete")
 
     def test_org_rotation_never_uses_the_host_cordon(self):
         state = self.state("deregister", target="swack-tools", target_type="org")

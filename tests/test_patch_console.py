@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 import unittest.mock as mock
 import urllib.parse
@@ -795,6 +796,89 @@ class ExecutorTests(unittest.TestCase):
                                                             [host("new"), host("legacy")])
         self.assertEqual({h["name"]: h["result"] for h in body["hosts"]}, {"new": "applied", "legacy": "refused"})
         self.assertEqual(body["status"], "partial")
+
+    def test_noop_hosts_reconcile_their_github_labels(self):
+        """PR #44 round 5 P2: a noop never runs the live script, so it is where stale labels get repaired."""
+        target = validate_patch_dict(merge_patch_dicts(json.loads(DEFAULTS), json.loads(OXIDEX))).to_canonical_dict()
+        executor = FakeExecutor({"same": target, "stale": target, "legacy": target})
+        reconciled = []
+
+        def reconcile(h, patch):
+            if h["name"] == "stale":
+                raise RuntimeError("GitHub labels for oxidex-stale-1 are [], expected ['oxidex-spot-ci']")
+            if h["name"] == "legacy":
+                raise pc.HostRefusedError("refused: the host record does not carry runner_label")
+            reconciled.append((h["name"], patch.patch_sha256))
+
+        executor.reconcile_labels = reconcile
+        status, body = console(executor=executor).hot_patch("swack-tools/oxidex", TARGET_SHA,
+                                                            [host("same"), host("stale"), host("legacy")])
+        got = {h["name"]: (h["result"], h["detail"]) for h in body["hosts"]}
+        self.assertEqual(reconciled, [("same", TARGET_SHA)])
+        self.assertEqual(got["same"][0], "noop")
+        self.assertIn("GitHub labels reconciled", got["same"][1])
+        self.assertEqual(got["stale"][0], "failed")
+        self.assertIn("reconciling its GitHub labels failed", got["stale"][1])
+        self.assertEqual(got["legacy"][0], "refused")
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(executor.applied, [])  # never the live script
+
+    def test_gcloud_executor_reconciles_labels_from_the_host_record_only(self):
+        from lib import runner_manager
+
+        ex = pc.GcloudHotPatchExecutor("proj", which=lambda _n: "/usr/bin/gcloud")
+        patch = validate_patch_dict(json.loads(OXIDEX))
+        before = runner_manager.PROJECT
+        seen = []
+        with mock.patch.object(runner_manager, "reconcile_runner_labels",
+                               side_effect=lambda *_a: seen.append(runner_manager.PROJECT)) as reconcile, \
+                mock.patch.object(runner_manager, "apply_live_patch") as apply:
+            ex.reconcile_labels(host("h1"), patch)
+            bad = host("h2")
+            bad.pop("runner_label")
+            with self.assertRaisesRegex(pc.HostRefusedError, "runner_label"):
+                ex.reconcile_labels(bad, patch)
+        apply.assert_not_called()
+        self.assertEqual((seen, runner_manager.PROJECT), (["proj"], before))
+        args, zone = reconcile.call_args[0]
+        self.assertEqual((args.instance_name, args.runner_label, args.target, args.runner_group_id, zone),
+                         ("h1", "oxidex-spot-ci", "swack-tools", 10, "us-central1-a"))
+        self.assertEqual(reconcile.call_count, 1)
+
+    def test_reconcile_runner_labels_syncs_only_a_running_host(self):
+        from lib import runner_manager
+        from lib.runner_fleet import GceVm
+
+        args = SimpleNamespace(instance_name="h1")
+        running = GceVm("h1", "us-central1-a", "RUNNING", "n2-standard-8", True, instance_id="1")
+        with mock.patch.object(runner_manager, "observed_deployment_vm", return_value=running), \
+                mock.patch.object(runner_manager, "sync_runner_labels") as sync:
+            runner_manager.reconcile_runner_labels(args, "us-central1-a")
+        sync.assert_called_once_with(args)
+        self.assertIs(args.deployment_vm, running)
+        stopped = GceVm("h1", "us-central1-a", "TERMINATED", "n2-standard-8", True, instance_id="1")
+        with mock.patch.object(runner_manager, "observed_deployment_vm", return_value=stopped), \
+                mock.patch.object(runner_manager, "sync_runner_labels") as sync, \
+                self.assertRaisesRegex(RuntimeError, "non-running"):
+            runner_manager.reconcile_runner_labels(args, "us-central1-a")
+        sync.assert_not_called()
+
+    def test_preview_fails_closed_over_an_unfinished_attempt_at_another_patch(self):
+        """PR #44 round 5 P1: the host's pending marker names another patch, whose partial changes are unknown."""
+        from lib.runner_patch import HostPatchReceipt
+
+        other = validate_patch_dict({"schema": "spot-runner-patch-v1", "repository": "swack-tools/oxidex",
+                                     "host": {"apt_packages": ["curl"]}})
+        executor = FakeExecutor({
+            "foreign": HostPatchReceipt(OLD, False, "an attempt has not completed", other.patch_sha256),
+            "damaged": HostPatchReceipt(OLD, False, "an attempt has not completed", "unknown"),
+            "own": HostPatchReceipt(OLD, False, "an attempt has not completed", TARGET_SHA),
+        })
+        got = {h["name"]: h for h in console(executor=executor).preview(
+            "swack-tools/oxidex", [host("foreign"), host("damaged"), host("own")])["hosts"]}
+        self.assertEqual({n: h["classification"] for n, h in got.items()},
+                         {"foreign": "replace_vm", "damaged": "replace_vm", "own": "hot_patch"})
+        self.assertIn(f"an attempt to apply patch {other.patch_sha256[:12]} never completed", got["foreign"]["detail"])
 
     def test_gcloud_executor_reads_host_receipt(self):
         from lib.runner_patch import PATCH_RECEIPT_READ_COMMAND, validate_patch_dict

@@ -205,6 +205,44 @@ container:
         self.assertEqual(patch_obj.host.sysctl["vm.max_map_count"], "262144")
         self.assertEqual(patch_obj.container.apt_packages, ("strace", "php-cli", "php-ffi", "composer"))
 
+    def test_fetch_patch_rejects_a_declared_repository_other_than_the_target(self):
+        """PR #44 round 5 P2: a manifest or inherited defaults naming another repository is never returned."""
+        sha = "e" * 40
+        prefix = "repos/swack-tools/spot-runners-config/contents/"
+
+        def loader(defaults_yaml, repo_yaml):
+            files = {f"{prefix}defaults.yaml?ref={sha}": defaults_yaml,
+                     f"{prefix}repos/xbmc4lyfe/newznab-tmux.yaml?ref={sha}": repo_yaml}
+
+            def fake_run(cmd, **kwargs):
+                endpoint = cmd[2]
+                if endpoint == "repos/swack-tools/spot-runners-config":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"default_branch": "main"}), stderr="")
+                if endpoint == "repos/swack-tools/spot-runners-config/commits/main":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"sha": sha}), stderr="")
+                if files.get(endpoint) is not None:
+                    encoded = base64.b64encode(files[endpoint].encode()).decode("ascii")
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"encoding": "base64", "content": encoded}),
+                                           stderr="")
+                return SimpleNamespace(returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)")
+
+            with patch("lib.runner_patch.subprocess.run", side_effect=fake_run):
+                return fetch_patch_from_config_repo("xbmc4lyfe/newznab-tmux", org="swack-tools")
+
+        body = "schema: spot-runner-patch-v1\nhost:\n  apt_packages:\n    - jq\n"
+        for name, defaults_yaml, repo_yaml in (
+            ("repo file names another repository", None, "repository: someone/else\n" + body),
+            ("defaults name another repository", "repository: someone/else\n" + body, body),
+            ("defaults name another repository, repo file matches", "repository: someone/else\n" + body,
+             "repository: xbmc4lyfe/newznab-tmux\n" + body),
+        ):
+            with self.subTest(name), self.assertRaisesRegex(ValueError, "declares repository 'someone/else'"):
+                loader(defaults_yaml, repo_yaml)
+        # A matching declaration (any case) or none is accepted; the declared spelling is kept, as the console does.
+        self.assertEqual(loader(None, "repository: XBMC4lyfe/Newznab-Tmux\n" + body).repository,
+                         "XBMC4lyfe/Newznab-Tmux")
+        self.assertEqual(loader(body, body).repository, "xbmc4lyfe/newznab-tmux")
+
     def test_validation_rejects_forbidden_mounts_and_mismatched_isa(self):
         with self.assertRaisesRegex(ValueError, "forbidden"):
             validate_patch_dict({
@@ -352,7 +390,9 @@ container:
         mount_change = validate_patch_dict({
             "schema": "spot-runner-patch-v1",
             "hardware": {"arch": "x86_64", "isa": ["avx512-vbmi2"]},
-            "container": {"mounts": [{"source": "/mnt/runner-data/a", "target": "/work/a"}]},
+            "host": {"sysctl": {"vm.max_map_count": 262144}},
+            "container": {"apt_packages": ["php-cli"],
+                          "mounts": [{"source": "/mnt/runner-data/a", "target": "/work/a"}]},
         })
         self.assertEqual(classify_patch_diff(initial.to_canonical_dict(), mount_change), "recreate_containers")
 
@@ -408,6 +448,97 @@ container:
         self.assertIn('docker exec -i -u root "$cid" bash -euo pipefail', live_script)
         self.assertIn('nsenter -t "$pid" -n sysctl -w', live_script)
         self.assertIn("docker build --pull -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build", live_script)
+
+    def test_dropping_an_applied_effect_is_never_a_hot_patch(self):
+        """PR #44 round 5 P1: the live script only adds and writes, so a target that drops an applied package, file,
+        sysctl, directory, or script needs a new VM; pure additions and in-place rewrites stay hot."""
+        host_file = {"path": "/etc/applied.conf", "content": "a\n"}
+        cnt_file = {"path": "/opt/applied.txt", "content": "a\n"}
+        applied = {
+            "schema": "spot-runner-patch-v1",
+            "host": {"apt_packages": ["htop"], "sysctl": {"vm.swappiness": 10}, "files": [host_file],
+                     "boot_mkdirs": ["/srv/applied"], "boot_script": "echo applied\n"},
+            "container": {"apt_packages": ["jq"], "sysctl": {"net.core.somaxconn": 1024}, "files": [cnt_file],
+                          "dockerfile_run": "echo applied\n"},
+        }
+        current = validate_patch_dict(applied).to_canonical_dict()
+
+        def target(section, key, value):
+            data = json.loads(json.dumps(applied))
+            data.setdefault(section, {})[key] = value
+            return validate_patch_dict(data)
+
+        destructive = {
+            "host package removed": target("host", "apt_packages", []),
+            "host sysctl removed": target("host", "sysctl", {}),
+            "host file removed": target("host", "files", []),
+            "host directory removed": target("host", "boot_mkdirs", []),
+            "host boot script changed": target("host", "boot_script", "echo other\n"),
+            "host boot script removed": target("host", "boot_script", ""),
+            "container package removed": target("container", "apt_packages", []),
+            "container sysctl removed": target("container", "sysctl", {"net.ipv4.tcp_fin_timeout": 30}),
+            "container file removed": target("container", "files", [{**cnt_file, "path": "/opt/renamed.txt"}]),
+            "container command changed": target("container", "dockerfile_run", "echo other\n"),
+            "container command removed": target("container", "dockerfile_run", ""),
+            "everything removed": validate_patch_dict({"schema": "spot-runner-patch-v1"}),
+        }
+        for name, patch_obj in destructive.items():
+            with self.subTest(name):
+                self.assertEqual(classify_patch_diff(current, patch_obj), "replace_vm")
+                self.assertTrue(runner_patch_mod.destructive_patch_changes(validate_patch_dict(current), patch_obj))
+        additive = {
+            "host package added": target("host", "apt_packages", ["htop", "strace"]),
+            "host sysctl rewritten and added": target("host", "sysctl", {"vm.swappiness": 20, "vm.max_map_count": 1}),
+            "host file rewritten": target("host", "files", [{**host_file, "content": "b\n", "mode": "0600"}]),
+            "host directory added": target("host", "boot_mkdirs", ["/srv/applied", "/srv/more"]),
+            "container package added": target("container", "apt_packages", ["jq", "ripgrep"]),
+            "container sysctl rewritten": target("container", "sysctl", {"net.core.somaxconn": 4096}),
+            "container file added": target("container", "files", [cnt_file, {"path": "/opt/new.txt", "content": ""}]),
+            "labels changed": target("hardware", "extra_labels", ["other"]),
+        }
+        for name, patch_obj in additive.items():
+            with self.subTest(name):
+                self.assertEqual(classify_patch_diff(current, patch_obj), "hot_patch")
+                self.assertEqual(runner_patch_mod.destructive_patch_changes(validate_patch_dict(current), patch_obj), [])
+        # A first script on a host that never ran one is an addition; a mount change with nothing dropped recreates.
+        bare = validate_patch_dict({"schema": "spot-runner-patch-v1"}).to_canonical_dict()
+        self.assertEqual(classify_patch_diff(bare, validate_patch_dict(applied)), "hot_patch")
+        with_mount = target("container", "mounts", [{"source": "/srv/applied", "target": "/cache"}])
+        self.assertEqual(classify_patch_diff(current, with_mount), "recreate_containers")
+        self.assertIn("host.apt_packages drops htop",
+                      runner_patch_mod.destructive_patch_changes(validate_patch_dict(current),
+                                                                 destructive["host package removed"]))
+
+    def test_an_unfinished_attempt_at_another_patch_fails_closed(self):
+        """An incomplete attempt left unknown partial changes: only one at the target itself may be re-applied."""
+        old = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["htop"]}})
+        new = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["htop", "jq"]}})
+        other = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["curl"]}})
+        current = old.to_canonical_dict()
+        self.assertEqual(classify_patch_diff(current, new), "hot_patch")
+        self.assertEqual(classify_patch_diff(current, new, pending_sha256=new.patch_sha256), "hot_patch")
+        self.assertEqual(classify_patch_diff(current, new, pending_sha256="none"), "hot_patch")
+        for pending in (other.patch_sha256, "unknown"):
+            self.assertEqual(classify_patch_diff(current, new, pending_sha256=pending), "replace_vm")
+            self.assertEqual(classify_patch_diff(None, new, pending_sha256=pending), "replace_vm")
+            self.assertEqual(classify_patch_diff(current, old, pending_sha256=pending), "replace_vm")  # never noop
+
+    def test_receipt_reports_the_pending_attempt(self):
+        import base64
+
+        patch_obj = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["jq"]}})
+        boot = "0f6c3a52-8d1e-4b7a-9c2d-5e8f1a2b3c4d"
+
+        def output(marker):
+            encoded = base64.b64encode(json.dumps(marker).encode()).decode() if marker is not None else ""
+            return f"state:\npending:{encoded}\nboot:{boot}\n"
+
+        parse = runner_patch_mod.parse_patch_receipt
+        self.assertEqual(parse(output(None)).pending_sha256, "")
+        self.assertEqual(parse(output({"pending_patch_sha256": patch_obj.patch_sha256})).pending_sha256,
+                         patch_obj.patch_sha256)
+        for damaged in ({"pending_patch_sha256": "abc"}, {}, ["not", "a", "mapping"]):
+            self.assertEqual(parse(output(damaged)).pending_sha256, "unknown")
 
     def test_live_script_writes_the_completion_receipt_only_after_every_step(self):
         """Codex round 14 P2: pending marker first; receipt (atomic rename) and LIVE_PATCH_APPLIED last."""

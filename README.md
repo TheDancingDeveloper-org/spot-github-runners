@@ -436,6 +436,14 @@ can't refuse jobs. The controller holds its retirement and logs `Retirement held
 That host keeps its labels and registrations until a cordon-capable host replaces
 it. A rotation that rolls back removes only the marker that it placed.
 
+Organization-target runners keep the same built-in labels, so label removal alone
+never isolates them either. An organization drain moves its runners into an
+isolated runner group with no repository access. When the rotation can't create
+or verify that group, it cordons the host the same way as for a repository
+target, and holds the rotation if the host can't refuse jobs. A drain that starts
+in `label_only` mode, as legacy scaling does, also cordons the host first. If that
+host can't refuse jobs, the drain switches to an isolated runner group.
+
 ## Provision a dedicated Rust builder
 
 The dedicated renderer fixes the host to `n4-highcpu-16`: 16 vCPU and 32 GiB RAM.

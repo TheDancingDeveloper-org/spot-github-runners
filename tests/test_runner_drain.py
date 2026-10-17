@@ -45,6 +45,38 @@ class RunnerDrainTests(unittest.TestCase):
         self.addCleanup(self.builder_guard.stop)
         self.inventory.start()
         self.addCleanup(self.inventory.stop)
+        # A host whose runners run the cordon-aware job-started hook (see RepositoryHostCordonDrainTests). Org
+        # label_only drains are host-cordoned too, since stripping labels alone leaves the built-in labels.
+        self.host = {'marker': False, 'workers': 0, 'supported': True, 'reachable': True}
+        self.cordon_results = []
+        cordon = patch('lib.runner_drain.cordon_runner_host', side_effect=self.cordon)
+        self.cordon_mock = cordon.start()
+        self.addCleanup(cordon.stop)
+
+    def cordon(self, vm, args, token, names, mutation_guard=None):
+        """Model of the host program: unsupported, else place the marker once, else report Workers."""
+        self.assertEqual(vm.instance_id, '123')
+        if mutation_guard is not None:
+            mutation_guard()
+        if not self.host['reachable']:
+            result = 'unreachable'
+        elif not self.host['supported']:
+            result = 'unsupported'
+        elif not self.host['marker']:
+            self.host['marker'] = token
+            result = 'placed'
+        else:
+            result = 'busy' if self.host['workers'] or any(r.busy for r in self.live) else 'idle'
+        self.commands.append(['host-cordon', result, token, tuple(names)])
+        self.cordon_results.append(result)
+        return result, {'reason': 'model'}
+
+    def mutations(self):
+        return [c for c in self.commands if c[0] == 'gh' and '-X' in c and c[c.index('-X') + 1] != 'GET']
+
+    def runner_deletes(self):
+        return [c for c in self.mutations() if c[c.index('-X') + 1] == 'DELETE' and not c[-1].endswith('/labels')
+                and '/actions/runners/' in c[-1]]
 
     def row(self, runner):
         return {'id':runner.runner_id, 'name':runner.name, 'status':runner.status, 'busy':runner.busy,
@@ -319,40 +351,13 @@ class RepositoryHostCordonDrainTests(unittest.TestCase):
     command = RunnerDrainTests.command
     begin = RunnerDrainTests.begin
     reconcile = RunnerDrainTests.reconcile
+    cordon = RunnerDrainTests.cordon
+    mutations = RunnerDrainTests.mutations
+    runner_deletes = RunnerDrainTests.runner_deletes
 
     def setUp(self):
         RunnerDrainTests.setUp(self)
         self.args.target = 'octo/hello-world'
-        self.host = {'marker': False, 'workers': 0, 'supported': True, 'reachable': True}
-        self.cordon_results = []
-        cordon = patch('lib.runner_drain.cordon_runner_host', side_effect=self.cordon)
-        self.cordon_mock = cordon.start()
-        self.addCleanup(cordon.stop)
-
-    def cordon(self, vm, args, token, names, mutation_guard=None):
-        """Model of the host program: unsupported, else place the marker once, else report Workers."""
-        self.assertEqual(vm.instance_id, '123')
-        if mutation_guard is not None:
-            mutation_guard()
-        if not self.host['reachable']:
-            result = 'unreachable'
-        elif not self.host['supported']:
-            result = 'unsupported'
-        elif not self.host['marker']:
-            self.host['marker'] = token
-            result = 'placed'
-        else:
-            result = 'busy' if self.host['workers'] else 'idle'
-        self.commands.append(['host-cordon', result, token, tuple(names)])
-        self.cordon_results.append(result)
-        return result, {'reason': 'model'}
-
-    def mutations(self):
-        return [c for c in self.commands if c[0] == 'gh' and '-X' in c and c[c.index('-X') + 1] != 'GET']
-
-    def runner_deletes(self):
-        return [c for c in self.mutations() if c[c.index('-X') + 1] == 'DELETE' and not c[-1].endswith('/labels')
-                and '/actions/runners/' in c[-1]]
 
     def test_repository_target_is_detected(self):
         self.assertTrue(controller.is_repo_target(self.args.target))
@@ -438,6 +443,64 @@ class RepositoryHostCordonDrainTests(unittest.TestCase):
             self.reconcile()
         self.assertFalse(self.host['marker'])
         self.assertEqual(self.mutations(), [])
+        self.assertEqual(self.state['host_operation']['kind'], 'drain')
+
+
+class OrgLabelOnlyHostCordonDrainTests(unittest.TestCase):
+    """PR #44 round 5 P1: an org label_only drain (legacy scaling) keeps the built-in labels, so it is host-cordoned
+    like a repository drain; a host that cannot refuse jobs is isolated in a runner group instead."""
+
+    row = RunnerDrainTests.row
+    command = RunnerDrainTests.command
+    begin = RunnerDrainTests.begin
+    reconcile = RunnerDrainTests.reconcile
+    cordon = RunnerDrainTests.cordon
+    mutations = RunnerDrainTests.mutations
+    runner_deletes = RunnerDrainTests.runner_deletes
+
+    def setUp(self):
+        RunnerDrainTests.setUp(self)
+        self.assertFalse(controller.is_repo_target(controller._active_target(self.args)))
+
+    def test_host_is_cordoned_before_labels_are_removed_and_deregistration_needs_an_idle_cordon(self):
+        self.begin()
+        operation = self.state['host_operation']
+        self.assertEqual((operation['drain_mode'], operation['cordon_mode']), ('label_only', 'host'))
+        self.assertEqual(operation['host_cordon_token'], 'drain-123')
+        first_cordon = next(i for i, c in enumerate(self.commands) if c[0] == 'host-cordon')
+        first_mutation = next(i for i, c in enumerate(self.commands) if c in self.mutations())
+        self.assertLess(first_cordon, first_mutation)
+        self.assertFalse(any('runner-groups' in str(c) for c in self.commands))
+        self.host['workers'] = 1  # a job that started before the cordon
+        self.reconcile()
+        self.assertEqual((self.cordon_results[-1], self.runner_deletes()), ('busy', []))
+        self.host['workers'] = 0
+        self.reconcile()
+        self.assertEqual(self.live, [])
+        last_idle = max(i for i, c in enumerate(self.commands) if c[:2] == ['host-cordon', 'idle'])
+        self.assertTrue(all(i > last_idle for i, c in enumerate(self.commands) if c in self.runner_deletes()))
+
+    def test_unsupported_host_is_isolated_in_a_runner_group_instead_of_by_labels(self):
+        self.host['supported'] = False
+        self.begin()
+        operation = self.state['host_operation']
+        self.assertEqual((operation['drain_mode'], operation['cordon_mode']), ('isolated_group', 'isolated_group'))
+        self.assertEqual(self.mutations(), [])  # nothing changed on GitHub under a label-only "cordon"
+        self.reconcile()
+        self.assertEqual(self.members, {r.runner_id for r in self.runners})
+        self.assertTrue(all(r.labels == ('self-hosted', 'Linux', 'X64') for r in self.live))
+        self.assertEqual(self.runner_deletes(), [])
+        self.reconcile()
+        self.assertEqual(self.live, [])
+
+    def test_unreachable_host_holds_the_drain_without_any_github_change(self):
+        self.host['reachable'] = False
+        self.begin()
+        for _ in range(2):
+            self.reconcile()
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(len(self.live), 8)
+        self.assertFalse(any(c[0] == 'gcloud' for c in self.commands))
         self.assertEqual(self.state['host_operation']['kind'], 'drain')
 
 

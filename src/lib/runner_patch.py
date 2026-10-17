@@ -911,9 +911,20 @@ def fetch_patch_from_config_repo(
     if repo_text is None:
         raise RuntimeError(f"No runner patch manifest found at {resolved_config_repo}:{repo_path}@{commit_sha}")
     repo_dict = parse_manifest_text(repo_text)
+    # A declared repository must be the target (case-insensitively, as the dashboard validator requires): a
+    # manifest naming another repository is never returned as this repository's patch.
+    for source, manifest in (("defaults.yaml", defaults_dict), (repo_path, repo_dict)):
+        declared = manifest.get("repository") if isinstance(manifest, dict) else None
+        if declared in (None, ""):
+            continue
+        if not isinstance(declared, str) or declared.lower() != target_repository.lower():
+            raise ValueError(f"{resolved_config_repo}:{source}@{commit_sha} declares repository {declared!r}, "
+                             f"not {target_repository!r}")
     merged = merge_patch_dicts(defaults_dict, repo_dict)
     if not merged.get("repository"):
         merged["repository"] = target_repository
+    if str(merged["repository"]).lower() != target_repository.lower():
+        raise ValueError(f"Effective runner patch names repository {merged['repository']!r}, not {target_repository!r}")
     return validate_patch_dict(merged, source_commit=commit_sha, source_branch=default_branch)
 
 
@@ -1064,11 +1075,14 @@ def render_patch_receipt_commands(patch: RunnerPatch) -> list[str]:
 @dataclass(frozen=True)
 class HostPatchReceipt:
     """What a host's patch state proves. ``manifest`` is the last completed (or legacy) patch, None for none;
-    ``proof`` is True only for a completion receipt from the current boot with no pending attempt."""
+    ``proof`` is True only for a completion receipt from the current boot with no pending attempt.
+    ``pending_sha256`` names the attempt in the host's pending marker (``unknown`` when unreadable, empty when
+    there is none): its partial effects are on the host too (see classify_patch_diff)."""
 
     manifest: dict[str, Any] | None
     proof: bool
     detail: str
+    pending_sha256: str = ""
 
 
 def parse_patch_receipt(output: str) -> HostPatchReceipt:
@@ -1088,8 +1102,10 @@ def parse_patch_receipt(output: str) -> HostPatchReceipt:
 
     state, pending = decode("state"), decode("pending")
     problems: list[str] = []
+    pending_sha = ""
     if pending is not None:
         sha = pending.get("pending_patch_sha256") if isinstance(pending, dict) else None
+        pending_sha = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha) else "unknown"
         problems.append(f"an attempt to apply patch {str(sha or 'unknown')[:12]} has not completed")
     manifest: dict[str, Any] | None = None
     detail = "no patch receipt on the host"
@@ -1110,7 +1126,7 @@ def parse_patch_receipt(output: str) -> HostPatchReceipt:
         problems.append("the receipt predates completion receipts, so it may name a patch that failed part way")
     else:
         raise ValueError("the host's patch state is not a receipt")
-    return HostPatchReceipt(manifest, not problems, "; ".join(problems) or detail)
+    return HostPatchReceipt(manifest, not problems, "; ".join(problems) or detail, pending_sha)
 
 
 def render_docker_run_args(patch: RunnerPatch | None) -> list[str]:
@@ -1215,13 +1231,55 @@ def host_capacity_problems(
     return violations, unknowns
 
 
-def classify_patch_diff(current_manifest: dict[str, Any] | None, target: RunnerPatch) -> str:
-    """Classify the transition from a deployed manifest to target into noop, hot_patch, recreate_containers, or replace_vm."""
+def destructive_patch_changes(current: RunnerPatch, target: RunnerPatch) -> list[str]:
+    """What moving from ``current`` (applied) to ``target`` would have to UNDO on the host or in its containers.
+
+    The live script only installs and writes; it never uninstalls a package, deletes a file or directory, resets
+    a sysctl, or reverses a script. So a host can hot-patch only to a target whose effects contain every applied
+    effect: a package, file path, sysctl key, or boot directory may be added, a file or sysctl rewritten in place
+    (the live script overwrites it whole), but none may be dropped, and a script that already ran must stay
+    byte-identical. ``hardware`` is excluded: labels are synced in full, and size/ISA are checked separately.
+    """
+    problems: list[str] = []
+    for section, cur, tgt in (("host", current.host, target.host), ("container", current.container, target.container)):
+        removed = [pkg for pkg in cur.apt_packages if pkg not in tgt.apt_packages]
+        if removed:
+            problems.append(f"{section}.apt_packages drops {', '.join(removed)}")
+        removed = sorted(set(cur.sysctl) - set(tgt.sysctl))
+        if removed:
+            problems.append(f"{section}.sysctl drops {', '.join(removed)}")
+        removed = sorted({f.path for f in cur.files} - {f.path for f in tgt.files})
+        if removed:
+            problems.append(f"{section}.files drops {', '.join(removed)}")
+    removed = [d for d in current.host.boot_mkdirs if d not in target.host.boot_mkdirs]
+    if removed:
+        problems.append(f"host.boot_mkdirs drops {', '.join(removed)}")
+    if current.host.boot_script.strip() and current.host.boot_script != target.host.boot_script:
+        problems.append("host.boot_script changes a script that already ran")
+    if current.container.dockerfile_run.strip() and current.container.dockerfile_run != target.container.dockerfile_run:
+        problems.append("container.dockerfile_run changes a script that already ran")
+    return problems
+
+
+def classify_patch_diff(current_manifest: dict[str, Any] | None, target: RunnerPatch, *,
+                        pending_sha256: str = "") -> str:
+    """Classify the transition from a deployed manifest to target into noop, hot_patch, recreate_containers, or replace_vm.
+
+    ``current_manifest`` is the last fully applied patch (None: the host never applied one). ``pending_sha256`` names
+    an attempt that started and never completed (empty: none; ``none``: a bootstrap that requested no patch). Its
+    partial effects are unknown unless it is the target itself, so anything else fails closed to ``replace_vm``.
+    Only additions and in-place rewrites are hot-patchable; any effect the target drops needs a new VM
+    (destructive_patch_changes), because neither the live script nor a container restart removes it.
+    """
+    if pending_sha256 and pending_sha256 not in ("none", target.patch_sha256):
+        return "replace_vm"
     if current_manifest is not None:
         current = validate_patch_dict(current_manifest)
         if current.patch_sha256 == target.patch_sha256:
             return "noop"
         if current.hardware.arch != target.hardware.arch or set(target.hardware.isa) - set(current.hardware.isa):
+            return "replace_vm"
+        if destructive_patch_changes(current, target):
             return "replace_vm"
         if current.container.mounts != target.container.mounts:
             return "recreate_containers"

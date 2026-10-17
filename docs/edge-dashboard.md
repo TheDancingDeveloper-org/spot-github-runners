@@ -181,6 +181,11 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   before it runs the live script. A live patch that fails part-way leaves the host pending, so the
   preview never trusts the earlier applied record. That holds even after the desired patch reverts to
   the earlier one. Refused live patches write no metadata.
+- After `LIVE_PATCH_APPLIED`, the live patch syncs the runners' GitHub labels first. Only then does it
+  write the applied keys and remove the pending keys. When the label sync fails, the host stays pending,
+  and `--patch-live` again re-applies the patch and retries the sync. A `--patch-live` run on a host that's
+  already at the patch also syncs its labels before it records the patch. A dashboard hot-patch syncs
+  the labels of each `noop` host too. When that sync fails, the host's result is `failed`.
 - On the host, the patch steps first write the pending marker `/var/lib/gha-runner-patch/pending.json`.
   Only after every step succeeds do they write the completion receipt `state.json`, with an atomic
   rename, and then remove the marker. For a live patch, the steps include the image build and every
@@ -202,6 +207,14 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   `hardware.min_vcpu`, `hardware.min_ram_gib`, the architecture, and the CPU platform for `hardware.isa`. A
   host that can't meet them is `replace_vm` with the reason, and a host whose capacity is unknown is
   `unknown`. The hot-patch executor and `--patch-live` refuse such hosts before they change anything.
+- The live script only installs and writes. It never removes a package, file, directory, or sysctl
+  setting, and it can't undo a script that already ran. So a target that drops anything the applied patch
+  has is `replace_vm`, and the reason names what it drops. A target can still add packages, files,
+  directories, and sysctl keys, and rewrite a file or sysctl value in place. It can't change a non-empty
+  `host.boot_script` or `container.dockerfile_run`. The same applies to a revert to an earlier patch.
+  When the host's pending marker names an attempt at another patch that never completed, that attempt's
+  partial changes are unknown, so the host is `replace_vm` too. `--patch-live` refuses such hosts before
+  it changes anything, and that includes pending metadata that names another patch.
 - The preview then classifies each host from its recorded manifest, after checking it against the recorded
   sha256. Hosts provisioned before patch recording show as `unknown`, with a reason. They stay that way
   until they're reprovisioned or hot-patched once with `--patch-live`. A host with a pending patch is

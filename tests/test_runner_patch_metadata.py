@@ -477,8 +477,9 @@ class AdoptionOwnershipTests(unittest.TestCase):
 
 
 class LivePatchMetadataTests(unittest.TestCase):
-    def run_live(self, receipt, script_output, pending="", receipt_text=None, observed=None):
-        args = args_for(TARGET, "--patch-live")
+    def run_live(self, receipt, script_output, pending="", receipt_text=None, observed=None, sync_error=None,
+                 target=TARGET):
+        args = args_for(target, "--patch-live")
         vm = runner_fleet.GceVm(args.instance_name, "us-central1-a", "RUNNING", "c4d-standard-32", True,
                                 instance_id="1", cpu_platform="AMD Turin", patch_pending_sha256=pending,
                                 last_start_timestamp=BOOT_TS)
@@ -492,9 +493,15 @@ class LivePatchMetadataTests(unittest.TestCase):
 
         cloud = GcloudRecorder(respond)
         listing = [[vm]] + [[later] for later in (observed or [vm] * 3)]
+
+        def sync(_args):
+            cloud.calls.append(["github", "sync-labels"])  # ordered among the gcloud calls
+            if sync_error is not None:
+                raise sync_error
+
         with unittest.mock.patch("lib.runner_manager.list_gcloud_vms", side_effect=listing), \
                 unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
-                unittest.mock.patch("lib.runner_manager.sync_runner_labels"), \
+                unittest.mock.patch("lib.runner_manager.sync_runner_labels", side_effect=sync), \
                     unittest.mock.patch("lib.runner_manager.runner_label_sync_plan"):
             try:
                 result = manager.apply_live_patch(args, "us-central1-a")
@@ -546,7 +553,80 @@ class LivePatchMetadataTests(unittest.TestCase):
         done = apply_metadata_writes(failed, cloud)
         self.assertEqual(runner_fleet.patch_record_from_gce_item(done)["patch_pending_sha256"], "")
         self.assertEqual(preview(done, TARGET).classification, "noop")
-        self.assertEqual(preview(done, OLD).classification, "hot_patch")
+        # Reverting to A would have to uninstall B's container package, which the live script never does.
+        reverted = preview(done, OLD)
+        self.assertEqual(reverted.classification, "replace_vm")
+        self.assertIn("container.apt_packages drops ripgrep", reverted.detail)
+
+    def test_failed_label_sync_keeps_the_live_patch_pending_and_a_retry_syncs(self):
+        """PR #44 round 5 P2: a label sync that fails after LIVE_PATCH_APPLIED records nothing and clears nothing, so
+        the host stays pending (unknown in the preview) and the retry re-applies and syncs the labels."""
+        labeled = validate_patch_dict({**BASE, "hardware": {"extra_labels": ["new-label"]},
+                                       "container": {"apt_packages": ["ripgrep"]}})
+        host = gce_item("oxidex-runners-1", sha=OLD.patch_sha256, manifest=canonical_json(OLD))
+        result, cloud = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{labeled.patch_sha256}\n", target=labeled,
+                                      sync_error=RuntimeError("GitHub labels for oxidex-1 are [], expected ['new-label']"))
+        self.assertIsInstance(result, RuntimeError)
+        self.assertIn("GitHub labels", str(result))
+        self.assertEqual(live_sequence(cloud), ["read-receipt", "write-pending", "live-script"])
+        self.assertIn(["github", "sync-labels"], cloud.calls)
+        failed = apply_metadata_writes(host, cloud)
+        record = runner_fleet.patch_record_from_gce_item(failed)
+        self.assertEqual(record["patch_pending_sha256"], labeled.patch_sha256)
+        self.assertEqual(record["patch_sha256"], OLD.patch_sha256)  # never advertised as current
+        [got] = pc.classify_hosts(compute_api.runner_host_records([failed]), labeled, pc.UnavailableHotPatchExecutor())
+        self.assertEqual(got.classification, "unknown")
+        # The retry: the host's receipt already names the patch, but the pending record forces a live re-apply, and
+        # the labels are synced before the applied record is written and the pending record removed.
+        result, cloud = self.run_live(labeled, f"LIVE_PATCH_APPLIED:{labeled.patch_sha256}\n", target=labeled,
+                                      pending=record["patch_pending_sha256"])
+        self.assertEqual(result, "hot_patch")
+        self.assertEqual(self.steps(cloud), ["read-receipt", "write-pending", "live-script", "sync-labels", "write-applied",
+                                    "label", "clear-pending"])
+        done = apply_metadata_writes(failed, cloud)
+        self.assertEqual(runner_fleet.patch_record_from_gce_item(done)["patch_pending_sha256"], "")
+        self.assertEqual(runner_fleet.patch_record_from_gce_item(done)["patch_sha256"], labeled.patch_sha256)
+
+    @staticmethod
+    def steps(cloud):
+        """live_sequence with the GitHub label sync in its place among the gcloud calls."""
+        names = []
+        for c in cloud.calls:
+            one = GcloudRecorder()
+            one.calls = [c]
+            names.extend(["sync-labels"] if c == ["github", "sync-labels"] else live_sequence(one))
+        return names
+
+    def test_verified_noop_reconciles_labels_before_recording(self):
+        result, cloud = self.run_live(TARGET, "")
+        self.assertEqual(result, "noop")
+        self.assertEqual(self.steps(cloud), ["read-receipt", "sync-labels", "write-applied", "label"])
+        result, cloud = self.run_live(TARGET, "", sync_error=RuntimeError("labels unavailable"))
+        self.assertIsInstance(result, RuntimeError)
+        self.assertEqual(live_sequence(cloud), ["read-receipt"])  # nothing recorded on a failed reconcile
+
+    def test_live_patch_refuses_a_target_that_drops_applied_changes(self):
+        """PR #44 round 5 P1: reverting TARGET's container package to OLD needs a new VM; nothing is touched."""
+        result, cloud = self.run_live(TARGET, "", target=OLD)
+        self.assertIsInstance(result, RuntimeError)
+        self.assertIn("cannot undo applied changes (container.apt_packages drops ripgrep)", str(result))
+        self.assertIn("rolling VM replacement", str(result))
+        self.assertEqual(live_sequence(cloud), ["read-receipt"])
+        self.assertNotIn(["github", "sync-labels"], cloud.calls)
+
+    def test_live_patch_refuses_over_an_unfinished_attempt_at_another_patch(self):
+        other = validate_patch_dict({**BASE, "host": {"apt_packages": ["curl"]}})
+        for name, kwargs in (("host pending marker", {"receipt_text": receipt_output(OLD, pending=other)}),
+                             ("pending metadata", {"pending": other.patch_sha256})):
+            with self.subTest(name):
+                result, cloud = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n", **kwargs)
+                self.assertIsInstance(result, RuntimeError)
+                self.assertIn(f"an attempt to apply patch {other.patch_sha256[:12]} never completed", str(result))
+                self.assertEqual(live_sequence(cloud), ["read-receipt"])
+        # The same attempt at the target itself is re-applied, as before.
+        result, _ = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n",
+                                  receipt_text=receipt_output(OLD, pending=TARGET), pending=TARGET.patch_sha256)
+        self.assertEqual(result, "hot_patch")
 
     def test_oversized_pending_manifest_is_replaced_by_a_placeholder(self):
         big = validate_patch_dict({**BASE, "host": {"files": [{"path": "/etc/big", "content": "x" * 70_000}]}})

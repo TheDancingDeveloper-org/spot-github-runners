@@ -186,9 +186,9 @@ def host_cordon_token(kind: str, vm: Any) -> str:
 def log_cordon_hold(vm: GceVm, state: str, detail: dict) -> None:
     reason = detail.get('reason') or state
     if state == 'unsupported':
-        LOG.error('Retirement held for %s: the host cannot refuse new jobs at job start (%s). Repository '
-                  'runners keep their built-in labels, so it stays in service, undrained and registered, '
-                  'until it is replaced by a host whose runners run the cordon-aware job-started hook',
+        LOG.error('Retirement held for %s: the host cannot refuse new jobs at job start (%s). Runners outside '
+                  'an isolated runner group keep their built-in labels, so it stays in service, undrained and '
+                  'registered, until it is replaced by a host whose runners run the cordon-aware job-started hook',
                   vm_details(vm), reason)
     elif state == 'busy':
         LOG.info('Drain waits for running jobs on cordoned host %s (%s Runner.Worker process(es))',
@@ -303,14 +303,16 @@ def drain_runners(operation, vm, args, state, save, assigned, mutation_guard=Non
     if repo_target:
         legacy_group = False
         operation['drain_mode'] = 'label_only'
-        operation['cordon_mode'] = 'host'
     else:
         legacy_group = operation.get('cordon_mode') == 'isolated_group' or operation.get('drain_mode') != 'label_only'
         if legacy_group:
             operation.setdefault('drain_group_name', f'spot-drain-{vm.name}-{vm.instance_id}')
             operation['cordon_mode'] = 'isolated_group'
-        else:
-            operation['cordon_mode'] = 'labels'
+    # Label removal alone never isolates: built-in labels (self-hosted, linux, X64) stay schedulable. Every drain
+    # outside an isolated runner group (repository targets, and org label_only drains) is host-cordoned instead.
+    host_cordoned = not legacy_group
+    if host_cordoned:
+        operation['cordon_mode'] = 'host'
     path = isolated_group(operation, target, save, mutation_guard) if legacy_group else None
     recorded = operation.setdefault('runner_names', {})
     done = set(operation.get('deregistered_runner_ids', []))
@@ -327,16 +329,24 @@ def drain_runners(operation, vm, args, state, save, assigned, mutation_guard=Non
         if runner.runner_id in done:
             raise RuntimeError('A deregistered runner appeared again during drain')
     cordon = None
-    if repo_target and assigned:
+    if host_cordoned and assigned:
         # Cordon on the host BEFORE any GitHub change, and re-verify it on every observation: only a
         # cordon already in place with no Runner.Worker on the host proves that no job can still run.
-        # An unsupported host keeps its labels and registrations: retirement is held, not forced.
+        # An unsupported host keeps its labels and registrations: retirement is held, not forced. An org
+        # drain can still isolate such a host GitHub-side, so it switches to an isolated runner group instead.
         if not operation.get('host_cordon_token'):
             operation['host_cordon_token'] = host_cordon_token('drain', vm)
             save()
         token = operation['host_cordon_token']
         cordon, detail = cordon_runner_host(vm, args, token, [runner.name for runner in assigned],
                                             mutation_guard)
+        if cordon == 'unsupported' and not repo_target:
+            operation.update(drain_mode='isolated_group', cordon_mode='isolated_group', runners_isolated=False)
+            operation.setdefault('drain_group_name', f'spot-drain-{vm.name}-{vm.instance_id}')
+            save()
+            LOG.warning('Host %s cannot refuse jobs at job start (%s); isolating its org runners in a runner group '
+                        'instead', vm_details(vm), detail.get('reason') or cordon)
+            return False
         if cordon not in ('placed', 'busy', 'idle'):
             log_cordon_hold(vm, cordon, detail)
             return False
@@ -377,7 +387,7 @@ def drain_runners(operation, vm, args, state, save, assigned, mutation_guard=Non
         return False
     if not jobs_finished(vm, state, target):
         return False
-    if assigned and repo_target and cordon != 'idle':
+    if assigned and host_cordoned and cordon != 'idle':
         log_cordon_hold(vm, cordon or 'unverified', {})
         return False
     if assigned:
