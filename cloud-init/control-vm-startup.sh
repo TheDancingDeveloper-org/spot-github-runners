@@ -97,11 +97,19 @@ image_ref_pinned() {
   [[ "$ref" != *:latest ]] || return 1
 }
 
-# Scheme and host of the public dashboard URL (https://host[:port]), with any path removed.
+# Origin (https://host[:port]) of the public dashboard URL. The URL must be https:// plus a DNS host name, an
+# optional port 1-65535 without leading zeros and at most a trailing slash: no path, query, fragment or user info. Mirrors
+# public_origin() in src/lib/control_vm.py, which refuses the same values before a VM is created.
 public_origin_of() {
-  local rest="${1#https://}"
-  rest="${rest%%/*}"
-  [[ "$rest" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || return 1
+  local url="$1" rest port label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+  [[ "$url" == https://* ]] || return 1
+  rest="${url#https://}"
+  rest="${rest%/}"
+  [[ "$rest" =~ ^($label(\.$label)*)(:([1-9][0-9]{0,4}))?$ ]] || return 1
+  port="${BASH_REMATCH[6]}"
+  if [[ -n "$port" ]]; then
+    ((10#$port >= 1 && 10#$port <= 65535)) || return 1
+  fi
   printf 'https://%s' "$rest"
 }
 
@@ -318,7 +326,7 @@ main() {
   config_repo_ok "$CONFIG_REPO" || fail "dashboard-config-repo must be owner/repo"
   CONTROLLED_TARGETS="$(controlled_targets_csv "$CONTROLLED_TARGETS_METADATA")" \
     || fail "dashboard-controlled-targets must be ;-separated organizations or owner/repo targets"
-  PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url has a malformed host"
+  PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url must be https://host[:port] without a path, query, or user info"
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     [[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"
   else

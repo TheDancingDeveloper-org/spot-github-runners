@@ -448,6 +448,76 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual((errors, patch.host.apt_packages), ([], ("jq",)))
 
 
+ARM_PATH = "repos/swack-tools/arm-repo.yaml"
+ARM = json.dumps({"schema": "spot-runner-patch-v1", "hardware": {"arch": "arm64", "extra_labels": ["arm"]}})
+# Valid on its own, but an x86-only ISA requirement that the arm64 override above can't inherit.
+X86_ONLY_DEFAULTS = json.dumps({"schema": "spot-runner-patch-v1", "hardware": {"isa": ["avx512-vbmi2"]}})
+
+
+class DefaultsOverrideCompatibilityTests(unittest.TestCase):
+    """PR #44 review: a defaults.yaml save checks every repository override merged with the new defaults."""
+
+    def fake(self):
+        fake = FakeGitHubRepo()
+        fake.files[HEAD][ARM_PATH] = ARM
+        return fake
+
+    def test_incompatible_defaults_name_the_repositories_and_open_no_pull_request(self):
+        fake = self.fake()
+        with self.assertRaises(pc.InvalidRequestError) as ctx:
+            console(fake).save("defaults.yaml", X86_ONLY_DEFAULTS, HEAD, idempotency_key="defaults-key-01")
+        body = ctx.exception.body
+        self.assertEqual(body["repositories"], ["swack-tools/arm-repo"])
+        [error] = body["errors"]
+        self.assertEqual(error["path"], ARM_PATH)
+        self.assertTrue(error["field"].startswith(ARM_PATH + ":"))
+        self.assertIn("swack-tools/arm-repo would be invalid with these defaults", error["message"])
+        self.assertIn("requires arch", error["message"])
+        self.assertEqual(fake.writes(), [])
+        self.assertEqual(fake.prs, [])
+
+    def test_compatible_defaults_check_every_override_at_the_base_and_save(self):
+        fake = self.fake()
+        new_defaults = DEFAULTS.replace("jq", "curl")
+        result = console(fake).save("defaults.yaml", new_defaults, HEAD, idempotency_key="defaults-key-02")
+        self.assertEqual(result["status"], "pull_request_opened")
+        read = {c[1] for c in fake.calls if c[0] == "GET" and "/contents/repos/" in c[1]}
+        self.assertEqual(read, {f"repos/{REPO}/contents/{OXIDEX_PATH}?ref={HEAD}",
+                                f"repos/{REPO}/contents/{ARM_PATH}?ref={HEAD}"})
+        self.assertIn(("GET", f"repos/{REPO}/git/trees/{HEAD}?recursive=1", None), fake.calls)
+
+    def test_listing_or_reading_failures_are_retryable_never_valid(self):
+        failures = [("GET", f"repos/{REPO}/git/trees", 500), ("GET", f"repos/{REPO}/git/trees", 403),
+                    ("GET", f"repos/{REPO}/contents/{ARM_PATH}", 502),
+                    ("GET", f"repos/{REPO}/contents/{ARM_PATH}", 404)]
+        for method, route, status in failures:
+            with self.subTest(route=route, status=status):
+                fake = self.fake()
+                fake.fail[(method, route)] = status
+                with self.assertRaises(pc.GitHubRestError) as ctx:
+                    console(fake).save("defaults.yaml", DEFAULTS.replace("jq", "curl"), HEAD,
+                                       idempotency_key="defaults-key-03")
+                self.assertIs(ctx.exception.body.get("retry_same_key"), True)
+                self.assertEqual(fake.writes(), [])
+
+    def test_repository_saves_do_not_scan_other_overrides(self):
+        fake = self.fake()
+        console(fake).save(OXIDEX_PATH, OXIDEX.replace("ripgrep", "fd-find"), HEAD, idempotency_key="repo-key-01")
+        self.assertFalse(any(c[0] == "GET" and ARM_PATH in c[1] for c in fake.calls))
+
+    def test_validate_reports_incompatible_overrides(self):
+        fake = self.fake()
+        body = console(fake).validate("defaults.yaml", X86_ONLY_DEFAULTS)
+        self.assertFalse(body["valid"])
+        self.assertEqual([e["repository"] for e in body["errors"]], ["swack-tools/arm-repo"])
+        self.assertTrue(console(self.fake()).validate("defaults.yaml", DEFAULTS)["valid"])
+        broken = self.fake()
+        broken.fail[("GET", f"repos/{REPO}/git/trees")] = 500
+        body = console(broken).validate("defaults.yaml", DEFAULTS)
+        self.assertIn("Checked without the repository manifests", body["warning"])
+        self.assertEqual(fake.writes(), [])
+
+
 class ConsoleTests(unittest.TestCase):
     def test_list_and_load_resolve_default_branch_and_head(self):
         fake = FakeGitHubRepo()

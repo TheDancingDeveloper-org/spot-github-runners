@@ -1215,18 +1215,21 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
         or getattr(args, "target", None) is not None
         or getattr(args, "price_rotation", False)
     )
-    if overpriced and use_rotation:
-        # A patched host this controller cannot relaunch with its patch is skipped, not allowed to
-        # stall the whole price path: restoration and normal scaling must keep running.
-        rotatable = []
+    if overpriced:
+        # A patched host this controller cannot relaunch with its patch is skipped on both paths, not
+        # allowed to stall the whole price path: restoration and normal scaling must keep running.
+        # Delete-first eviction needs the hold as much as rotation does: its replacement comes from
+        # scale_up, which would launch without the host's patch.
+        replaceable = []
         for candidate in overpriced:
             why = patched_rotation_hold(candidate, args)
             if why:
-                LOG.warning("Make-before-break rotation held for %s: %s; keeping it running over the cap",
+                LOG.warning("%s held for %s: %s; keeping it running over the cap",
+                            "Make-before-break rotation" if use_rotation else "Delete-first price eviction",
                             vm_details(candidate), why)
             else:
-                rotatable.append(candidate)
-        overpriced = rotatable
+                replaceable.append(candidate)
+        overpriced = replaceable
     if overpriced:
         vm = overpriced[0]
         if use_rotation:
@@ -2978,11 +2981,30 @@ def manage_control_vm(args: argparse.Namespace, state: dict, state_path: Path):
 
     Control VMs (``spot-control-*``) are separate from runner hosts: runner inventory, price
     rotation, and scaling never list, rotate, or delete them.
+
+    Several --target controllers can manage the one control VM pair of a project, so each check takes the
+    project-wide control VM lock (skipping the check while another controller holds it) and works on the
+    project-scoped control VM state, never on this controller's own state file. Control VM state saved in
+    this controller's state file before project scoping is moved to the project state first.
     """
-    from .control_vm import autoscaler_tick
-    if getattr(args, 'dry_run', False):
-        return autoscaler_tick(args, copy.deepcopy(state), lambda: None)
-    return autoscaler_tick(args, state, lambda: write_scale_state(state_path, state))
+    from .control_vm import ControlStateConflict, ProjectControlLock, autoscaler_tick
+    dry_run = getattr(args, 'dry_run', False)
+    try:
+        with ProjectControlLock(args.project, getattr(args, 'control_state_dir', None)) as project:
+            if project is None:
+                LOG.info('Control VM management skipped this check: another controller holds the %s control VM '
+                         'lock', args.project)
+                return None
+            if dry_run:
+                project.adopt(copy.deepcopy(state), state_path, persist=False)
+                return autoscaler_tick(args, copy.deepcopy(project.state), lambda: None)
+            if project.adopt(state, state_path, persist=True):
+                write_scale_state(state_path, state)
+            return autoscaler_tick(args, project.state, project.save)
+    except (ControlStateConflict, OSError, ValueError) as exc:
+        # Control VM failures never stop runner management.
+        LOG.error('Control VM management failed this check: %s', exc)
+        return None
 
 
 def run_controller(args: argparse.Namespace) -> int:

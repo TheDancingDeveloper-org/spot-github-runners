@@ -239,8 +239,7 @@ class ControlConfig:
             problems.append("set a digest-pinned dashboard image or a 40-hex dashboard source commit")
         if not _REPO_RE.match(self.dashboard_repo):
             problems.append("dashboard repository must be owner/name")
-        if not self.public_url.startswith("https://") or any(c in self.public_url for c in " ,\n\t"):
-            problems.append("dashboard public URL must be an https:// URL without spaces or commas")
+        problems.extend(public_url_problems(self.public_url))
         if not _ID_RE.match(self.cloudflare_account_id or ""):
             problems.append(f"{edge_state.ENV_ACCOUNT_ID} is missing or malformed")
         if not _ID_RE.match(self.cloudflare_kv_namespace_id or ""):
@@ -267,6 +266,62 @@ def session_not_before_problems(value: str, now: float | None = None) -> list[st
         return [f"{ENV_SESSION_NOT_BEFORE} must be a Unix timestamp in seconds"]
     if int(value) > (time.time() if now is None else now) + SESSION_NOT_BEFORE_SKEW_SECONDS:
         return [f"{ENV_SESSION_NOT_BEFORE} must not be in the future"]
+    return []
+
+
+_DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_PUBLIC_AUTHORITY_RE = re.compile(rf"({_DNS_LABEL}(?:\.{_DNS_LABEL})*)(?::([1-9][0-9]{{0,4}}))?")
+
+
+def public_origin(url: str) -> str | None:
+    """``https://host[:port]`` for a valid dashboard public URL, else None.
+
+    The URL must be ``https://`` plus a DNS host name, an optional port 1-65535 without leading zeros (the
+    origin must equal the browser's ``Origin`` header) and at most a trailing ``/``: no path, query, fragment or
+    userinfo. The startup script derives DASHBOARD_PUBLIC_ORIGIN and the OAuth callback from it and refuses
+    anything else, so a VM created with another value would never come up. Two independent checks must both
+    pass: the parsed URL (``urllib.parse``) and the exact authority shape that ``public_origin_of`` in
+    cloud-init/control-vm-startup.sh accepts.
+    """
+    authority = _public_authority(url)
+    return f"https://{authority}" if authority is not None and _public_url_parts_ok(url) else None
+
+
+def _public_authority(url: Any) -> str | None:
+    """The ``host[:port]`` the startup script's ``public_origin_of`` accepts, else None (mirrors it exactly)."""
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return None
+    authority = url[len("https://"):]
+    authority = authority[:-1] if authority.endswith("/") else authority
+    match = _PUBLIC_AUTHORITY_RE.fullmatch(authority)
+    if not match or (match.group(2) is not None and not 1 <= int(match.group(2)) <= 65535):
+        return None
+    return authority
+
+
+def _public_url_parts_ok(url: Any) -> bool:
+    """The parsed URL is https with a host, an optional valid port and nothing else (no userinfo, path, query,
+    or fragment)."""
+    import urllib.parse
+
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # noqa: B018 - raises ValueError for a port outside 0-65535 or a non-numeric one
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and bool(parts.hostname) and parts.username is None and parts.password is None
+            and parts.port != 0 and parts.path in ("", "/")
+            # Literal checks, so an empty query ("?") or fragment ("#") is refused too.
+            and "?" not in url and "#" not in url)
+
+
+def public_url_problems(value: str) -> list[str]:
+    """Problems with SPOT_DASHBOARD_PUBLIC_URL, checked before a control VM is created."""
+    if public_origin(value) is None:
+        return ["dashboard public URL must be https://host[:port] with an optional trailing slash and no path, "
+                "query, fragment or user info"]
     return []
 
 
@@ -1994,6 +2049,129 @@ def autoscaler_tick(args: Any, state: dict, save: Callable[[], None], *,
 
 
 # --------------------------------------------------------------------------------------------
+# Project-scoped control VM state
+# --------------------------------------------------------------------------------------------
+#
+# The control VM slots (spot-control-a/b) are fixed per project, but several runner controllers (one per
+# --target, each with its own --state-file) can run --manage-control-vm in one project. Each check therefore
+# takes one project-wide lock, and the control VM lifecycle state (transition, retained disks, history) lives in
+# one project-scoped file that whichever controller holds the lock reads and writes. A transition that one
+# controller started and then crashed in is resumed by the next controller that gets the lock.
+
+ENV_CONTROL_STATE_DIR = "SPOT_CONTROL_STATE_DIR"
+_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}$")
+
+
+class ControlStateConflict(RuntimeError):
+    """A controller state file holds control VM state that differs from, and can't replace, the project state."""
+
+
+def default_control_state_dir(env: Mapping[str, str] | None = None) -> Path:
+    env = os.environ if env is None else env
+    configured = str(env.get(ENV_CONTROL_STATE_DIR, "") or "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_STATE_FILE.parent
+
+
+def project_control_paths(project: str, directory: Path | str | None = None) -> tuple[Path, Path]:
+    """(state file, lock file) of a project's control VM lifecycle."""
+    if not isinstance(project, str) or not _PROJECT_ID_RE.match(project):
+        raise ValueError(f"invalid GCP project id for control VM state: {project!r}")
+    base = Path(directory).expanduser() if directory else default_control_state_dir()
+    name = f"control-vm-{project.replace(':', '__')}"
+    return base / f"{name}.json", base / f"{name}.lock"
+
+
+def _must_preserve(cstate: Any) -> bool:
+    """Control VM state that can't be dropped: an in-progress transition or boot disks kept for recovery."""
+    return isinstance(cstate, dict) and bool(cstate.get("transition") or cstate.get("retained_disks"))
+
+
+class ProjectControlState:
+    """The project's control VM state file, read and written only while the project lock is held."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.state: dict[str, Any] = {}
+
+    def load(self) -> "ProjectControlState":
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            data = {}
+        if not isinstance(data, dict) or not isinstance(data.get(STATE_KEY, {}), dict):
+            # Never start over from defaults: an unreadable record could hide an in-progress transition.
+            raise ControlStateConflict(f"control VM state {self.path} is not a JSON object; repair it by hand")
+        self.state = data
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=self.path.parent, delete=False, encoding="utf-8") as temp:
+            json.dump(self.state, temp)
+            temp.flush()
+            os.fsync(temp.fileno())
+        Path(temp.name).replace(self.path)
+
+    def adopt(self, controller_state: dict, source: Path | str, *, persist: bool) -> bool:
+        """Move control VM state saved in a controller's own state file (before project scoping) into this one.
+
+        Returns True when ``controller_state`` changed and its owner must write it (after this file was written
+        when ``persist``). A copy equal to the project state, or one holding nothing that must be kept, is
+        dropped. Raises ControlStateConflict when both hold state that must be kept and they differ.
+        """
+        if STATE_KEY not in controller_state:
+            return False
+        legacy = controller_state[STATE_KEY]
+        current = self.state.get(STATE_KEY)
+        if legacy == current or not _must_preserve(legacy):
+            controller_state.pop(STATE_KEY)
+            if legacy and legacy != current:
+                LOG.info("Control VM: dropped idle control VM state from %s; %s is authoritative", source, self.path)
+            return True
+        if _must_preserve(current):
+            raise ControlStateConflict(
+                f"{source} and {self.path} both hold an in-progress control VM transition or retained disks, and "
+                "they differ; resolve which one is current before this controller manages the control VM")
+        self.state[STATE_KEY] = copy.deepcopy(legacy)
+        if persist:
+            self.save()
+        controller_state.pop(STATE_KEY)
+        LOG.warning("Control VM: moved control VM state from %s to the project state %s", source, self.path)
+        return True
+
+
+class ProjectControlLock:
+    """Non-blocking exclusive project lock; ``__enter__`` returns the loaded ProjectControlState, or None when
+    another controller holds the lock."""
+
+    def __init__(self, project: str, directory: Path | str | None = None) -> None:
+        self.state_path, self.lock_path = project_control_paths(project, directory)
+        self._handle: Any = None
+
+    def __enter__(self) -> ProjectControlState | None:
+        import fcntl
+
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return None
+        self._handle = handle
+        try:
+            return ProjectControlState(self.state_path).load()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._handle is not None:
+            self._handle.close()  # Closing the descriptor releases the flock.
+            self._handle = None
+
+
+# --------------------------------------------------------------------------------------------
 # Command-line interface (src/control_vm.py)
 # --------------------------------------------------------------------------------------------
 
@@ -2007,7 +2185,11 @@ def args_parser() -> "argparse.ArgumentParser":
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--project", default=DEFAULT_PROJECT)
     common.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE,
-                        help="Controller state shared with the autoscaler (default: %(default)s)")
+                        help="Autoscaler state file whose control VM state, saved before project scoping, is "
+                             "moved to the project state file (default: %(default)s)")
+    common.add_argument("--control-state-dir", type=Path, default=None,
+                        help=f"Directory of the project-scoped control VM state and lock (or "
+                             f"{ENV_CONTROL_STATE_DIR}; default: {DEFAULT_STATE_FILE.parent})")
     common.add_argument("--regions", help="Comma-separated allowed regions (or SPOT_CONTROL_REGIONS)")
     common.add_argument("--max-daily-usd", type=Decimal,
                         help="Daily compute plus boot-disk cap per control VM (or SPOT_CONTROL_MAX_DAILY_USD)")
@@ -2062,12 +2244,11 @@ def main(argv: Sequence[str] | None = None, *, manager_factory: Callable[..., Co
     load_env(ROOT / ".env")
     from .spot_runner_autoscaler import read_scale_state, write_scale_state
 
-    state_path = args.state_file.expanduser()
+    legacy_path = args.state_file.expanduser()
     apply = bool(getattr(args, "apply", False))
     factory = manager_factory or build_manager
 
-    def run(state: dict) -> int:
-        save = (lambda: write_scale_state(state_path, state)) if apply else (lambda: None)
+    def run(state: dict, save: Callable[[], None]) -> int:
         manager = factory(args.project, state, save, **_overrides(args))
         if args.command == "status":
             print(json.dumps(manager.status(manager.observe(want_offers=True)), indent=2, sort_keys=True,
@@ -2080,14 +2261,30 @@ def main(argv: Sequence[str] | None = None, *, manager_factory: Callable[..., Co
         return 0
 
     if not apply:
-        # Read-only: work on a copy and never write the state file.
-        return run(copy.deepcopy(read_scale_state(state_path)))
+        # Read-only: plan on a copy that also folds in unmigrated controller state, and write nothing.
+        state_path, _lock = project_control_paths(args.project, args.control_state_dir)
+        project = ProjectControlState(state_path).load()
+        project.adopt(copy.deepcopy(read_scale_state(legacy_path)), legacy_path, persist=False)
+        return run(copy.deepcopy(project.state), lambda: None)
     import fcntl
 
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    with state_path.with_suffix(state_path.suffix + ".lock").open("a") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(f"Another controller owns state {state_path}; stop it or wait") from exc
-        return run(read_scale_state(state_path))
+    with ProjectControlLock(args.project, args.control_state_dir) as project:
+        if project is None:
+            raise RuntimeError(f"Another controller is managing the control VM of project {args.project}; wait "
+                               "for its check to finish")
+        legacy = read_scale_state(legacy_path) if legacy_path.exists() else {}
+        if STATE_KEY in legacy:
+            # Moving state out of a controller's file needs that controller's lock; a running autoscaler keeps
+            # it and moves the state itself on its next check.
+            with legacy_path.with_suffix(legacy_path.suffix + ".lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    if _must_preserve(legacy.get(STATE_KEY)) and legacy.get(STATE_KEY) != project.state.get(STATE_KEY):
+                        raise RuntimeError(f"{legacy_path} still holds control VM state that its running controller "
+                                           "moves to the project state on its next check; wait for it") from exc
+                else:
+                    legacy = read_scale_state(legacy_path)
+                    if project.adopt(legacy, legacy_path, persist=True):
+                        write_scale_state(legacy_path, legacy)
+        return run(project.state, project.save)

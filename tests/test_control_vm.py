@@ -33,6 +33,18 @@ from lib.edge_state import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "cloud-init" / "control-vm-startup.sh"
+_CONTROL_STATE_DIR = tempfile.TemporaryDirectory()
+_CONTROL_STATE_ENV = patch.dict("os.environ", {cv.ENV_CONTROL_STATE_DIR: _CONTROL_STATE_DIR.name})
+
+
+def setUpModule():
+    # Never let a test read or write the operator's real project-scoped control VM state.
+    _CONTROL_STATE_ENV.start()
+
+
+def tearDownModule():
+    _CONTROL_STATE_ENV.stop()
+    _CONTROL_STATE_DIR.cleanup()
 IMAGE = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "a" * 64
 SECRET = "control-secret-for-tests"
 
@@ -2018,12 +2030,146 @@ class AutoscalerHookTests(unittest.TestCase):
 
     def test_autoscaler_dry_run_passes_a_copy(self):
         from lib import spot_runner_autoscaler as autoscaler
-        state = {"control_vm": {"transition": None}}
-        with patch("lib.control_vm.autoscaler_tick") as tick:
-            autoscaler.manage_control_vm(SimpleNamespace(dry_run=True), state, Path("/nonexistent/state.json"))
-        passed_state, save = tick.call_args[0][1], tick.call_args[0][2]
-        self.assertIsNot(passed_state, state)
-        save()  # No-op: must not try to write the nonexistent path.
+        state = {"control_vm": {"transition": {"id": "t", "step": "wait_health"}}}
+        with tempfile.TemporaryDirectory() as tmp, patch("lib.control_vm.autoscaler_tick") as tick:
+            autoscaler.manage_control_vm(SimpleNamespace(dry_run=True, project="proj", control_state_dir=tmp),
+                                         state, Path("/nonexistent/state.json"))
+            passed_state, save = tick.call_args[0][1], tick.call_args[0][2]
+            self.assertIsNot(passed_state, state)
+            # The plan sees the unmigrated transition, but nothing moves and nothing is written.
+            self.assertEqual(passed_state["control_vm"]["transition"]["id"], "t")
+            self.assertEqual(state, {"control_vm": {"transition": {"id": "t", "step": "wait_health"}}})
+            save()  # No-op: must not try to write the nonexistent path.
+            self.assertFalse(cv.project_control_paths("proj", tmp)[0].exists())
+
+
+class ProjectControlStateTests(unittest.TestCase):
+    """PR #44 review: one project-wide lock and state for every controller that manages the control VM."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.dir = Path(directory.name)
+
+    def args(self, **extra):
+        return SimpleNamespace(dry_run=False, project="proj", control_state_dir=str(self.dir), **extra)
+
+    def tick_with(self, state, state_path, record):
+        from lib import spot_runner_autoscaler as autoscaler
+
+        def tick(args, cstate, save):
+            record.append(copy.deepcopy(cstate))
+            cstate.setdefault("control_vm", {})["transition"] = {"id": f"t{len(record)}", "step": "wait_health"}
+            save()
+            return "planned"
+        with patch("lib.control_vm.autoscaler_tick", side_effect=tick):
+            return autoscaler.manage_control_vm(self.args(), state, state_path)
+
+    def test_second_controller_resumes_the_same_transition(self):
+        record = []
+        first, second = {}, {}
+        self.assertEqual(self.tick_with(first, self.dir / "a.json", record), "planned")
+        # A crash of the first controller leaves the transition in the project file, not in a.json.
+        self.assertNotIn("control_vm", first)
+        self.assertEqual(self.tick_with(second, self.dir / "b.json", record), "planned")
+        self.assertEqual(record[1]["control_vm"]["transition"]["id"], "t1")
+        project_file = cv.project_control_paths("proj", self.dir)[0]
+        self.assertEqual(json.loads(project_file.read_text())["control_vm"]["transition"]["id"], "t2")
+
+    def test_held_lock_skips_the_check(self):
+        import fcntl
+        from lib import spot_runner_autoscaler as autoscaler
+        _, lock_file = cv.project_control_paths("proj", self.dir)
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with lock_file.open("a") as held, patch("lib.control_vm.autoscaler_tick") as tick, \
+                self.assertLogs("spot_runner_autoscaler", "INFO") as logs:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIsNone(autoscaler.manage_control_vm(self.args(), {}, self.dir / "a.json"))
+        tick.assert_not_called()
+        self.assertIn("another controller holds the proj control VM lock", "\n".join(logs.output))
+        # Released: the next check runs.
+        record = []
+        self.assertEqual(self.tick_with({}, self.dir / "a.json", record), "planned")
+
+    def test_lock_is_held_while_the_tick_runs(self):
+        import fcntl
+        from lib import spot_runner_autoscaler as autoscaler
+        _, lock_file = cv.project_control_paths("proj", self.dir)
+        seen = []
+
+        def tick(args, cstate, save):
+            with lock_file.open("a") as other:
+                try:
+                    fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    seen.append("acquired")
+                except BlockingIOError:
+                    seen.append("held")
+        with patch("lib.control_vm.autoscaler_tick", side_effect=tick):
+            autoscaler.manage_control_vm(self.args(), {}, self.dir / "a.json")
+        self.assertEqual(seen, ["held"])
+
+    def test_unmigrated_transition_moves_to_the_project_state(self):
+        from lib import spot_runner_autoscaler as autoscaler
+        state_path = self.dir / "a.json"
+        legacy = {"idle_loops": 0, "control_vm": {"transition": {"id": "old", "step": "freeze"}}}
+        autoscaler.write_scale_state(state_path, legacy)
+        state = autoscaler.read_scale_state(state_path)
+        record = []
+        self.tick_with(state, state_path, record)
+        self.assertEqual(record[0]["control_vm"]["transition"]["id"], "old")  # resumed, not restarted
+        self.assertNotIn("control_vm", state)
+        self.assertNotIn("control_vm", json.loads(state_path.read_text()))
+
+    def test_conflicting_transitions_refuse_without_ticking(self):
+        from lib import spot_runner_autoscaler as autoscaler
+        project = cv.ProjectControlState(cv.project_control_paths("proj", self.dir)[0])
+        project.state = {"control_vm": {"transition": {"id": "theirs"}}}
+        project.save()
+        state = {"control_vm": {"transition": {"id": "mine"}}}
+        with patch("lib.control_vm.autoscaler_tick") as tick, \
+                self.assertLogs("spot_runner_autoscaler", "ERROR") as logs:
+            self.assertIsNone(autoscaler.manage_control_vm(self.args(), state, self.dir / "a.json"))
+        tick.assert_not_called()
+        self.assertIn("both hold an in-progress control VM transition", "\n".join(logs.output))
+        self.assertEqual(state["control_vm"]["transition"]["id"], "mine")  # nothing dropped
+
+    def test_adopt_rules(self):
+        project = cv.ProjectControlState(self.dir / "p.json")
+        project.state = {"control_vm": {"transition": {"id": "x"}}}
+        same = {"control_vm": {"transition": {"id": "x"}}}
+        self.assertTrue(project.adopt(same, "a", persist=False))
+        self.assertNotIn("control_vm", same)
+        idle = {"control_vm": {"down_since": {"a": 1}, "transition": None}}
+        self.assertTrue(project.adopt(idle, "a", persist=False))
+        self.assertEqual(project.state["control_vm"]["transition"]["id"], "x")  # idle copies never overwrite
+        self.assertFalse(project.adopt({"idle_loops": 1}, "a", persist=False))
+        empty = cv.ProjectControlState(self.dir / "q.json")
+        disks = {"control_vm": {"retained_disks": [{"disk": "spot-control-a", "zone": "z", "slot": "a"}]}}
+        self.assertTrue(empty.adopt(disks, "a", persist=True))
+        self.assertEqual(json.loads((self.dir / "q.json").read_text())["control_vm"]["retained_disks"][0]["disk"],
+                         "spot-control-a")
+
+    def test_unreadable_project_state_fails_closed(self):
+        from lib import spot_runner_autoscaler as autoscaler
+        path = cv.project_control_paths("proj", self.dir)[0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[1]")
+        with patch("lib.control_vm.autoscaler_tick") as tick, self.assertLogs("spot_runner_autoscaler", "ERROR"):
+            self.assertIsNone(autoscaler.manage_control_vm(self.args(), {}, self.dir / "a.json"))
+        tick.assert_not_called()
+        self.assertEqual(path.read_text(), "[1]")
+
+    def test_paths_are_project_scoped_and_validated(self):
+        a, lock = cv.project_control_paths("homelab-424523", self.dir)
+        self.assertEqual((a.name, lock.name), ("control-vm-homelab-424523.json", "control-vm-homelab-424523.lock"))
+        self.assertNotEqual(cv.project_control_paths("other-project", self.dir)[0], a)
+        self.assertEqual(cv.project_control_paths("example.com:proj", self.dir)[0].name,
+                         "control-vm-example.com__proj.json")
+        for bad in ("", "../etc", "Proj", "a/b", "p" * 64):
+            with self.assertRaises(ValueError, msg=bad):
+                cv.project_control_paths(bad, self.dir)
+        self.assertEqual(cv.default_control_state_dir({}), cv.DEFAULT_STATE_FILE.parent)
+        self.assertEqual(cv.default_control_state_dir({cv.ENV_CONTROL_STATE_DIR: str(self.dir)}), self.dir)
 
 
 class CliTests(unittest.TestCase):
@@ -2041,9 +2187,15 @@ class CliTests(unittest.TestCase):
                                        requester=harness.http, offer_source=lambda: OFFERS,
                                        clock=lambda: harness.clock[0])
         out = io.StringIO()
+        argv = [*argv, "--control-state-dir", str(self.control_dir)] if "--control-state-dir" not in argv else argv
         with redirect_stdout(out), patch("lib.environment.load_env"):
             code = cv.main(argv, manager_factory=factory)
         return code, out.getvalue()
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.control_dir = Path(directory.name)
 
     def test_plan_ensure_rotate_without_apply_change_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2071,8 +2223,27 @@ class CliTests(unittest.TestCase):
             code, output = self.run_cli(["ensure", "--apply", "--state-file", str(state_file)], h)
             self.assertEqual(code, 0)
             self.assertIn("Executed: bootstrap", output)
-            saved = json.loads(state_file.read_text())
+            self.assertFalse(state_file.exists())  # the controller's own state file is not the control VM's
+            saved = json.loads(cv.project_control_paths("homelab-424523", self.control_dir)[0].read_text())
             self.assertEqual(saved["control_vm"]["transition"]["step"], "wait_health")
+
+    def test_apply_moves_unmigrated_controller_state_and_refuses_a_held_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            disk = {"disk": "spot-control-b", "zone": "us-east1-b", "slot": "b", "transition": "t0", "reason": "r", "at": 1}
+            state_file.write_text(json.dumps({"idle_loops": 3, "control_vm": {"retained_disks": [disk]}}))
+            h = Harness()
+            code, _ = self.run_cli(["ensure", "--apply", "--state-file", str(state_file)], h)
+            self.assertEqual(code, 0)
+            self.assertNotIn("control_vm", json.loads(state_file.read_text()))
+            self.assertEqual(json.loads(state_file.read_text())["idle_loops"], 3)
+            project_file, lock_file = cv.project_control_paths("homelab-424523", self.control_dir)
+            self.assertEqual(json.loads(project_file.read_text())["control_vm"]["retained_disks"], [disk])
+            with lock_file.open("a") as held:
+                fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(RuntimeError, "Another controller is managing the control VM"):
+                    self.run_cli(["ensure", "--apply", "--state-file", str(state_file)], Harness())
 
 
 class StartupScriptTests(unittest.TestCase):
@@ -2227,11 +2398,62 @@ class StartupScriptTests(unittest.TestCase):
         self.assertIn('PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail', self.text)
         for url, origin in (("https://spot.swacktech.com", "https://spot.swacktech.com"),
                             ("https://spot.swacktech.com/", "https://spot.swacktech.com"),
-                            ("https://spot.swacktech.com:8443/app", "https://spot.swacktech.com:8443")):
+                            ("https://spot.swacktech.com:8443/", "https://spot.swacktech.com:8443")):
             result = self._run_function("public_origin_of", url)
             self.assertEqual((result.returncode, result.stdout), (0, origin), url)
-        for url in ("https://bad host", "https://user@spot.swacktech.com", "https://"):
+        # A path is refused too: the OAuth callback and the Worker serve the dashboard at the origin root.
+        for url in ("https://bad host", "https://user@spot.swacktech.com", "https://",
+                    "https://spot.swacktech.com:8443/app"):
             self.assertNotEqual(self._run_function("public_origin_of", url).returncode, 0, url)
+
+    PUBLIC_URLS = (
+        "https://spot.swacktech.com", "https://spot.swacktech.com/", "https://Spot.SwackTech.com",
+        "https://localhost", "https://spot.example:1", "https://spot.example:8443", "https://spot.example:65535/",
+        "https://a-b.example", "https://" + "a" * 63 + ".example",
+        # Refused by both:
+        "https://spot.example?bad", "https://spot.example/?q=1", "https://spot.example#frag",
+        "https://spot.example/#", "https://spot.example/path", "https://spot.example//",
+        "https://user@spot.example", "https://user:pw@spot.example", "https://spot.example:0", "https://spot.example:08443",
+        "https://spot.example:65536", "https://spot.example:123456", "https://spot.example:", "https://:8443",
+        "https://", "http://spot.example", "HTTPS://spot.example", "https:/spot.example", "spot.example",
+        "https://spot..example", "https://.example", "https://example.", "https://-bad.example",
+        "https://bad-.example", "https://" + "a" * 64 + ".example", "https://spot_example.com",
+        "https://[::1]", "https://spot.example\n", "https://spot example", "https://spot.example,b", "",
+    )
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_public_url_check_matches_create_problems(self):
+        self.assertIn('PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail', self.text)
+        accepted = 0
+        for url in self.PUBLIC_URLS:
+            python_origin = cv.public_origin(url)
+            result = self._run_function("public_origin_of", url)
+            bash_origin = result.stdout if result.returncode == 0 else None
+            self.assertEqual(python_origin, bash_origin, repr(url))
+            problems = [p for p in config(public_url=url).create_problems() if "public URL" in p]
+            self.assertEqual(not problems, python_origin is not None, repr(url))
+            accepted += python_origin is not None
+        self.assertEqual(accepted, 9)
+
+    def test_each_public_url_check_refuses_on_its_own(self):
+        # The parsed-URL check and the authority check are independent; each refuses these by itself.
+        for url in ("https://u@spot.example", "https://u:p@spot.example", "https://spot.example?x",
+                    "https://spot.example?", "https://spot.example#f", "https://spot.example/#", "https://spot.example/p",
+                    "https://spot.example:65536", "https://spot.example:0", "https://spot.example:x", "http://spot.example",
+                    "https://", "https:///p", None):
+            self.assertFalse(cv._public_url_parts_ok(url), url)
+        for url in ("https://u@spot.example", "https://spot.example?x", "https://spot.example#f",
+                    "https://spot.example/p", "https://spot.example:65536", "https://spot.example:0",
+                    "https://spot..example", "https://spot_example.com", "HTTPS://spot.example", None):
+            self.assertIsNone(cv._public_authority(url), url)
+        for url in ("https://spot.example", "https://spot.example:8443/"):
+            self.assertTrue(cv._public_url_parts_ok(url), url)
+            self.assertIsNotNone(cv._public_authority(url), url)
+
+    def test_malformed_public_url_never_reaches_gcloud(self):
+        for url in ("https://spot.example?bad", "https://spot.example/app", "https://u@spot.example"):
+            with self.assertRaisesRegex(ValueError, "public URL", msg=url):
+                cv.create_command(config(public_url=url), "a", offer(), "/s")
 
     def test_image_paths(self):
         self.assertIn("docker login ghcr.io", self.text)

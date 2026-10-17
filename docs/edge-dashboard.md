@@ -142,6 +142,12 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   moved, or GitHub reports that the file changed, the dashboard answers HTTP 409. The token in
   `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` needs contents and pull-request write access to the config
   repository.
+- Every repository manifest overrides `defaults.yaml`, so saving `defaults.yaml` also reads each
+  `repos/<owner>/<repo>.yaml` at the same `base_sha` and checks it merged with the new defaults. If any
+  of them would be invalid, the save opens no pull request and answers HTTP 400 with field errors that
+  name each affected repository. If the dashboard can't list or read those manifests, the save answers
+  HTTP 424 with `"retry_same_key": true`, because the check didn't run. `POST /api/patches/validate`
+  reports the same errors for `defaults.yaml`, or a `warning` when it can't read the manifests.
 - `src/spot_runner_manager.py` records the patch on each runner host as instance metadata, but only after
   the host confirms it. A provisioned host confirms it when its bootstrap writes the completion marker
   for this deployment, every runner is online, and the storage check passes. A live patch confirms it
@@ -299,6 +305,20 @@ same idempotency key after `/api/health` returns 200.
 
 The autoscaler handles the control VM when you run it with `--manage-control-vm`:
 
+- **One manager per project**: the `spot-control-a` and `spot-control-b` slots belong to the project, and
+  more than one `--target` controller can enable `--manage-control-vm` there. Each check first takes an
+  exclusive lock on `control-vm-<project>.lock`. While another controller or `src/control_vm.py --apply`
+  holds it, the autoscaler skips its control VM step for that check and logs why. Runner management
+  continues either way.
+- **Shared control VM state**: the transition, retained boot disks, and history live in
+  `control-vm-<project>.json`, not in each controller's `--state-file`. If one controller crashes during a
+  transition, the next controller that takes the lock resumes the same transition. Both files live in
+  `SPOT_CONTROL_STATE_DIR`, which defaults to the autoscaler's default state directory. Every controller
+  in the project must use the same directory, and the lock only serializes controllers on one machine.
+- **Moving earlier state**: control VM state that an older version saved in a controller's `--state-file`
+  moves to the project file on that controller's first check. An idle copy is dropped. When both files
+  hold different transitions or retained disks, that controller refuses to manage the control VM and
+  logs an error until an operator decides which state is current.
 - **Preempted VM**: the autoscaler starts it again. If the start keeps failing, it creates the other slot,
   which loads state from KV, then points `origin:active` at it. If the old VM still answers but reports
   `frozen`, the autoscaler freezes it again, or reads its snapshot, and imports that state before the

@@ -2551,3 +2551,67 @@ class PatchedRotationHoldTests(unittest.TestCase):
                 patch.object(controller, "runner_inventory_stale", return_value=False):
             controller.reconcile_prices([patched, plain], [], args, {}, Path("/tmp/unused.json"))
         self.assertIs(begin.call_args.args[0], plain)
+
+
+class DeleteFirstPatchHoldTests(unittest.TestCase):
+    """PR #44 review: delete-first eviction (the --no-make-before-break default) holds patched hosts too."""
+
+    def vm(self, name, **patch_fields):
+        return replace_vm(GceVm(name, "z", "RUNNING", "n4-highcpu-16", True, instance_id=name), **patch_fields)
+
+    def reconcile(self, overpriced, fleet, *, make_before_break, patch_repo=None, state=None):
+        from lib import spot_runner_autoscaler as controller
+        args = SimpleNamespace(org="swack-tools", patch_repo=patch_repo, project="p",
+                               max_daily_usd=Decimal("1"), make_before_break=make_before_break)
+        state = {} if state is None else state
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch.object(controller, "check_running_prices", return_value=overpriced), \
+                patch.object(controller, "begin_price_rotation", return_value=True) as begin, \
+                patch.object(controller, "delete_overpriced_vm") as delete, \
+                patch.object(controller, "guard_fleet_mutation"), \
+                patch.object(controller, "protected_heavy_routes", return_value={}), \
+                patch.object(controller, "heavy_route_capacity_hold", return_value=False), \
+                patch.object(controller, "runner_inventory_stale", return_value=False), \
+                patch.object(controller, "offer_refresher", return_value=lambda: []), \
+                self.assertLogs("spot_runner_autoscaler", "INFO") as logs:
+            result = controller.reconcile_prices(fleet, [], args, state, Path(tmpdir) / "s.json")
+        return result, begin, delete, state, "\n".join(logs.output)
+
+    def test_delete_first_skips_held_patched_host_and_evicts_the_next(self):
+        patched = self.vm("oxidex-runners-patched", patch_sha256="a" * 64, patch_target="swack-tools/oxidex")
+        plain = self.vm("oxidex-runners-plain", patch_sha256="none")
+        result, begin, delete, state, logs = self.reconcile([patched, plain], [patched, plain],
+                                                            make_before_break=False)
+        self.assertTrue(result)
+        begin.assert_not_called()
+        delete.assert_called_once()
+        self.assertIs(delete.call_args.args[0], plain)
+        self.assertEqual(state["host_operation"]["vm"]["name"], "oxidex-runners-plain")
+        self.assertIn("Delete-first price eviction held for", logs)
+        self.assertIn("oxidex-runners-patched", logs)
+
+    def test_delete_first_never_deletes_a_held_host_and_restoration_continues(self):
+        patched = self.vm("oxidex-runners-patched", patch_pending_sha256="b" * 64)
+        state = {"price_replacement_target": 2}
+        result, begin, delete, state, logs = self.reconcile([patched], [patched], make_before_break=False,
+                                                            state=state)
+        delete.assert_not_called()
+        begin.assert_not_called()
+        self.assertNotIn("host_operation", state)
+        # The hold did not stall the price path: restoration looked for the missing host.
+        self.assertIn("Finding one affordable replacement", logs)
+        self.assertTrue(result)
+
+    def test_delete_first_evicts_patched_host_when_patch_source_matches(self):
+        patched = self.vm("oxidex-runners-patched", patch_sha256="a" * 64, patch_target="swack-tools/oxidex")
+        _, _, delete, _, _ = self.reconcile([patched], [patched], make_before_break=False,
+                                            patch_repo="swack-tools/oxidex")
+        self.assertIs(delete.call_args.args[0], patched)
+
+    def test_rotation_path_still_holds_patched_host(self):
+        patched = self.vm("oxidex-runners-patched", patch_sha256="a" * 64)
+        plain = self.vm("oxidex-runners-plain")
+        _, begin, delete, _, logs = self.reconcile([patched, plain], [patched, plain], make_before_break=True)
+        delete.assert_not_called()
+        self.assertIs(begin.call_args.args[0], plain)
+        self.assertIn("Make-before-break rotation held for", logs)

@@ -781,6 +781,53 @@ class PatchConsole:
             raise ConflictError(f"defaults.yaml at {sha[:12]} does not parse: {exc}") from exc
         return parsed if isinstance(parsed, dict) else {}
 
+    def _override_errors(self, client: ConfigRepoClient, sha: str, defaults: Mapping[str, Any]) -> list[dict[str, str]]:
+        """Field errors for every ``repos/<owner>/<repo>.yaml`` at ``sha`` that is invalid merged with ``defaults``.
+
+        Each repository manifest is an override of defaults.yaml, so a defaults change can break every override
+        after it merges. A failed listing or read is never treated as "no overrides": it raises a
+        same-key-retryable error, because the check did not happen.
+        """
+        try:
+            paths = client.tree_paths(sha)
+        except PatchConsoleError as exc:
+            raise _retry_error("list the repository manifests to check them against these defaults", exc) from exc
+        errors: list[dict[str, str]] = []
+        for path in sorted((p for p in paths if _REPO_MANIFEST_RE.match(p)), key=str.lower):
+            try:
+                found = client.read_file(path, sha)
+            except PatchConsoleError as exc:
+                raise _retry_error(f"read {path} to check it against these defaults", exc) from exc
+            if found is None:
+                raise _retry_error(f"read {path} to check it against these defaults",
+                                   GitHubRestError(f"{path} is listed at {sha[:12]} but could not be read"))
+            repository = repository_for_path(path)
+            _, problems, _ = validate_manifest(found[0], path=path, defaults=defaults)
+            for problem in problems:
+                errors.append({"field": f"{path}:{problem['field']}", "repository": str(repository), "path": path,
+                               "message": f"{repository} would be invalid with these defaults: {problem['message']}"})
+        return errors
+
+    def _validated(self, client: ConfigRepoClient, path: str, content: Any, sha: str) -> RunnerPatch:
+        """Validate ``content`` for ``path`` at commit ``sha``, as it merges with everything it affects.
+
+        A repository manifest merges with defaults.yaml at ``sha``; new defaults merge with every repository
+        manifest at ``sha``, and a defaults change that breaks any of them is refused with field errors naming
+        those repositories.
+        """
+        repository = repository_for_path(path)
+        defaults = self._defaults(client, sha) if repository else None
+        patch, errors, data = validate_manifest(content, path=path, defaults=defaults)
+        if patch is not None and repository is None:
+            errors = self._override_errors(client, sha, data or {})
+            if errors:
+                raise InvalidRequestError("These defaults would make repository manifests invalid",
+                                          body={"errors": errors,
+                                                "repositories": sorted({e["repository"] for e in errors})})
+        if patch is None:
+            raise InvalidRequestError("The manifest is invalid", body={"errors": errors})
+        return patch
+
     def list_manifests(self) -> dict[str, Any]:
         client = self.client()
         branch, sha = client.resolve()
@@ -825,7 +872,16 @@ class PatchConsole:
                 defaults = self._defaults(client, client.resolve()[1])
             except PatchConsoleError as exc:
                 warning = f"Checked without defaults.yaml (could not read it: {exc})"
-        patch, errors, _ = validate_manifest(content, path=path, defaults=defaults)
+        patch, errors, data = validate_manifest(content, path=path, defaults=defaults)
+        if patch is not None and path == DEFAULTS_PATH:
+            # New defaults must also keep every repository override valid once they merge.
+            try:
+                client = self.client()
+                errors = self._override_errors(client, client.resolve()[1], data or {})
+            except PatchConsoleError as exc:
+                warning = f"Checked without the repository manifests (could not read them: {exc})"
+            if errors:
+                patch = None
         body: dict[str, Any] = {"valid": patch is not None, "errors": errors, "path": path}
         if warning:
             body["warning"] = warning
@@ -902,7 +958,7 @@ class PatchConsole:
 
     def _save(self, path: str, content: Any, base_sha: Any, message: Any,
               idempotency_key: str | None) -> dict[str, Any]:
-        repository = repository_for_path(path)
+        repository_for_path(path)  # Refuses any path that is not defaults.yaml or a repository manifest.
         if not isinstance(base_sha, str) or not _SHA_RE.match(base_sha):
             raise InvalidRequestError("base_sha must be the 40-hex commit the manifest was loaded from")
         client = self.client()
@@ -919,10 +975,7 @@ class PatchConsole:
             if on_branch is None or on_branch[0] != content:
                 raise IdempotencyMismatchError(
                     "This Idempotency-Key was already used for a different change to this file")
-            defaults = self._defaults(client, base_sha) if repository else None
-            patch, errors, _ = validate_manifest(content, path=path, defaults=defaults)
-            if patch is None:
-                raise InvalidRequestError("The manifest is invalid", body={"errors": errors})
+            patch = self._validated(client, path, content, base_sha)
             pr = self._lookup("find the earlier attempt's pull request", client.find_pull_request,
                               new_branch) or client.open_pull_request(
                 new_branch, branch, title,
@@ -936,10 +989,7 @@ class PatchConsole:
                 f"{branch} moved from {base_sha[:12]} to {head[:12]} since this manifest was loaded; reload and edit again",
                 body={"status": "conflict", "head_sha": head, "base_sha": base_sha},
             )
-        defaults = self._defaults(client, base_sha) if repository else None
-        patch, errors, _ = validate_manifest(content, path=path, defaults=defaults)
-        if patch is None:
-            raise InvalidRequestError("The manifest is invalid", body={"errors": errors})
+        patch = self._validated(client, path, content, base_sha)
         found = client.read_file(path, base_sha)
         blob = found[1] if found is not None else None
         if found is not None and found[0] == content:
