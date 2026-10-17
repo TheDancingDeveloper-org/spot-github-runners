@@ -118,6 +118,10 @@ KV_WRITER_RECHECK_SECONDS = 30.0
 KV_RETRY_BACKOFF_SECONDS = 5.0
 KV_LOOP_INTERVAL_SECONDS = 0.25
 HYDRATE_RETRY_DELAYS_SECONDS = (4.0, 5.0)  # 3 KV reads over roughly 10 seconds
+# With no local state and KV unreachable, hydration keeps retrying with this backoff (seconds).
+HYDRATE_BACKOFF_INITIAL_SECONDS = 5.0
+HYDRATE_BACKOFF_MAX_SECONDS = 60.0
+KV_STALE_REFUSAL_BACKOFF_SECONDS = 30.0
 
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # POST endpoints that compute a response without changing dashboard state; they skip idempotency storage.
@@ -984,6 +988,10 @@ class DashboardStore:
         self._kv_dirty_last_at = 0.0
         self._kv_next_attempt_at = 0.0
         self.kv_last_written_version: int | None = None
+        # Every KV snapshot write (background write-behind and freeze) runs under this lock, in version order.
+        self._kv_write_lock = threading.Lock()
+        # False until this writer has confirmed KV does not already hold a newer snapshot.
+        self._kv_floor_checked = False
         self._defer: dict[str, Any] | None = None
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -1012,6 +1020,11 @@ class DashboardStore:
                 except OSError:
                     # Preserve loaded and normalized in-memory state when startup write-back fails.
                     pass
+        elif self.kv is not None:
+            # No local state yet: hydrate from KV first. Writing version-0 defaults here would let a
+            # restart before hydration mistake them for real local state.
+            self.state = default_dashboard_state(project=project, org=org)
+            self._sync_fleet_telemetry()
         else:
             self.state = default_dashboard_state(project=project, org=org)
             self._sync_fleet_telemetry()
@@ -1066,12 +1079,20 @@ class DashboardStore:
                 thread.join(timeout=timeout)
 
     def _background_main(self) -> None:
-        try:
-            self.hydrate()
-        except Exception:  # noqa: BLE001 - never leave the dashboard unhydrated forever
-            LOG.exception("Dashboard hydration failed; serving local state")
-            with self._lock:
-                self.hydrated = True
+        delay = HYDRATE_BACKOFF_INITIAL_SECONDS
+        while not self._stop_event.is_set():
+            try:
+                self.hydrate()
+            except Exception:  # noqa: BLE001 - keep retrying; serve local state when there is some
+                LOG.exception("Dashboard hydration failed")
+                if self.loaded_from_file:
+                    with self._lock:
+                        self.hydrated = True
+            if self.hydrated:
+                break
+            # No local state and KV unreachable: stay unhydrated (health 503) rather than serve defaults.
+            self._stop_event.wait(delay)
+            delay = min(delay * 2, HYDRATE_BACKOFF_MAX_SECONDS)
         while not self._stop_event.is_set():
             try:
                 self.kv_tick()
@@ -1104,15 +1125,24 @@ class DashboardStore:
     def hydrate(self) -> str:
         """Choose the newer of the local state file and the KV snapshot (tie: local), then mark hydrated.
 
-        Returns the chosen source: ``local``, ``kv``, or ``default``.
+        Returns the chosen source: ``local``, ``kv``, or ``default``, or ``unavailable`` (still unhydrated)
+        when there is no local state and KV is configured but unreachable. Defaults are used only when KV
+        is not configured or positively reports that no snapshot exists.
         """
         snapshot: dict[str, Any] | None = None
         if self.kv is not None:
             snapshot, reachable = self._read_kv_snapshot()
             if not reachable:
+                if not self.loaded_from_file:
+                    LOG.error("Cloudflare KV unreachable and no local dashboard state; staying unhydrated "
+                              "and retrying instead of serving defaults")
+                    return "unavailable"
                 LOG.warning("Cloudflare KV unreachable during hydration; using local dashboard state")
             self.refresh_writer()
         with self._lock:
+            if self.hydrated:
+                # A control-plane import hydrated the store meanwhile; it is authoritative.
+                return self.hydration_source
             source = "local" if self.loaded_from_file else "default"
             if snapshot is not None:
                 newer = snapshot["state_version"] > self.state_version()
@@ -1182,6 +1212,8 @@ class DashboardStore:
         else:
             record = OriginRecord.from_json(raw)
             writer = record is not None and record.slot == self.control_slot
+        if writer and not self.kv_writer:
+            self._kv_floor_checked = False  # Re-check KV's version before the first write as writer.
         self.kv_writer = writer
         self._writer_checked_at = self._clock()
         return writer
@@ -1195,23 +1227,56 @@ class DashboardStore:
         self._kv_dirty = True
         self._kv_dirty_last_at = now
 
-    def _kv_put_snapshot(self) -> int:
-        """Serialize under the lock and write outside it. Returns the written state_version; raises KvError."""
-        assert self.kv is not None
+    def _restore_kv_dirty(self) -> None:
         with self._lock:
-            envelope = self.snapshot_envelope()
-            payload = json.dumps(envelope, separators=(",", ":"), allow_nan=False)
-            self._kv_dirty = False
-        try:
-            self.kv.put(KV_STATE_KEY, payload)
-        except KvError:
-            with self._lock:
-                if not self._kv_dirty:
-                    self._kv_dirty = True
-                    self._kv_dirty_first_at = self._kv_dirty_last_at = self._clock()
-            raise
-        self.kv_last_written_version = int(envelope["state_version"])
-        return self.kv_last_written_version
+            if not self._kv_dirty:
+                self._kv_dirty = True
+                self._kv_dirty_first_at = self._kv_dirty_last_at = self._clock()
+
+    def _publish_snapshot(self, envelope: dict[str, Any] | None = None) -> int | None:
+        """Write a snapshot to KV, serialized with every other KV snapshot write.
+
+        ``envelope`` None captures the current state inside the write lock. Returns the state_version now
+        in KV from this writer, or None when the write was refused because it would move KV backwards
+        (older than this process's last write, or older than the snapshot already in KV). Raises KvError.
+        """
+        assert self.kv is not None
+        with self._kv_write_lock:
+            captured = envelope is None
+            if captured:
+                with self._lock:
+                    envelope = self.snapshot_envelope()
+                    self._kv_dirty = False
+            version = int(envelope["state_version"])
+            last = self.kv_last_written_version
+            if last is not None and version <= last:
+                if version < last:
+                    LOG.error("Refusing to write dashboard snapshot state_version %d to KV after already "
+                              "writing state_version %d", version, last)
+                    return None
+                return version  # Already published.
+            try:
+                if not self._kv_floor_checked:
+                    current = parse_snapshot(self.kv.get(KV_STATE_KEY))
+                    if current is not None and current["state_version"] > version:
+                        LOG.error("REFUSING to overwrite the KV dashboard snapshot at state_version %d with "
+                                  "older local state_version %d; this VM's state is stale",
+                                  current["state_version"], version)
+                        if captured:
+                            self._restore_kv_dirty()
+                        return None
+                    self._kv_floor_checked = True
+                self.kv.put(KV_STATE_KEY, json.dumps(envelope, separators=(",", ":"), allow_nan=False))
+            except KvError:
+                if captured:
+                    self._restore_kv_dirty()
+                raise
+            self.kv_last_written_version = version
+            return version
+
+    def _kv_put_snapshot(self) -> int | None:
+        """Background write of the current state. Returns the written state_version (None when refused)."""
+        return self._publish_snapshot()
 
     def kv_tick(self) -> bool:
         """One write-behind iteration. Returns True when a snapshot was written to KV."""
@@ -1227,10 +1292,13 @@ class DashboardStore:
         if not (quiet or overdue) or now < self._kv_next_attempt_at:
             return False
         try:
-            self._kv_put_snapshot()
+            written = self._kv_put_snapshot()
         except KvError as exc:
             LOG.warning("Dashboard KV write-behind failed: %s", exc)
             self._kv_next_attempt_at = now + KV_RETRY_BACKOFF_SECONDS
+            return False
+        if written is None:
+            self._kv_next_attempt_at = now + KV_STALE_REFUSAL_BACKOFF_SECONDS
             return False
         return True
 
@@ -1297,12 +1365,13 @@ class DashboardStore:
         flushed = False
         if self.kv is not None and self.refresh_writer():
             try:
-                self.kv.put(KV_STATE_KEY, json.dumps(envelope, separators=(",", ":"), allow_nan=False))
-                flushed = True
-                self.kv_last_written_version = int(envelope["state_version"])
-                with self._lock:
-                    if self.state_version() == envelope["state_version"]:
-                        self._kv_dirty = False
+                # Waits for any in-flight background write, which can therefore never land after this one.
+                written = self._publish_snapshot(envelope)
+                flushed = written is not None and written >= int(envelope["state_version"])
+                if flushed:
+                    with self._lock:
+                        if self.state_version() == envelope["state_version"]:
+                            self._kv_dirty = False
             except KvError as exc:
                 LOG.warning("Dashboard KV flush during freeze failed: %s", exc)
         return {"state_version": envelope["state_version"], "snapshot": envelope, "kv_flushed": flushed}

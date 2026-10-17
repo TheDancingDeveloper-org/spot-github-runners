@@ -742,6 +742,48 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.assertEqual(h.kv.origin_slot(), "b")
         self.assertEqual(h.transition["step"], "delete_old")
 
+    def test_abort_after_replacement_vanishes_carries_back_its_newer_kv_state(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0, freeze_requested=True,
+                                frozen_version=7)
+        h.kv.set_origin("b")
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({"targets": ["after-cutover"]}, 9, "b", now=1))
+        h.tick()  # spot-control-b is gone
+        self.assertEqual(h.mutations(), [("import", "a"), ("unfreeze", "a"), ("origin", "a")])
+        self.assertEqual(h.http.versions["a"], 9)
+        self.assertIsNone(h.transition)
+
+    def frozen_old(self, h):
+        h.http.health["a"] = (503, {"error": "control_vm_unavailable", "status": "frozen", "hydrated": True,
+                                    "frozen": True, "state_version": 7, "slot": "a", "kv_writer": True})
+
+    def test_recovery_imports_from_reachable_frozen_old_vm(self):
+        h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER, freeze_requested=True)
+        self.frozen_old(h)
+        self.with_new_vm(h)
+        h.tick()
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("import", "b"), ("origin", "b")])
+        self.assertEqual(h.http.versions["b"], 7)
+        self.assertFalse(h.transition["import_skipped"])
+
+    def test_recovery_falls_back_to_snapshot_when_frozen_old_vm_will_not_freeze(self):
+        h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER, freeze_requested=True)
+        self.frozen_old(h)
+        self.with_new_vm(h)
+        h.http.freeze_status = 500
+        for _ in range(cv.STEP_RETRY_LIMIT):
+            h.tick()
+        self.assertIn(("snapshot", "a"), h.events)
+        self.assertEqual(h.mutations()[-2:], [("import", "b"), ("origin", "b")])
+        self.assertEqual(h.http.versions["b"], 7)
+
+    def test_recovery_still_skips_import_when_old_vm_is_down(self):
+        h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER)
+        h.gcloud.status("a", "TERMINATED")
+        self.with_new_vm(h)
+        h.tick()
+        self.assertEqual(h.mutations(), [("origin", "b")])
+        self.assertTrue(h.transition["import_skipped"])
+
     def test_delete_old_refuses_while_origin_points_at_old(self):
         h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0)
         self.with_new_vm(h)

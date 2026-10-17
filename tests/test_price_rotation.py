@@ -1104,8 +1104,8 @@ def replace_vm(vm, **changes):
     return replace(vm, **changes)
 
 
-class ReplacementEvidenceTests(unittest.TestCase):
-    """Finding 2: every retirement step needs fresh proof the replacement is live."""
+class RotationHarness:
+    """Shared fixtures for retirement-phase rotation tests."""
 
     def setUp(self):
         self.outgoing_vm = GceVm("oxidex-runners-old", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
@@ -1142,6 +1142,10 @@ class ReplacementEvidenceTests(unittest.TestCase):
             saved = read_scale_state(path) if path.exists() else {}
         return mock_api, delete_old, delete_new, saved
 
+
+class ReplacementEvidenceTests(RotationHarness, unittest.TestCase):
+    """Finding 2: every retirement step needs fresh proof the replacement is live."""
+
     def test_preempted_replacement_stops_drain_uncordons_and_aborts(self):
         terminated = replace_vm(self.replacement_vm, status="TERMINATED")
         state = self.state("cordon_drain")
@@ -1170,7 +1174,9 @@ class ReplacementEvidenceTests(unittest.TestCase):
         _, delete_old, delete_new, saved = self.step(state, [self.outgoing_vm, impostor], [self.new_runner])
         delete_old.assert_not_called()
         delete_new.assert_not_called()  # Never delete a VM that is not this rotation's replacement.
-        self.assertNotIn("price_rotation", saved)
+        # Outgoing listeners are already gone, so the rotation stays pending for fresh capacity.
+        self.assertEqual(saved["price_rotation"]["phase"], "select")
+        self.assertEqual(saved["price_rotation"]["failed_replacements"][0]["instance_id"], "new-456")
 
     def test_missing_replacement_blocks_delete(self):
         state = self.state("delete")
@@ -1245,6 +1251,101 @@ class ReplacementEvidenceTests(unittest.TestCase):
         reused = replace_vm(self.outgoing_vm, instance_id="reused-999")
         state = self.state("delete")
         _, delete_old, _, saved = self.step(state, [reused, self.replacement_vm], [self.new_runner])
+        delete_old.assert_not_called()
+        self.assertNotIn("price_rotation", saved)
+
+
+class LostCapacityRecoveryTests(RotationHarness, unittest.TestCase):
+    """Round 2: once outgoing listeners are deregistered, rollback never strands both hosts."""
+
+    def test_offline_replacement_after_deregistration_is_kept_and_old_host_stays_cordoned(self):
+        offline = GitHubRunner(500, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
+        state = self.state("deregister", deregistered_runner_ids=[99])
+        mock_api, delete_old, delete_new, saved = self.step(
+            state, [self.outgoing_vm, self.replacement_vm], [offline])
+        mock_api.assert_not_called()  # No pretend uncordon of deregistered listeners.
+        delete_old.assert_not_called()
+        delete_new.assert_not_called()
+        rotation = saved["price_rotation"]
+        self.assertTrue(rotation["capacity_lost"])
+        self.assertTrue(rotation["recovering"])
+        self.assertNotIn("restored", rotation["cordoned_runners"]["99"])
+        # Listeners return: recovery clears and retirement resumes on the following check.
+        _, _, delete_new, saved = self.step(saved, [self.outgoing_vm, self.replacement_vm], [self.new_runner])
+        delete_new.assert_not_called()
+        self.assertNotIn("recovering", saved["price_rotation"])
+        self.assertEqual(saved["price_rotation"]["phase"], "deregister")
+        mock_api, _, _, saved = self.step(saved, [self.outgoing_vm, self.replacement_vm], [self.new_runner])
+        self.assertEqual(saved["price_rotation"]["phase"], "delete")
+
+    def test_gone_replacement_after_deregistration_provisions_fresh_capacity(self):
+        terminated = replace_vm(self.replacement_vm, status="TERMINATED")
+        state = self.state("delete")
+        mock_api, delete_old, delete_new, saved = self.step(state, [self.outgoing_vm, terminated], [])
+        mock_api.assert_not_called()
+        delete_old.assert_not_called()
+        delete_new.assert_not_called()
+        rotation = saved["price_rotation"]
+        self.assertEqual(rotation["phase"], "select")
+        self.assertIsNone(rotation["replacement_vm"])
+        self.assertTrue(rotation["cordon_complete"])  # Old host stays out of service.
+
+    def test_uncertain_deregistration_counts_as_lost_capacity(self):
+        def failing_delete(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, ["gh"], stderr="timeout")
+        state = self.state("deregister")
+        mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                          [self.old_runner, self.new_runner], api=failing_delete)
+        self.assertEqual(saved["price_rotation"]["deregistering_runner_id"], 99)
+        offline = GitHubRunner(500, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
+        mock_api, _, delete_new, saved = self.step(saved, [self.outgoing_vm, self.replacement_vm],
+                                                   [self.old_runner, offline])
+        mock_api.assert_not_called()
+        delete_new.assert_not_called()
+        self.assertIn("price_rotation", saved)
+
+    def test_rollback_with_no_online_outgoing_listener_keeps_replacement(self):
+        offline_old = GitHubRunner(99, "gha-oxidex-runners-old-1", "offline", False, ("self-hosted",))
+        offline_new = GitHubRunner(500, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
+        state = self.state("cordon_drain")
+        _, _, delete_new, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                            [offline_old, offline_new])
+        delete_new.assert_not_called()
+        self.assertTrue(saved["price_rotation"]["capacity_lost"])
+
+    def test_fresh_replacement_timeout_in_lost_mode_keeps_transaction(self):
+        from lib.spot_runner_autoscaler import _step_rotation_boot
+        stuck = replace_vm(self.replacement_vm, status="PROVISIONING")
+        state = self.state("boot", capacity_lost=True)
+        rotation = state["price_rotation"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete_new, \
+                    patch("lib.spot_runner_autoscaler.now", return_value=1000.0 + 10_000):
+                _step_rotation_boot([self.outgoing_vm, stuck], [], self.args, state, path, rotation)
+            saved = read_scale_state(path)
+        delete_new.assert_called_once_with(stuck, "homelab-424523")  # Never had a listener online.
+        self.assertEqual(saved["price_rotation"]["phase"], "select")
+
+
+class RecreatedOutgoingHostTests(RotationHarness, unittest.TestCase):
+    """Round 2: a same-named recreated outgoing VM is never cordoned or deregistered."""
+
+    def test_cordon_never_touches_a_recreated_outgoing_instance(self):
+        recreated = replace_vm(self.outgoing_vm, instance_id="new-instance")
+        state = self.state("cordon_drain", cordon_complete=False, cordoned_runners={})
+        mock_api, delete_old, _, saved = self.step(state, [recreated, self.replacement_vm],
+                                                   [self.old_runner, self.new_runner])
+        mock_api.assert_not_called()
+        delete_old.assert_not_called()
+        self.assertNotIn("price_rotation", saved)
+
+    def test_deregister_never_touches_a_recreated_outgoing_instance(self):
+        recreated = replace_vm(self.outgoing_vm, instance_id="new-instance")
+        state = self.state("deregister")
+        mock_api, delete_old, _, saved = self.step(state, [recreated, self.replacement_vm],
+                                                   [self.old_runner, self.new_runner])
+        mock_api.assert_not_called()
         delete_old.assert_not_called()
         self.assertNotIn("price_rotation", saved)
 

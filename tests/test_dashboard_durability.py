@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+import urllib.parse
 
 from lib import billing_catalog, compute_api
 from lib.dashboard_server import (
@@ -377,6 +378,145 @@ class DurableFreezeTests(unittest.TestCase):
         store.freeze()
         self.assertTrue(store.frozen)
         self.assertEqual(store.unfreeze(), {"frozen": False})
+
+
+class HydrationSafetyTests(unittest.TestCase):
+    """A fresh VM never serves or publishes version-0 defaults over newer KV state."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "state.json"
+        self.fake = FakeKvRequester()
+        self.clock = FakeClock()
+
+    def store(self) -> DashboardStore:
+        store = DashboardStore(self.path, control_slot="b", kv=make_kv(self.fake), clock=self.clock,
+                               sleep=lambda _s: None)
+        store.hydrate_retry_delays = (0.0, 0.0)
+        return store
+
+    def test_fresh_vm_with_kv_unreachable_stays_unhydrated(self):
+        self.fake.fail = True
+        store = self.store()
+        self.assertFalse(self.path.exists())  # no version-0 defaults on disk before hydration
+        self.assertEqual(store.hydrate(), "unavailable")
+        self.assertFalse(store.hydrated)
+        self.assertEqual(store.health()["status"], "starting")
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.store().loaded_from_file)  # a restart does not mistake defaults for state
+        self.fake.fail = False
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(9, ["kv/repo"])
+        self.assertEqual(store.hydrate(), "kv")
+        self.assertEqual((store.hydrated, store.state_version()), (True, 9))
+
+    def test_kv_reporting_no_snapshot_uses_defaults(self):
+        store = self.store()
+        self.assertEqual(store.hydrate(), "default")
+        self.assertTrue(store.hydrated)
+
+    def test_background_hydration_retries_until_kv_returns(self):
+        self.fake.fail = True
+        store = self.store()
+        with mock.patch("lib.dashboard_server.HYDRATE_BACKOFF_INITIAL_SECONDS", 0.01), \
+                mock.patch("lib.dashboard_server.HYDRATE_BACKOFF_MAX_SECONDS", 0.02):
+            store.start()
+            self.addCleanup(store.close)
+            time.sleep(0.1)
+            self.assertFalse(store.hydrated)
+            with self.fake.lock:
+                self.fake.values[KV_STATE_KEY] = kv_snapshot(9, ["kv/repo"])
+                self.fake.fail = False
+            deadline = time.time() + 5
+            while not store.hydrated and time.time() < deadline:
+                time.sleep(0.01)
+        self.assertTrue(store.hydrated)
+        self.assertEqual(store.state_version(), 9)
+
+    def test_import_during_pending_hydration_is_kept(self):
+        self.fake.fail = True
+        store = self.store()
+        store.hydrate()
+        store.import_snapshot(build_snapshot({"controlled_targets": ["o/imported"]}, 5, "a"))
+        self.fake.fail = False
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(3, ["kv/older"])
+        self.assertEqual(store.hydrate(), "import")
+        self.assertEqual(store.get_controlled_targets(), ["o/imported"])
+
+    def test_writer_refuses_to_overwrite_newer_kv_snapshot(self):
+        write_state(self.path, 1, ["local/repo"])
+        self.fake.fail = True
+        store = self.store()
+        self.assertEqual(store.hydrate(), "local")  # local state exists, KV down
+        self.fake.fail = False
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(9, ["kv/repo"])
+        store.set_controlled_targets(["local/change"])
+        self.clock.now += 10
+        with self.assertLogs("spot_dashboard", level="ERROR") as logs:
+            self.assertFalse(store.kv_tick())
+        self.assertIn("REFUSING", "\n".join(logs.output))
+        self.assertEqual(parse_snapshot(self.fake.values[KV_STATE_KEY])["state_version"], 9)
+        self.assertEqual(self.fake.count("PUT", KV_STATE_KEY), 0)
+
+    def test_never_writes_older_than_last_written(self):
+        store = self.store()
+        store.hydrate()
+        store.set_controlled_targets(["o/r"])
+        store.kv_last_written_version = store.state_version() + 5
+        self.clock.now += 10
+        with self.assertLogs("spot_dashboard", level="ERROR"):
+            self.assertFalse(store.kv_tick())
+        self.assertEqual(self.fake.count("PUT", KV_STATE_KEY), 0)
+
+
+class BlockingKvRequester(FakeKvRequester):
+    """Blocks the first snapshot PUT until released, to model a slow in-flight background write."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.blocked = False
+
+    def __call__(self, method, url, headers, body, timeout):
+        key = urllib.parse.unquote(url.rsplit("/values/", 1)[1])
+        if method == "PUT" and key == KV_STATE_KEY:
+            if not self.blocked:
+                self.blocked = True
+                self.entered.set()
+                self.release.wait(5)
+        return super().__call__(method, url, headers, body, timeout)
+
+
+class KvWriteOrderingTests(unittest.TestCase):
+    def test_freeze_waits_for_inflight_background_write(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fake = BlockingKvRequester()
+        clock = FakeClock()
+        store = DashboardStore(Path(tmp.name) / "state.json", control_slot="a", kv=make_kv(fake), clock=clock,
+                               sleep=lambda _s: None)
+        store.hydrate()
+        store.set_controlled_targets(["o/first"])
+        clock.now += 10
+        background = threading.Thread(target=store.kv_tick)
+        background.start()
+        self.assertTrue(fake.entered.wait(5))  # background captured version N and is mid-PUT
+        store.set_controlled_targets(["o/second"])  # version N+1
+        newest = store.state_version()
+        results: list[dict] = []
+        freezer = threading.Thread(target=lambda: results.append(store.freeze()))
+        freezer.start()
+        time.sleep(0.1)
+        self.assertTrue(freezer.is_alive())  # freeze waits for the in-flight write
+        fake.release.set()
+        background.join(5)
+        freezer.join(5)
+        self.assertTrue(results[0]["kv_flushed"])
+        written = parse_snapshot(fake.values[KV_STATE_KEY])
+        self.assertEqual(written["state_version"], newest)
+        self.assertEqual(written["state"]["controlled_targets"], ["o/second"])
+        self.assertEqual(store.kv_last_written_version, newest)
 
 
 class ServerHarness(unittest.TestCase):

@@ -46,7 +46,12 @@ startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` 
   Control VMs use the `STOP` termination action, so a preemption keeps the boot disk.
 - Every save increments `state_version`. The active slot copies each save to KV about one second later.
 - At startup the dashboard loads the newer of the local file and the KV snapshot, then reports
-  `hydrated`.
+  `hydrated`. A new VM with no local file waits while KV is unreachable: `/api/health` returns 503 and
+  the dashboard retries with backoff. It starts from defaults only when KV reports that no snapshot
+  exists.
+- KV writes run one at a time in version order, and a freeze waits for any write in progress. The
+  active slot never writes a snapshot older than its last write. Before its first write as the active
+  slot, it reads KV and refuses to replace a newer snapshot.
 - The browser sends an `Idempotency-Key` header with every change. The dashboard stores the response in
   the same atomic save as the change, so a retried request never applies twice.
 - A freeze writes the marker file `state.json.frozen` next to the state file. If the container restarts
@@ -63,7 +68,9 @@ same idempotency key after `/api/health` returns 200.
 The autoscaler handles the control VM when you run it with `--manage-control-vm`:
 
 - **Preempted VM**: the autoscaler starts it again. If the start keeps failing, it creates the other slot,
-  which loads state from KV, then points `origin:active` at it.
+  which loads state from KV, then points `origin:active` at it. If the old VM still answers but reports
+  `frozen`, the autoscaler freezes it again, or reads its snapshot, and imports that state before the
+  switch.
 - **Price rotation**: the autoscaler creates the other slot, waits for health, freezes the old VM, copies
   its snapshot into the new VM, writes `origin:active` with read-back verification, waits for KV to
   propagate, then deletes the old VM. A failed origin write unfreezes the old VM and deletes the new one.

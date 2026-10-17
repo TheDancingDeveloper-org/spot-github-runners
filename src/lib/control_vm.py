@@ -1025,7 +1025,14 @@ class ControlVmManager:
             self._note("old slot %s went down during the price rotation; continuing as recovery", t["old_slot"],
                        level=logging.WARNING)
         if t["mode"] == MODE_RECOVER:
-            healthy = old is not None and old.running and (obs.health.get(t["old_slot"]) or HealthResult.unknown()).ok
+            old_health = obs.health.get(t["old_slot"]) or HealthResult.unknown()
+            # A reachable old VM that reports frozen (an earlier freeze whose response was lost, or a
+            # controller crash after freezing) still holds the newest state: freeze again (idempotent)
+            # and import its snapshot instead of cutting over to older state.
+            frozen_reachable = old_health.frozen and old_health.hydrated
+            healthy = old is not None and old.running and (old_health.ok or frozen_reachable)
+            if frozen_reachable and not old_health.ok:
+                self._note("old slot %s is reachable but frozen; taking its snapshot before cutover", t["old_slot"])
             if not healthy:
                 t["import_skipped"] = True
                 self._note("old slot %s is down; new VM keeps the state it hydrated from KV", t["old_slot"])
@@ -1050,6 +1057,14 @@ class ControlVmManager:
             return self._advance_step(t)
         if self._fail_attempt(t, f"freeze returned {status}"):
             if t["mode"] == MODE_RECOVER:
+                status, body = self._control(t["old_slot"], "snapshot", "GET")
+                snapshot = parse_snapshot(body) if status == 200 and isinstance(body, dict) else None
+                if snapshot is not None:
+                    self._snapshot = snapshot
+                    t["frozen_version"] = snapshot["state_version"]
+                    self._note("old slot %s did not freeze; importing its snapshot at state_version %d",
+                               t["old_slot"], snapshot["state_version"], level=logging.WARNING)
+                    return self._advance_step(t)
                 t["import_skipped"] = True
                 self._goto(t, "cutover")
                 return "advance"
@@ -1152,8 +1167,9 @@ class ControlVmManager:
     def _replacement_not_ready(self, t: dict, obs: Observation, detail: str) -> str:
         """Never delete the old VM for an unready replacement: wait a bounded time, then fall back.
 
-        The fallback is the regular abort path, which unfreezes the old VM, restores ``origin:active`` to
-        it with a verified write, and deletes the replacement only once the origin no longer names it.
+        The fallback is the regular abort path, which carries newer KV state back into the old VM,
+        unfreezes it, restores ``origin:active`` to it with a verified write, and deletes the replacement
+        only once the origin no longer names it.
         Without a running old VM to fall back to, the transition keeps waiting (nothing is deleted).
         """
         now = self.clock()
@@ -1172,8 +1188,6 @@ class ControlVmManager:
                 self._start(new)
         if now - since >= REPLACEMENT_READY_GRACE_SECONDS:
             if old is not None and old.running:
-                if not self._carry_back_newer_state(t):
-                    return "wait"
                 return self._abort(t, f"replacement not ready {int(now - since)}s after cutover: {detail}")
             self._note("replacement still not ready and old slot %s is %s; waiting", t["old_slot"],
                        old.status if old else "missing", level=logging.ERROR)
@@ -1206,6 +1220,11 @@ class ControlVmManager:
 
     def _step_abort(self, t: dict, obs: Observation) -> str:
         old = obs.vm(t.get("old_slot"))
+        # After a cutover attempt the replacement may have accepted changes and published them to KV
+        # (even if it has since disappeared): import them into the old VM before it serves again.
+        if t.get("cutover_attempted") and t.get("old_slot") and old is not None and old.running \
+                and not self._carry_back_newer_state(t):
+            return "wait"
         if t.get("freeze_requested") and old is not None and old.running and not t.get("unfrozen"):
             status, _ = self._control(t["old_slot"], "unfreeze", "POST")
             if status == 200:

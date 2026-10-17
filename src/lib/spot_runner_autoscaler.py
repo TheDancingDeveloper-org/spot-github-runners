@@ -1342,8 +1342,19 @@ def _replacement_from_inventory(vms, repl: dict | None) -> GceVm | None:
     return None
 
 
-def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str) -> bool:
+def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, runners=()) -> bool:
     repl_vm = _replacement_from_inventory(vms, rotation.get("replacement_vm"))
+    if _outgoing_capacity_lost(rotation):
+        # The outgoing host no longer has its listeners, so dropping the transaction would leave
+        # no usable capacity. Keep it pending and try another fresh replacement instead.
+        LOG.error("%s; outgoing listeners were removed, so the rotation keeps provisioning capacity", reason)
+        if repl_vm and not any(r.online for r in _replacement_runners(runners, repl_vm.name)):
+            try:
+                delete_vm_and_disks(repl_vm, args.project)
+            except Exception as exc:
+                LOG.error("Failed to delete replacement VM %s: %s", repl_vm.name, error_detail(exc))
+        _restart_replacement(rotation, state, state_path)
+        return True
     LOG.error("%s; aborting replacement to preserve old capacity", reason)
     if repl_vm:
         try:
@@ -1438,6 +1449,59 @@ def _uncordon_outgoing(rotation, runners, state, state_path) -> bool:
     return True
 
 
+def _outgoing_capacity_lost(rotation) -> bool:
+    """Return whether any outgoing listener was (or may have been) deregistered."""
+    return bool(rotation.get("capacity_lost") or rotation.get("deregistered_runner_ids")
+                or rotation.get("deregistering_runner_id") is not None
+                or rotation.get("phase") == "delete")
+
+
+def _restart_replacement(rotation, state, state_path) -> None:
+    """Return to offer selection for a fresh replacement; the outgoing host stays cordoned."""
+    failed = rotation.setdefault("failed_replacements", [])
+    if rotation.get("replacement_vm"):
+        failed.append(rotation["replacement_vm"])
+    rotation.update(replacement_vm=None, pending_replacement=None, attempt_count=0,
+                    readiness={"runners_online": False})
+    rotation.pop("recovering", None)
+    _advance_rotation(rotation, "select", state, state_path)
+
+
+# Statuses in which a replacement may still bring its listeners back online.
+REPLACEMENT_ALIVE_STATUSES = {"PROVISIONING", "STAGING", "RUNNING", "REPAIRING"}
+
+
+def _recover_lost_capacity(vms, runners, args, state, state_path, rotation) -> bool:
+    """Keep the transaction pending until a replacement's listeners are online again.
+
+    The outgoing host lost listeners to deregistration, so it stays cordoned and out of service
+    (bootstrap is never replayed on it). The replacement is never deleted here: the rotation
+    resumes retirement once it is live again, or provisions fresh capacity if it is truly gone.
+    """
+    out_name = rotation["outgoing_vm"]["name"]
+    if not rotation.get("capacity_lost"):
+        rotation["capacity_lost"] = True
+        write_scale_state(state_path, state)
+    if _replacement_live_failure(vms, runners, rotation) is None:
+        rotation.pop("recovering", None)
+        rotation["readiness"] = {"runners_online": True}
+        write_scale_state(state_path, state)
+        LOG.info("Replacement listeners are online again; resuming retirement of %s", out_name)
+        return True
+    repl_vm = _replacement_from_inventory(vms, rotation.get("replacement_vm"))
+    repl = rotation.get("replacement_vm") or {}
+    if (repl_vm is not None and repl.get("instance_id") and repl_vm.instance_id == repl["instance_id"]
+            and repl_vm.status.upper() in REPLACEMENT_ALIVE_STATUSES):
+        LOG.warning("Rotation waits for replacement %s listeners; %s stays cordoned with removed listeners",
+                    repl_vm.name, out_name)
+        write_scale_state(state_path, state)
+        return True
+    LOG.error("Replacement %s is gone after %s lost listeners; provisioning fresh capacity",
+              repl.get("name", "unknown"), out_name)
+    _restart_replacement(rotation, state, state_path)
+    return True
+
+
 def _recover_failed_replacement(vms, runners, args, state, state_path, rotation, reason: str) -> bool:
     """Stop retiring the outgoing host, restore its scheduling, then abort the rotation."""
     out_name = rotation["outgoing_vm"]["name"]
@@ -1446,9 +1510,19 @@ def _recover_failed_replacement(vms, runners, args, state, state_path, rotation,
         rotation["readiness"] = {"runners_online": False}
         write_scale_state(state_path, state)
         LOG.error("Retirement of %s stopped: %s; restoring the outgoing host", out_name, reason)
+    if _outgoing_capacity_lost(rotation):
+        return _recover_lost_capacity(vms, runners, args, state, state_path, rotation)
     if not _uncordon_outgoing(rotation, runners, state, state_path):
         LOG.warning("Rotation recovery waits to uncordon %s; retrying next loop", out_name)
         return True
+    records = rotation.get("cordoned_runners") or {}
+    present = {r.runner_id: r for r in runners}
+    if records and not any(present.get(int(key)) is not None and present[int(key)].online
+                           and present[int(key)].name == record.get("name")
+                           for key, record in records.items()):
+        # Nothing on the outgoing host can take work, so the replacement is the only capacity.
+        LOG.error("Outgoing host %s has no online listeners after uncordon", out_name)
+        return _recover_lost_capacity(vms, runners, args, state, state_path, rotation)
     repl = rotation.get("replacement_vm") or {}
     if any(r.busy for r in _replacement_runners(runners, repl.get("name", ""))):
         # Never kill jobs that already landed on a partially healthy replacement.
@@ -1473,7 +1547,7 @@ def _step_rotation_boot(vms, runners, args, state, state_path, rotation):
     if not new_vm or new_vm.status != "RUNNING":
         if now_ts - rotation.get("phase_started_at", now_ts) >= BOOT_TIMEOUT_SECONDS:
             return _abort_runner_rotation(rotation, vms, args, state, state_path,
-                                          f"Boot timed out for {repl['name']}")
+                                          f"Boot timed out for {repl['name']}", runners)
         LOG.info("Rotation waits for replacement VM %s to reach RUNNING status (currently %s)",
                  repl["name"], new_vm.status if new_vm else "PROVISIONING")
         return True
@@ -1510,9 +1584,31 @@ def _step_rotation_verify_readiness(vms, runners, args, state, state_path, rotat
 
     if now_ts - rotation.get("phase_started_at", now_ts) >= READINESS_DEADLINE_SECONDS:
         return _abort_runner_rotation(rotation, vms, args, state, state_path,
-                                      f"Readiness gate timed out for replacement {repl_name or 'new'}")
+                                      f"Readiness gate timed out for replacement {repl_name or 'new'}", runners)
 
     LOG.info("Rotation waits for runners on %s: %d/%d online", repl_name or "new", online_count, expected_count)
+    write_scale_state(state_path, state)
+    return True
+
+
+def _outgoing_from_inventory(vms, out_dict):
+    """Return (vm, recreated) for the outgoing host by recorded name, zone, and instance ID.
+
+    ``recreated`` is True when a VM with the recorded name exists in that zone under another
+    instance ID: the original host is gone and that VM's runners must never be touched.
+    """
+    named = [v for v in vms if v.name == out_dict["name"] and v.zone == out_dict.get("zone", v.zone)]
+    recorded_id = out_dict.get("instance_id", "")
+    match = next((v for v in named if not recorded_id or v.instance_id == recorded_id), None)
+    return match, match is None and bool(named)
+
+
+def _abandon_recreated_outgoing(rotation, state, state_path) -> bool:
+    out = rotation["outgoing_vm"]
+    LOG.error("Outgoing host %s (instance %s) was recreated under the same name; abandoning its "
+              "retirement without touching the new instance", out["name"], out.get("instance_id") or "unknown")
+    state.pop("price_rotation", None)
+    state["idle_loops"] = 0
     write_scale_state(state_path, state)
     return True
 
@@ -1521,7 +1617,9 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
     """Phase 5: Cordon old runners, wait for in-flight jobs to complete."""
     out_dict = rotation["outgoing_vm"]
     out_name = out_dict["name"]
-    out_vm = next((v for v in vms if v.name == out_name), None)
+    out_vm, recreated = _outgoing_from_inventory(vms, out_dict)
+    if recreated:
+        return _abandon_recreated_outgoing(rotation, state, state_path)
     target = rotation["target"]
     target_type = rotation.get("target_type", "org")
     now_ts = now()
@@ -1611,7 +1709,9 @@ def _step_rotation_deregister(vms, runners, args, state, state_path, rotation):
     """Phase 6: Remove old runners from GitHub API."""
     out_dict = rotation["outgoing_vm"]
     out_name = out_dict["name"]
-    out_vm = next((v for v in vms if v.name == out_name), None)
+    out_vm, recreated = _outgoing_from_inventory(vms, out_dict)
+    if recreated:
+        return _abandon_recreated_outgoing(rotation, state, state_path)
     target = rotation["target"]
     target_type = rotation.get("target_type", "org")
     assigned = host_runners(out_vm, runners, vms) if out_vm else [r for r in runners if out_name in r.name]
@@ -1619,12 +1719,20 @@ def _step_rotation_deregister(vms, runners, args, state, state_path, rotation):
     from .runner_drain import api
     for runner in assigned:
         endpoint = f"repos/{target}/actions/runners/{runner.runner_id}" if target_type == "repo" else f"orgs/{target}/actions/runners/{runner.runner_id}"
+        # Persist intent first: from here on, rollback can no longer restore this listener.
+        rotation["deregistering_runner_id"] = runner.runner_id
+        write_scale_state(state_path, state)
         try:
             api(target, "DELETE", endpoint)
             LOG.info("Deregistered old runner %s (%d) from %s", runner.name, runner.runner_id, target)
         except Exception as exc:
             LOG.warning("Deregistration pending for runner %s: %s", runner.name, error_detail(exc))
             return True
+        done = rotation.setdefault("deregistered_runner_ids", [])
+        if runner.runner_id not in done:
+            done.append(runner.runner_id)
+        rotation.pop("deregistering_runner_id", None)
+        write_scale_state(state_path, state)
 
     _advance_rotation(rotation, "delete", state, state_path)
     LOG.info("All old runners deregistered for %s; advancing to VM deletion", out_dict["name"])
