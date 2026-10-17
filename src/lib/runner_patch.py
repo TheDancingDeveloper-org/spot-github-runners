@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import urllib.parse
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -732,7 +733,33 @@ def load_patch_from_file(path: Path) -> RunnerPatch:
 GITHUB_API_BASE = "https://api.github.com"
 GH_API_TIMEOUT_SECONDS = 30.0
 MAX_GH_API_RESPONSE_BYTES = 16 * 1024 * 1024
-_ENDPOINT_RE = re.compile(r"^[A-Za-z0-9._~/?=&%:+,@-]+$")
+# Unreserved and delimiter characters, plus WELL-FORMED percent-escapes only: a git ref is sent percent-encoded
+# (see _ref_component), so '#', '%', '?', spaces, '/' and non-ASCII never appear raw in an endpoint.
+_ENDPOINT_RE = re.compile(r"^(?:[A-Za-z0-9._~/?=&:+,@-]|%[0-9A-Fa-f]{2})+$")
+
+
+def _ref_component(ref: str) -> str:
+    """Percent-encode a git ref as ONE URL path segment or query value.
+
+    Without this a valid branch such as ``fix#1`` turns ``#1`` into a URL fragment, ``a?b`` starts a query, and
+    ``feature/x`` or ``a b`` change or break the request path. Every byte outside the unreserved set is escaped
+    (``safe=""`` also escapes '/'), for the gh and urllib transports alike.
+    """
+    return urllib.parse.quote(ref, safe="")
+
+
+def _endpoint_is_safe(endpoint: str) -> bool:
+    """Accept only allowlisted endpoint text whose path segments never decode to '.' or '..'.
+
+    Decoding catches an escaped traversal such as ``%2E%2E`` or ``a%2F..%2Fb`` that a server could normalize.
+    Git forbids '..' in ref names, so no valid encoded ref is refused.
+    """
+    if not _ENDPOINT_RE.match(endpoint):
+        return False
+    for segment in endpoint.split("?", 1)[0].split("/"):
+        if any(part in (".", "..") for part in urllib.parse.unquote(segment).split("/")):
+            return False
+    return True
 
 
 def _gh_token(run_env: dict[str, str]) -> str:
@@ -745,7 +772,7 @@ def _gh_api_json_urllib(endpoint: str, token: str) -> Any:
     import urllib.request
 
     clean = endpoint.lstrip("/")
-    if not _ENDPOINT_RE.match(clean) or ".." in clean.split("?", 1)[0].split("/"):
+    if not _endpoint_is_safe(clean):
         raise RuntimeError(f"gh api {endpoint} failed: refusing unexpected endpoint")
     headers = {
         "Accept": "application/vnd.github+json",
@@ -779,6 +806,8 @@ def _gh_api_json(endpoint: str, *, env: dict[str, str] | None = None) -> Any:
     token = _gh_token(run_env)
     if token:
         run_env["GH_TOKEN"] = token
+    if not _endpoint_is_safe(endpoint.lstrip("/")):
+        raise RuntimeError(f"gh api {endpoint} failed: refusing unexpected endpoint")
     if shutil.which("gh", path=run_env.get("PATH")) is None:
         return _gh_api_json_urllib(endpoint, token)
     result = subprocess.run(
@@ -840,7 +869,7 @@ def resolve_repo_default_branch(repo_full_name: str, *, env: dict[str, str] | No
     default_branch = meta.get("default_branch")
     if not isinstance(default_branch, str) or not default_branch.strip():
         raise RuntimeError(f"Repository {repo_full_name} does not report a valid default_branch")
-    commit = _gh_api_json(f"repos/{repo_full_name}/commits/{default_branch}", env=env)
+    commit = _gh_api_json(f"repos/{repo_full_name}/commits/{_ref_component(default_branch)}", env=env)
     sha = commit.get("sha")
     if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise RuntimeError(f"Could not resolve HEAD commit SHA for {repo_full_name}@{default_branch}")
@@ -849,7 +878,9 @@ def resolve_repo_default_branch(repo_full_name: str, *, env: dict[str, str] | No
 
 def _fetch_repo_file_at_ref(repo_full_name: str, file_path: str, ref: str, *, env: dict[str, str] | None = None) -> str | None:
     try:
-        payload = _gh_api_json(f"repos/{repo_full_name}/contents/{file_path}?ref={ref}", env=env)
+        payload = _gh_api_json(
+            f"repos/{repo_full_name}/contents/{urllib.parse.quote(file_path, safe='/')}?ref={_ref_component(ref)}",
+            env=env)
     except RuntimeError as exc:
         if "404" in str(exc) or "Not Found" in str(exc):
             return None

@@ -875,6 +875,32 @@ def _rotation_drain_token(rotation) -> str:
     return "rotation-" + str((rotation.get("outgoing_vm") or {}).get("instance_id") or "unknown")
 
 
+def _rotation_host_cordon(out_vm, assigned, args, state, state_path, rotation) -> str:
+    """Ensure the outgoing repository host refuses new jobs at start; return its cordon state.
+
+    The owner token is persisted BEFORE the marker can exist, so recovery can always release exactly the
+    marker this rotation placed. Only ``idle`` (cordon already in place, no job on the host) is proof that
+    deregistration cannot strand a job; ``placed`` must be observed again.
+    """
+    from .runner_drain import cordon_runner_host, host_cordon_token, log_cordon_hold
+    if not rotation.get("host_cordon_token"):
+        rotation["host_cordon_token"] = host_cordon_token("rotation-cordon", rotation["outgoing_vm"])
+        write_scale_state(state_path, state)
+    names = [runner.name for runner in assigned]
+    if not names:
+        # No listener of this host is registered, so none can receive a job; deregistration has nothing to do.
+        LOG.info("Outgoing host %s has no registered listeners; no job-start cordon is needed", out_vm.name)
+        return "idle"
+    try:
+        status, detail = cordon_runner_host(out_vm, args, rotation["host_cordon_token"], names,
+                                            lambda: guard_fleet_mutation(state, out_vm, is_rotation=True))
+    except RuntimeError as exc:
+        status, detail = "held", {"reason": error_detail(exc)}
+    if status != "idle":
+        log_cordon_hold(out_vm, status, detail)
+    return status
+
+
 def builder_ready(vm,args):
     """Run a bounded builder canary with the exact installed launcher revision."""
     import hashlib
@@ -1994,6 +2020,18 @@ def _recover_failed_replacement(vms, runners, args, state, state_path, rotation,
         # Nothing on the outgoing host can take work, so the replacement is the only capacity.
         LOG.error("Outgoing host %s has no online listeners after uncordon", out_name)
         return _recover_lost_capacity(vms, runners, args, state, state_path, rotation)
+    cordon_token = rotation.get("host_cordon_token")
+    if cordon_token:
+        from .runner_drain import release_runner_host_cordon
+        out_vm, _ = _outgoing_from_inventory(vms, rotation["outgoing_vm"])
+        if out_vm is not None and out_vm.running and not release_runner_host_cordon(out_vm, args, cordon_token):
+            # Leaving the marker would refuse every job on the restored host; retry until released.
+            LOG.warning("Rotation recovery waits to release the host job-start cordon on %s; retrying next loop",
+                        out_name)
+            return True
+        rotation.pop("host_cordon_token", None)
+        write_scale_state(state_path, state)
+        LOG.info("Released rotation-owned host job-start cordon on %s", out_name)
     token = rotation.get("builder_drain_token")
     if token:
         out_vm = next((vm for vm in vms if vm.name == out_name
@@ -2104,6 +2142,14 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
         cordon_success = True
         cordon_mode = "labels"
         if target_type == "repo":
+            # GitHub keeps a repository runner's built-in labels, so stripping custom labels alone never stops
+            # a job that selects only self-hosted/linux/X64. Cordon on the host first; a host that cannot refuse
+            # jobs at start keeps its labels and stays in service (retirement held, never forced).
+            if out_vm is not None:
+                host_state = _rotation_host_cordon(out_vm, assigned, args, state, state_path, rotation)
+                if host_state not in ("placed", "busy", "idle"):
+                    write_scale_state(state_path, state)
+                    return True
             for runner in assigned:
                 try:
                     _record_cordon(rotation, runner, state, state_path)
@@ -2111,7 +2157,7 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
                 except Exception as exc:
                     cordon_success = False
                     LOG.warning("Could not strip labels from repo runner %s: %s", runner.name, error_detail(exc))
-            cordon_mode = "labels"
+            cordon_mode = "host" if out_vm is not None else "labels"
         else:
             drain_group_name = f"spot-drain-{out_dict['name']}-{out_dict.get('instance_id', '')}"
             operation = {"drain_group_name": drain_group_name, "drain_group_id": rotation.get("drain_group_id")}
@@ -2177,6 +2223,12 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
             write_scale_state(state_path, state)
             return True
 
+    if (target_type == "repo" and out_vm is not None
+            and _rotation_host_cordon(out_vm, assigned, args, state, state_path, rotation) != "idle"):
+        # The drain deadline never overrides this: a job running under the cordon must finish first.
+        write_scale_state(state_path, state)
+        return True
+
     if out_vm is not None:
         # Record ownership before the marker can exist, so a crash right after placing it still
         # lets rollback release it.
@@ -2228,6 +2280,11 @@ def _step_rotation_deregister(vms, runners, args, state, state_path, rotation):
     busy = _outgoing_work_active(out_vm, assigned, state, target)
     if busy:
         return _return_to_drain(rotation, state, state_path, busy)
+    if target_type == "repo" and out_vm is not None and assigned:
+        host_state = _rotation_host_cordon(out_vm, assigned, args, state, state_path, rotation)
+        if host_state != "idle":
+            # Never deregister unless the host already refuses new jobs and runs none.
+            return _return_to_drain(rotation, state, state_path, f"host cordon is {host_state}")
     for runner in assigned:
         endpoint = f"repos/{target}/actions/runners/{runner.runner_id}" if target_type == "repo" else f"orgs/{target}/actions/runners/{runner.runner_id}"
         try:

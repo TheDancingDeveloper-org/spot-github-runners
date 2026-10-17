@@ -418,6 +418,24 @@ assigned jobs finish. Dedicated builder drain follows active builds, admission
 leases, source/cache locks, and export activity; it does not use GitHub runner
 idleness as proof that a build is finished.
 
+Repository-target runners keep GitHub's read-only `self-hosted`, `linux`, and
+`X64` labels, and personal repositories have no runner groups. Removing custom
+labels therefore doesn't stop a workflow that selects only built-in labels. Before
+any GitHub change, the controller cordons the host over identity-checked SSH. It
+places the root-owned `/run/gha-runner-cordon/draining` marker, which every
+runner container mounts read-only. While the marker exists, the job-started hook
+refuses each new job before admission and before any job step runs.
+
+The controller deregisters a runner only after a later observation finds the
+marker still in place and no `Runner.Worker` process on the host. An idle
+listener can still accept an assignment during the drain. That job fails before
+its first step runs, with a "Runner host is being retired" error. GitHub reports the
+failure and doesn't reassign the job, so re-run it to schedule it on another
+runner. A host whose containers lack the read-only mount or the cordon-aware hook
+can't refuse jobs. The controller holds its retirement and logs `Retirement held`.
+That host keeps its labels and registrations until a cordon-capable host replaces
+it. A rotation that rolls back removes only the marker that it placed.
+
 ## Provision a dedicated Rust builder
 
 The dedicated renderer fixes the host to `n4-highcpu-16`: 16 vCPU and 32 GiB RAM.
@@ -711,6 +729,8 @@ cgroup `cpu.max`, `memory.max`, and `memory.swap.max` values.
 | No memory observations | Check service-account role/scope, Ops Agent status, timestamps, and boot identity |
 | Registration timeout | Inspect the exact deployment marker, startup log, token scope, group, and expected runner names |
 | Admission denied or exit 75 | Check draining state, owned leases, limits, and full container inventory; wait for active work |
+| Job failed with "Runner host is being retired" | The host was cordoned for retirement after GitHub assigned the job; re-run the job |
+| `Retirement held: the host cannot refuse new jobs` | Replace the repository host with one whose runners mount `/run/gha-runner-cordon` read-only; don't remove its runners by hand |
 | Transfer permission denied | Verify the approved uploader identity and group; do not broaden permissions |
 | Exit 137 | Join kernel/cgroup OOM evidence to the actual job interval before assigning a cause |
 | Compiler/header failure | Repair source or toolchain inputs; do not retry on another VM as a capacity workaround |

@@ -20,6 +20,7 @@ import urllib.parse
 from lib import billing_catalog, compute_api
 from lib.dashboard_server import (
     IDEMPOTENCY_MAX_KEYS,
+    request_fingerprint,
     DashboardStore,
     args_parser,
     create_dashboard_server,
@@ -1387,9 +1388,16 @@ class IdempotencyTests(ServerHarness):
         self.assertIn(self.KEY, on_disk["idempotency"])
         self.assertEqual(on_disk["global_budget"]["max_hourly_usd"], first["budget"]["max_hourly_usd"])
 
-        status, msg, replay = self.budget(self.KEY, amount=9.99)
+        status, msg, replay = self.budget(self.KEY)
         self.assertEqual((status, msg["Idempotent-Replay"]), (200, "true"))
         self.assertEqual(replay, first)
+        self.assertEqual(store.state_version(), before + 1)
+        self.assertEqual(store.state["global_budget"]["max_hourly_usd"], first["budget"]["max_hourly_usd"])
+
+        # The same key with a different body is a different change: 422, never a replay that drops it.
+        status, msg, body = self.budget(self.KEY, amount=9.99)
+        self.assertEqual((status, msg["Idempotent-Replay"]), (422, None))
+        self.assertIn("different request", body["error"])
         self.assertEqual(store.state_version(), before + 1)
         self.assertEqual(store.state["global_budget"]["max_hourly_usd"], first["budget"]["max_hourly_usd"])
 
@@ -1404,8 +1412,11 @@ class IdempotencyTests(ServerHarness):
         status, _, err = self.budget("4f0c1d9e-1111-4222-8333-944455556666", amount=-5)
         self.assertEqual(status, 400)
         self.assertEqual(json.dumps(store.state.get("global_budget"), sort_keys=True), before)
-        status, msg, again = self.budget("4f0c1d9e-1111-4222-8333-944455556666", amount=1)
+        status, msg, again = self.budget("4f0c1d9e-1111-4222-8333-944455556666", amount=-5)
         self.assertEqual((status, msg["Idempotent-Replay"], again), (400, "true", err))
+        status, msg, _ = self.budget("4f0c1d9e-1111-4222-8333-944455556666", amount=1)
+        self.assertEqual((status, msg["Idempotent-Replay"]), (422, None))
+        self.assertEqual(json.dumps(store.state.get("global_budget"), sort_keys=True), before)
 
     def test_replay_after_restart_from_persisted_file(self):
         self.start()
@@ -1414,13 +1425,59 @@ class IdempotencyTests(ServerHarness):
         restarted = DashboardStore(self.path)
         restarted.hydrate()
         calls = []
-        replay = restarted.run_request(self.KEY, "POST", "/api/budget", lambda: calls.append(1) or (200, {}))
+        fingerprint = request_fingerprint({"max_hourly_usd": 1.25, "target": "global"})
+        replay = restarted.run_request(self.KEY, "POST", "/api/budget", lambda: calls.append(1) or (200, {}),
+                                       fingerprint=fingerprint)
         self.assertEqual(replay, (200, first, True))
+        self.assertEqual(calls, [])
+        # The persisted body fingerprint survives the restart: a different body is refused, not replayed.
+        mismatch = restarted.run_request(self.KEY, "POST", "/api/budget", lambda: calls.append(1) or (200, {}),
+                                         fingerprint=request_fingerprint({"max_hourly_usd": 7, "target": "global"}))
+        self.assertEqual(mismatch[0], 422)
         self.assertEqual(calls, [])
         # Through a fresh server on the same state file.
         self.start()
-        status, msg, body = self.budget(self.KEY, amount=7)
+        status, msg, body = self.budget(self.KEY)
         self.assertEqual((status, msg["Idempotent-Replay"], body), (200, "true", first))
+        status, msg, _ = self.budget(self.KEY, amount=7)
+        self.assertEqual((status, msg["Idempotent-Replay"]), (422, None))
+
+    def test_record_binds_the_canonical_body_fingerprint(self):
+        store = self.start()
+        status, _, first = self.budget(self.KEY)
+        self.assertEqual(status, 200)
+        record = json.loads(self.path.read_text())["idempotency"][self.KEY]
+        self.assertEqual(record["f"], request_fingerprint({"target": "global", "max_hourly_usd": 1.25}))
+        before = store.state_version()
+        # Key order and whitespace do not change the canonical fingerprint, so a reordered body replays.
+        status, msg, body = self.request(
+            "POST", "/api/budget", raw_body=b'{ "target" : "global",  "max_hourly_usd": 1.25 }',
+            headers={"Content-Type": "application/json", "Idempotency-Key": self.KEY})
+        self.assertEqual((status, msg["Idempotent-Replay"], body), (200, "true", first))
+        self.assertEqual(store.state_version(), before)
+
+    def test_same_key_with_a_different_body_never_applies_or_replays(self):
+        store = self.start()
+        self.assertEqual(self.budget(self.KEY, amount=2)[0], 200)
+        for amount in (3, 2.0000001):
+            status, msg, body = self.budget(self.KEY, amount=amount)
+            self.assertEqual((status, msg["Idempotent-Replay"]), (422, None))
+            self.assertIn("different request", body["error"])
+        self.assertEqual(store.state["global_budget"]["max_hourly_usd"], 2)
+
+    def test_legacy_record_without_a_fingerprint_fails_closed(self):
+        clock = FakeClock()
+        store = DashboardStore(Path(self.tmp.name) / "legacy.json", clock=clock)
+        store.hydrate()
+        store.state["idempotency"] = {"legacy-key-0001": {"m": "POST", "p": "/api/budget", "s": 200,
+                                                          "b": {"old": True}, "t": clock.now}}
+        calls = []
+        result = store.run_request("legacy-key-0001", "POST", "/api/budget", lambda: calls.append(1) or (200, {}),
+                                   fingerprint=request_fingerprint({"max_hourly_usd": 1}))
+        # Body equality cannot be proven without a stored fingerprint: never replay over a possibly new change.
+        self.assertEqual(result[0], 422)
+        self.assertEqual(calls, [])
+        self.assertNotIn("f", store.state["idempotency"]["legacy-key-0001"])
 
     def test_records_are_bounded_and_expire(self):
         clock = FakeClock()

@@ -19,6 +19,7 @@ from lib.machine_profiles import platform_preferences, machine_profile, configur
 from lib.runner_assets import RUNNER_DOCKERFILE
 from lib.runner_fleet import GceVm
 import urllib.error
+import urllib.parse
 from lib import runner_patch as runner_patch_mod
 from lib.runner_patch import (
     RunnerPatch,
@@ -141,6 +142,29 @@ class RunnerPatchTests(unittest.TestCase):
             with patch("lib.runner_patch.subprocess.run", side_effect=fake_run):
                 resolved_branch, resolved_sha = resolve_repo_default_branch(repo)
             self.assertEqual((resolved_branch, resolved_sha), (branch, sha))
+
+    def test_gh_transport_receives_the_encoded_default_branch(self):
+        sha = "9" * 40
+        for branch in ("fix#1", "100%", "my branch", "feature/x", "ünïcødé"):
+            calls = []
+
+            def fake_run(cmd, branch=branch, **kwargs):
+                calls.append(cmd[2])
+                if cmd[2] == "repos/o/r":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"default_branch": branch}), stderr="")
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"sha": sha}), stderr="")
+
+            with patch("lib.runner_patch.shutil.which", return_value="/usr/bin/gh"), \
+                    patch("lib.runner_patch.subprocess.run", side_effect=fake_run):
+                self.assertEqual(resolve_repo_default_branch("o/r"), (branch, sha))
+            self.assertEqual(calls[1], "repos/o/r/commits/" + urllib.parse.quote(branch, safe=""))
+
+    def test_gh_transport_refuses_an_unsafe_endpoint_before_running_gh(self):
+        with patch("lib.runner_patch.shutil.which", return_value="/usr/bin/gh"), \
+                patch("lib.runner_patch.subprocess.run", side_effect=AssertionError("gh must not run")):
+            for endpoint in ("repos/o/r/commits/%2E%2E", "repos/o/r/commits/fix#1", "repos/../../user"):
+                with self.assertRaisesRegex(RuntimeError, "refusing unexpected endpoint", msg=endpoint):
+                    runner_patch_mod._gh_api_json(endpoint)
 
     def test_fetch_patch_from_config_repo_merges_defaults_and_repo_manifest(self):
         sha = "d" * 40
@@ -666,6 +690,80 @@ class GhApiFallbackTests(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=AssertionError("no request expected")):
             with self.assertRaises(RuntimeError):
                 runner_patch_mod._gh_api_json("repos/../../evil", env={})
+
+    TRICKY_BRANCHES = ("fix#1", "100%-done", "my branch", "feature/x#y", "ünïcødé-✓", "a?b=c&d", "rel+1@{x}")
+
+    def test_default_branch_is_one_encoded_segment_over_urllib(self):
+        sha = "f" * 40
+        for branch in self.TRICKY_BRANCHES:
+            seen = []
+
+            def fake_urlopen(request, timeout=None, branch=branch):
+                seen.append(request.full_url)
+                if request.full_url == "https://api.github.com/repos/o/r":
+                    return _FakeUrlResponse({"default_branch": branch})
+                return _FakeUrlResponse({"sha": sha})
+
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                self.assertEqual(resolve_repo_default_branch("o/r", env={"GH_TOKEN": "t"}), (branch, sha))
+            url = seen[1]
+            parts = urllib.parse.urlsplit(url)
+            # No fragment or query appears, and the ref decodes back to exactly one path segment.
+            self.assertEqual((parts.fragment, parts.query), ("", ""), url)
+            prefix = "/repos/o/r/commits/"
+            self.assertTrue(parts.path.startswith(prefix), url)
+            encoded = parts.path[len(prefix):]
+            self.assertNotIn("/", encoded)
+            self.assertEqual(urllib.parse.unquote(encoded), branch)
+            self.assertTrue(url.isascii())
+
+    def test_contents_ref_query_value_is_encoded(self):
+        seen = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            return _FakeUrlResponse({"encoding": "base64", "content": base64.b64encode(b"x: 1\n").decode()})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            runner_patch_mod._fetch_repo_file_at_ref("o/r", "repos/a/b.yaml", "v1#2&x=y", env={"GH_TOKEN": "t"})
+        parts = urllib.parse.urlsplit(seen[0])
+        self.assertEqual(parts.path, "/repos/o/r/contents/repos/a/b.yaml")
+        self.assertEqual(urllib.parse.parse_qs(parts.query), {"ref": ["v1#2&x=y"]})
+        self.assertEqual(parts.fragment, "")
+
+    def test_fetch_patch_follows_a_default_branch_with_a_hash(self):
+        sha = "1" * 40
+        files = {"defaults.yaml": "", "repos/xbmc4lyfe/newznab-tmux.yaml": YAML_NNTMUX_MANIFEST}
+
+        def fake_urlopen(request, timeout=None):
+            parts = urllib.parse.urlsplit(request.full_url)
+            base = "/repos/swack-tools/spot-runners-config"
+            if parts.path == base:
+                return _FakeUrlResponse({"default_branch": "release#2"})
+            if parts.path == base + "/commits/release%232" and not parts.fragment:
+                return _FakeUrlResponse({"sha": sha})
+            name = parts.path[len(base + "/contents/"):]
+            if parts.path.startswith(base + "/contents/") and parts.query == f"ref={sha}" and name in files:
+                if not files[name]:
+                    raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+                return _FakeUrlResponse({"encoding": "base64", "content": base64.b64encode(files[name].encode()).decode()})
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            patch_obj = fetch_patch_from_config_repo("xbmc4lyfe/newznab-tmux", env={"GH_TOKEN": "t"})
+        self.assertEqual(patch_obj.source_branch, "release#2")
+        self.assertEqual(patch_obj.source_commit, sha)
+
+    def test_encoded_traversal_and_malformed_escapes_are_refused(self):
+        for endpoint in ("repos/o/r/commits/%2E%2E", "repos/o/r/commits/%2e", "repos/o/r/commits/a%2F..%2Fb",
+                         "repos/o/r/%2E%2E/x", "repos/o/r/commits/fix#1", "repos/o/r/commits/%zz",
+                         "repos/o/r/commits/%2", "repos/o/r/commits/a b", "repos/o/r/commits/ü"):
+            with patch("urllib.request.urlopen", side_effect=AssertionError("no request expected")):
+                with self.assertRaisesRegex(RuntimeError, "refusing unexpected endpoint", msg=endpoint):
+                    runner_patch_mod._gh_api_json(endpoint, env={})
+        for endpoint in ("repos/o/r/commits/fix%231", "repos/o/r/commits/a%2Fb", "repos/o/r/commits/%25",
+                         "repos/o/r/commits/%C3%BC", "repos/o/r/commits/v1.2.x"):
+            self.assertTrue(runner_patch_mod._endpoint_is_safe(endpoint), endpoint)
 
     def _tree_responses(self, tree_payload):
         sha = "e" * 40

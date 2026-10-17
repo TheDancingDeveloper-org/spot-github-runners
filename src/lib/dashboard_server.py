@@ -118,6 +118,15 @@ IDEMPOTENCY_TTL_SECONDS = 86_400
 IDEMPOTENCY_MAX_BODY_BYTES = 65_536
 _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{8,128}")
 
+
+def request_fingerprint(payload: Any) -> str:
+    """SHA-256 of the canonical JSON request body that an Idempotency-Key record is bound to.
+
+    Keys are sorted and separators fixed, so the same body always yields the same fingerprint regardless of key
+    order or whitespace on the wire.
+    """
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
 KV_WRITE_DEBOUNCE_SECONDS = 1.0
 KV_WRITE_MAX_DELAY_SECONDS = 5.0
 KV_WRITER_RECHECK_SECONDS = 30.0
@@ -2053,11 +2062,15 @@ class DashboardStore:
         return fresh
 
     def run_request(self, key: str | None, method: str, path: str, fn: Any, *, mutating: bool = True,
-                    ) -> tuple[int, Any, bool]:
+                    fingerprint: str = "") -> tuple[int, Any, bool]:
         """Run ``fn() -> (status, body)`` with frozen and idempotency handling. Returns (status, body, replayed).
 
         With a key, the stored response and the mutation are written in the SAME atomic persist: store
         writes inside ``fn`` are deferred and the state is rolled back when the request fails.
+        ``fingerprint`` (see :func:`request_fingerprint`) binds the record to the request body: reusing a key
+        with a different method, path, or body gets 422 and never replays the first response over the second
+        change. A record saved before fingerprints were stored has no ``f`` and cannot prove the body matched,
+        so it also gets 422 instead of a replay (fail closed: no second change is silently dropped).
         """
         if not mutating:
             status, body = fn()
@@ -2073,7 +2086,7 @@ class DashboardStore:
             records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, now)
             existing = records.get(key)
             if existing is not None:
-                if existing.get("m") != method or existing.get("p") != path:
+                if existing.get("m") != method or existing.get("p") != path or existing.get("f") != fingerprint:
                     return 422, {"error": "Idempotency-Key was already used for a different request"}, False
                 return int(existing.get("s", 200)), copy.deepcopy(existing.get("b")), True
             snapshot = copy.deepcopy(self.state)
@@ -2090,8 +2103,8 @@ class DashboardStore:
             if status >= 500:
                 return status, body, False
             records = self._prune_idempotency(
-                {**records, key: {"m": method, "p": path, "s": int(status), "b": self._replay_copy(status, body),
-                                  "t": now}}, now
+                {**records, key: {"m": method, "p": path, "f": fingerprint, "s": int(status),
+                                  "b": self._replay_copy(status, body), "t": now}}, now
             )
             self.state[IDEMPOTENCY_STATE_KEY] = records
             try:
@@ -5949,7 +5962,7 @@ def make_handler(
             try:
                 status, body, replayed = store.run_request(
                     key, "POST", path, lambda: self._dispatch_post(path, payload),
-                    mutating=path not in NON_MUTATING_POST_PATHS,
+                    mutating=path not in NON_MUTATING_POST_PATHS, fingerprint=request_fingerprint(payload),
                 )
             except DashboardFrozenError:
                 self._send_unavailable()
@@ -6014,10 +6027,9 @@ def make_handler(
                 except PatchConsoleError as exc:
                     return exc.status, {"error": str(exc), **exc.body}
 
-            fingerprint = hashlib.sha256(
-                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
             try:
-                status, body, replayed = store.run_external(key, "POST", path, run, fingerprint=fingerprint)
+                status, body, replayed = store.run_external(key, "POST", path, run,
+                                                            fingerprint=request_fingerprint(payload))
             except DashboardFrozenError:
                 self._send_unavailable()
                 return

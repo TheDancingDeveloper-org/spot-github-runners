@@ -1349,3 +1349,22 @@ const NATIVE_FETCH = async (url, init) => {
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadFileRefEncodingTests(unittest.TestCase):
+    """Refs with URL-significant characters stay in the ``ref`` query value."""
+
+    def test_ref_is_percent_encoded(self) -> None:
+        seen: list[str] = []
+
+        def requester(method, url, headers, data, timeout):
+            seen.append(url)
+            return 404, b'{"message": "Not Found"}'
+
+        client = pc.ConfigRepoClient("o/r", "t", requester=requester)
+        for ref in ("release#2", "a&b=c", "feat/x y", "100%"):
+            self.assertIsNone(client.read_file("repos/o/r.yaml", ref))
+            parsed = urllib.parse.urlsplit(seen[-1])
+            self.assertEqual(parsed.fragment, "")
+            self.assertEqual(parsed.path.split("/contents/", 1)[1], "repos/o/r.yaml")
+            self.assertEqual(urllib.parse.parse_qs(parsed.query), {"ref": [ref]})

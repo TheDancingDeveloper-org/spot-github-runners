@@ -220,7 +220,7 @@ class ConfigRepoClient:
     def read_file(self, path: str, ref: str) -> tuple[str, str] | None:
         """(text, blob sha) of ``path`` at ``ref``, or None when it does not exist."""
         try:
-            _, payload = self._call("GET", f"repos/{self.repo}/contents/{path}?ref={ref}")
+            _, payload = self._call("GET", f"repos/{self.repo}/contents/{urllib.parse.quote(path, safe='/')}?ref={urllib.parse.quote(ref, safe='')}")
         except GitHubRestError as exc:
             if exc.http_status == 404:
                 return None

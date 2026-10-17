@@ -703,6 +703,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                         {"name": "gha-oxidex-runners-old-1", "busy": False, "status": "online"}
                         if method == "GET" else {})) as mock_api, \
                     patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True) as quiesce, \
+                    patch("lib.runner_drain.cordon_runner_host", return_value=("idle", {})) as host_cordon, \
                     patch("lib.runner_drain.subprocess.run") as mock_delete_cmd:
                 # Step 1: Drain finishes -> advances to deregister
                 live = [self.outgoing_vm, self.replacement_vm]
@@ -724,6 +725,10 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 self.assertNotIn("price_rotation", read_scale_state(path))
                 # Builder quiescence was confirmed before deregistration and again before deletion.
                 self.assertEqual(quiesce.call_count, 2)
+                # The host job-start cordon was verified idle before advancing and again right before deregistering.
+                self.assertEqual(host_cordon.call_count, 2)
+                self.assertEqual(host_cordon.call_args.args[2], "rotation-cordon-old-123")
+                self.assertEqual(host_cordon.call_args.args[3], ["gha-oxidex-runners-old-1"])
 
     def test_launch_offer_propagates_target_argument(self):
         from lib.spot_runner_autoscaler import launch_offer
@@ -884,6 +889,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
             with patch("lib.runner_drain.api", side_effect=subprocess.CalledProcessError(1, ["gh", "api"], stderr="403 Forbidden")), \
+                 patch("lib.runner_drain.cordon_runner_host", return_value=("placed", {})), \
                  patch("lib.spot_runner_autoscaler.now", return_value=1010.0):
                 step_price_rotation([self.outgoing_vm, self.replacement_vm], [runner, self.replacement_runner],
                                     self.args, state, path)
@@ -1154,11 +1160,17 @@ class RotationHarness:
         rotation.update(extra)
         return {"price_rotation": rotation}
 
-    def step(self, state, vms, runners, api=None, builders_quiet=True, jobs_done=True):
+    def step(self, state, vms, runners, api=None, builders_quiet=True, jobs_done=True, cordon="idle",
+             release=True):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
             api_kwargs = {"side_effect": api} if api is not None else {"return_value": {}}
+            cordon_kwargs = ({"side_effect": cordon} if callable(cordon)
+                             else {"return_value": (cordon, {"reason": "test"})})
             with patch("lib.runner_drain.api", **api_kwargs) as mock_api, \
+                    patch("lib.runner_drain.cordon_runner_host", **cordon_kwargs) as self.host_cordon, \
+                    patch("lib.runner_drain.release_runner_host_cordon", return_value=release) as self.release_cordon, \
+                    patch("lib.runner_drain.subprocess.run", side_effect=AssertionError("no live SSH or gcloud")), \
                     patch("lib.runner_drain.jobs_finished", return_value=jobs_done), \
                     patch("lib.spot_runner_autoscaler.delete_overpriced_vm") as delete_old, \
                     patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete_new, \
@@ -1235,6 +1247,7 @@ class ReplacementEvidenceTests(RotationHarness, unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
             with patch("lib.runner_drain.api", return_value={}), \
+                    patch("lib.runner_drain.cordon_runner_host", return_value=("idle", {})), \
                     patch("lib.runner_drain.jobs_finished", return_value=True), \
                     patch("lib.spot_runner_autoscaler.quiesce_remote_builder", side_effect=quiesce), \
                     patch("lib.spot_runner_autoscaler.now", return_value=self.now):
@@ -1409,6 +1422,120 @@ class ReplacementEvidenceTests(RotationHarness, unittest.TestCase):
         _, delete_old, _, saved = self.step(state, [reused, self.replacement_vm], [self.new_runner])
         delete_old.assert_not_called()
         self.assertNotIn("price_rotation", saved)
+
+
+class RepositoryHostCordonRotationTests(RotationHarness, unittest.TestCase):
+    """A repository rotation retires the outgoing host only behind a verified host job-start cordon."""
+
+    def calls(self, mock_api):
+        return [c.args for c in mock_api.call_args_list]
+
+    def test_host_cordon_precedes_label_removal_and_token_is_persisted_first(self):
+        labeled = GitHubRunner(99, "gha-oxidex-runners-old-1", "online", False, ("self-hosted", "X64", "spot"))
+        state = self.state("cordon_drain", cordon_complete=False, cordoned_runners={})
+        order = []
+
+        def cordon(vm, args, token, names, guard=None):
+            order.append(("cordon", token, dict(state["price_rotation"]).get("host_cordon_token")))
+            return "placed", {}
+
+        def api(target, method, path, body=None, paginate=False):
+            order.append((method, path))
+            return {}
+
+        _, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm], [labeled, self.new_runner],
+                                   api=api, cordon=cordon)
+        self.assertEqual(order[0], ("cordon", "rotation-cordon-old-123", "rotation-cordon-old-123"))
+        self.assertEqual(order[1], ("DELETE", "repos/xbmc4lyfe/newznab-tmux/actions/runners/99/labels"))
+        self.assertTrue(saved["price_rotation"]["cordon_complete"])
+        self.assertEqual(saved["price_rotation"]["cordon_mode"], "host")
+        self.assertEqual(saved["price_rotation"]["host_cordon_token"], "rotation-cordon-old-123")
+        self.assertEqual(saved["price_rotation"]["phase"], "cordon_drain")
+
+    def test_unsupported_host_holds_rotation_with_labels_untouched(self):
+        state = self.state("cordon_drain", cordon_complete=False, cordoned_runners={})
+        with self.assertLogs("spot_runner_autoscaler", level="ERROR") as logs:
+            for _ in range(2):
+                mock_api, delete_old, _, state = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                                           [self.old_runner, self.new_runner], cordon="unsupported")
+                mock_api.assert_not_called()
+                delete_old.assert_not_called()
+        self.assertTrue(any("Retirement held" in line for line in logs.output))
+        self.assertFalse(state["price_rotation"]["cordon_complete"])
+        self.assertEqual(state["price_rotation"]["phase"], "cordon_drain")
+
+    def test_drain_never_advances_until_the_cordoned_host_is_idle_even_past_the_deadline(self):
+        from lib.spot_runner_autoscaler import DRAIN_DEADLINE_SECONDS
+        self.now = 1000.0 + DRAIN_DEADLINE_SECONDS + 60
+        state = self.state("cordon_drain", host_cordon_token="rotation-cordon-old-123")
+        for host_state in ("busy", "placed", "unreachable", "identity"):
+            mock_api, delete_old, _, state = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                                       [self.old_runner, self.new_runner], cordon=host_state)
+            self.assertEqual(state["price_rotation"]["phase"], "cordon_drain", host_state)
+            mock_api.assert_not_called()
+        _, _, _, state = self.step(state, [self.outgoing_vm, self.replacement_vm], [self.old_runner, self.new_runner])
+        self.assertEqual(state["price_rotation"]["phase"], "deregister")
+
+    def test_deregister_returns_to_drain_unless_the_host_cordon_is_idle(self):
+        for host_state in ("busy", "placed", "unsupported", "unreachable"):
+            state = self.state("deregister", host_cordon_token="rotation-cordon-old-123")
+            mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                              [self.old_runner, self.new_runner],
+                                              api=DeregisterIdleRecheckTests.idle_get(self), cordon=host_state)
+            self.assertNotIn("DELETE", [c[1] for c in self.calls(mock_api)], host_state)
+            self.assertEqual(saved["price_rotation"]["phase"], "cordon_drain", host_state)
+            self.assertNotIn("deregistering_runner_id", saved["price_rotation"])
+
+    def test_deregister_verifies_the_cordon_before_the_first_deletion(self):
+        order = []
+
+        def cordon(vm, args, token, names, guard=None):
+            order.append("cordon")
+            return "idle", {}
+
+        def api(target, method, path, body=None, paginate=False):
+            order.append(method)
+            return {"name": "gha-oxidex-runners-old-1", "busy": False, "status": "online"} if method == "GET" else {}
+
+        state = self.state("deregister")
+        _, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm], [self.old_runner, self.new_runner],
+                                   api=api, cordon=cordon)
+        self.assertEqual(order, ["cordon", "GET", "DELETE"])
+        self.assertEqual(saved["price_rotation"]["phase"], "delete")
+        # A legacy record without a token gets one before the host is touched.
+        self.assertEqual(saved["price_rotation"]["host_cordon_token"], "rotation-cordon-old-123")
+
+    def test_recovery_releases_the_rotation_owned_cordon_before_aborting(self):
+        terminated = replace_vm(self.replacement_vm, status="TERMINATED")
+        state = self.state("cordon_drain", host_cordon_token="rotation-cordon-old-123")
+        mock_api, delete_old, delete_new, saved = self.step(state, [self.outgoing_vm, terminated], [self.old_runner])
+        self.release_cordon.assert_called_once_with(self.outgoing_vm, self.args, "rotation-cordon-old-123")
+        delete_old.assert_not_called()
+        self.assertNotIn("price_rotation", saved)
+
+    def test_failed_cordon_release_holds_recovery(self):
+        terminated = replace_vm(self.replacement_vm, status="TERMINATED")
+        state = self.state("cordon_drain", host_cordon_token="rotation-cordon-old-123")
+        _, delete_old, delete_new, saved = self.step(state, [self.outgoing_vm, terminated], [self.old_runner],
+                                                     release=False)
+        delete_old.assert_not_called()
+        delete_new.assert_not_called()
+        self.assertEqual(saved["price_rotation"]["host_cordon_token"], "rotation-cordon-old-123")
+        self.assertTrue(saved["price_rotation"]["recovering"])
+
+    def test_host_without_registered_listeners_needs_no_cordon(self):
+        state = self.state("cordon_drain", host_cordon_token="rotation-cordon-old-123")
+        _, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm], [self.new_runner],
+                                   cordon=AssertionError)
+        self.host_cordon.assert_not_called()
+        self.assertEqual(saved["price_rotation"]["phase"], "deregister")
+
+    def test_org_rotation_never_uses_the_host_cordon(self):
+        state = self.state("deregister", target="swack-tools", target_type="org")
+        self.args.target = "swack-tools"
+        self.step(state, [self.outgoing_vm, self.replacement_vm], [self.old_runner, self.new_runner],
+                  api=DeregisterIdleRecheckTests.idle_get(self), cordon=AssertionError)
+        self.host_cordon.assert_not_called()
 
 
 class LostCapacityRecoveryTests(RotationHarness, unittest.TestCase):
