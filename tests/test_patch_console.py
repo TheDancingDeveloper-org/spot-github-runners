@@ -304,13 +304,13 @@ class SaveExitAuditTests(unittest.TestCase):
     def test_every_lookup_or_lost_answer_is_retryable(self):
         branch = pc.PatchConsole.branch_for(OXIDEX_PATH, "audit-0001").split("/", 1)[1]
         cases = [
-            ("resolve lost", lambda: FakeGitHubRepo(), [("GET", f"repos/{REPO}", "status")]),
-            ("initial branch lookup", lambda: FakeGitHubRepo(), [("GET", branch, "before")]),
-            ("defaults read", lambda: FakeGitHubRepo(), [("GET", "contents/defaults.yaml", "status")]),
-            ("base file read", lambda: FakeGitHubRepo(), [("GET", f"contents/{OXIDEX_PATH}", "before")]),
-            ("lookup after a lost branch create", lambda: FakeGitHubRepo(),
+            ("resolve lost", FakeGitHubRepo, [("GET", f"repos/{REPO}", "status")]),
+            ("initial branch lookup", FakeGitHubRepo, [("GET", branch, "before")]),
+            ("defaults read", FakeGitHubRepo, [("GET", "contents/defaults.yaml", "status")]),
+            ("base file read", FakeGitHubRepo, [("GET", f"contents/{OXIDEX_PATH}", "before")]),
+            ("lookup after a lost branch create", FakeGitHubRepo,
              [("POST", "/git/refs", "after"), ("GET", branch, "before", 1)]),  # skip the initial lookup
-            ("lookup after a lost commit", lambda: FakeGitHubRepo(),
+            ("lookup after a lost commit", FakeGitHubRepo,
              [("PUT", f"contents/{OXIDEX_PATH}", "after"), ("GET", branch, "before", 1)]),
             ("reconcile file read", lambda: self.committed_without_pr("audit-0001"),
              [("GET", f"contents/{OXIDEX_PATH}", "before")]),
@@ -318,15 +318,15 @@ class SaveExitAuditTests(unittest.TestCase):
             ("reconcile PR open lost", lambda: self.committed_without_pr("audit-0001"),
              [("POST", "/pulls", "before")]),
             # A 4xx on a reconciliation lookup is still not an answer about the earlier attempt.
-            ("PR lookup 403 after a lost create", lambda: FakeGitHubRepo(),
+            ("PR lookup 403 after a lost create", FakeGitHubRepo,
              [("POST", "/pulls", "after"), ("GET", "/pulls", "403")]),
-            ("branch lookup 403", lambda: FakeGitHubRepo(), [("GET", branch, "403")]),
+            ("branch lookup 403", FakeGitHubRepo, [("GET", branch, "403")]),
             ("reconcile file read 403", lambda: self.committed_without_pr("audit-0001"),
              [("GET", f"contents/{OXIDEX_PATH}", "403")]),
             ("reconcile PR lookup 403", lambda: self.committed_without_pr("audit-0001"), [("GET", "/pulls", "403")]),
-            ("lookup 403 after a lost branch create", lambda: FakeGitHubRepo(),
+            ("lookup 403 after a lost branch create", FakeGitHubRepo,
              [("POST", "/git/refs", "after"), ("GET", branch, "403", 1)]),
-            ("lookup 403 after a lost commit", lambda: FakeGitHubRepo(),
+            ("lookup 403 after a lost commit", FakeGitHubRepo,
              [("PUT", f"contents/{OXIDEX_PATH}", "after"), ("GET", branch, "403", 1)]),
         ]
         for name, make, rules in cases:
