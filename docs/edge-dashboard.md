@@ -157,6 +157,10 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   fails, the pending keys stay, and the applied keys stay unset or keep their earlier value. Confirmation
   writes the applied keys and the label, then removes the pending keys. `--patch-live` on a pending host
   applies the patch again, even when its receipt already matches, so `LIVE_PATCH_APPLIED` confirms it.
+- A live patch writes only the same two pending keys. It writes them after every check passes, right
+  before it runs the live script. A live patch that fails part-way leaves the host pending, so the
+  preview never trusts the earlier applied record. That holds even after the desired patch reverts to
+  the earlier one. Refused live patches write no metadata.
 - On the host, the patch steps first write the pending marker `/var/lib/gha-runner-patch/pending.json`.
   Only after every step succeeds do they write the completion receipt `state.json`, with an atomic
   rename, and then remove the marker. For a live patch, the steps include the image build and every

@@ -86,6 +86,45 @@ def plain_metadata(command) -> dict[str, str]:
     return dict(p.split("=", 1) for p in flag[len("--metadata="):].split(","))
 
 
+def applied_writes(cloud):
+    return [c for c in cloud.named("compute", "instances", "add-metadata") if "spot-runner-patch-sha256" in plain_metadata(c)]
+
+
+def pending_writes(cloud):
+    return [c for c in cloud.named("compute", "instances", "add-metadata")
+            if set(plain_metadata(c)) == {"spot-runner-patch-pending-sha256"}]
+
+
+def live_sequence(cloud):
+    """The live patch's steps, named: receipt read, pending write, live script, applied write, label, clear."""
+    steps = []
+    for c in cloud.calls:
+        if c[:2] == ["compute", "ssh"]:
+            steps.append("read-receipt" if "state.json" in c[-1] else "live-script")
+        elif c[:3] == ["compute", "instances", "add-metadata"]:
+            steps.append("write-applied" if "spot-runner-patch-sha256" in plain_metadata(c) else "write-pending")
+        elif c[:3] == ["compute", "instances", "add-labels"]:
+            steps.append("label")
+        elif c[:3] == ["compute", "instances", "remove-metadata"]:
+            steps.append("clear-pending" if "pending" in c[-1] else c[-1])
+    return steps
+
+
+def apply_metadata_writes(item, cloud):
+    """Replay the recorded gcloud metadata writes onto a GCE item, as GCE would."""
+    items = {e["key"]: e["value"] for e in item["metadata"]["items"]}
+    files = iter(cloud.files)
+    for c in cloud.calls:
+        if c[:3] == ["compute", "instances", "add-metadata"]:
+            items.update(plain_metadata(c))
+            if any(a.startswith("--metadata-from-file=") for a in c):
+                items.update(next(files))
+        elif c[:3] == ["compute", "instances", "remove-metadata"]:
+            for key in c[-1][len("--keys="):].split(","):
+                items.pop(key, None)
+    return {**item, "metadata": {"items": [{"key": k, "value": v} for k, v in items.items()]}}
+
+
 class ProvisioningMetadataTests(unittest.TestCase):
     def provision(self, patch, vm=None):
         args = args_for(patch, *(["--existing-instance"] if vm else []))
@@ -433,21 +472,60 @@ class LivePatchMetadataTests(unittest.TestCase):
         return result, cloud
 
     def test_metadata_is_updated_only_after_the_host_confirms(self):
-        result, cloud = self.run_live(OLD, "something went wrong\n")
-        self.assertIsInstance(result, RuntimeError)
-        self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
-        self.assertEqual(cloud.named("compute", "instances", "add-labels"), [])
-        result, cloud = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{OLD.patch_sha256}\n")  # another patch's marker
-        self.assertIsInstance(result, RuntimeError)
-        self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
+        for output in ("something went wrong\n", f"LIVE_PATCH_APPLIED:{OLD.patch_sha256}\n"):  # another patch's marker
+            result, cloud = self.run_live(OLD, output)
+            self.assertIsInstance(result, RuntimeError)
+            # Only the attempt is announced (pending) before the script; nothing applied, labeled, or cleared.
+            self.assertEqual(live_sequence(cloud), ["read-receipt", "write-pending", "live-script"])
         result, cloud = self.run_live(OLD, f"ok\nLIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n")
         self.assertEqual(result, "hot_patch")
-        order = [c[:3] for c in cloud.calls]
-        apply_index = max(i for i, c in enumerate(cloud.calls) if c[:2] == ["compute", "ssh"])
-        self.assertEqual(order[apply_index + 1:], [["compute", "instances", "add-metadata"],
-                                                    ["compute", "instances", "add-labels"]])
-        self.assertEqual(plain_metadata(cloud.calls[apply_index + 1])["spot-runner-patch-sha256"], TARGET.patch_sha256)
+        self.assertEqual(live_sequence(cloud), ["read-receipt", "write-pending", "live-script", "write-applied", "label",
+                                                "clear-pending"])
+        [pending] = pending_writes(cloud)
+        self.assertEqual(plain_metadata(pending), {"spot-runner-patch-pending-sha256": TARGET.patch_sha256})
+        self.assertEqual(cloud.files[0], {"spot-runner-patch-pending": canonical_json(TARGET)})
+        [applied] = applied_writes(cloud)
+        self.assertEqual(plain_metadata(applied)["spot-runner-patch-sha256"], TARGET.patch_sha256)
         self.assertEqual(cloud.files[-1]["spot-runner-patch"], canonical_json(TARGET))
+        self.assertEqual(cloud.calls[-1][-1], "--keys=spot-runner-patch-pending-sha256,spot-runner-patch-pending")
+
+    def test_failed_live_patch_leaves_the_host_pending_so_reverting_is_never_noop(self):
+        """Codex round 15 P2: A recorded, live B fails part-way. GCE must show pending B, so a preview for A is
+        unknown (not noop); a later successful B clears it."""
+        host_a = gce_item("oxidex-runners-1", sha=OLD.patch_sha256, manifest=canonical_json(OLD))
+
+        def preview(item, desired):
+            [host] = compute_api.runner_host_records([item])
+            [got] = pc.classify_hosts([host], desired, pc.UnavailableHotPatchExecutor())
+            return got
+
+        self.assertEqual(preview(host_a, OLD).classification, "noop")
+        result, cloud = self.run_live(OLD, "docker build failed\n")
+        self.assertIsInstance(result, RuntimeError)
+        failed = apply_metadata_writes(host_a, cloud)
+        got = preview(failed, OLD)
+        self.assertEqual(got.classification, "unknown")
+        self.assertIn(f"pending, unconfirmed: provisioning requested patch {TARGET.patch_sha256[:12]}", got.detail)
+        self.assertEqual(preview(failed, TARGET).classification, "unknown")
+        [vm] = [runner_fleet.GceVm("oxidex-runners-1", "us-central1-a", "RUNNING", "c4d-standard-32", True,
+                                   **runner_fleet.patch_record_from_gce_item(failed))]
+        result, cloud = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n",
+                                      pending=vm.patch_pending_sha256)
+        self.assertEqual(result, "hot_patch")
+        done = apply_metadata_writes(failed, cloud)
+        self.assertEqual(runner_fleet.patch_record_from_gce_item(done)["patch_pending_sha256"], "")
+        self.assertEqual(preview(done, TARGET).classification, "noop")
+        self.assertEqual(preview(done, OLD).classification, "hot_patch")
+
+    def test_oversized_pending_manifest_is_replaced_by_a_placeholder(self):
+        big = validate_patch_dict({**BASE, "host": {"files": [{"path": "/etc/big", "content": "x" * 70_000}]}})
+        args = args_for(big)
+        cloud = GcloudRecorder()
+        with mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
+            manager.record_pending_patch_metadata(args, "us-central1-a", big)
+        [write] = cloud.calls
+        self.assertEqual(plain_metadata(write), {"spot-runner-patch-pending-sha256": big.patch_sha256})
+        self.assertEqual(json.loads(cloud.files[0]["spot-runner-patch-pending"])["patch_sha256"], big.patch_sha256)
 
     def test_label_sync_preflight_failure_stops_before_the_host_changes(self):
         args = args_for(TARGET, "--patch-live")
@@ -461,8 +539,7 @@ class LivePatchMetadataTests(unittest.TestCase):
                 mock.patch("lib.runner_manager.sync_runner_labels") as sync:
             with self.assertRaisesRegex(RuntimeError, "Runner group"):
                 manager.apply_live_patch(args, "us-central1-a")
-        self.assertEqual(len([c for c in cloud.calls if c[:2] == ["compute", "ssh"]]), 1)  # only the receipt read
-        self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
+        self.assertEqual(live_sequence(cloud), ["read-receipt"])  # no pending write, no script
         sync.assert_not_called()
         self.assertIs(args.deployment_vm, vm)  # strict pools verify cached identities against the observed VM
 
@@ -493,15 +570,11 @@ class LivePatchMetadataTests(unittest.TestCase):
         """Codex round 13 P2: a matching receipt on an unconfirmed bootstrap re-applies live before recording."""
         result, cloud = self.run_live(TARGET, "partial output\n", pending=TARGET.patch_sha256)
         self.assertIsInstance(result, RuntimeError)
-        self.assertEqual(len([c for c in cloud.calls if c[:2] == ["compute", "ssh"]]), 2)  # the script ran
-        self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
-        self.assertEqual(cloud.named("compute", "instances", "remove-metadata"), [])
+        self.assertEqual(live_sequence(cloud), ["read-receipt", "write-pending", "live-script"])  # the script ran
         result, cloud = self.run_live(TARGET, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n", pending=TARGET.patch_sha256)
         self.assertEqual(result, "hot_patch")
-        apply_index = max(i for i, c in enumerate(cloud.calls) if c[:2] == ["compute", "ssh"])
-        self.assertEqual([c[:3] for c in cloud.calls[apply_index + 1:]],
-                         [["compute", "instances", "add-metadata"], ["compute", "instances", "add-labels"],
-                          ["compute", "instances", "remove-metadata"]])  # pending cleared last
+        self.assertEqual(live_sequence(cloud), ["read-receipt", "write-pending", "live-script", "write-applied", "label",
+                                                "clear-pending"])  # pending cleared last
         self.assertEqual(cloud.calls[-1][-1], "--keys=spot-runner-patch-pending-sha256,spot-runner-patch-pending")
 
     def test_only_a_completion_receipt_from_this_boot_skips_the_live_apply(self):
@@ -514,18 +587,16 @@ class LivePatchMetadataTests(unittest.TestCase):
             with self.subTest(name):
                 result, cloud = self.run_live(None, "build failed\n", receipt_text=text)
                 self.assertIsInstance(result, RuntimeError)  # the live script ran and did not confirm
-                self.assertEqual(len([c for c in cloud.calls if c[:2] == ["compute", "ssh"]]), 2)
-                self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
+                self.assertEqual(live_sequence(cloud), ["read-receipt", "write-pending", "live-script"])
         result, cloud = self.run_live(TARGET, "")  # a completion receipt from this boot
         self.assertEqual(result, "noop")
-        self.assertEqual(plain_metadata(cloud.named("compute", "instances", "add-metadata")[0])["spot-runner-patch-boot"],
-                         BOOT_TS)
+        self.assertEqual(live_sequence(cloud), ["read-receipt", "write-applied", "label"])  # no script, no pending
+        self.assertEqual(plain_metadata(applied_writes(cloud)[0])["spot-runner-patch-boot"], BOOT_TS)
 
     def test_live_patch_binds_the_record_to_the_boot_and_refuses_a_restart(self):
         result, cloud = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n")
         self.assertEqual(result, "hot_patch")
-        self.assertEqual(plain_metadata(cloud.named("compute", "instances", "add-metadata")[0])["spot-runner-patch-boot"],
-                         BOOT_TS)
+        self.assertEqual(plain_metadata(applied_writes(cloud)[0])["spot-runner-patch-boot"], BOOT_TS)
         args = args_for(TARGET)
         rebooted = runner_fleet.GceVm(args.instance_name, "us-central1-a", "RUNNING", "c4d-standard-32", True,
                                       instance_id="1", cpu_platform="AMD Turin",
@@ -533,7 +604,7 @@ class LivePatchMetadataTests(unittest.TestCase):
         result, cloud = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n", observed=[rebooted])
         self.assertIsInstance(result, RuntimeError)
         self.assertIn("restarted while", str(result))
-        self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
+        self.assertEqual(live_sequence(cloud), ["read-receipt", "write-pending", "live-script"])  # stays pending
         with self.assertRaisesRegex(RuntimeError, "without the boot"):
             manager.record_patch_metadata(args, "us-central1-a", TARGET, boot="")
 
@@ -542,7 +613,7 @@ class LivePatchMetadataTests(unittest.TestCase):
             # The target has no mounts and x86_64, so an arm host needs a new VM and a mounts host recreated containers.
             result, cloud = self.run_live(receipt, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}")
             self.assertIsInstance(result, RuntimeError, receipt.patch_sha256)
-            self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
+            self.assertEqual(live_sequence(cloud), ["read-receipt"])  # no pending write, no script, no record
 
     def test_dashboard_executor_path_records_only_after_confirmation(self):
         ex = pc.GcloudHotPatchExecutor("proj", which=lambda _n: "/usr/bin/gcloud")
@@ -568,7 +639,9 @@ class LivePatchMetadataTests(unittest.TestCase):
                 else:
                     with self.assertRaises(RuntimeError):
                         ex.apply(host, TARGET)
-            self.assertEqual(bool(cloud.named("compute", "instances", "add-metadata")), expect_metadata, output)
+            self.assertEqual(live_sequence(cloud),
+                             ["read-receipt", "write-pending", "live-script"]
+                             + (["write-applied", "label", "clear-pending"] if expect_metadata else []), output)
 
 
 def gce_item(name, *, sha=None, manifest=None, target=REPO, label=True, status="RUNNING", extra=(), pending=None,
@@ -892,7 +965,8 @@ class HostCapacityTests(unittest.TestCase):
         big_vm = runner_fleet.GceVm("oxidex-runners-1", vcpu=64, ram_gib=256.0, **base)
         result, cloud = self.run_live(big_vm, BIG)
         self.assertEqual(result, "hot_patch")
-        self.assertEqual(len(cloud.named("compute", "instances", "add-metadata")), 1)
+        self.assertEqual(live_sequence(cloud), ["read-receipt", "write-pending", "live-script", "write-applied", "label",
+                                                "clear-pending"])
 
     def test_preview_classifies_undersized_hosts_as_replace_vm(self):
         hosts = [

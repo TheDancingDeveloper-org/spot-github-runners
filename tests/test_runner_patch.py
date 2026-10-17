@@ -370,9 +370,13 @@ container:
 
         self.assertEqual(result, "hot_patch")
         self.assertEqual(len([c for c in ssh_commands if c[:2] == ["compute", "ssh"]]), 2)
-        # After the confirmed apply, the recorded patch metadata and label are updated.
-        self.assertEqual([c[:3] for c in ssh_commands[2:]],
-                         [["compute", "instances", "add-metadata"], ["compute", "instances", "add-labels"]])
+        # Pending is announced before the live script; after the confirmed apply, the applied metadata and label
+        # are recorded and the pending keys cleared, last.
+        self.assertEqual([c[:3] for c in ssh_commands],
+                         [["compute", "ssh", args.instance_name], ["compute", "instances", "add-metadata"],
+                          ["compute", "ssh", args.instance_name], ["compute", "instances", "add-metadata"],
+                          ["compute", "instances", "add-labels"], ["compute", "instances", "remove-metadata"]])
+        self.assertIn("--metadata=spot-runner-patch-pending-sha256=" + updated.patch_sha256, ssh_commands[1])
         sync_labels.assert_called_once_with(args)
         preflight.assert_called_once_with(args)  # checked before the live script ran
 

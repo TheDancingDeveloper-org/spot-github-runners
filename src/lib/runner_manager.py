@@ -513,6 +513,32 @@ def pending_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) ->
     return plain, manifest
 
 
+def record_pending_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatch | None) -> None:
+    """Announce ``patch`` as in progress (PENDING keys only) before anything on the host changes.
+
+    A live patch that fails part-way must not leave the previous applied record looking current: the
+    preview treats any pending host as unknown until record_patch_metadata(clear_pending=True) runs. Only the
+    two PENDING keys are written, so a failed attempt changes nothing else; an oversized manifest is replaced by
+    a placeholder naming its sha so no earlier attempt's pending manifest survives.
+    """
+    plain, manifest = pending_patch_record(args, patch)
+    sha = plain[PATCH_PENDING_SHA_METADATA_KEY]
+    if manifest is None:
+        manifest = json.dumps({"patch_sha256": sha, "manifest_omitted": "larger than the metadata limit"},
+                              sort_keys=True, separators=(",", ":"))
+    manifest_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", prefix="gha-patch-pending-", suffix=".json", delete=False) as temp:
+            temp.write(manifest)
+            manifest_path = temp.name
+        gcloud(["compute", "instances", "add-metadata", args.instance_name, f"--zone={zone}",
+                _plain_metadata_flag({PATCH_PENDING_SHA_METADATA_KEY: sha}),
+                f"--metadata-from-file={PATCH_PENDING_METADATA_KEY}={manifest_path}"])
+    finally:
+        if manifest_path:
+            Path(manifest_path).unlink(missing_ok=True)
+
+
 def _plain_metadata_flag(plain: dict[str, str]) -> str:
     for key, value in plain.items():
         if any(c in value for c in ",=\n\r") or any(c in key for c in ",=\n\r"):
@@ -1005,6 +1031,9 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     )
     script_b64 = base64.b64encode(live_script.encode("utf-8")).decode("ascii")
     remote_cmd = f"printf '%s' '{script_b64}' | base64 -d | sudo -n bash -euo pipefail"
+    # Publish the attempt before the host changes: if it fails part-way, the host stays pending
+    # (preview: unknown) instead of still advertising the previous patch as confirmed.
+    record_pending_patch_metadata(args, zone, patch)
     output = gcloud(
         ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={remote_cmd}"],
         quiet=True,
@@ -1012,7 +1041,7 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
         raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
     # Only now, after the host confirmed this exact patch in this boot, does the recorded patch change.
-    record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm), clear_pending=pending)
+    record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm), clear_pending=True)
     sync_runner_labels(args)
     LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
     return "hot_patch"
