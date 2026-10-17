@@ -142,7 +142,11 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   Engine. A runner host carries the `spot-target` label or the patch metadata. The control VM's
   service account needs `compute.instances.list`. Elsewhere the preview uses the host records in the
   dashboard state.
-- The preview classifies each host from its recorded manifest, after checking it against the recorded
+- The preview checks each host's observed capacity against every hardware constraint of the patch first:
+  `hardware.min_vcpu`, `hardware.min_ram_gib`, the architecture, and the CPU platform for `hardware.isa`. A
+  host that can't meet them is `replace_vm` with the reason, and a host whose capacity is unknown is
+  `unknown`. The hot-patch executor and `--patch-live` refuse such hosts before they change anything.
+- The preview then classifies each host from its recorded manifest, after checking it against the recorded
   sha256. Hosts provisioned before patch recording show as `unknown`, with a reason. They stay that way
   until they're reprovisioned or hot-patched once with `--patch-live`.
 - Hot-patching applies the saved effective patch, never a draft. It runs only when every host is

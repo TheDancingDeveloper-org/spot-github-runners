@@ -30,6 +30,7 @@ from .runner_patch import (
     SCHEMA_VERSION,
     RunnerPatch,
     classify_patch_diff,
+    host_capacity_problems,
     merge_patch_dicts,
     parse_manifest_text,
     validate_patch_dict,
@@ -521,6 +522,9 @@ class GcloudHotPatchExecutor:
         if missing:
             raise HostRefusedError(f"refused: the host record does not carry {', '.join(missing)} "
                                    "(provisioned before deployment details were recorded)")
+        violations, unknowns = _capacity(host, patch)
+        if violations or unknowns:
+            raise HostRefusedError("refused: " + "; ".join(violations + unknowns))
         zone, region = str(host["zone"]), str(host["runner_region"])
         if not zone.startswith(region + "-"):
             raise HostRefusedError(f"refused: recorded region {region} does not contain zone {zone}")
@@ -564,13 +568,25 @@ def gce_host_source(project: str) -> Callable[[], list[dict[str, Any]]]:
             api = compute_api.AsyncGoogleApi(auth.token, 4)
             try:
                 items, unreachables = await compute_api.list_instances(api, auth.project)
+                hosts = compute_api.runner_host_records(items)
+                # Observed capacity for the hardware-constraint check (one lookup per zone and machine type).
+                shapes = {(h["zone"], h["machine_type"]) for h in hosts if h.get("zone") and h.get("machine_type")}
+                specs = {}
+                for zone, machine_type in shapes:
+                    try:
+                        specs[(zone, machine_type)] = await compute_api.machine_type_capacity(
+                            api, auth.project, zone, machine_type)
+                    except Exception:  # noqa: BLE001 - unknown capacity is reported as such, never guessed
+                        specs[(zone, machine_type)] = {}
+                for h in hosts:
+                    h.update(specs.get((h.get("zone"), h.get("machine_type")), {}))
             finally:
                 while not api.connections.empty():
                     _reader, writer = api.connections.get_nowait()
                     writer.close()
             if unreachables:
                 raise RuntimeError(f"zones unreachable: {', '.join(unreachables[:5])}")
-            return compute_api.runner_host_records(items)
+            return hosts
 
         return asyncio.run(listing())
 
@@ -616,6 +632,16 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
     out = []
     for host in hosts:
         host = dict(host)
+        violations, unknowns = _capacity(host, target)
+        if violations:
+            # The host can never satisfy the patch's hardware constraints: it needs a different VM.
+            out.append(HostClassification(host, "replace_vm", _recorded_sha(host),
+                                          "undersized or incompatible for this patch: " + "; ".join(violations)))
+            continue
+        if unknowns:
+            out.append(HostClassification(host, "unknown", _recorded_sha(host),
+                                          "cannot verify the patch's hardware constraints: " + "; ".join(unknowns)))
+            continue
         try:
             if executor.available:
                 current = executor.read_manifest(host)
@@ -637,6 +663,17 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
         except Exception as exc:  # noqa: BLE001 - an unreadable host is "unknown", never a guess
             out.append(HostClassification(host, "unknown", None, f"could not determine the current patch: {exc}"))
     return out
+
+
+def _capacity(host: Mapping[str, Any], target: RunnerPatch) -> tuple[list[str], list[str]]:
+    return host_capacity_problems(target, machine_type=str(host.get("machine_type") or ""),
+                                  vcpu=host.get("vcpu"), ram_gib=host.get("ram_gib"),
+                                  cpu_platform=str(host.get("cpu_platform") or ""))
+
+
+def _recorded_sha(host: Mapping[str, Any]) -> str | None:
+    sha = str(host.get("patch_sha256") or "")
+    return sha if len(sha) == 64 else None
 
 
 # --------------------------------------------------------------------------------------------------

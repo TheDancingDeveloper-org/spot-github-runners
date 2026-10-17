@@ -1038,6 +1038,53 @@ def inject_startup_patch(startup_script: str, patch: RunnerPatch | None) -> str:
     return startup_script
 
 
+_ARM64_FAMILIES = frozenset(
+    family for cap in ISA_CAPABILITIES.values() if cap["arch"] == "arm64" for family, _platform in cap["gce_platforms"]
+)
+
+
+def host_capacity_problems(
+    patch: RunnerPatch,
+    *,
+    machine_type: str,
+    vcpu: Any,
+    ram_gib: Any,
+    cpu_platform: str = "",
+) -> tuple[list[str], list[str]]:
+    """Check a host's observed capacity against every hardware constraint of ``patch``.
+
+    Returns ``(violations, unknowns)``: a violation means the host can never run the patch (a different VM is
+    needed); an unknown means a constraint could not be verified from what was observed. Both block a live patch.
+    """
+    violations: list[str] = []
+    unknowns: list[str] = []
+    hw = patch.hardware
+    family = str(machine_type or "").split("-", 1)[0]
+    if not family:
+        unknowns.append("the machine type is unknown, so the architecture cannot be checked")
+    else:
+        host_arch = "arm64" if family in _ARM64_FAMILIES else "x86_64"
+        if host_arch != hw.arch:
+            violations.append(f"{machine_type} is {host_arch}; the patch requires {hw.arch}")
+    if hw.min_vcpu is not None:
+        if not isinstance(vcpu, (int, float)) or isinstance(vcpu, bool) or vcpu <= 0:
+            unknowns.append(f"the host's vCPU count is unknown (the patch requires at least {hw.min_vcpu})")
+        elif vcpu < hw.min_vcpu:
+            violations.append(f"{machine_type} has {vcpu:g} vCPU; the patch requires at least {hw.min_vcpu}")
+    if hw.min_ram_gib is not None:
+        if not isinstance(ram_gib, (int, float)) or isinstance(ram_gib, bool) or ram_gib <= 0:
+            unknowns.append(f"the host's RAM is unknown (the patch requires at least {hw.min_ram_gib} GiB)")
+        elif ram_gib < hw.min_ram_gib:
+            violations.append(f"{machine_type} has {ram_gib:g} GiB RAM; the patch requires at least {hw.min_ram_gib} GiB")
+    allowed = patch.allowed_gce_platforms()
+    if allowed is not None and family:
+        if not cpu_platform:
+            unknowns.append(f"the host's CPU platform is unknown (the patch requires {', '.join(hw.isa)})")
+        elif (family, cpu_platform) not in allowed:
+            violations.append(f"{family} on {cpu_platform} does not provide {', '.join(hw.isa)}")
+    return violations, unknowns
+
+
 def classify_patch_diff(current_manifest: dict[str, Any] | None, target: RunnerPatch) -> str:
     """Classify the transition from a deployed manifest to target into noop, hot_patch, recreate_containers, or replace_vm."""
     if current_manifest is not None:

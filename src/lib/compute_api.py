@@ -329,7 +329,8 @@ async def list_instances(api: AsyncGoogleApi, project: str) -> tuple[list[dict],
     query = {
         "maxResults": "500",
         "returnPartialSuccess": "true",
-        "fields": "nextPageToken,unreachables,items/*/instances(name,zone,status,machineType,labels,metadata/items)",
+        "fields": ("nextPageToken,unreachables,"
+                   "items/*/instances(name,zone,status,machineType,cpuPlatform,labels,metadata/items)"),
     }
     rows: list[dict] = []
     unreachables: list[str] = []
@@ -368,12 +369,24 @@ def runner_host_records(items: list[dict]) -> list[dict]:
             "zone": str(item.get("zone", "")).rsplit("/", 1)[-1],
             "status": str(item.get("status", "UNKNOWN")),
             "machine_type": str(item.get("machineType", "")).rsplit("/", 1)[-1],
+            "cpu_platform": str(item.get("cpuPlatform", "") or ""),
             "role": "cicd_runner",
             "target_label": target_label,
             **runner_deployment_from_gce_item(item),
             **record,
         })
     return hosts
+
+
+async def machine_type_capacity(api: AsyncGoogleApi, project: str, zone: str, machine_type: str) -> dict:
+    """``{"vcpu": int, "ram_gib": float}`` for one machine type in one zone."""
+    path = (f"{API_ROOT}/projects/{quote(project, safe='')}/zones/{quote(zone, safe='')}/machineTypes/"
+            f"{quote(machine_type, safe='')}")
+    data = await api.get_json(path, {"fields": "guestCpus,memoryMb"})
+    vcpu, memory_mb = data.get("guestCpus"), data.get("memoryMb")
+    if not isinstance(vcpu, int) or not isinstance(memory_mb, int) or vcpu <= 0 or memory_mb <= 0:
+        raise RuntimeError(f"machine type {machine_type} in {zone} returned no capacity")
+    return {"vcpu": vcpu, "ram_gib": memory_mb / 1024}
 
 
 async def list_machines(api: AsyncGoogleApi, project: str,

@@ -55,6 +55,7 @@ from .runner_patch import (
     RunnerPatch,
     classify_patch_diff,
     fetch_patch_from_config_repo,
+    host_capacity_problems,
     inject_startup_patch,
     load_patch_from_file,
     render_dockerfile,
@@ -818,6 +819,12 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
         raise RuntimeError(f"Cannot hot-patch non-running VM: {vm_details(vm)}")
     if vm.machine_type and vm.machine_type != args.instance_type:
         raise RuntimeError(f"Existing VM type {vm.machine_type} does not match {args.instance_type}")
+    # Every hardware constraint (min vCPU/RAM, arch, ISA) against the observed VM, before anything changes.
+    violations, unknowns = host_capacity_problems(patch, machine_type=vm.machine_type or args.instance_type,
+                                                  vcpu=vm.vcpu, ram_gib=vm.ram_gib, cpu_platform=vm.cpu_platform)
+    if violations or unknowns:
+        raise RuntimeError(f"Patch {patch.patch_sha256[:12]} cannot be live-applied to {args.instance_name}: "
+                           + "; ".join(violations + unknowns))
     state_raw = gcloud(
         ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet",
          "--command=sudo -n cat /var/lib/gha-runner-patch/state.json 2>/dev/null || true"],

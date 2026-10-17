@@ -396,5 +396,131 @@ class PreviewFromRecordedPatchTests(unittest.TestCase):
         self.assertIn("printf 'DASHBOARD_FLEET_INVENTORY=gce\\n'", script)
 
 
+BIG = validate_patch_dict({**BASE, "hardware": {"min_vcpu": 64, "min_ram_gib": 256},
+                           "container": {"apt_packages": ["ripgrep"]}})
+VBMI = validate_patch_dict({**BASE, "hardware": {"isa": ["avx512-vbmi2"]}})
+
+
+class HostCapacityTests(unittest.TestCase):
+    """Codex round 8: hardware.min_vcpu/min_ram_gib (and arch/ISA) are checked against the observed host."""
+
+    def test_capacity_rules(self):
+        from lib.runner_patch import host_capacity_problems as check
+
+        violations, unknowns = check(BIG, machine_type="n2-standard-32", vcpu=32, ram_gib=128.0)
+        self.assertEqual(len(violations), 2)
+        self.assertIn("32 vCPU", violations[0])
+        self.assertIn("128 GiB", violations[1])
+        self.assertEqual(unknowns, [])
+        self.assertEqual(check(BIG, machine_type="n2-highmem-64", vcpu=64, ram_gib=512.0), ([], []))
+        self.assertEqual(len(check(BIG, machine_type="n2-standard-32", vcpu=None, ram_gib=None)[1]), 2)
+        self.assertIn("arm64", check(ARM, machine_type="n2-standard-32", vcpu=32, ram_gib=128)[0][0])
+        self.assertEqual(check(ARM, machine_type="c4a-standard-32", vcpu=32, ram_gib=128), ([], []))
+        self.assertEqual(check(VBMI, machine_type="c4d-standard-32", vcpu=32, ram_gib=128, cpu_platform="AMD Turin"),
+                         ([], []))
+        self.assertIn("does not provide", check(VBMI, machine_type="n2-standard-32", vcpu=32, ram_gib=128,
+                                                cpu_platform="Intel Cascade Lake")[0][0])
+        self.assertIn("CPU platform is unknown", check(VBMI, machine_type="c4d-standard-32", vcpu=32, ram_gib=128)[1][0])
+        self.assertIn("machine type is unknown", check(TARGET, machine_type="", vcpu=32, ram_gib=128)[1][0])
+
+    def run_live(self, vm, patch):
+        # The operator's arguments claim a 64 vCPU / 256 GiB host (so select_sizing passes); only the observed VM
+        # tells the truth, which is exactly the bypass this check closes.
+        args = args_for(patch, "--patch-live", "--cpu", "64", "--ram", "256")
+        cloud = GcloudRecorder(lambda c: json.dumps({"manifest": OLD.to_canonical_dict()})
+                               if c[:2] == ["compute", "ssh"] and "state.json" in c[-1]
+                               else f"LIVE_PATCH_APPLIED:{patch.patch_sha256}")
+        with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
+                mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
+                mock.patch("lib.runner_manager.runner_label_sync_plan"), \
+                mock.patch("lib.runner_manager.sync_runner_labels"):
+            try:
+                return manager.apply_live_patch(args, "us-central1-a"), cloud
+            except RuntimeError as exc:
+                return exc, cloud
+
+    def test_cli_live_patch_refuses_undersized_or_unmeasured_hosts_before_changing_anything(self):
+        base = dict(zone="us-central1-a", status="RUNNING", machine_type="c4d-standard-32", spot=True,
+                    instance_id="1", cpu_platform="AMD Turin")
+        for vcpu, ram in ((32, 128.0), (None, None)):
+            vm = runner_fleet.GceVm("oxidex-runners-1", vcpu=vcpu, ram_gib=ram, **base)
+            result, cloud = self.run_live(vm, BIG)
+            with self.subTest(vcpu=vcpu):
+                self.assertIsInstance(result, RuntimeError)
+                self.assertIn("cannot be live-applied", str(result))
+                self.assertEqual(cloud.calls, [])  # not even the receipt read: nothing touched the host
+        big_vm = runner_fleet.GceVm("oxidex-runners-1", vcpu=64, ram_gib=256.0, **base)
+        result, cloud = self.run_live(big_vm, BIG)
+        self.assertEqual(result, "hot_patch")
+        self.assertEqual(len(cloud.named("compute", "instances", "add-metadata")), 1)
+
+    def test_preview_classifies_undersized_hosts_as_replace_vm(self):
+        hosts = [
+            {**compute_api.runner_host_records([gce_item("small", sha=OLD.patch_sha256, manifest=canonical_json(OLD))])[0],
+             "vcpu": 32, "ram_gib": 128.0},
+            {**compute_api.runner_host_records([gce_item("large", sha=OLD.patch_sha256, manifest=canonical_json(OLD))])[0],
+             "vcpu": 64, "ram_gib": 256.0},
+            compute_api.runner_host_records([gce_item("unmeasured", sha=OLD.patch_sha256,
+                                                      manifest=canonical_json(OLD))])[0],
+        ]
+        console = pc.PatchConsole("swack-tools/spot-runners-config", token="t", host_source=lambda: hosts)
+        with mock.patch.object(pc.PatchConsole, "effective_patch", return_value=(BIG, {"draft": False})):
+            result = console.preview(REPO, [])
+        got = {h["name"]: (h["classification"], h["detail"]) for h in result["hosts"]}
+        self.assertEqual({n: c for n, (c, _) in got.items()},
+                         {"small": "replace_vm", "large": "hot_patch", "unmeasured": "unknown"})
+        self.assertIn("undersized", got["small"][1])
+        self.assertIn("requires at least 64", got["small"][1])
+        self.assertIn("vCPU count is unknown", got["unmeasured"][1])
+        self.assertFalse(result["hot_patch_allowed"])
+
+    def test_executor_refuses_undersized_hosts_without_running_anything(self):
+        ex = pc.GcloudHotPatchExecutor("proj", which=lambda _n: "/usr/bin/gcloud")
+        record = {"name": "h", "zone": "us-central1-a", "machine_type": "n2-standard-32", "runner_prefix": "oxidex",
+                  "runners_count": 3, "runner_label": "l", "runner_region": "us-central1", "patch_target": REPO,
+                  "registration_target": "swack-tools", "runner_group_id": 10, "vcpu": 32, "ram_gib": 128.0}
+        with mock.patch.object(manager, "apply_live_patch") as apply:
+            for bad in (record, {k: v for k, v in record.items() if k not in ("vcpu", "ram_gib")}):
+                with self.assertRaisesRegex(pc.HostRefusedError, "refused"):
+                    ex.apply(bad, BIG)
+            apply.assert_not_called()
+            ex.apply({**record, "vcpu": 64, "ram_gib": 256.0}, BIG)
+            apply.assert_called_once()
+
+    def test_inventory_carries_observed_capacity(self):
+        class FakeApi:
+            async def get_json(self, path, query=None):
+                self.path, self.query = path, query
+                return {"guestCpus": 32, "memoryMb": 131072}
+
+        api = FakeApi()
+        spec = asyncio.run(compute_api.machine_type_capacity(api, "proj", "us-central1-a", "n2-standard-32"))
+        self.assertEqual(spec, {"vcpu": 32, "ram_gib": 128.0})
+        self.assertTrue(api.path.endswith("/zones/us-central1-a/machineTypes/n2-standard-32"))
+        item = gce_item("h1", sha=OLD.patch_sha256, manifest=canonical_json(OLD))
+        item["cpuPlatform"] = "AMD Turin"
+        self.assertEqual(compute_api.runner_host_records([item])[0]["cpu_platform"], "AMD Turin")
+
+        async def listing(_api, _project):
+            return [item, gce_item("h2", sha=OLD.patch_sha256, manifest=canonical_json(OLD))], []
+
+        async def capacity(_api, _project, zone, machine_type):
+            raise RuntimeError("denied")
+
+        async def measured(_api, _project, zone, machine_type):
+            return {"vcpu": 32, "ram_gib": 128.0}
+
+        with mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("tok", "proj")), \
+                mock.patch.object(compute_api, "list_instances", side_effect=listing), \
+                mock.patch.object(compute_api, "machine_type_capacity", side_effect=measured):
+            hosts = pc.gce_host_source("proj")()
+        self.assertEqual([(h["vcpu"], h["ram_gib"]) for h in hosts], [(32, 128.0), (32, 128.0)])
+        with mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("tok", "proj")), \
+                mock.patch.object(compute_api, "list_instances", side_effect=listing), \
+                mock.patch.object(compute_api, "machine_type_capacity", side_effect=capacity):
+            hosts = pc.gce_host_source("proj")()
+        self.assertTrue(all("vcpu" not in h for h in hosts))  # unknown, never guessed
+
+
 if __name__ == "__main__":
     unittest.main()
