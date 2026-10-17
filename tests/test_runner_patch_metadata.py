@@ -257,7 +257,7 @@ class BootstrapConfirmationTests(unittest.TestCase):
                 unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
             try:
                 result = manager.main()
-            except BaseException as exc:  # noqa: BLE001 - the test inspects the failure
+            except (Exception, SystemExit) as exc:  # the test inspects the failure, including sys.exit
                 result = exc
             finally:
                 manager.PROJECT, manager.ORG = saved
