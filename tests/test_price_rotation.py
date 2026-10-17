@@ -1899,7 +1899,8 @@ class ReplacementCleanupRetryTests(unittest.TestCase):
                 _abort_runner_rotation(state["price_rotation"], [outgoing, dead], args, state, path, "timeout")
                 self.assertNotIn("price_rotation", state)
                 self.assertEqual(read_scale_state(path)["replacement_cleanups"]["z/oxidex-runners-new"],
-                                 {"name": dead.name, "zone": "z", "instance_id": "new"})
+                                 {"name": dead.name, "zone": "z", "instance_id": "new",
+                                  "target": "swack-tools", "runners": {}})
                 reconcile_replacement_cleanups([outgoing, dead], [], args, state, path)  # Still failing.
             self.assertIn("z/oxidex-runners-new", read_scale_state(path)["replacement_cleanups"])
             with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as retry:
@@ -1973,6 +1974,48 @@ class ReplacementCleanupRetryTests(unittest.TestCase):
                 reconcile_replacement_cleanups([repl], [offline], SimpleNamespace(project="p"), state, path)
             delete.assert_called_once_with(repl, "p")
             self.assertIn(key, state["replacement_cleanups"])  # awaiting confirmed absence
+
+    def test_deleted_replacement_runner_registrations_are_removed(self):
+        """Codex M4 round 5: offline registrations of a deleted replacement must not be orphaned."""
+        from lib.spot_runner_autoscaler import _abort_runner_rotation, reconcile_replacement_cleanups
+        outgoing = GceVm("oxidex-runners-old", "z", "RUNNING", "n4-highcpu-16", True, instance_id="old")
+        repl = GceVm("oxidex-runners-new", "z", "TERMINATED", "n4-highcpu-16", True, instance_id="new")
+        offline = GitHubRunner(77, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
+        late = GitHubRunner(78, "gha-oxidex-runners-new-2", "offline", False, ("spot",))
+        args = SimpleNamespace(project="p")
+        state = {"price_rotation": {"phase": "verify_readiness", "target": "xbmc4lyfe/newznab-tmux",
+                                    "outgoing_vm": {"name": outgoing.name, "zone": "z", "instance_id": "old"},
+                                    "replacement_vm": {"name": repl.name, "zone": "z", "instance_id": "new"}}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks"):
+                _abort_runner_rotation(state["price_rotation"], [outgoing, repl], args, state, path, "timeout",
+                                       [offline])
+            record = state["replacement_cleanups"]["z/oxidex-runners-new"]
+            self.assertEqual(record["runners"], {"77": "gha-oxidex-runners-new-1"})
+            # VM gone, but GitHub deregistration fails: the obligation stays.
+            with patch("lib.runner_drain.api", side_effect=subprocess.CalledProcessError(1, ["gh"])):
+                reconcile_replacement_cleanups([outgoing], [offline, late], args, state, path)
+            self.assertIn("z/oxidex-runners-new", read_scale_state(path)["replacement_cleanups"])
+            with patch("lib.runner_drain.api", return_value={}) as api:
+                reconcile_replacement_cleanups([outgoing], [offline, late], args, state, path)
+            deleted = sorted(c.args[2] for c in api.call_args_list)
+            self.assertEqual(deleted, ["repos/xbmc4lyfe/newznab-tmux/actions/runners/77",
+                                       "repos/xbmc4lyfe/newznab-tmux/actions/runners/78"])
+            self.assertEqual(read_scale_state(path)["replacement_cleanups"], {})
+
+    def test_online_runner_of_deleted_replacement_is_not_deregistered(self):
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups
+        online = GitHubRunner(77, "gha-oxidex-runners-new-1", "online", False, ("spot",))
+        state = {"replacement_cleanups": {"z/oxidex-runners-new": {
+            "name": "oxidex-runners-new", "zone": "z", "instance_id": "new", "target": "swack-tools",
+            "runners": {"77": "gha-oxidex-runners-new-1"}}}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.runner_drain.api") as api:
+                reconcile_replacement_cleanups([], [online], SimpleNamespace(project="p"), state, path)
+            api.assert_not_called()
+            self.assertIn("z/oxidex-runners-new", state["replacement_cleanups"])
 
     def test_controller_loop_runs_cleanup_each_check(self):
         import inspect

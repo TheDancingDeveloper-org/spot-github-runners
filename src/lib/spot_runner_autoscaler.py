@@ -1417,7 +1417,7 @@ def _replacement_from_inventory(vms, repl: dict | None) -> GceVm | None:
     return None
 
 
-def _delete_replacement(repl_vm, args, state, state_path) -> None:
+def _delete_replacement(repl_vm, args, state, state_path, *, target=None, runners=()) -> None:
     """Delete a rotation replacement after persisting it as an intentional deletion.
 
     Without the record, the next observation would treat the replacement's disappearance as an
@@ -1429,14 +1429,55 @@ def _delete_replacement(repl_vm, args, state, state_path) -> None:
     state.setdefault("intentional_deletion_ids", {})[key] = repl_vm.instance_id
     # The intentional-deletion marker suppresses loss recovery, so persist a cleanup obligation
     # that is retried every check until fresh inventory confirms the VM is gone.
-    state.setdefault("replacement_cleanups", {})[key] = {
-        "name": repl_vm.name, "zone": repl_vm.zone, "instance_id": repl_vm.instance_id}
+    record = {"name": repl_vm.name, "zone": repl_vm.zone, "instance_id": repl_vm.instance_id}
+    if target:
+        # Its (offline) runner registrations must be removed too; the intentional-deletion marker
+        # suppresses the lost-host path that would otherwise clean them up.
+        record["target"] = target
+        record["runners"] = {str(r.runner_id): r.name for r in _replacement_runners(runners, repl_vm.name)}
+    state.setdefault("replacement_cleanups", {})[key] = record
     write_scale_state(state_path, state)
     try:
         delete_vm_and_disks(repl_vm, args.project)
     except Exception as exc:
         LOG.error("Failed to delete replacement VM %s: %s; cleanup retries next check",
                   repl_vm.name, error_detail(exc))
+
+
+def _deregister_replacement_runners(record, runners, state, state_path) -> bool:
+    """Remove a deleted replacement's runner registrations; True once none remain.
+
+    Uses this check's fresh runner inventory: recorded runners (and any other ``gha-<vm>-`` runner
+    that appeared later) are deregistered only while offline and idle, matched by id and name.
+    """
+    target = record.get("target")
+    if not target:
+        return True  # Records written before registrations were tracked.
+    if runner_inventory_stale(state):
+        LOG.warning("Deregistration for deleted replacement %s held: runner inventory is stale", record.get("name"))
+        return False
+    from .runner_drain import api
+    pending = dict(record.get("runners") or {})
+    for runner in _replacement_runners(runners, record.get("name")):
+        pending.setdefault(str(runner.runner_id), runner.name)
+    present = {str(r.runner_id): r for r in runners}
+    for rid, name in list(pending.items()):
+        runner = present.get(rid)
+        if runner is None or runner.name != name:
+            pending.pop(rid)  # already gone
+            continue
+        if runner.online or runner.busy:
+            LOG.warning("Runner %s of deleted replacement %s still reports online; waiting", name, record.get("name"))
+            continue
+        try:
+            api(target, "DELETE", f"{target_api_prefix(target)}/actions/runners/{rid}")
+            pending.pop(rid)
+            LOG.info("Deregistered runner %s of deleted replacement %s", name, record.get("name"))
+        except Exception as exc:
+            LOG.warning("Could not deregister runner %s: %s; retrying next check", name, error_detail(exc))
+    record["runners"] = pending
+    write_scale_state(state_path, state)
+    return not pending
 
 
 def _release_replacement_cleanup(key, state, state_path) -> None:
@@ -1466,6 +1507,8 @@ def reconcile_replacement_cleanups(vms, runners, args, state, state_path) -> Non
         current = next((vm for vm in vms if vm.name == record.get("name") and vm.zone == record.get("zone")
                         and (not record.get("instance_id") or vm.instance_id == record["instance_id"])), None)
         if current is None:
+            if not _deregister_replacement_runners(record, runners, state, state_path):
+                continue  # keep the obligation until every registration is confirmed gone
             cleanups.pop(key)
             LOG.info("Confirmed aborted replacement %s is deleted", record.get("name"))
             write_scale_state(state_path, state)
@@ -1510,14 +1553,14 @@ def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, 
         # no usable capacity. Keep it pending and try another fresh replacement instead.
         LOG.error("%s; outgoing listeners were removed, so the rotation keeps provisioning capacity", reason)
         if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True):
-            _delete_replacement(repl_vm, args, state, state_path)
+            _delete_replacement(repl_vm, args, state, state_path, target=rotation.get("target"), runners=runners)
         _restart_replacement(rotation, state, state_path)
         return True
     LOG.error("%s; aborting replacement to preserve old capacity", reason)
     # Online listeners stay schedulable during the builder check and deletion, so a replacement with
     # any online listener is kept and drained normally rather than deleted with jobs landing on it.
     if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True):
-        _delete_replacement(repl_vm, args, state, state_path)
+        _delete_replacement(repl_vm, args, state, state_path, target=rotation.get("target"), runners=runners)
     elif repl_vm:
         # Online, busy or building: keep it as ordinary fleet capacity; normal draining (cordon,
         # wait for jobs and builds, deregister) owns any later removal.
