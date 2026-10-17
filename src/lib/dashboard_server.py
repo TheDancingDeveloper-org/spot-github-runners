@@ -88,6 +88,7 @@ from .rust_build_telemetry import (
 MAX_JSON_BODY_BYTES = 262_144
 MAX_LOGIN_BODY_BYTES = 4_096
 MAX_CONTROLLED_TARGETS_HISTORY = 50
+SESSION_TOO_LARGE_ERROR = "Controlled target list is too long to fit in a session cookie; use fewer or shorter targets"
 NOT_PERSISTENT_TARGETS_WARNING = (
     "Controlled targets are kept in memory only (the dashboard runs without --state-file); "
     "this change is lost when the process restarts."
@@ -3802,6 +3803,8 @@ def make_handler(
                     "missing_targets": decision.missing_targets,
                 }, []
             body: dict[str, Any] = {"status": "authorized", "user": decision.user_login}
+            if not oauth_manager.session_fits(decision.verified_targets):
+                return HTTPStatus.BAD_REQUEST, {"status": "error", "error": SESSION_TOO_LARGE_ERROR}, []
             if change is not None:
                 try:
                     store.set_controlled_targets(
@@ -3997,6 +4000,16 @@ def make_handler(
                 self._send_json({"status": "unchanged", **self._targets_view()})
                 return
             warning = {} if store.state_path is not None else {"warning": NOT_PERSISTENT_TARGETS_WARNING}
+            if oauth_manager is not None:
+                # OAuth sign-ins after this change carry the verified targets inside the session cookie.
+                sized = static_targets + (current + names if method == "github_oauth" else names)
+                try:
+                    fits = oauth_manager.session_fits(t.name for t in parse_controlled_targets(sized))
+                except ValueError:
+                    fits = True  # Reported below with the specific validation error.
+                if not fits:
+                    self._send_json({"error": SESSION_TOO_LARGE_ERROR}, status=HTTPStatus.BAD_REQUEST)
+                    return
             if method == "github_oauth":
                 assert oauth_manager is not None
                 if self._rate_limited("start"):
@@ -4498,6 +4511,8 @@ def create_dashboard_server(
                 "--allow-insecure-non-loopback (DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1) if a trusted network proxy terminates TLS."
             )
     static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
+    if oauth_manager is not None and not oauth_manager.session_fits(static_targets):
+        raise ValueError(SESSION_TOO_LARGE_ERROR.replace("Controlled target list", "Static controlled target list"))
     if oauth_manager is not None and oauth_manager.web_flow_enabled and not oauth_manager.redirect_uri:
         _AUDIT_LOG.warning(
             "GITHUB_OAUTH_REDIRECT_URI is unset; the OAuth callback URL is derived from the request Host header. "

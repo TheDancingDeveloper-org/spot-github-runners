@@ -1587,6 +1587,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
       reqInit.headers = headers;
       let res = await NATIVE_FETCH(input, reqInit);
+      if (res.status === 401 && token && !new Headers(init.headers || {}).has("Authorization")) {
+        // The server checks a stored bearer token before the session cookie, so a stale one masks a
+        // valid GitHub or token session; drop it and retry once with the cookie alone.
+        storeDashboardAuthToken("");
+        res = await NATIVE_FETCH(input, { ...reqInit, headers: new Headers(init.headers || {}) });
+      }
       if (res.status === 401 && typeof window.prompt === "function") {
         const prompted = window.prompt("Dashboard authentication required. Enter your dashboard token:");
         if (prompted && prompted.trim()) {

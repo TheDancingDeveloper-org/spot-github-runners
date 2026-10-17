@@ -135,6 +135,11 @@ class FakeGitHub:
         return status, json.dumps(payload).encode()
 
 
+def _long_repo_targets(count: int) -> list[str]:
+    """Valid but long owner/repo names whose combined session would exceed cookie limits."""
+    return [f"owner{i:02d}-{'o' * 30}/{'r' * 90}" for i in range(count)]
+
+
 def make_manager(fake: FakeGitHub | None = None, **kwargs) -> GitHubOAuthManager:
     client_secret = kwargs.pop("client_secret", "web-secret")
     params = {"http_requester": fake or FakeGitHub()}
@@ -670,6 +675,27 @@ class AuthorizationTests(unittest.TestCase):
         self.fake.set_org("tok-admin", "swack-tools", role="member")
         self.assertFalse(self.mgr.authorize("tok-admin", ["swack-tools"], use_cache=False).authorized)
 
+    def test_fresh_denial_invalidates_cached_grant(self):
+        self.fake.set_org("tok-admin", "swack-tools")
+        self.assertTrue(self.mgr.authorize("tok-admin", ["swack-tools"]).authorized)
+        self.fake.set_org("tok-admin", "swack-tools", role="member")
+        self.assertFalse(self.mgr.authorize("tok-admin", ["swack-tools"], use_cache=False).authorized)
+        # An ordinary sign-in right after the observed revocation must not reuse the old grant.
+        decision = self.mgr.authorize("tok-admin", ["swack-tools"])
+        self.assertFalse(decision.authorized)
+        self.assertFalse(decision.checks[0].cached)
+        # API errors on a fresh check also drop the grant.
+        self.fake.set_org("tok-admin", "swack-tools")
+        self.assertTrue(self.mgr.authorize("tok-admin", ["swack-tools"]).authorized)
+        self.fake.set_org("tok-admin", "swack-tools", status=500)
+        self.assertFalse(self.mgr.authorize("tok-admin", ["swack-tools"], use_cache=False).authorized)
+        self.assertFalse(self.mgr.verification_cache.is_verified(ADMIN_UID, "swackhamer", "swack-tools"))
+
+    def test_session_fits_rejects_oversized_target_lists(self):
+        self.assertTrue(self.mgr.session_fits([]))
+        self.assertTrue(self.mgr.session_fits(["swack-tools", "xbmc4lyfe/newznab-tmux"]))
+        self.assertFalse(self.mgr.session_fits(_long_repo_targets(32)))
+
     def test_cache_is_pinned_to_github_uid(self):
         self.fake.set_org("tok-admin", "swack-tools")
         self.assertTrue(self.mgr.authorize("tok-admin", ["swack-tools"]).authorized)
@@ -1197,6 +1223,41 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         self.assertEqual((status, json.loads(raw)["status"]), (409, "conflict"))
         self.assertIsNone(self.cookie_pair(msg, SESSION_COOKIE_NAME)[0])
         self.assertEqual(store.get_controlled_targets(), ["o/r"])
+
+    def test_oversized_target_change_rejected_before_commit(self):
+        store = self.start(auth_token=self.LEGACY_TOKEN, client_secret="")
+        big = _long_repo_targets(32)
+        for headers in ({"Authorization": f"Bearer {self.LEGACY_TOKEN}"}, {"Cookie": self.login_cookie()}):
+            status, _, raw = self.request("POST", "/api/auth/targets", headers=headers, body={"targets": big})
+            self.assertEqual(status, 400, raw)
+            self.assertIn("too long to fit in a session cookie", json.loads(raw)["error"])
+            self.assertEqual(store.get_controlled_targets(), [])
+
+    def test_oversized_stored_policy_never_issues_broken_cookie(self):
+        store = self.start(client_secret="")
+        big = _long_repo_targets(32)
+        for name in big:
+            self.fake.set_repo("tok-admin", name)
+        store.set_controlled_targets(big)  # e.g. a policy written before the size check existed
+        status, msg, raw = self.device_login("tok-admin")
+        self.assertEqual(status, 400, raw)
+        pair, _ = self.cookie_pair(msg, SESSION_COOKIE_NAME)
+        self.assertIsNone(pair)
+
+    def test_oversized_static_targets_refused_at_startup(self):
+        mgr = GitHubOAuthManager(CLIENT_ID, "", None, SECRET, http_requester=self.fake, clock=self.clock)
+        with self.assertRaisesRegex(ValueError, "too long to fit in a session cookie"):
+            create_dashboard_server(host="127.0.0.1", port=0, oauth_manager=mgr,
+                                    controlled_targets=_long_repo_targets(32))
+
+    def test_stale_stored_bearer_token_does_not_mask_session(self):
+        from lib.dashboard_ui_assets import render_dashboard_html
+        page = render_dashboard_html()
+        self.assertIn('storeDashboardAuthToken("");', page)
+        self.assertIn('res.status === 401 && token && !new Headers(init.headers || {}).has("Authorization")', page)
+        self.start()
+        _, _, raw = self.request("GET", "/")
+        self.assertIn('sessionStorage.removeItem("dashboard_auth_token")', raw.decode())
 
     def test_unchanged_targets_need_no_reauth(self):
         self.start()

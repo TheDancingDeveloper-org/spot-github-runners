@@ -92,6 +92,8 @@ MAX_VERIFICATION_CACHE_ENTRIES = 1024
 MAX_DEVICE_HANDLE_TTL_SECONDS = 1800
 MIN_SESSION_SECRET_BYTES = 32
 MAX_TOKEN_CHARS = 4096
+# Browsers cap a cookie (name, value and attributes) near 4096 bytes; keep headroom.
+MAX_SESSION_COOKIE_BYTES = 3900
 MAX_GITHUB_RESPONSE_BYTES = 1_048_576
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 CLOCK_SKEW_SECONDS = 60
@@ -640,6 +642,11 @@ class TargetVerificationCache:
                     del self._entries[next(iter(self._entries))]
             self._entries[(int(uid), login.lower(), target_key.lower())] = now + self.ttl_seconds
 
+    def invalidate(self, uid: int, login: str, target_key: str) -> None:
+        """Drop a cached grant once a fresh check failed to confirm it."""
+        with self._lock:
+            self._entries.pop((int(uid), login.lower(), target_key.lower()), None)
+
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
@@ -1128,8 +1135,10 @@ class GitHubOAuthManager:
         try:
             status, data = self._api_get(target.api_path(), access_token)
         except GitHubApiError as exc:
+            self.verification_cache.invalidate(uid, login, target.key)
             return TargetCheck(target.name, target.key, target.kind, False, f"GitHub API error: {exc}")
         if status != 200 or data is None:
+            self.verification_cache.invalidate(uid, login, target.key)
             return TargetCheck(target.name, target.key, target.kind, False, f"GitHub API returned HTTP {status}")
         if target.kind == "repo":
             perms = data.get("permissions")
@@ -1142,6 +1151,9 @@ class GitHubOAuthManager:
             )
         if ok:
             self.verification_cache.mark_verified(uid, login, target.key)
+        else:
+            # A fresh denial supersedes any earlier positive result for this account and target.
+            self.verification_cache.invalidate(uid, login, target.key)
         return TargetCheck(target.name, target.key, target.kind, ok, reason)
 
     def authorize(
@@ -1228,6 +1240,20 @@ class GitHubOAuthManager:
             verified_targets=tuple(str(t).lower() for t in verified_targets),
         )
         return sign_token(self._session_key, session.to_payload())
+
+    def session_fits(self, verified_targets: Iterable[str]) -> bool:
+        """Whether a session verified for these targets stays within token and cookie size limits.
+
+        Measured with a worst-case login and user id so the answer holds for every user.
+        """
+        token = self.create_session_cookie_value(
+            "a" * 39,
+            self.session_ttl_seconds,
+            user_id=2**53,
+            verified_targets=verified_targets,
+        )
+        cookie = format_session_cookie(token, self.session_ttl_seconds)
+        return len(token) <= MAX_TOKEN_CHARS and len(cookie.encode("ascii")) <= MAX_SESSION_COOKIE_BYTES
 
     def issue_session(self, decision: AuthorizationDecision) -> str:
         if not decision.authorized:
@@ -1327,6 +1353,8 @@ def render_login_gate_html(
     )
     script = """
 (function () {
+  // The gate only renders without a valid session; a stored bearer token would mask the new one.
+  try { sessionStorage.removeItem("dashboard_auth_token"); localStorage.removeItem("dashboard_auth_token"); } catch (_e) {}
   const msg = document.getElementById("msg");
   function show(text) { msg.textContent = text || ""; }
   async function postJson(url, body) {
