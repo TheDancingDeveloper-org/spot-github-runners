@@ -482,9 +482,11 @@ class HotPatchExecutor(Protocol):
     available: bool
     reason: str
 
-    def read_manifest(self, host: Mapping[str, Any]) -> HostPatchReceipt | dict[str, Any] | None: ...
+    def read_manifest(self, host: Mapping[str, Any]) -> HostPatchReceipt | dict[str, Any] | None:
+        """Return the host's patch receipt (or recorded manifest), or None when it has none."""
 
-    def apply(self, host: Mapping[str, Any], patch: RunnerPatch) -> dict[str, Any]: ...
+    def apply(self, host: Mapping[str, Any], patch: RunnerPatch) -> dict[str, Any]:
+        """Live-apply ``patch`` to ``host`` and return the per-host result."""
 
 
 class UnavailableHotPatchExecutor:
