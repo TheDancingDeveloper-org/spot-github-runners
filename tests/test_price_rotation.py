@@ -1341,13 +1341,42 @@ class ReplacementEvidenceTests(RotationHarness, unittest.TestCase):
         labeled = GitHubRunner(99, "gha-oxidex-runners-old-1", "online", False, ("self-hosted", "spot"))
 
         def api(target, method, path, body=None, paginate=False):
-            return {"id": 99, "runner_group_id": 10} if method == "GET" else {}
+            # The individual-runner endpoint has no runner_group_id; membership comes from groups.
+            if path == "orgs/swack-tools/actions/runner-groups":
+                return [{"runner_groups": [{"id": 1}, {"id": 23}, {"id": 77}]}]
+            if path.endswith("/runner-groups/1/runners"):
+                return [{"runners": [{"id": 500}]}]
+            if path.endswith("/runner-groups/23/runners"):
+                return [{"runners": [{"id": 99}]}]
+            if path.endswith("/runner-groups/77/runners"):
+                raise AssertionError("the drain group must not be consulted")
+            return {}
+        with patch("lib.runner_drain.isolated_group", return_value="orgs/swack-tools/actions/runner-groups/77"), \
+                patch("lib.spot_runner_autoscaler.DEFAULT_RUNNER_GROUP_ID", 10):
+            state["price_rotation"]["drain_group_id"] = 77
+            mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                              [labeled, self.new_runner], api=api)
+        self.assertEqual(saved["price_rotation"]["cordoned_runners"]["99"]["group_id"], 23)  # actual, not 10
+        self.assertEqual(saved["price_rotation"]["cordon_mode"], "isolated_group")
+        self.assertEqual([c.args[1] for c in mock_api.call_args_list][-2:], ["DELETE", "PUT"])
+
+    def test_org_cordon_refuses_to_guess_unknown_group(self):
+        state = self.state("cordon_drain", target="swack-tools", target_type="org",
+                           cordon_complete=False, cordoned_runners={})
+        self.args.target = "swack-tools"
+        labeled = GitHubRunner(99, "gha-oxidex-runners-old-1", "online", False, ("self-hosted", "spot"))
+
+        def api(target, method, path, body=None, paginate=False):
+            if path == "orgs/swack-tools/actions/runner-groups":
+                return [{"runner_groups": [{"id": 1}]}]
+            if path.endswith("/runners") and method == "GET":
+                return [{"runners": []}]
+            return {}
         with patch("lib.runner_drain.isolated_group", return_value="orgs/swack-tools/actions/runner-groups/77"):
             mock_api, _, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm],
                                               [labeled, self.new_runner], api=api)
-        self.assertEqual(saved["price_rotation"]["cordoned_runners"]["99"]["group_id"], 10)
-        self.assertEqual(saved["price_rotation"]["cordon_mode"], "isolated_group")
-        self.assertEqual([c.args[1] for c in mock_api.call_args_list], ["GET", "DELETE", "PUT"])
+        self.assertNotIn("99", saved["price_rotation"].get("cordoned_runners", {}))
+        self.assertNotIn("DELETE", [c.args[1] for c in mock_api.call_args_list])  # labels untouched
 
     def test_delete_never_targets_a_same_named_vm_with_another_identity(self):
         reused = replace_vm(self.outgoing_vm, instance_id="reused-999")

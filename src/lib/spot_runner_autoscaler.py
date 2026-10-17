@@ -171,6 +171,27 @@ def host_runners(vm: GceVm, runners: list[GitHubRunner] | tuple[GitHubRunner, ..
     return assigned
 
 
+def _runner_group_memberships(api, org, exclude_group_id=None) -> dict:
+    """Map runner id -> runner group id for an organization, from the runner-group APIs."""
+    from .runner_drain import pages
+    groups = pages(api(org, "GET", f"orgs/{org}/actions/runner-groups", paginate=True), "runner_groups")
+    memberships: dict = {}
+    for group in groups:
+        group_id = group.get("id")
+        if type(group_id) is not int or group_id == exclude_group_id:
+            continue
+        members = pages(api(org, "GET", f"orgs/{org}/actions/runner-groups/{group_id}/runners", paginate=True),
+                        "runners")
+        for member in members:
+            runner_id = member.get("id")
+            if type(runner_id) is not int:
+                continue
+            if memberships.get(runner_id, group_id) != group_id:
+                raise RuntimeError(f"runner {runner_id} is reported in more than one runner group")
+            memberships[runner_id] = group_id
+    return memberships
+
+
 def _missing_outgoing_runners(out_name, runners, vms, rotation):
     """Runners of an outgoing VM that is no longer in inventory, without touching other hosts.
 
@@ -1913,13 +1934,17 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
                 group_path = isolated_group(operation, target, lambda: None)
                 rotation["drain_group_id"] = operation.get("drain_group_id")
                 write_scale_state(state_path, state)
+                memberships = None
                 for runner in assigned:
                     try:
                         if str(runner.runner_id) not in rotation.get("cordoned_runners", {}):
-                            current = api(target, "GET", f"orgs/{target}/actions/runners/{runner.runner_id}") or {}
-                            group_id = current.get("runner_group_id")
-                            if type(group_id) is not int or group_id == rotation.get("drain_group_id"):
-                                group_id = DEFAULT_RUNNER_GROUP_ID
+                            # The individual-runner endpoint does not report group membership, so
+                            # resolve it from the runner-group APIs; never guess a default group.
+                            if memberships is None:
+                                memberships = _runner_group_memberships(api, target, rotation.get("drain_group_id"))
+                            group_id = memberships.get(runner.runner_id)
+                            if type(group_id) is not int:
+                                raise RuntimeError(f"runner {runner.name} is in no known runner group")
                             _record_cordon(rotation, runner, state, state_path, group_id)
                         api(target, "DELETE", f"orgs/{target}/actions/runners/{runner.runner_id}/labels")
                         api(target, "PUT", f"{group_path}/runners/{runner.runner_id}")
