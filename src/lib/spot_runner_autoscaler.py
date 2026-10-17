@@ -2807,10 +2807,38 @@ def run_controller(args: argparse.Namespace) -> int:
         return _run_controller(args)
 
 
+def bind_state_to_target(state: dict, args: Any) -> bool:
+    """Bind controller state to its GitHub target; refuse state saved by another target.
+
+    Saved observations, recovery obligations, rotations and host operations all assume one target.
+    Reusing a state file under another --target would turn the old target's absent hosts into
+    "lost" capacity and replace or clean them up under the wrong target. State saved before
+    binding existed belongs to the default organization target. Returns True when the binding
+    was just added (the caller persists it).
+    """
+    active = str(_active_target(args)).lower()
+    bound = state.get("controller_target")
+    if isinstance(bound, str) and bound:
+        if bound.lower() != active:
+            raise RuntimeError(f"Controller state belongs to target {bound!r}, not {active!r}; "
+                               "use a separate --state-file for each target")
+        return False
+    legacy = any(state.get(key) for key in ("observed_vms", "pending_vm_recovery", "price_rotation",
+                                            "host_operation", "replacement_cleanups"))
+    default_org = str(getattr(args, "org", None) or DEFAULT_ORG).lower()
+    if legacy and active != default_org:
+        raise RuntimeError(f"Controller state predates target binding and belongs to {default_org!r}; "
+                           f"use a separate --state-file for target {active!r}")
+    state["controller_target"] = active
+    return True
+
+
 def _run_controller(args: argparse.Namespace) -> int:
     """Run fleet checks until interrupted or a single check completes."""
     state_path = args.state_file.expanduser()
     state = read_scale_state(state_path)
+    if bind_state_to_target(state, args) and not getattr(args, 'dry_run', False):
+        write_scale_state(state_path, state)
     if getattr(args,'dry_run',False):
         if getattr(args, 'manage_control_vm', False):
             # Plans only: the control VM manager reads inventory, KV, and health but never mutates.

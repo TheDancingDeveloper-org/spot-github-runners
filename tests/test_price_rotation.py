@@ -2266,3 +2266,46 @@ class DrainTargetFallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControllerTargetBindingTests(unittest.TestCase):
+    """Codex M4 round 13: controller state is bound to its target."""
+
+    def args(self, target=None, org="swack-tools"):
+        return SimpleNamespace(target=target, org=org)
+
+    def test_fresh_state_binds_to_active_target(self):
+        from lib.spot_runner_autoscaler import bind_state_to_target
+        state = {}
+        self.assertTrue(bind_state_to_target(state, self.args("xbmc4lyfe/newznab-tmux")))
+        self.assertEqual(state["controller_target"], "xbmc4lyfe/newznab-tmux")
+        self.assertFalse(bind_state_to_target(state, self.args("XBMC4LYFE/newznab-tmux")))
+
+    def test_state_of_another_target_is_refused(self):
+        from lib.spot_runner_autoscaler import bind_state_to_target
+        state = {"controller_target": "swack-tools",
+                 "observed_vms": {"z/oxidex-runners-a": {"name": "oxidex-runners-a", "zone": "z"}}}
+        with self.assertRaisesRegex(RuntimeError, "separate --state-file"):
+            bind_state_to_target(state, self.args("xbmc4lyfe/newznab-tmux"))
+        self.assertIn("z/oxidex-runners-a", state["observed_vms"])  # untouched
+
+    def test_legacy_state_belongs_to_default_org(self):
+        from lib.spot_runner_autoscaler import bind_state_to_target
+        legacy = {"observed_vms": {"z/oxidex-runners-a": {"name": "oxidex-runners-a", "zone": "z"}}}
+        with self.assertRaisesRegex(RuntimeError, "predates target binding"):
+            bind_state_to_target(dict(legacy), self.args("xbmc4lyfe/newznab-tmux"))
+        state = dict(legacy)
+        self.assertTrue(bind_state_to_target(state, self.args()))
+        self.assertEqual(state["controller_target"], "swack-tools")
+
+    def test_controller_refuses_foreign_state_before_any_action(self):
+        from lib import spot_runner_autoscaler as controller
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            controller.write_scale_state(path, {"controller_target": "swack-tools"})
+            args = SimpleNamespace(target="xbmc4lyfe/newznab-tmux", org="swack-tools", state_file=path,
+                                   dry_run=False)
+            with patch.object(controller, "list_github_runners") as runners:
+                with self.assertRaisesRegex(RuntimeError, "separate --state-file"):
+                    controller._run_controller(args)
+                runners.assert_not_called()
