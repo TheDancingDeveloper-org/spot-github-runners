@@ -8,7 +8,7 @@ import subprocess
 from dataclasses import replace
 from decimal import Decimal
 
-from .runner_fleet import GceVm
+from .runner_fleet import RUNNER_HOST_NAME_PREFIXES, GceVm
 from .fleet_logging import vm_details
 from .log_format import error_detail
 from .runner_manager import spot_rates
@@ -31,7 +31,7 @@ def check_running_prices(vms: list[GceVm], project: str,
     shapes = {}
     overpriced = []
     for vm in vms:
-        if not vm.running or not vm.spot or not vm.name.startswith("oxidex-runners-"):
+        if not vm.running or not vm.spot or not vm.name.startswith(RUNNER_HOST_NAME_PREFIXES):
             continue
         region = vm.zone.rsplit("-", 1)[0]
         family = vm.machine_type.split("-", 1)[0]
@@ -79,7 +79,7 @@ def check_running_prices(vms: list[GceVm], project: str,
 
 def delete_overpriced_vm(vm: GceVm, project: str) -> None:
     """Delete a managed Spot VM and its disks even when jobs are running."""
-    if not vm.running or not vm.spot or not vm.name.startswith("oxidex-runners-"):
+    if not vm.running or not vm.spot or not vm.name.startswith(RUNNER_HOST_NAME_PREFIXES):
         raise ValueError("Price eviction requires a running managed Spot VM")
     subprocess.run([
         "gcloud", "compute", "instances", "delete", vm.name,

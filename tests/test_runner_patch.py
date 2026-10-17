@@ -15,21 +15,30 @@ from unittest.mock import patch
 from lib import runner_manager as manager
 from lib.compute_api import Offer
 from lib.launch_candidates import LaunchInventory, candidate_key, launchable_candidates
-from lib.machine_profiles import platform_preferences
+from lib.machine_profiles import platform_preferences, machine_profile, configure_storage
 from lib.runner_assets import RUNNER_DOCKERFILE
 from lib.runner_fleet import GceVm
+import urllib.error
+import urllib.parse
+from lib import runner_patch as runner_patch_mod
 from lib.runner_patch import (
     RunnerPatch,
     classify_patch_diff,
     fetch_patch_from_config_repo,
+    list_config_repo_targets,
     parse_manifest_text,
     render_dockerfile,
     render_host_patch_script,
     render_live_hot_patch_script,
+    PATCH_RECEIPT_READ_COMMAND,
     resolve_repo_default_branch,
     validate_patch_dict,
+    SCHEMA_VERSION,
 )
-from pricing_fixtures import storage_prices_for
+try:
+    from pricing_fixtures import storage_prices_for
+except ModuleNotFoundError:
+    from tests.pricing_fixtures import storage_prices_for
 from lib import spot_runner_autoscaler as controller
 
 
@@ -98,6 +107,9 @@ class RunnerPatchTests(unittest.TestCase):
         blocker = patch("subprocess.run", side_effect=AssertionError("Unexpected external command"))
         blocker.start()
         self.addCleanup(blocker.stop)
+        gh_present = patch("lib.runner_patch.shutil.which", return_value="/usr/bin/gh")
+        gh_present.start()
+        self.addCleanup(gh_present.stop)
 
     def test_yaml_and_json_manifests_parse_to_identical_patch(self):
         parsed_yaml = validate_patch_dict(parse_manifest_text(YAML_NNTMUX_MANIFEST))
@@ -130,6 +142,29 @@ class RunnerPatchTests(unittest.TestCase):
             with patch("lib.runner_patch.subprocess.run", side_effect=fake_run):
                 resolved_branch, resolved_sha = resolve_repo_default_branch(repo)
             self.assertEqual((resolved_branch, resolved_sha), (branch, sha))
+
+    def test_gh_transport_receives_the_encoded_default_branch(self):
+        sha = "9" * 40
+        for branch in ("fix#1", "100%", "my branch", "feature/x", "ünïcødé"):
+            calls = []
+
+            def fake_run(cmd, branch=branch, **kwargs):
+                calls.append(cmd[2])
+                if cmd[2] == "repos/o/r":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"default_branch": branch}), stderr="")
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"sha": sha}), stderr="")
+
+            with patch("lib.runner_patch.shutil.which", return_value="/usr/bin/gh"), \
+                    patch("lib.runner_patch.subprocess.run", side_effect=fake_run):
+                self.assertEqual(resolve_repo_default_branch("o/r"), (branch, sha))
+            self.assertEqual(calls[1], "repos/o/r/commits/" + urllib.parse.quote(branch, safe=""))
+
+    def test_gh_transport_refuses_an_unsafe_endpoint_before_running_gh(self):
+        with patch("lib.runner_patch.shutil.which", return_value="/usr/bin/gh"), \
+                patch("lib.runner_patch.subprocess.run", side_effect=AssertionError("gh must not run")):
+            for endpoint in ("repos/o/r/commits/%2E%2E", "repos/o/r/commits/fix#1", "repos/../../user"):
+                with self.assertRaisesRegex(RuntimeError, "refusing unexpected endpoint", msg=endpoint):
+                    runner_patch_mod._gh_api_json(endpoint)
 
     def test_fetch_patch_from_config_repo_merges_defaults_and_repo_manifest(self):
         sha = "d" * 40
@@ -164,10 +199,49 @@ container:
             patch_obj = fetch_patch_from_config_repo("xbmc4lyfe/newznab-tmux", org="swack-tools")
 
         self.assertEqual(patch_obj.source_commit, sha)
+        self.assertEqual(patch_obj.source_branch, "main")
         self.assertEqual(patch_obj.host.apt_packages, ("htop", "linux-perf"))
         self.assertEqual(patch_obj.host.sysctl["vm.swappiness"], "10")
         self.assertEqual(patch_obj.host.sysctl["vm.max_map_count"], "262144")
         self.assertEqual(patch_obj.container.apt_packages, ("strace", "php-cli", "php-ffi", "composer"))
+
+    def test_fetch_patch_rejects_a_declared_repository_other_than_the_target(self):
+        """PR #44 round 5 P2: a manifest or inherited defaults naming another repository is never returned."""
+        sha = "e" * 40
+        prefix = "repos/swack-tools/spot-runners-config/contents/"
+
+        def loader(defaults_yaml, repo_yaml):
+            files = {f"{prefix}defaults.yaml?ref={sha}": defaults_yaml,
+                     f"{prefix}repos/xbmc4lyfe/newznab-tmux.yaml?ref={sha}": repo_yaml}
+
+            def fake_run(cmd, **kwargs):
+                endpoint = cmd[2]
+                if endpoint == "repos/swack-tools/spot-runners-config":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"default_branch": "main"}), stderr="")
+                if endpoint == "repos/swack-tools/spot-runners-config/commits/main":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"sha": sha}), stderr="")
+                if files.get(endpoint) is not None:
+                    encoded = base64.b64encode(files[endpoint].encode()).decode("ascii")
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"encoding": "base64", "content": encoded}),
+                                           stderr="")
+                return SimpleNamespace(returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)")
+
+            with patch("lib.runner_patch.subprocess.run", side_effect=fake_run):
+                return fetch_patch_from_config_repo("xbmc4lyfe/newznab-tmux", org="swack-tools")
+
+        body = "schema: spot-runner-patch-v1\nhost:\n  apt_packages:\n    - jq\n"
+        for name, defaults_yaml, repo_yaml in (
+            ("repo file names another repository", None, "repository: someone/else\n" + body),
+            ("defaults name another repository", "repository: someone/else\n" + body, body),
+            ("defaults name another repository, repo file matches", "repository: someone/else\n" + body,
+             "repository: xbmc4lyfe/newznab-tmux\n" + body),
+        ):
+            with self.subTest(name), self.assertRaisesRegex(ValueError, "declares repository 'someone/else'"):
+                loader(defaults_yaml, repo_yaml)
+        # A matching declaration (any case) or none is accepted; the declared spelling is kept, as the console does.
+        self.assertEqual(loader(None, "repository: XBMC4lyfe/Newznab-Tmux\n" + body).repository,
+                         "XBMC4lyfe/Newznab-Tmux")
+        self.assertEqual(loader(body, body).repository, "xbmc4lyfe/newznab-tmux")
 
     def test_validation_rejects_forbidden_mounts_and_mismatched_isa(self):
         with self.assertRaisesRegex(ValueError, "forbidden"):
@@ -277,7 +351,16 @@ container:
         host_patch = render_host_patch_script(patch_obj)
         self.assertIn("grep -Eiwq avx512_vbmi2 /proc/cpuinfo", host_patch)
         self.assertIn("/etc/sysctl.d/99-spot-runner-patch.conf", host_patch)
-        self.assertIn("/var/lib/gha-runner-patch/state.json", host_patch)
+        # The host steps carry no receipt: startup writes the pending marker before them and the completion
+        # receipt only after every runner container started, right before the bootstrap completion marker.
+        self.assertNotIn("state.json", host_patch)
+        pending_at = startup.index("/var/lib/gha-runner-patch/pending.json.tmp")
+        self.assertLess(pending_at, startup.index("/opt/gha-runners/repo-host-patch.sh"))
+        receipt_at = startup.index("mv -f /var/lib/gha-runner-patch/state.json.tmp /var/lib/gha-runner-patch/state.json")
+        self.assertLess(startup.index('docker run "${docker_args[@]}"'), receipt_at)
+        self.assertLess(receipt_at, startup.index("rm -f /var/lib/gha-runner-patch/pending.json"))
+        self.assertLess(startup.index("rm -f /var/lib/gha-runner-patch/pending.json"),
+                        startup.index("/var/lib/gha-runner-bootstrap.complete"))
 
         for script_text in (startup, host_patch):
             with tempfile.NamedTemporaryFile("w", suffix=".sh") as f:
@@ -307,7 +390,9 @@ container:
         mount_change = validate_patch_dict({
             "schema": "spot-runner-patch-v1",
             "hardware": {"arch": "x86_64", "isa": ["avx512-vbmi2"]},
-            "container": {"mounts": [{"source": "/mnt/runner-data/a", "target": "/work/a"}]},
+            "host": {"sysctl": {"vm.max_map_count": 262144}},
+            "container": {"apt_packages": ["php-cli"],
+                          "mounts": [{"source": "/mnt/runner-data/a", "target": "/work/a"}]},
         })
         self.assertEqual(classify_patch_diff(initial.to_canonical_dict(), mount_change), "recreate_containers")
 
@@ -327,29 +412,203 @@ container:
         args.runner_patch = updated
         manager.select_sizing(args)
         vm = GceVm(args.instance_name, "asia-south2-a", "RUNNING", "c4d-standard-32", True,
-                   instance_id="123", cpu_platform="AMD Turin")
+                   instance_id="123", cpu_platform="AMD Turin", last_start_timestamp="2026-10-01T09:00:00.000-07:00")
 
         ssh_commands = []
+        boot_id = "0f6c3a52-8d1e-4b7a-9c2d-5e8f1a2b3c4d"
+        state = {"boot_id": boot_id, "receipt": {"receipt_schema": "gha-runner-patch-receipt-v2",
+                                                 "patch_sha256": initial.patch_sha256,
+                                                 "manifest": initial.to_canonical_dict()}}
 
         def fake_gcloud(cmd, **kwargs):
             ssh_commands.append(cmd)
-            if "cat /var/lib/gha-runner-patch/state.json" in cmd[-1]:
-                return json.dumps({"manifest": initial.to_canonical_dict()})
+            if cmd[-1] == f"--command={PATCH_RECEIPT_READ_COMMAND}":
+                return f"state:{base64.b64encode(json.dumps(state).encode()).decode()}\npending:\nboot:{boot_id}\n"
             return f"LIVE_PATCH_APPLIED:{updated.patch_sha256}\n"
 
         with patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
              patch("lib.runner_manager.gcloud", side_effect=fake_gcloud), \
-             patch("lib.runner_manager.sync_runner_labels") as sync_labels:
+             patch("lib.runner_manager.sync_runner_labels") as sync_labels, \
+             patch("lib.runner_manager.runner_label_sync_plan") as preflight:
             result = manager.apply_live_patch(args, "asia-south2-a")
 
         self.assertEqual(result, "hot_patch")
-        self.assertEqual(len(ssh_commands), 2)
+        self.assertEqual(len([c for c in ssh_commands if c[:2] == ["compute", "ssh"]]), 2)
+        # Pending is announced before the live script; after the confirmed apply, the applied metadata and label
+        # are recorded and the pending keys cleared, last.
+        self.assertEqual([c[:3] for c in ssh_commands],
+                         [["compute", "ssh", args.instance_name], ["compute", "instances", "add-metadata"],
+                          ["compute", "ssh", args.instance_name], ["compute", "instances", "add-metadata"],
+                          ["compute", "instances", "add-labels"], ["compute", "instances", "remove-metadata"]])
+        self.assertIn("--metadata=spot-runner-patch-pending-sha256=" + updated.patch_sha256, ssh_commands[1])
         sync_labels.assert_called_once_with(args)
+        preflight.assert_called_once_with(args)  # checked before the live script ran
 
         live_script = render_live_hot_patch_script(updated, base_dockerfile=RUNNER_DOCKERFILE, runner_prefix="oxidex-asia-")
         self.assertIn('docker exec -i -u root "$cid" bash -euo pipefail', live_script)
         self.assertIn('nsenter -t "$pid" -n sysctl -w', live_script)
         self.assertIn("docker build --pull -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build", live_script)
+
+    def test_dropping_an_applied_effect_is_never_a_hot_patch(self):
+        """PR #44 round 5 P1: the live script only adds and writes, so a target that drops an applied package, file,
+        sysctl, directory, or script needs a new VM; pure additions and in-place rewrites stay hot."""
+        host_file = {"path": "/etc/applied.conf", "content": "a\n"}
+        cnt_file = {"path": "/opt/applied.txt", "content": "a\n"}
+        applied = {
+            "schema": "spot-runner-patch-v1",
+            "host": {"apt_packages": ["htop"], "sysctl": {"vm.swappiness": 10}, "files": [host_file],
+                     "boot_mkdirs": ["/srv/applied"], "boot_script": "echo applied\n"},
+            "container": {"apt_packages": ["jq"], "sysctl": {"net.core.somaxconn": 1024}, "files": [cnt_file],
+                          "dockerfile_run": "echo applied\n"},
+        }
+        current = validate_patch_dict(applied).to_canonical_dict()
+
+        def target(section, key, value):
+            data = json.loads(json.dumps(applied))
+            data.setdefault(section, {})[key] = value
+            return validate_patch_dict(data)
+
+        destructive = {
+            "host package removed": target("host", "apt_packages", []),
+            "host sysctl removed": target("host", "sysctl", {}),
+            "host file removed": target("host", "files", []),
+            "host directory removed": target("host", "boot_mkdirs", []),
+            "host boot script changed": target("host", "boot_script", "echo other\n"),
+            "host boot script removed": target("host", "boot_script", ""),
+            "container package removed": target("container", "apt_packages", []),
+            "container sysctl removed": target("container", "sysctl", {"net.ipv4.tcp_fin_timeout": 30}),
+            "container file removed": target("container", "files", [{**cnt_file, "path": "/opt/renamed.txt"}]),
+            "container command changed": target("container", "dockerfile_run", "echo other\n"),
+            "container command removed": target("container", "dockerfile_run", ""),
+            "everything removed": validate_patch_dict({"schema": "spot-runner-patch-v1"}),
+        }
+        for name, patch_obj in destructive.items():
+            with self.subTest(name):
+                self.assertEqual(classify_patch_diff(current, patch_obj), "replace_vm")
+                self.assertTrue(runner_patch_mod.destructive_patch_changes(validate_patch_dict(current), patch_obj))
+        additive = {
+            "host package added": target("host", "apt_packages", ["htop", "strace"]),
+            "host sysctl rewritten and added": target("host", "sysctl", {"vm.swappiness": 20, "vm.max_map_count": 1}),
+            "host file rewritten": target("host", "files", [{**host_file, "content": "b\n", "mode": "0600"}]),
+            "host directory added": target("host", "boot_mkdirs", ["/srv/applied", "/srv/more"]),
+            "container package added": target("container", "apt_packages", ["jq", "ripgrep"]),
+            "container sysctl rewritten": target("container", "sysctl", {"net.core.somaxconn": 4096}),
+            "container file added": target("container", "files", [cnt_file, {"path": "/opt/new.txt", "content": ""}]),
+            "labels changed": target("hardware", "extra_labels", ["other"]),
+        }
+        for name, patch_obj in additive.items():
+            with self.subTest(name):
+                self.assertEqual(classify_patch_diff(current, patch_obj), "hot_patch")
+                self.assertEqual(runner_patch_mod.destructive_patch_changes(validate_patch_dict(current), patch_obj), [])
+        # A first script on a host that never ran one is an addition; a mount change with nothing dropped recreates.
+        bare = validate_patch_dict({"schema": "spot-runner-patch-v1"}).to_canonical_dict()
+        self.assertEqual(classify_patch_diff(bare, validate_patch_dict(applied)), "hot_patch")
+        with_mount = target("container", "mounts", [{"source": "/srv/applied", "target": "/cache"}])
+        self.assertEqual(classify_patch_diff(current, with_mount), "recreate_containers")
+        self.assertIn("host.apt_packages drops htop",
+                      runner_patch_mod.destructive_patch_changes(validate_patch_dict(current),
+                                                                 destructive["host package removed"]))
+
+    def test_an_unfinished_attempt_at_another_patch_fails_closed(self):
+        """An incomplete attempt left unknown partial changes: only one at the target itself may be re-applied."""
+        old = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["htop"]}})
+        new = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["htop", "jq"]}})
+        other = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["curl"]}})
+        current = old.to_canonical_dict()
+        self.assertEqual(classify_patch_diff(current, new), "hot_patch")
+        self.assertEqual(classify_patch_diff(current, new, pending_sha256=new.patch_sha256), "hot_patch")
+        self.assertEqual(classify_patch_diff(current, new, pending_sha256="none"), "hot_patch")
+        for pending in (other.patch_sha256, "unknown"):
+            self.assertEqual(classify_patch_diff(current, new, pending_sha256=pending), "replace_vm")
+            self.assertEqual(classify_patch_diff(None, new, pending_sha256=pending), "replace_vm")
+            self.assertEqual(classify_patch_diff(current, old, pending_sha256=pending), "replace_vm")  # never noop
+
+    def test_receipt_reports_the_pending_attempt(self):
+        import base64
+
+        patch_obj = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["jq"]}})
+        boot = "0f6c3a52-8d1e-4b7a-9c2d-5e8f1a2b3c4d"
+
+        def output(marker):
+            encoded = base64.b64encode(json.dumps(marker).encode()).decode() if marker is not None else ""
+            return f"state:\npending:{encoded}\nboot:{boot}\n"
+
+        parse = runner_patch_mod.parse_patch_receipt
+        self.assertEqual(parse(output(None)).pending_sha256, "")
+        self.assertEqual(parse(output({"pending_patch_sha256": patch_obj.patch_sha256})).pending_sha256,
+                         patch_obj.patch_sha256)
+        for damaged in ({"pending_patch_sha256": "abc"}, {}, ["not", "a", "mapping"]):
+            self.assertEqual(parse(output(damaged)).pending_sha256, "unknown")
+
+    def test_live_script_writes_the_completion_receipt_only_after_every_step(self):
+        """Codex round 14 P2: pending marker first; receipt (atomic rename) and LIVE_PATCH_APPLIED last."""
+        target = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["jq"]},
+                                      "container": {"apt_packages": ["ripgrep"]}})
+        lines = render_live_hot_patch_script(target, base_dockerfile=RUNNER_DOCKERFILE,
+                                             runner_prefix="oxidex-").splitlines()
+
+        def at(fragment, last=False):
+            hits = [i for i, line in enumerate(lines) if fragment in line]
+            self.assertTrue(hits, fragment)
+            return hits[-1] if last else hits[0]
+
+        order = [at("pending.json.tmp"), at("Repo runner patch:"), at("apt-get install"), at("docker build"),
+                 at("docker exec", last=True), at("done", last=True), at("state.json.tmp /var/lib/gha-runner-patch/state.json"),
+                 at("rm -f /var/lib/gha-runner-patch/pending.json"), at("LIVE_PATCH_APPLIED")]
+        self.assertEqual(order, sorted(order))
+        empty = validate_patch_dict({"schema": "spot-runner-patch-v1"})
+        self.assertIn("state.json.tmp", render_live_hot_patch_script(empty, base_dockerfile=RUNNER_DOCKERFILE))
+
+    def test_receipt_commands_on_a_real_shell(self):
+        from lib.runner_patch import (PATCH_STATE_DIR, parse_patch_receipt, render_patch_pending_commands,
+                                      render_patch_receipt_commands)
+
+        first = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["jq"]}})
+        second = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["ripgrep"]}})
+        boot = "0f6c3a52-8d1e-4b7a-9c2d-5e8f1a2b3c4d"
+
+        def canonical(patch):
+            return json.loads(json.dumps(patch.to_canonical_dict()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir, boot_file = Path(tmp) / "state", Path(tmp) / "boot_id"
+            boot_file.write_text(boot + "\n")
+
+            def attempt(patch, step):
+                body = "\n".join([*render_patch_pending_commands(patch), step, *render_patch_receipt_commands(patch)])
+                body = body.replace(PATCH_STATE_DIR, str(state_dir)).replace("/proc/sys/kernel/random/boot_id",
+                                                                             str(boot_file))
+                return self.real_subprocess_run(["bash", "-c", "set -Eeuo pipefail\n" + body],
+                                                capture_output=True, text=True).returncode
+
+            def read(current_boot=boot):  # what PATCH_RECEIPT_READ_COMMAND prints (base64 -w0 of each file)
+                def b64(name):
+                    f = state_dir / name
+                    return base64.b64encode(f.read_bytes()).decode() if f.exists() else ""
+                return parse_patch_receipt(f"state:{b64('state.json')}\npending:{b64('pending.json')}\n"
+                                           f"boot:{current_boot}\n")
+
+            self.assertNotEqual(attempt(first, "false"), 0)  # e.g. the image build failed
+            receipt = read()
+            self.assertEqual((receipt.manifest, receipt.proof), (None, False))
+            self.assertIn("has not completed", receipt.detail)
+            self.assertEqual(attempt(first, "true"), 0)
+            receipt = read()
+            self.assertEqual((receipt.manifest, receipt.proof), (canonical(first), True))
+            self.assertFalse((state_dir / "pending.json").exists())
+            self.assertFalse(read("1" * 8 + boot[8:]).proof)  # another boot
+            self.assertNotEqual(attempt(second, "false"), 0)
+            receipt = read()  # the last completed patch stays the receipt; the failed attempt stays pending
+            self.assertEqual((receipt.manifest, receipt.proof), (canonical(first), False))
+            tampered = json.loads((state_dir / "state.json").read_text())
+            tampered["receipt"]["patch_sha256"] = second.patch_sha256
+            (state_dir / "state.json").write_text(json.dumps(tampered))
+            with self.assertRaises(ValueError):
+                read()
+        with self.assertRaises(ValueError):
+            parse_patch_receipt("state:\npending:\nboot:\n")
+        self.assertIn("base64 -w0", PATCH_RECEIPT_READ_COMMAND)
+        self.assertIn("/proc/sys/kernel/random/boot_id", PATCH_RECEIPT_READ_COMMAND)
 
     def test_path_normalization_and_arm64_storage_and_yaml_chomping(self) -> None:
         from decimal import Decimal
@@ -380,7 +639,303 @@ container:
         boot, data, _ = cheapest_storage("c4a-standard-32", 200, rates, arch="arm64")
         self.assertEqual((boot, data), ("hyperdisk-balanced", "hyperdisk-balanced"))
 
+    def test_schema_and_field_validations(self) -> None:
+        # Schema version mismatch
+        with self.assertRaisesRegex(ValueError, "Unsupported runner patch schema"):
+            validate_patch_dict({"schema": "spot-runner-patch-v2"})
+
+        # Booleans rejected for min_vcpu and min_ram_gib
+        with self.assertRaisesRegex(ValueError, "hardware.min_vcpu must be a positive integer"):
+            validate_patch_dict({"hardware": {"min_vcpu": True}})
+        with self.assertRaisesRegex(ValueError, "hardware.min_ram_gib must be a positive integer"):
+            validate_patch_dict({"hardware": {"min_ram_gib": False}})
+
+        # Directory traversal in file paths rejected
+        with self.assertRaisesRegex(ValueError, "Invalid absolute file path"):
+            validate_patch_dict({"host": {"files": [{"path": "/etc/../passwd", "content": "bad"}]}})
+
+        # Duplicate mount targets rejected
+        with self.assertRaisesRegex(ValueError, "Duplicate mount target"):
+            validate_patch_dict({
+                "container": {
+                    "mounts": [
+                        {"source": "/mnt/runner-data/a", "target": "/work/target"},
+                        {"source": "/mnt/runner-data/b", "target": "/work/target"},
+                    ]
+                }
+            })
+
+        # Duplicate file paths rejected
+        with self.assertRaisesRegex(ValueError, "Duplicate file path"):
+            validate_patch_dict({
+                "host": {
+                    "files": [
+                        {"path": "/opt/file.txt", "content": "1"},
+                        {"path": "/opt/file.txt", "content": "2"},
+                    ]
+                }
+            })
+
+        # Sysctl newline injection rejected
+        with self.assertRaisesRegex(ValueError, "Invalid sysctl value"):
+            validate_patch_dict({"host": {"sysctl": {"net.core.rmem_max": "134217728\nkernel.panic=1"}}})
+        with self.assertRaisesRegex(ValueError, "Invalid sysctl value"):
+            validate_patch_dict({"host": {"sysctl": {"net.core.rmem_max": "134217728\rkernel.panic=1"}}})
+
+        # Runner label regex validation
+        with self.assertRaisesRegex(ValueError, "Invalid runner label"):
+            validate_patch_dict({"hardware": {"extra_labels": ["invalid label with spaces"]}})
+        with self.assertRaisesRegex(ValueError, "Invalid runner label"):
+            validate_patch_dict({"hardware": {"extra_labels": ["-leading-dash"]}})
+
+    def test_canonical_dict_and_sha256_stability(self) -> None:
+        p1 = validate_patch_dict({"hardware": {"arch": "x86_64"}}, source_commit="sha1", source_branch="branch1")
+        p2 = validate_patch_dict({"hardware": {"arch": "x86_64"}}, source_commit="sha2", source_branch="branch2")
+        self.assertEqual(p1.patch_sha256, p2.patch_sha256)
+        self.assertNotIn("source_commit", p1.to_canonical_dict())
+        self.assertNotIn("source_branch", p1.to_canonical_dict())
+
+    def test_toml_manifest_parsing(self) -> None:
+        toml_text = """
+schema = "spot-runner-patch-v1"
+repository = "swack-tools/oxidex"
+
+[hardware]
+arch = "x86_64"
+isa = ["avx2"]
+min_vcpu = 4
+min_ram_gib = 16
+
+[host.sysctl]
+"net.core.rmem_max" = "134217728"
+"""
+        parsed = parse_manifest_text(toml_text)
+        patch_obj = validate_patch_dict(parsed)
+        self.assertEqual(patch_obj.schema, SCHEMA_VERSION)
+        self.assertEqual(patch_obj.repository, "swack-tools/oxidex")
+        self.assertEqual(patch_obj.hardware.min_vcpu, 4)
+        self.assertEqual(patch_obj.hardware.isa, ("avx2",))
+
+    def test_hardware_sizing_enforcement_in_select_sizing(self) -> None:
+        patch_obj = validate_patch_dict({
+            "schema": "spot-runner-patch-v1",
+            "hardware": {"arch": "x86_64", "min_vcpu": 16, "min_ram_gib": 64},
+        })
+        args_too_small_cpu = manager.args_parser().parse_args([
+            "--max-cost", "0.2",
+            "--instance-type", "n2-standard-8",
+            "--cpu", "8",
+            "--ram", "64",
+        ])
+        args_too_small_cpu.runner_patch = patch_obj
+        with self.assertRaisesRegex(RuntimeError, "Host vCPU 8 is below patch minimum 16"):
+            manager.select_sizing(args_too_small_cpu)
+
+        args_too_small_ram = manager.args_parser().parse_args([
+            "--max-cost", "0.2",
+            "--instance-type", "n2-standard-16",
+            "--cpu", "16",
+            "--ram", "32",
+        ])
+        args_too_small_ram.runner_patch = patch_obj
+        with self.assertRaisesRegex(RuntimeError, "Host RAM 32 GiB is below patch minimum 64 GiB"):
+            manager.select_sizing(args_too_small_ram)
+
+    def test_machine_profiles_arm64_and_storage(self) -> None:
+        c4a = machine_profile("c4a-standard-16", arch="arm64")
+        self.assertIsNotNone(c4a)
+        self.assertEqual(c4a.quota_metric, "C4A_CPUS")
+        self.assertEqual(c4a.disk_type, "hyperdisk-balanced")
+        self.assertEqual(c4a.disk_interface, "NVME")
+
+        t2a = machine_profile("t2a-standard-16", arch="arm64")
+        self.assertIsNotNone(t2a)
+        self.assertEqual(t2a.quota_metric, "T2A_CPUS")
+        self.assertEqual(t2a.disk_type, "pd-standard")
+        self.assertEqual(t2a.disk_interface, "SCSI")
+
+        args = manager.args_parser().parse_args([
+            "--max-cost", "0.2",
+            "--instance-type", "c4a-standard-16",
+            "--cpu", "16",
+            "--ram", "64",
+        ])
+        args.arch = "arm64"
+        profile = configure_storage(args)
+        self.assertEqual(profile.disk_type, "hyperdisk-balanced")
+        self.assertEqual(args.disk_type, "hyperdisk-balanced")
+        self.assertEqual(args.disk_interface, "NVME")
+
+
+class _FakeUrlResponse:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode()
+        self.status = 200
+
+    def read(self, _limit=-1):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class GhApiFallbackTests(unittest.TestCase):
+    """runner_patch._gh_api_json uses urllib against api.github.com when the gh CLI is absent."""
+
+    def setUp(self):
+        blocker = patch("subprocess.run", side_effect=AssertionError("gh must not run when it is not on PATH"))
+        blocker.start()
+        self.addCleanup(blocker.stop)
+        no_gh = patch("lib.runner_patch.shutil.which", return_value=None)
+        no_gh.start()
+        self.addCleanup(no_gh.stop)
+
+    def test_urllib_fallback_sends_token_and_parses_json(self):
+        seen = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append((request.full_url, dict(request.header_items()), timeout))
+            return _FakeUrlResponse({"default_branch": "main"})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            data = runner_patch_mod._gh_api_json("repos/o/r", env={"SPOT_CONFIG_GH_TOKEN": "cfg-token", "GH_TOKEN": "other"})
+        self.assertEqual(data, {"default_branch": "main"})
+        url, headers, timeout = seen[0]
+        self.assertEqual(url, "https://api.github.com/repos/o/r")
+        self.assertEqual(headers.get("Authorization"), "Bearer cfg-token")
+        self.assertGreater(timeout, 0)
+
+    def test_urllib_fallback_maps_404_for_missing_files(self):
+        def not_found(request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+        with patch("urllib.request.urlopen", side_effect=not_found):
+            self.assertIsNone(runner_patch_mod._fetch_repo_file_at_ref("o/r", "defaults.yaml", "a" * 40, env={"GH_TOKEN": "t"}))
+            with self.assertRaisesRegex(RuntimeError, "404"):
+                runner_patch_mod._gh_api_json("repos/o/r", env={"GH_TOKEN": "t"})
+
+    def test_urllib_fallback_rejects_path_traversal(self):
+        with patch("urllib.request.urlopen", side_effect=AssertionError("no request expected")):
+            with self.assertRaises(RuntimeError):
+                runner_patch_mod._gh_api_json("repos/../../evil", env={})
+
+    TRICKY_BRANCHES = ("fix#1", "100%-done", "my branch", "feature/x#y", "ünïcødé-✓", "a?b=c&d", "rel+1@{x}")
+
+    def test_default_branch_is_one_encoded_segment_over_urllib(self):
+        sha = "f" * 40
+        for branch in self.TRICKY_BRANCHES:
+            seen = []
+
+            def fake_urlopen(request, timeout=None, branch=branch):
+                seen.append(request.full_url)
+                if request.full_url == "https://api.github.com/repos/o/r":
+                    return _FakeUrlResponse({"default_branch": branch})
+                return _FakeUrlResponse({"sha": sha})
+
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                self.assertEqual(resolve_repo_default_branch("o/r", env={"GH_TOKEN": "t"}), (branch, sha))
+            url = seen[1]
+            parts = urllib.parse.urlsplit(url)
+            # No fragment or query appears, and the ref decodes back to exactly one path segment.
+            self.assertEqual((parts.fragment, parts.query), ("", ""), url)
+            prefix = "/repos/o/r/commits/"
+            self.assertTrue(parts.path.startswith(prefix), url)
+            encoded = parts.path[len(prefix):]
+            self.assertNotIn("/", encoded)
+            self.assertEqual(urllib.parse.unquote(encoded), branch)
+            self.assertTrue(url.isascii())
+
+    def test_contents_ref_query_value_is_encoded(self):
+        seen = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            return _FakeUrlResponse({"encoding": "base64", "content": base64.b64encode(b"x: 1\n").decode()})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            runner_patch_mod._fetch_repo_file_at_ref("o/r", "repos/a/b.yaml", "v1#2&x=y", env={"GH_TOKEN": "t"})
+        parts = urllib.parse.urlsplit(seen[0])
+        self.assertEqual(parts.path, "/repos/o/r/contents/repos/a/b.yaml")
+        self.assertEqual(urllib.parse.parse_qs(parts.query), {"ref": ["v1#2&x=y"]})
+        self.assertEqual(parts.fragment, "")
+
+    def test_fetch_patch_follows_a_default_branch_with_a_hash(self):
+        sha = "1" * 40
+        files = {"defaults.yaml": "", "repos/xbmc4lyfe/newznab-tmux.yaml": YAML_NNTMUX_MANIFEST}
+
+        def fake_urlopen(request, timeout=None):
+            parts = urllib.parse.urlsplit(request.full_url)
+            base = "/repos/swack-tools/spot-runners-config"
+            if parts.path == base:
+                return _FakeUrlResponse({"default_branch": "release#2"})
+            if parts.path == base + "/commits/release%232" and not parts.fragment:
+                return _FakeUrlResponse({"sha": sha})
+            name = parts.path[len(base + "/contents/"):]
+            if parts.path.startswith(base + "/contents/") and parts.query == f"ref={sha}" and name in files:
+                if not files[name]:
+                    raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+                return _FakeUrlResponse({"encoding": "base64", "content": base64.b64encode(files[name].encode()).decode()})
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            patch_obj = fetch_patch_from_config_repo("xbmc4lyfe/newznab-tmux", env={"GH_TOKEN": "t"})
+        self.assertEqual(patch_obj.source_branch, "release#2")
+        self.assertEqual(patch_obj.source_commit, sha)
+
+    def test_encoded_traversal_and_malformed_escapes_are_refused(self):
+        for endpoint in ("repos/o/r/commits/%2E%2E", "repos/o/r/commits/%2e", "repos/o/r/commits/a%2F..%2Fb",
+                         "repos/o/r/%2E%2E/x", "repos/o/r/commits/fix#1", "repos/o/r/commits/%zz",
+                         "repos/o/r/commits/%2", "repos/o/r/commits/a b", "repos/o/r/commits/ü"):
+            with patch("urllib.request.urlopen", side_effect=AssertionError("no request expected")):
+                with self.assertRaisesRegex(RuntimeError, "refusing unexpected endpoint", msg=endpoint):
+                    runner_patch_mod._gh_api_json(endpoint, env={})
+        for endpoint in ("repos/o/r/commits/fix%231", "repos/o/r/commits/a%2Fb", "repos/o/r/commits/%25",
+                         "repos/o/r/commits/%C3%BC", "repos/o/r/commits/v1.2.x"):
+            self.assertTrue(runner_patch_mod._endpoint_is_safe(endpoint), endpoint)
+
+    def _tree_responses(self, tree_payload):
+        sha = "e" * 40
+
+        def fake_urlopen(request, timeout=None):
+            url = request.full_url
+            if url.endswith("/repos/swack-tools/spot-runners-config"):
+                return _FakeUrlResponse({"default_branch": "main"})
+            if url.endswith("/repos/swack-tools/spot-runners-config/commits/main"):
+                return _FakeUrlResponse({"sha": sha})
+            if url.endswith(f"/repos/swack-tools/spot-runners-config/git/trees/{sha}?recursive=1"):
+                return _FakeUrlResponse(tree_payload)
+            raise AssertionError(f"unexpected URL {url}")
+
+        return sha, fake_urlopen
+
+    def test_list_config_repo_targets(self):
+        sha, fake = self._tree_responses({"truncated": False, "tree": [
+            {"path": "defaults.yaml", "type": "blob"},
+            {"path": "repos", "type": "tree"},
+            {"path": "repos/swack-tools", "type": "tree"},
+            {"path": "repos/swack-tools/oxidex.yaml", "type": "blob"},
+            {"path": "repos/xbmc4lyfe/newznab-tmux.yaml", "type": "blob"},
+            {"path": "repos/README.md", "type": "blob"},
+        ]})
+        with patch("urllib.request.urlopen", side_effect=fake):
+            targets, got_sha = list_config_repo_targets(env={"GH_TOKEN": "t"})
+        self.assertEqual(targets, ["swack-tools/oxidex", "xbmc4lyfe/newznab-tmux"])
+        self.assertEqual(got_sha, sha)
+
+    def test_list_config_repo_targets_fails_closed(self):
+        for payload in (
+            {"truncated": True, "tree": [{"path": "repos/a/b.yaml", "type": "blob"}]},
+            {"truncated": False, "tree": [{"path": "repos/-bad/x.yaml", "type": "blob"}]},
+            {"message": "Not Found"},
+        ):
+            _sha, fake = self._tree_responses(payload)
+            with patch("urllib.request.urlopen", side_effect=fake):
+                with self.assertRaises(RuntimeError, msg=payload):
+                    list_config_repo_targets(env={"GH_TOKEN": "t"})
+
 
 if __name__ == "__main__":
     unittest.main()
-

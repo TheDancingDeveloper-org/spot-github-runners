@@ -8,11 +8,13 @@ import base64
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import tempfile
 import time
 import uuid
+from typing import Any
 from datetime import datetime, timezone
 from dataclasses import asdict
 from decimal import Decimal
@@ -24,20 +26,50 @@ from .billing_catalog import catalog_skus, unit_price, monthly_to_daily
 from .storage_selection import storage_rates, cheapest_storage, throughput_floor, observed_storage_monthly, disk_monthly_cost
 from .project_costs import log_project_costs
 from .fleet_logging import vm_details
-from .runner_fleet import GceVm, list_gcloud_vms
+from .runner_fleet import (
+    MAX_PATCH_METADATA_BYTES,
+    NO_PATCH,
+    PATCH_BOOT_METADATA_KEY,
+    PATCH_LABEL_KEY,
+    PATCH_LABEL_SHA_CHARS,
+    PATCH_METADATA_KEY,
+    PATCH_PENDING_METADATA_KEY,
+    PATCH_PENDING_SHA_METADATA_KEY,
+    PATCH_SHA_METADATA_KEY,
+    PATCH_TARGET_METADATA_KEY,
+    RUNNER_COUNT_METADATA_KEY,
+    RUNNER_HEAVY_POOL_METADATA_KEY,
+    RUNNER_LABEL_METADATA_KEY,
+    RUNNER_GROUP_METADATA_KEY,
+    RUNNER_PREFIX_METADATA_KEY,
+    RUNNER_REGION_METADATA_KEY,
+    RUNNER_REGISTRATION_TARGET_METADATA_KEY,
+    GceVm,
+    gce_metadata_items,
+    gce_timestamp,
+    list_gcloud_vms,
+    runner_deployment_from_gce_item,
+)
 from .log_format import configure_logging, error_detail, single_line
 from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED,
                             RUNNER_DOCKERFILE, RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
 from .builder_assets import BUILDER_DOCKERFILE, BUILDER_ENTRYPOINT, HOST_LAUNCHER
+from .target_config import (DEFAULT_ORG, TARGET_LABEL_KEY, TargetConfig, resolve_target, target_label_value,
+                            target_owns_vm_label)
 from .runner_patch import (
     RunnerPatch,
     classify_patch_diff,
+    destructive_patch_changes,
     fetch_patch_from_config_repo,
+    host_capacity_problems,
+    PATCH_RECEIPT_READ_COMMAND,
     inject_startup_patch,
     load_patch_from_file,
+    parse_patch_receipt,
     render_dockerfile,
     render_live_hot_patch_script,
+    validate_patch_dict,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,6 +113,8 @@ def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", default=PROJECT)
     parser.add_argument("--org", default=ORG)
+    parser.add_argument("--target", default=None,
+                        help="Target repository (owner/repo) or organization (org); overrides --org")
     parser.add_argument("--max-cost", type=Decimal, required=True, help="Maximum compute USD/hour for this VM")
     parser.add_argument('--max-total-daily-usd', type=Decimal, help='Maximum compute plus boot/data storage USD/day')
     parser.add_argument('--cheapest-storage', action='store_true', help='Choose compatible storage using current regional prices')
@@ -152,6 +186,11 @@ def strict_pool_settings(args):
     if type(count)is not int or count not in (2,3):raise RuntimeError('Strict pool must contain two or three runners')
     if getattr(args,'remote_builder',False):raise RuntimeError('Strict CI pool cannot host remote builders')
     if getattr(args,'tier',None):raise RuntimeError('Strict pool is an explicit fixed mode, not a tier override')
+    # Strict pools are verified through an organization runner group; reject a repository target
+    # here, before any VM is provisioned or listener registered, instead of failing afterwards.
+    target=resolve_target(getattr(args,'target',None) or getattr(args,'org',ORG))
+    if target.is_repo:raise RuntimeError(f'Strict pools need an organization runner group; repository target {target.name} is not supported')
+    if not getattr(args,'runner_group_id',None):raise RuntimeError('Strict pool requires --runner-group-id')
     if args.cpu < count*8+2 or args.ram < count*32+16:raise RuntimeError('Strict pool needs 2 CPU and 16 GiB host headroom')
     return count
 
@@ -196,16 +235,32 @@ def select_sizing(args: argparse.Namespace) -> None:
         if len(f'{args.runner_prefix}-{args.instance_name}-{args.runner_count}') > 64:
             raise RuntimeError('GitHub runner name exceeds64 characters')
         return
+    host_overhead = int(getattr(args, 'host_overhead_gib', 2)) if args.ram <= 8 else (4 if args.ram <= 16 else 8)
+
     if not args.fixed_runner_sizing:
-        if args.cpu < 4:
-            raise RuntimeError("At least 4 host vCPUs are required for one runner")
-        args.runner_count = args.cpu // 4
-        args.runner_cpu = 4
-        args.runner_memory_gb = (args.ram - 8) // args.runner_count
+        if args.cpu < 2:
+            raise RuntimeError("At least 2 host vCPUs are required for one runner")
+        if args.ram < 4:
+            raise RuntimeError("At least 4 GiB host RAM is required for one runner")
+        if getattr(args, "runner_count", None) == 1 or args.cpu < 4 or args.ram <= 8:
+            args.runner_count = 1
+            args.runner_cpu = min(4, args.cpu)
+            args.runner_memory_gb = max(2, args.ram - host_overhead)
+        else:
+            args.runner_count = args.cpu // 4
+            args.runner_cpu = 4
+            args.runner_memory_gb = (args.ram - host_overhead) // args.runner_count
+            if args.runner_memory_gb < 2:
+                args.runner_count = 1
+                args.runner_cpu = min(4, args.cpu)
+                args.runner_memory_gb = max(2, args.ram - host_overhead)
+
     if args.runner_count < 1 or args.runner_cpu * args.runner_count > args.cpu:
         raise RuntimeError("Runner count or CPU limits exceed the requested host capacity")
-    if args.runner_memory_gb * args.runner_count > args.ram - 8:
-        raise RuntimeError("Runner RAM exceeds (host RAM - 8 GiB); lower runner count/memory")
+    if args.runner_memory_gb < 2:
+        raise RuntimeError(f"At least 2 GiB runner RAM is required; allocated {args.runner_memory_gb} GiB")
+    if args.runner_memory_gb * args.runner_count > args.ram - host_overhead:
+        raise RuntimeError(f"Runner RAM exceeds (host RAM - {host_overhead} GiB); lower runner count/memory")
     longest_name = len(f"{args.runner_prefix}-{args.instance_name}-{args.runner_count}")
     if longest_name > 64:
         raise RuntimeError(f"Runner name would be {longest_name} characters; GitHub allows at most 64")
@@ -271,17 +326,28 @@ def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:
 
 
 def verify_runner_group(args: argparse.Namespace) -> dict:
-    group = json.loads(run(["gh", "api", f"orgs/{ORG}/actions/runner-groups/{args.runner_group_id}"], quiet=True))
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    if target.is_repo:
+        raise RuntimeError(f"Runner groups are not supported for personal repository targets: {target.name}")
+    org = target.name
+    group = json.loads(run(["gh", "api", f"orgs/{org}/actions/runner-groups/{args.runner_group_id}"], quiet=True))
     if group.get("visibility") != "selected":
         raise RuntimeError("Runner group must be repository-scoped")
-    repos = json.loads(run(["gh", "api", f"orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/repositories"], quiet=True))
-    if not any(repo.get("full_name") == f"{ORG}/oxidex" for repo in repos.get("repositories", [])):
-        raise RuntimeError(f"Runner group {args.runner_group_id} is not enabled for {ORG}/oxidex")
-    if getattr(args,'heavy_runner_pool',None) and group.get('allows_public_repositories') is not True:
+    repos = json.loads(run(["gh", "api", f"orgs/{org}/actions/runner-groups/{args.runner_group_id}/repositories"], quiet=True))
+    if not any(repo.get("full_name") == f"{org}/oxidex" for repo in repos.get("repositories", [])):
+        raise RuntimeError(f"Runner group {args.runner_group_id} is not enabled for {org}/oxidex")
+    if getattr(args, 'heavy_runner_pool', None) and group.get('allows_public_repositories') is not True:
         raise RuntimeError('Strict runner group must permit the public OxiDex repository')
-    if getattr(args,'heavy_runner_pool',None) and [repo.get('full_name') for repo in repos.get('repositories',[])]!=[f'{ORG}/oxidex']:
+    if getattr(args, 'heavy_runner_pool', None) and [repo.get('full_name') for repo in repos.get('repositories', [])] != [f'{org}/oxidex']:
         raise RuntimeError('Strict runner group must select only OxiDex')
     return group
+
+
+def generate_registration_token(target: TargetConfig) -> str:
+    token = run(["gh", "api", "--method", "POST", target.registration_token_url, "--jq", ".token"], quiet=True)
+    if not token:
+        raise RuntimeError(f"GitHub returned an empty {target.target_type} runner registration token for {target.name}")
+    return token
 
 
 def cleanup_orphan_runner_disks(zone: str) -> list[str]:
@@ -336,7 +402,7 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "CLEAN_TARGET_B64": base64.b64encode(CLEAN_TARGET.encode()).decode("ascii"),
         "DOCKER_WRAPPER_B64": base64.b64encode(DOCKER_WRAPPER.encode()).decode("ascii"),
         "RUNNER_VERSION": "2.337.0",
-        "ORG": getattr(args,'org',ORG),
+        "ORG": getattr(args, "target", None) or getattr(args, "org", None) or ORG,
         "RUNNER_LABELS": labels_csv,
         "RUNNER_GROUP": group_name,
         "RUNNER_PREFIX": args.runner_prefix,
@@ -389,6 +455,242 @@ def write_deployment_receipt(args: argparse.Namespace, vm: GceVm) -> None:
     temporary.replace(path)
 
 
+def launch_target_label(args: argparse.Namespace) -> str:
+    """Return the ownership label value that scopes this host to its GitHub target's controller."""
+    return target_label_value(resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG)))
+
+
+def runner_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) -> tuple[dict[str, str], str | None, str]:
+    """(plain metadata, canonical manifest JSON or None when too large, label value) recording ``patch``.
+
+    Nothing here is secret: the manifest is the reviewed config-repo patch, never the registration token.
+    """
+    target = (patch.repository if patch is not None and patch.repository else "") or str(getattr(args, "target", "") or "")
+    plain: dict[str, str] = {}
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target):
+        plain[PATCH_TARGET_METADATA_KEY] = target
+    prefix = str(getattr(args, "runner_prefix", "") or "")
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,63}", prefix):
+        plain[RUNNER_PREFIX_METADATA_KEY] = prefix
+    count = getattr(args, "runner_count", None)
+    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        plain[RUNNER_COUNT_METADATA_KEY] = str(count)
+    # What sync_runner_labels needs to keep the host's real GitHub scheduling labels after a live patch.
+    runner_label = str(getattr(args, "runner_label", "") or "")
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", runner_label):
+        plain[RUNNER_LABEL_METADATA_KEY] = runner_label
+    region = str(getattr(args, "region", "") or "")
+    if re.fullmatch(r"[a-z0-9-]{1,40}", region):
+        plain[RUNNER_REGION_METADATA_KEY] = region
+    heavy = getattr(args, "heavy_runner_pool", None)
+    if heavy in (2, 3):
+        plain[RUNNER_HEAVY_POOL_METADATA_KEY] = str(heavy)
+    # The scope the runners registered with (org or repo) and its runner group, which label sync needs.
+    registration = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    plain[RUNNER_REGISTRATION_TARGET_METADATA_KEY] = registration.name
+    group = getattr(args, "runner_group_id", None)
+    if registration.is_org and isinstance(group, int) and not isinstance(group, bool) and group > 0:
+        plain[RUNNER_GROUP_METADATA_KEY] = str(group)
+    if patch is None:
+        plain[PATCH_SHA_METADATA_KEY] = NO_PATCH
+        return plain, None, NO_PATCH
+    plain[PATCH_SHA_METADATA_KEY] = patch.patch_sha256
+    manifest = json.dumps(patch.to_canonical_dict(), sort_keys=True, separators=(",", ":"))
+    if len(manifest.encode("utf-8")) > MAX_PATCH_METADATA_BYTES:
+        LOG.warning("Patch %s manifest is %d bytes; recording its sha256 only", patch.patch_sha256[:12],
+                    len(manifest.encode("utf-8")))
+        manifest = None
+    return plain, manifest, patch.patch_sha256[:PATCH_LABEL_SHA_CHARS]
+
+
+def pending_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) -> tuple[dict[str, str], str | None]:
+    """(plain metadata, canonical manifest JSON or None) announcing ``patch`` as requested but not yet applied.
+
+    The deployment keys match runner_patch_record; the patch sha goes under the PENDING key (and the manifest
+    under PATCH_PENDING_METADATA_KEY), never the applied keys or the label. Those wait for
+    record_patch_metadata, after the bootstrap confirms the patch.
+    """
+    plain, manifest, _label = runner_patch_record(args, patch)
+    plain[PATCH_PENDING_SHA_METADATA_KEY] = plain.pop(PATCH_SHA_METADATA_KEY)
+    return plain, manifest
+
+
+def record_pending_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatch | None) -> None:
+    """Announce ``patch`` as in progress (PENDING keys only) before anything on the host changes.
+
+    A live patch that fails part-way must not leave the previous applied record looking current: the
+    preview treats any pending host as unknown until record_patch_metadata(clear_pending=True) runs. Only the
+    two PENDING keys are written, so a failed attempt changes nothing else; an oversized manifest is replaced by
+    a placeholder naming its sha so no earlier attempt's pending manifest survives.
+    """
+    plain, manifest = pending_patch_record(args, patch)
+    sha = plain[PATCH_PENDING_SHA_METADATA_KEY]
+    if manifest is None:
+        manifest = json.dumps({"patch_sha256": sha, "manifest_omitted": "larger than the metadata limit"},
+                              sort_keys=True, separators=(",", ":"))
+    manifest_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", prefix="gha-patch-pending-", suffix=".json", delete=False) as temp:
+            temp.write(manifest)
+            manifest_path = temp.name
+        gcloud(["compute", "instances", "add-metadata", args.instance_name, f"--zone={zone}",
+                _plain_metadata_flag({PATCH_PENDING_SHA_METADATA_KEY: sha}),
+                f"--metadata-from-file={PATCH_PENDING_METADATA_KEY}={manifest_path}"])
+    finally:
+        if manifest_path:
+            Path(manifest_path).unlink(missing_ok=True)
+
+
+def _plain_metadata_flag(plain: dict[str, str]) -> str:
+    for key, value in plain.items():
+        if any(c in value for c in ",=\n\r") or any(c in key for c in ",=\n\r"):
+            raise RuntimeError(f"Refusing metadata value with a separator for {key}")
+    return "--metadata=" + ",".join(f"{k}={v}" for k, v in plain.items())
+
+
+def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatch | None, *, boot: str,
+                          existing_keys: set[str] | None = None, clear_pending: bool = False) -> None:
+    """Record the patch a running host now runs (instance metadata plus a sha-prefix label).
+
+    Call it only after the host confirmed ``patch`` (a completed bootstrap or LIVE_PATCH_APPLIED). ``boot`` is
+    the GCE lastStartTimestamp of the boot that confirmation belongs to (see confirmed_boot); a later boot makes
+    the record stale. ``clear_pending`` then removes the PENDING keys, last, so the host never looks
+    confirmed before the applied record is complete.
+    """
+    if not gce_timestamp(boot):
+        raise RuntimeError(f"Refusing to record a patch for {args.instance_name} without the boot it was confirmed in")
+    plain, manifest, label = runner_patch_record(args, patch)
+    plain[PATCH_BOOT_METADATA_KEY] = gce_timestamp(boot)
+    manifest_path = None
+    try:
+        command = ["compute", "instances", "add-metadata", args.instance_name, f"--zone={zone}",
+                   _plain_metadata_flag(plain)]
+        if manifest is not None:
+            with tempfile.NamedTemporaryFile("w", prefix="gha-patch-", suffix=".json", delete=False) as temp:
+                temp.write(manifest)
+                manifest_path = temp.name
+            command.append(f"--metadata-from-file={PATCH_METADATA_KEY}={manifest_path}")
+        gcloud(command)
+        if manifest is None and (existing_keys is None or PATCH_METADATA_KEY in existing_keys):
+            gcloud(["compute", "instances", "remove-metadata", args.instance_name, f"--zone={zone}",
+                    f"--keys={PATCH_METADATA_KEY}"])
+        gcloud(["compute", "instances", "add-labels", args.instance_name, f"--zone={zone}",
+                f"--labels={PATCH_LABEL_KEY}={label}"])
+        if clear_pending:
+            gcloud(["compute", "instances", "remove-metadata", args.instance_name, f"--zone={zone}",
+                    f"--keys={PATCH_PENDING_SHA_METADATA_KEY},{PATCH_PENDING_METADATA_KEY}"])
+    finally:
+        if manifest_path:
+            Path(manifest_path).unlink(missing_ok=True)
+
+
+def boot_change_problem(args: argparse.Namespace, before: GceVm, now: GceVm) -> str | None:
+    """Why ``now`` is not the same instance and boot (GCE lastStartTimestamp) as ``before``; None when it is."""
+    first, then = gce_timestamp(before.last_start_timestamp), gce_timestamp(now.last_start_timestamp)
+    if not first or not then:
+        return (f"Cannot bind the confirmed patch of {args.instance_name} to a boot: lastStartTimestamp is "
+                "unknown; the applied patch is not recorded")
+    if first != then or (before.instance_id and now.instance_id != before.instance_id):
+        return (f"{args.instance_name} restarted while its patch was being confirmed (boot {first}, now "
+                f"{then}); the applied patch is not recorded")
+    return None
+
+
+def confirmed_boot(args: argparse.Namespace, zone: str, observed: GceVm) -> str:
+    """The boot (GCE lastStartTimestamp) a patch confirmation belongs to.
+
+    ``observed`` is the VM as seen BEFORE the confirmation was read (bootstrap marker or LIVE_PATCH_APPLIED);
+    never pass an observation taken after it, which may already show a later boot. A fresh observation must
+    show the same instance and boot; otherwise it restarted mid-confirmation and nothing is recorded.
+    """
+    problem = boot_change_problem(args, observed, observed_deployment_vm(args, zone))
+    if problem:
+        raise RuntimeError(problem)
+    return gce_timestamp(observed.last_start_timestamp)
+
+
+def registered_runner_rows(target: TargetConfig) -> list[dict]:
+    """Every runner registered to ``target`` on GitHub (raises when the scope can't be listed)."""
+    output = run(["gh", "api", "--paginate", target.runners_url, "--jq", ".runners[] | @json"], quiet=True)
+    return [json.loads(row) for row in output.splitlines() if row.strip()]
+
+
+def runners_named_for_vm(rows: list[dict], vm_name: str) -> list[str]:
+    """Names of the runners startup.sh registers for ``vm_name`` (``<prefix>-<vm>-<n>``), with any prefix."""
+    pattern = re.compile(rf"[A-Za-z0-9._-]+-{re.escape(vm_name)}-[0-9]+")
+    return sorted(str(row.get("name")) for row in rows
+                  if isinstance(row, dict) and pattern.fullmatch(str(row.get("name") or "")))
+
+
+def verify_adoption_registrations(args: argparse.Namespace, vm: dict) -> None:
+    """Refuse to relabel an unlabeled VM whose runners are registered to another GitHub scope.
+
+    The runner data disk keeps each runner's ``.runner`` registration and entrypoint.sh skips configuration when
+    it exists, so relabeling would scope the VM to the new target while its listeners stay registered elsewhere.
+    The new target, the default organization (which owns unlabeled hosts), and any registration scope recorded on
+    the VM are listed; a scope that can't be listed refuses the adoption rather than guessing.
+    """
+    new = resolve_target(args.target)
+    recorded = gce_metadata_items(vm).get(RUNNER_REGISTRATION_TARGET_METADATA_KEY, "").strip()
+    if recorded and runner_deployment_from_gce_item(vm).get("registration_target") != recorded:
+        raise RuntimeError(f"Cannot verify which GitHub scope the runners of {args.instance_name} are registered to "
+                           f"(recorded scope {recorded!r} is malformed); refusing to adopt it for {new.name}")
+    candidates = [args.target, DEFAULT_ORG, ORG, recorded]
+    elsewhere: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or str(candidate).lower() in seen:
+            continue
+        seen.add(str(candidate).lower())
+        try:
+            scope = resolve_target(candidate)
+            names = runners_named_for_vm(registered_runner_rows(scope), args.instance_name)
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(f"Cannot verify which GitHub scope the runners of {args.instance_name} are registered "
+                               f"to ({candidate}: {exc}); refusing to adopt it for {new.name}") from exc
+        if names and scope.name.lower() != new.name.lower():
+            elsewhere[scope.name] = names
+    if elsewhere:
+        found = "; ".join(f"{scope}: {', '.join(names)}" for scope, names in sorted(elsewhere.items()))
+        raise RuntimeError(f"VM {args.instance_name} has runners registered to another target ({found}). Their "
+                           f"persisted registrations would keep serving that target after it is labeled for "
+                           f"{new.name}; drain the host and remove those registrations (or reprovision it) first")
+
+
+def adoption_preflight(args: argparse.Namespace, zone: str) -> None:
+    """Ownership and registration checks for --existing-instance, before anything (even a start) changes the VM."""
+    describe = subprocess.run(["gcloud", "compute", "instances", "describe", args.instance_name,
+                               "--zone", zone, "--project", PROJECT, "--format=json"], text=True, capture_output=True)
+    if describe.returncode:
+        raise RuntimeError(f"Existing VM {args.instance_name} was not found")
+    adoption_target_label(args, json.loads(describe.stdout))
+
+
+def adoption_target_label(args: argparse.Namespace, vm: dict) -> str | None:
+    """Ownership check for adopting an existing VM; returns the target label to set first, or None.
+
+    A VM labeled for another target is refused. An unlabeled VM (owned by the default org, see
+    target_owns_vm_label) is labeled only when the operator passed --target explicitly; without --target
+    it may be adopted only by the default-org target that already owns it.
+    """
+    labels = vm.get("labels") if isinstance(vm.get("labels"), dict) else {}
+    current = str(labels.get(TARGET_LABEL_KEY) or "")
+    expected = launch_target_label(args)
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    if current:
+        if current != expected:
+            raise RuntimeError(f"VM {args.instance_name} is owned by another target ({TARGET_LABEL_KEY}={current}); "
+                               f"refusing to adopt it for {target.name}")
+        return None
+    if getattr(args, "target", None):
+        verify_adoption_registrations(args, vm)  # Never relabel a host whose registrations belong elsewhere.
+        return expected
+    if target_owns_vm_label(None, target):
+        return None
+    raise RuntimeError(f"Unlabeled VM {args.instance_name} belongs to the default organization; pass "
+                       f"--target {target.name} to adopt it explicitly")
+
+
 def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     configure_storage(args)
     configure_cpu_platform(args)
@@ -407,6 +709,8 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
         actual_type = vm.get("machineType", "").rsplit("/", 1)[-1]
         if actual_type != args.instance_type:
             raise RuntimeError(f"Existing VM type {actual_type} does not match {args.instance_type}")
+        # Ownership before any change to the VM (and long before its runners register).
+        adopt_label = adoption_target_label(args, vm)
         if vm.get('status') == 'RUNNING' and args.min_cpu_platform and not cpu_platform_satisfies(
                 args.instance_type, vm.get('cpuPlatform', ''), args.min_cpu_platform, arch=arch, required_isa=required_isa):
             raise RuntimeError(f"Existing CPU platform {vm.get('cpuPlatform', 'unknown')} does not match requested {args.min_cpu_platform}")
@@ -446,8 +750,24 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     with tempfile.NamedTemporaryFile("w", prefix="gha-startup-", delete=False) as temp:
         temp.write(script)
         script_path = temp.name
+    # Announce the patch this startup script applies as PENDING only. A VM is RUNNING long before its bootstrap
+    # finishes and stays running when the package install or patch step fails, so the applied keys and label
+    # (which runner_fleet and the dashboard trust) wait for main() to confirm the completed bootstrap.
+    startup_patch = resolve_runner_patch(args)
+    args.startup_patch = startup_patch
+    patch_plain, patch_manifest = pending_patch_record(args, startup_patch)
+    patch_path = None
+    if patch_manifest is not None:
+        with tempfile.NamedTemporaryFile("w", prefix="gha-patch-", suffix=".json", delete=False) as temp:
+            temp.write(patch_manifest)
+            patch_path = temp.name
+    metadata_files = f"startup-script={script_path}" + (f",{PATCH_PENDING_METADATA_KEY}={patch_path}" if patch_path else "")
     try:
         if vm:
+            if adopt_label:
+                # Same ownership label as a new instance gets, set before the startup script registers anything.
+                gcloud(["compute", "instances", "add-labels", args.instance_name, f"--zone={zone}",
+                        f"--labels={TARGET_LABEL_KEY}={adopt_label}"])
             for boot_disk in vm.get("disks", []):
                 if boot_disk.get("boot"):
                     gcloud(["compute", "instances", "set-disk-auto-delete", args.instance_name,
@@ -462,7 +782,12 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                 gcloud(["compute", "instances", "set-disk-auto-delete", args.instance_name,
                         f"--zone={zone}", f"--disk={args.disk_device_name}", "--auto-delete", "--quiet"])
             gcloud(["compute", "instances", "add-metadata", args.instance_name, f"--zone={zone}",
-                    f"--metadata-from-file=startup-script={script_path}"])
+                    f"--metadata-from-file={metadata_files}", _plain_metadata_flag(patch_plain)])
+            if patch_path is None and PATCH_PENDING_METADATA_KEY in gce_metadata_items(vm):
+                # A pending manifest left by an earlier, unconfirmed attempt must not describe this one.
+                gcloud(["compute", "instances", "remove-metadata", args.instance_name, f"--zone={zone}",
+                        f"--keys={PATCH_PENDING_METADATA_KEY}"])
+            # The applied keys and label keep their previous value; the pending keys mark them unconfirmed.
             if vm.get("status") == "RUNNING":
                 gcloud(["compute", "instances", "reset", args.instance_name, f"--zone={zone}", "--quiet"])
             elif vm.get("status") in {"STOPPED", "TERMINATED"}:
@@ -476,6 +801,7 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                                     if args.boot_disk_type == 'hyperdisk-balanced' else [])
                 network = ("--network-interface=network=default,nic-type=GVNIC"
                            if args.boot_disk_type == 'hyperdisk-balanced' else "--network=default")
+                arch, _ = _requested_arch_and_isa(args)
                 image_family = "--image-family=debian-13-arm64" if arch == "arm64" else "--image-family=debian-13"
                 created = gcloud(["compute", "instances", "create", args.instance_name, f"--zone={zone}",
                         f"--machine-type={args.instance_type}", "--provisioning-model=SPOT",
@@ -486,7 +812,8 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                         f"--boot-disk-interface={args.boot_disk_interface}", *boot_performance,
                         image_family, "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
-                        network, f"--metadata-from-file=startup-script={script_path}",
+                        network, f"--metadata-from-file={metadata_files}", _plain_metadata_flag(patch_plain),
+                        f"--labels={TARGET_LABEL_KEY}={launch_target_label(args)}",
                         "--format=json(id,name,zone,status,disks,cpuPlatform,minCpuPlatform)",
                         "--quiet"], quiet=True)
                 if getattr(args, "deployment_receipt", None):
@@ -528,19 +855,22 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                 raise
     finally:
         Path(script_path).unlink(missing_ok=True)
+        if patch_path:
+            Path(patch_path).unlink(missing_ok=True)
 
 
 def online_runners(args: argparse.Namespace) -> list[str]:
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
     expected_names = {f"{args.runner_prefix}-{args.instance_name}-{n}" for n in range(1, args.runner_count + 1)}
     online: list[str] = []
     for _ in range(120):
-        output = run(["gh", "api", "--paginate", f"orgs/{ORG}/actions/runners", "--jq", ".runners[] | @json"], quiet=True)
+        output = run(["gh", "api", "--paginate", target.runners_url, "--jq", ".runners[] | @json"], quiet=True)
         runners = [json.loads(row) for row in output.splitlines() if row.strip()]
         matches = [runner for runner in runners if runner.get("name") in expected_names]
         online = [runner["name"] for runner in matches if runner.get("status") == "online"]
         if online and hasattr(args, "deployment_started_at") and not getattr(args, "registration_logged", False):
             LOG.info("Instance first seen online in %s runners, registered to take jobs: %s; %.1f seconds "
-                     "from starting VM deployment; %d/%d runners online", ORG, deployment_details(args),
+                     "from starting VM deployment; %d/%d runners online", target.name, deployment_details(args),
                      time.monotonic() - args.deployment_started_at, len(online), args.runner_count)
             args.registration_logged = True
         if len(online) == args.runner_count:
@@ -550,16 +880,17 @@ def online_runners(args: argparse.Namespace) -> list[str]:
 
 
 def verify_strict_runner_membership(args) -> dict[str, int] | None:
-    if not getattr(args,'heavy_runner_pool',None):return None
-    expected={f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1,args.runner_count+1)}
-    output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/runners','--jq','.runners[] | @json'],quiet=True)
-    rows=[json.loads(line) for line in output.splitlines() if line.strip()]
-    selected=[row for row in rows if row.get('name') in expected]
-    if (len(selected)!=len(expected) or {row.get('name') for row in selected}!=expected
-        or any(type(row.get('id'))is not int for row in selected)
-        or len({row['id'] for row in selected})!=len(expected)):
+    if not getattr(args, 'heavy_runner_pool', None): return None
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    expected = {f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1, args.runner_count + 1)}
+    output = run(['gh', 'api', '--paginate', f'orgs/{target.name}/actions/runner-groups/{args.runner_group_id}/runners', '--jq', '.runners[] | @json'], quiet=True)
+    rows = [json.loads(line) for line in output.splitlines() if line.strip()]
+    selected = [row for row in rows if row.get('name') in expected]
+    if (len(selected) != len(expected) or {row.get('name') for row in selected} != expected
+        or any(type(row.get('id')) is not int for row in selected)
+        or len({row['id'] for row in selected}) != len(expected)):
         raise RuntimeError('Registered strict runners are not in the verified OxiDex group')
-    return {row['name']:row['id'] for row in selected}
+    return {row['name']: row['id'] for row in selected}
 
 
 def start_retained_strict_host(args, zone):
@@ -606,27 +937,37 @@ def verify_strict_identities(args,org_rows=None):
     group_ids=verify_strict_runner_membership(args)
     cached=read_cached_runner_ids(args)
     if org_rows is None:
-        output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runners','--jq','.runners[] | @json'],quiet=True)
+        target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+        output=run(['gh','api','--paginate',f'orgs/{target.name}/actions/runners','--jq','.runners[] | @json'],quiet=True)
         org_rows=[json.loads(line)for line in output.splitlines()if line.strip()]
     validate_strict_identity_join(group_ids,cached,org_rows)
 
 
-def sync_runner_labels(args: argparse.Namespace) -> None:
-    """Ensure every Spot VM runner has the common scheduling labels."""
-    if getattr(args,'heavy_runner_pool',None):
+def runner_label_sync_plan(args: argparse.Namespace) -> tuple[Any, list[dict], list[str], dict[str, int]]:
+    """Every read-only check label sync depends on: group and strict-pool verification, and that GitHub lists
+    every expected runner. Returns (target, runner rows, desired labels, expected names); raises otherwise."""
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    if getattr(args, 'heavy_runner_pool', None):
         verify_runner_group(args)
         verify_strict_runner_membership(args)
     expected_names = {f"{args.runner_prefix}-{args.instance_name}-{n}": n
                       for n in range(1, args.runner_count + 1)}
-    output = run(["gh", "api", "--paginate", f"orgs/{ORG}/actions/runners",
+    output = run(["gh", "api", "--paginate", target.runners_url,
                   "--jq", ".runners[] | @json"], quiet=True)
-    if getattr(args,'heavy_runner_pool',None):verify_strict_identities(args,[json.loads(line)for line in output.splitlines()if line.strip()])
+    rows = [json.loads(line) for line in output.splitlines() if line.strip()]
+    if getattr(args, 'heavy_runner_pool', None):
+        verify_strict_identities(args, rows)
+    missing = sorted(set(expected_names) - {row.get("name") for row in rows})
+    if missing:
+        raise RuntimeError(f"GitHub did not list all expected runners for label sync: {missing}")
+    return target, rows, _desired_runner_labels(args), expected_names
+
+
+def sync_runner_labels(args: argparse.Namespace) -> None:
+    """Ensure every Spot VM runner has the common scheduling labels."""
+    target, rows, desired, expected_names = runner_label_sync_plan(args)
     seen: set[str] = set()
-    desired = _desired_runner_labels(args)
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        runner = json.loads(line)
+    for runner in rows:
         name = runner.get("name")
         if name not in expected_names:
             continue
@@ -634,7 +975,7 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
         current = {label.get("name") for label in runner.get("labels", [])} - DEFAULT_RUNNER_LABELS
         if current != set(desired):
             response = run(["gh", "api", "--method", "PUT",
-                            f"orgs/{ORG}/actions/runners/{runner['id']}/labels", "--input", "-"],
+                            f"{target.runners_url}/{runner['id']}/labels", "--input", "-"],
                            quiet=True, input_data=json.dumps({"labels": desired}))
             actual = {label.get("name") for label in json.loads(response).get("labels", [])} - DEFAULT_RUNNER_LABELS
             if actual != set(desired):
@@ -650,23 +991,43 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     if patch is None:
         raise RuntimeError("Live patching requires --patch-repo or --patch-file")
     vm = observed_deployment_vm(args, zone)
+    args.deployment_vm = vm  # Strict pools verify cached runner identities against this VM.
     if not vm.running:
         raise RuntimeError(f"Cannot hot-patch non-running VM: {vm_details(vm)}")
     if vm.machine_type and vm.machine_type != args.instance_type:
         raise RuntimeError(f"Existing VM type {vm.machine_type} does not match {args.instance_type}")
-    state_raw = gcloud(
-        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet",
-         "--command=sudo -n cat /var/lib/gha-runner-patch/state.json 2>/dev/null || true"],
+    # Every hardware constraint (min vCPU/RAM, arch, ISA) against the observed VM, before anything changes.
+    violations, unknowns = host_capacity_problems(patch, machine_type=vm.machine_type or args.instance_type,
+                                                  vcpu=vm.vcpu, ram_gib=vm.ram_gib, cpu_platform=vm.cpu_platform)
+    if violations or unknowns:
+        raise RuntimeError(f"Patch {patch.patch_sha256[:12]} cannot be live-applied to {args.instance_name}: "
+                           + "; ".join(violations + unknowns))
+    receipt = parse_patch_receipt(gcloud(
+        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={PATCH_RECEIPT_READ_COMMAND}"],
         quiet=True,
-    )
-    current_manifest = json.loads(state_raw).get("manifest") if state_raw.strip() else None
-    action = classify_patch_diff(current_manifest, patch)
-    if action == "noop":
+    ))
+    # An unfinished attempt at another patch (the host's pending marker, or provisioning/live pending metadata)
+    # left unknown partial changes behind, which only a new VM removes; one at this patch is simply re-applied.
+    foreign_pending = next((sha for sha in (receipt.pending_sha256, vm.patch_pending_sha256)
+                            if sha and sha not in ("none", patch.patch_sha256)), "")
+    action = classify_patch_diff(receipt.manifest, patch, pending_sha256=foreign_pending)
+    pending = bool(vm.patch_pending_sha256)
+    if action == "noop" and (pending or not receipt.proof):
+        # The host names this patch, but only a completion receipt from this boot (and a confirmed bootstrap)
+        # proves it: re-apply it live so LIVE_PATCH_APPLIED confirms it before anything is recorded.
+        LOG.info("VM %s reports patch %s, but %s; re-applying it live", args.instance_name, patch.patch_sha256[:12],
+                 "its bootstrap never confirmed it" if pending else receipt.detail)
+    elif action == "noop":
         LOG.info("VM %s is already at patch %s", args.instance_name, patch.patch_sha256[:12])
+        # A verified noop still reconciles the GitHub labels (a host may predate label-sync-before-record), and
+        # only then records the patch (backfills hosts provisioned before recording).
+        sync_runner_labels(args)
+        record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm))
         return "noop"
     if action == "replace_vm":
         raise RuntimeError(
-            f"Patch {patch.patch_sha256[:12]} changes hardware architecture or CPU ISA requirements; "
+            f"Patch {patch.patch_sha256[:12]} cannot be live-applied to {args.instance_name}: "
+            f"{live_patch_replace_reason(receipt.manifest, patch, foreign_pending)}; "
             "a rolling VM replacement is required instead of --patch-live"
         )
     if action == "recreate_containers":
@@ -674,6 +1035,8 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
             f"Patch {patch.patch_sha256[:12]} modifies container bind mounts; "
             "containers must be drained and recreated instead of --patch-live"
         )
+    # Everything label sync needs is checked BEFORE the host changes, so nothing fails after the patch applied.
+    runner_label_sync_plan(args)
     prefix = f"{args.runner_prefix}-"
     live_script = render_live_hot_patch_script(
         patch,
@@ -683,15 +1046,49 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     )
     script_b64 = base64.b64encode(live_script.encode("utf-8")).decode("ascii")
     remote_cmd = f"printf '%s' '{script_b64}' | base64 -d | sudo -n bash -euo pipefail"
+    # Publish the attempt before the host changes: if it fails part-way, the host stays pending
+    # (preview: unknown) instead of still advertising the previous patch as confirmed.
+    record_pending_patch_metadata(args, zone, patch)
     output = gcloud(
         ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={remote_cmd}"],
         quiet=True,
     )
     if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
         raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
+    # The GitHub labels follow before anything is recorded: a failed label sync leaves the host pending (so a retry
+    # re-applies and syncs again), never recorded as current with stale labels. Only after the host confirmed this
+    # exact patch in this boot AND its labels match does the recorded patch change and the pending record go.
     sync_runner_labels(args)
+    record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm), clear_pending=True)
     LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
     return "hot_patch"
+
+
+def reconcile_runner_labels(args: argparse.Namespace, zone: str) -> None:
+    """Sync the GitHub labels of a running host that is already verified at its patch (a hot-patch noop).
+
+    A host whose patch was recorded before label sync had to succeed first can carry stale labels; a noop never
+    runs the live script, so this is the only step that repairs them. Nothing on the host or its metadata changes.
+    """
+    vm = observed_deployment_vm(args, zone)
+    args.deployment_vm = vm  # Strict pools verify cached runner identities against this VM.
+    if not vm.running:
+        raise RuntimeError(f"Cannot reconcile the runner labels of non-running VM: {vm_details(vm)}")
+    sync_runner_labels(args)
+
+
+def live_patch_replace_reason(current_manifest: dict | None, patch: RunnerPatch, foreign_pending: str) -> str:
+    """Why classify_patch_diff answered replace_vm for this host (for the refusal message)."""
+    if foreign_pending:
+        return (f"an attempt to apply patch {foreign_pending[:12]} never completed, so its partial changes "
+                "are unknown")
+    if current_manifest is not None:
+        current = validate_patch_dict(current_manifest)
+        if current.hardware.arch == patch.hardware.arch and not set(patch.hardware.isa) - set(current.hardware.isa):
+            dropped = destructive_patch_changes(current, patch)
+            if dropped:
+                return "the live script cannot undo applied changes (" + "; ".join(dropped) + ")"
+    return "it changes the hardware architecture or CPU ISA requirements"
 
 
 def wait_for_bootstrap(args: argparse.Namespace, zone: str, deployment_id: str) -> None:
@@ -796,15 +1193,18 @@ def main() -> int:
         LOG.info("Preview only. Add --apply to provision through GCE startup metadata and register the runners.")
         return 0
 
-    group = verify_runner_group(args)
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    group_name = ""
+    if target.is_org and getattr(args, "runner_group_id", None):
+        group = verify_runner_group(args)
+        group_name = group["name"]
     if args.existing_instance:
-        start_retained_strict_host(args,zone)
+        adoption_preflight(args, zone)  # Before the retained-host start, the first change to the VM.
+        start_retained_strict_host(args, zone)
         verify_strict_identities(args)
-    token = run(["gh", "api", "--method", "POST", f"orgs/{ORG}/actions/runners/registration-token", "--jq", ".token"], quiet=True)
-    if not token:
-        raise RuntimeError("GitHub returned an empty org runner registration token")
+    token = generate_registration_token(target)
     deployment_id = uuid.uuid4().hex
-    script = render_startup(args, token, group["name"], deployment_id)
+    script = render_startup(args, token, group_name, deployment_id)
     token = ""
 
     failure: BaseException | None = None
@@ -814,17 +1214,32 @@ def main() -> int:
         log_project_costs(args.project, args.billing_export_table)
         apply_startup(args, zone, script)
         args.deployment_vm = observed_deployment_vm(args, zone)
+        # The boot that runs this deployment's startup script, captured BEFORE the bootstrap marker is read. The
+        # marker persists on disk across reboots, so it proves completion only for a boot that is still current:
+        # every later observation through publication must show this same boot, or nothing is confirmed (a reboot
+        # after the marker read would otherwise lend the previous boot's completion to the new boot).
+        bootstrap_vm = args.deployment_vm
         write_deployment_receipt(args, args.deployment_vm)
         wait_for_bootstrap(args, zone, deployment_id)
         args.deployment_vm = observed_deployment_vm(args, zone)
         if not args.deployment_vm.running:
             raise RuntimeError(f'Deployed VM is not running: {deployment_details(args)}')
+        boot_problem = boot_change_problem(args, bootstrap_vm, args.deployment_vm)
+        if boot_problem:
+            raise RuntimeError(boot_problem)
         online = online_runners(args)
         if len(online) != args.runner_count:
             raise RuntimeError(f"Only {len(online)}/{args.runner_count} expected runners are online")
         sync_runner_labels(args)
         verify_runner_storage(args, zone)
         online = online_runners(args)
+        if len(online) == args.runner_count:
+            # This deployment's bootstrap marker, every runner online, and verified storage: only now does the
+            # host advertise the patch its startup script applied (and the pending record go away).
+            if not hasattr(args, "startup_patch"):
+                raise RuntimeError("apply_startup did not record which patch the startup script applies")
+            record_patch_metadata(args, zone, args.startup_patch, clear_pending=True,
+                                  boot=confirmed_boot(args, zone, bootstrap_vm))
     except BaseException as exc:
         failure = exc
     finally:

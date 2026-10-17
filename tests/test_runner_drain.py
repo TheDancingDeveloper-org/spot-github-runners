@@ -45,6 +45,38 @@ class RunnerDrainTests(unittest.TestCase):
         self.addCleanup(self.builder_guard.stop)
         self.inventory.start()
         self.addCleanup(self.inventory.stop)
+        # A host whose runners run the cordon-aware job-started hook (see RepositoryHostCordonDrainTests). Org
+        # label_only drains are host-cordoned too, since stripping labels alone leaves the built-in labels.
+        self.host = {'marker': False, 'workers': 0, 'supported': True, 'reachable': True}
+        self.cordon_results = []
+        cordon = patch('lib.runner_drain.cordon_runner_host', side_effect=self.cordon)
+        self.cordon_mock = cordon.start()
+        self.addCleanup(cordon.stop)
+
+    def cordon(self, vm, args, token, names, mutation_guard=None):
+        """Model of the host program: unsupported, else place the marker once, else report Workers."""
+        self.assertEqual(vm.instance_id, '123')
+        if mutation_guard is not None:
+            mutation_guard()
+        if not self.host['reachable']:
+            result = 'unreachable'
+        elif not self.host['supported']:
+            result = 'unsupported'
+        elif not self.host['marker']:
+            self.host['marker'] = token
+            result = 'placed'
+        else:
+            result = 'busy' if self.host['workers'] or any(r.busy for r in self.live) else 'idle'
+        self.commands.append(['host-cordon', result, token, tuple(names)])
+        self.cordon_results.append(result)
+        return result, {'reason': 'model'}
+
+    def mutations(self):
+        return [c for c in self.commands if c[0] == 'gh' and '-X' in c and c[c.index('-X') + 1] != 'GET']
+
+    def runner_deletes(self):
+        return [c for c in self.mutations() if c[c.index('-X') + 1] == 'DELETE' and not c[-1].endswith('/labels')
+                and '/actions/runners/' in c[-1]]
 
     def row(self, runner):
         return {'id':runner.runner_id, 'name':runner.name, 'status':runner.status, 'busy':runner.busy,
@@ -310,3 +342,377 @@ class RunnerDrainTests(unittest.TestCase):
         self.assertFalse(self.state.get('intentional_deletions'))
         self.assertEqual(self.state['host_operation']['kind'],'recovery')
         self.assertEqual(self.state['price_replacement_target'],2)
+
+
+class RepositoryHostCordonDrainTests(unittest.TestCase):
+    """Repository runners keep built-in labels: drain only behind a verified host job-start cordon."""
+
+    row = RunnerDrainTests.row
+    command = RunnerDrainTests.command
+    begin = RunnerDrainTests.begin
+    reconcile = RunnerDrainTests.reconcile
+    cordon = RunnerDrainTests.cordon
+    mutations = RunnerDrainTests.mutations
+    runner_deletes = RunnerDrainTests.runner_deletes
+
+    def setUp(self):
+        RunnerDrainTests.setUp(self)
+        self.args.target = 'octo/hello-world'
+
+    def test_repository_target_is_detected(self):
+        self.assertTrue(controller.is_repo_target(self.args.target))
+
+    def test_host_is_cordoned_before_any_github_change_and_first_observation_never_deregisters(self):
+        self.begin()
+        first_cordon = next(i for i, c in enumerate(self.commands) if c[0] == 'host-cordon')
+        first_mutation = next(i for i, c in enumerate(self.commands) if c in self.mutations())
+        self.assertLess(first_cordon, first_mutation)
+        self.assertEqual(self.cordon_results, ['placed'])
+        self.assertEqual(self.state['host_operation']['host_cordon_token'], 'drain-123')
+        self.assertEqual(self.state['host_operation']['cordon_mode'], 'host')
+        self.assertEqual(self.runner_deletes(), [])
+        self.assertEqual(len(self.live), 8)
+        self.assertEqual(self.cordon_mock.call_args.args[3], [r.name for r in self.runners])
+
+    def test_deregistration_only_after_a_later_idle_observation_under_the_cordon(self):
+        self.begin()
+        # A job assigned before the cordon still runs: GitHub may not show it busy yet, the host does.
+        self.host['workers'] = 1
+        self.reconcile()
+        self.assertEqual(self.cordon_results[-1], 'busy')
+        self.assertEqual(self.runner_deletes(), [])
+        self.assertFalse(any(c[:4] == ['gcloud', 'compute', 'instances', 'delete'] for c in self.commands))
+        self.host['workers'] = 0
+        self.reconcile()
+        self.assertEqual(self.live, [])
+        # Every deregistration in that observation came after an idle cordon verification.
+        last_idle = max(i for i, c in enumerate(self.commands) if c[:2] == ['host-cordon', 'idle'])
+        deletes = [i for i, c in enumerate(self.commands) if c in self.runner_deletes()]
+        self.assertEqual(len(deletes), 8)
+        self.assertTrue(all(i > last_idle for i in deletes))
+        self.reconcile()
+        self.assertTrue(any(c[:4] == ['gcloud', 'compute', 'instances', 'delete'] for c in self.commands))
+
+    def test_job_assigned_under_the_cordon_is_waited_out_not_deleted(self):
+        self.begin()
+        # An idle listener still accepts an assignment; its hook refuses the job, which fails fast.
+        self.live[3] = replace(self.live[3], busy=True)
+        self.host['workers'] = 1
+        self.reconcile()
+        self.assertEqual(self.runner_deletes(), [])
+        self.live[3] = replace(self.live[3], busy=False)
+        self.host['workers'] = 0
+        self.reconcile()
+        self.assertEqual(self.live, [])
+
+    def test_unsupported_host_holds_retirement_without_any_github_or_provider_change(self):
+        self.host['supported'] = False
+        with self.assertLogs('spot_runner_autoscaler', level='ERROR') as logs:
+            self.begin()
+            for _ in range(3):
+                self.reconcile()
+        self.assertTrue(any('Retirement held' in line and 'cannot refuse new jobs' in line for line in logs.output))
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(len(self.live), 8)
+        self.assertTrue(all('spot' in r.labels for r in self.live))
+        self.assertFalse(any(c[0] == 'gcloud' for c in self.commands))
+        self.assertEqual(self.state['host_operation']['kind'], 'drain')
+
+    def test_unreachable_or_unverified_host_holds_retirement(self):
+        self.begin()
+        self.host['reachable'] = False
+        for _ in range(2):
+            self.reconcile()
+        self.assertEqual(self.runner_deletes(), [])
+        self.assertFalse(any(c[0] == 'gcloud' for c in self.commands))
+
+    def test_lost_marker_is_placed_again_and_needs_another_idle_observation(self):
+        self.begin()
+        self.host['marker'] = False  # for example, a reboot cleared /run
+        self.reconcile()
+        self.assertEqual(self.cordon_results[-1], 'placed')
+        self.assertEqual(self.runner_deletes(), [])
+        self.reconcile()
+        self.assertEqual(self.live, [])
+
+    def test_mutation_guard_refusal_prevents_the_cordon(self):
+        self.host['reachable'] = False
+        self.begin()
+        self.host['reachable'] = True
+        with patch.object(controller, 'guard_fleet_mutation', side_effect=RuntimeError('held')):
+            self.reconcile()
+        self.assertFalse(self.host['marker'])
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(self.state['host_operation']['kind'], 'drain')
+
+
+class OrgLabelOnlyHostCordonDrainTests(unittest.TestCase):
+    """PR #44 round 5 P1: an org label_only drain (legacy scaling) keeps the built-in labels, so it is host-cordoned
+    like a repository drain; a host that cannot refuse jobs is isolated in a runner group instead."""
+
+    row = RunnerDrainTests.row
+    command = RunnerDrainTests.command
+    begin = RunnerDrainTests.begin
+    reconcile = RunnerDrainTests.reconcile
+    cordon = RunnerDrainTests.cordon
+    mutations = RunnerDrainTests.mutations
+    runner_deletes = RunnerDrainTests.runner_deletes
+
+    def setUp(self):
+        RunnerDrainTests.setUp(self)
+        self.assertFalse(controller.is_repo_target(controller._active_target(self.args)))
+
+    def test_host_is_cordoned_before_labels_are_removed_and_deregistration_needs_an_idle_cordon(self):
+        self.begin()
+        operation = self.state['host_operation']
+        self.assertEqual((operation['drain_mode'], operation['cordon_mode']), ('label_only', 'host'))
+        self.assertEqual(operation['host_cordon_token'], 'drain-123')
+        first_cordon = next(i for i, c in enumerate(self.commands) if c[0] == 'host-cordon')
+        first_mutation = next(i for i, c in enumerate(self.commands) if c in self.mutations())
+        self.assertLess(first_cordon, first_mutation)
+        self.assertFalse(any('runner-groups' in str(c) for c in self.commands))
+        self.host['workers'] = 1  # a job that started before the cordon
+        self.reconcile()
+        self.assertEqual((self.cordon_results[-1], self.runner_deletes()), ('busy', []))
+        self.host['workers'] = 0
+        self.reconcile()
+        self.assertEqual(self.live, [])
+        last_idle = max(i for i, c in enumerate(self.commands) if c[:2] == ['host-cordon', 'idle'])
+        self.assertTrue(all(i > last_idle for i, c in enumerate(self.commands) if c in self.runner_deletes()))
+
+    def test_unsupported_host_is_isolated_in_a_runner_group_instead_of_by_labels(self):
+        self.host['supported'] = False
+        self.begin()
+        operation = self.state['host_operation']
+        self.assertEqual((operation['drain_mode'], operation['cordon_mode']), ('isolated_group', 'isolated_group'))
+        self.assertEqual(self.mutations(), [])  # nothing changed on GitHub under a label-only "cordon"
+        self.reconcile()
+        self.assertEqual(self.members, {r.runner_id for r in self.runners})
+        self.assertTrue(all(r.labels == ('self-hosted', 'Linux', 'X64') for r in self.live))
+        self.assertEqual(self.runner_deletes(), [])
+        self.reconcile()
+        self.assertEqual(self.live, [])
+
+    def test_unreachable_host_holds_the_drain_without_any_github_change(self):
+        self.host['reachable'] = False
+        self.begin()
+        for _ in range(2):
+            self.reconcile()
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(len(self.live), 8)
+        self.assertFalse(any(c[0] == 'gcloud' for c in self.commands))
+        self.assertEqual(self.state['host_operation']['kind'], 'drain')
+
+
+class HostCordonProgramTests(unittest.TestCase):
+    """Run the real host-side cordon program against a sandboxed Docker, /proc, and cordon directory."""
+
+    def setUp(self):
+        import os
+        import sys
+        from lib import runner_drain
+        self.runner_drain = runner_drain
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cordon_dir = root / 'cordon'
+        self.cordon_dir.mkdir(mode=0o755)
+        self.cordon_dir.chmod(0o755)
+        self.proc = root / 'proc'
+        self.proc.mkdir()
+        self.fixtures = root / 'fixtures'
+        self.fixtures.mkdir()
+        self.state_dir = root / 'state'
+        self.state_dir.mkdir()
+        self.hook = (Path(__file__).resolve().parents[1] / 'runner' / 'job-started.sh').read_text()
+        (self.fixtures / 'hook.sh').write_text(self.hook)
+        docker = root / 'docker'
+        docker.write_text(f'#!{sys.executable}\n' + '''import io, os, sys, tarfile
+root = os.environ['FAKE_DOCKER_ROOT']
+args = sys.argv[1:]
+if args[0] == 'inspect':
+    path = os.path.join(root, args[-1] + '.json')
+    if not os.path.exists(path):
+        sys.exit(1)
+    sys.stdout.write(open(path).read())
+elif args[0] == 'cp':
+    data = open(os.path.join(root, 'hook.sh'), 'rb').read()
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode='w') as archive:
+        info = tarfile.TarInfo('gha-runner-job-started.sh'); info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    sys.stdout.buffer.write(buffer.getvalue())
+else:
+    sys.exit(2)
+''')
+        docker.chmod(0o755)
+        self.program = runner_drain.host_cordon_program(directory=str(self.cordon_dir), docker=str(docker),
+                                                        proc=str(self.proc), owner_uid=os.getuid())
+        self.env = {**os.environ, 'FAKE_DOCKER_ROOT': str(self.fixtures)}
+        self.names = ['gha-host-1', 'gha-host-2']
+        for name in self.names:
+            self.container(name)
+
+    def container(self, name, **changes):
+        row = {'Name': '/' + name,
+               'Mounts': [{'Type': 'bind', 'Source': str(self.cordon_dir), 'Destination': str(self.cordon_dir),
+                           'RW': False},
+                          {'Type': 'bind', 'Source': str(self.state_dir), 'Destination': '/runner-state', 'RW': True}],
+               'Config': {'Env': ['PATH=/usr/bin',
+                                  'ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh']}}
+        row.update(changes)
+        (self.fixtures / (name + '.json')).write_text(json.dumps([row]))
+        return row
+
+    def run_program(self, action='cordon', token='drain-123', names=None):
+        import sys
+        names = self.names if names is None else names
+        result = subprocess.run([sys.executable, '-I', '-c', self.program, action, token, *names],
+                                env=self.env, capture_output=True, text=True, timeout=60)
+        detail = json.loads(result.stdout.splitlines()[-1]) if result.stdout.strip() else {}
+        return result.returncode, detail
+
+    @property
+    def marker(self):
+        return self.cordon_dir / 'draining'
+
+    def worker(self, pid, comm='Runner.Worker'):
+        (self.proc / str(pid)).mkdir()
+        (self.proc / str(pid) / 'comm').write_text(comm + '\n')
+
+    def test_places_marker_then_reports_idle_and_busy(self):
+        self.assertEqual(self.run_program(), (10, {'state': 'placed'}))
+        self.assertEqual(self.marker.read_text(), 'drain-123')
+        self.worker(77, comm='Runner.Listener')
+        self.assertEqual(self.run_program(), (0, {'state': 'idle'}))
+        self.worker(78)
+        self.assertEqual(self.run_program(), (75, {'state': 'busy', 'workers': 1}))
+        # Any owner's marker refuses jobs; it is never replaced while present.
+        self.assertEqual(self.run_program(token='rotation-cordon-123')[0], 75)
+        self.assertEqual(self.marker.read_text(), 'drain-123')
+
+    def test_unsupported_hosts_are_refused_without_placing_a_marker(self):
+        env_hook = ['ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-runner-job-started.sh']
+        cordon_mount = {'Type': 'bind', 'Source': str(self.cordon_dir), 'Destination': str(self.cordon_dir)}
+        state_mount = {'Type': 'bind', 'Source': str(self.state_dir), 'Destination': '/runner-state', 'RW': True}
+        cases = {
+            'writable mount': {'Mounts': [{**cordon_mount, 'RW': True}, state_mount]},
+            'no mount': {'Mounts': [state_mount]},
+            'other source': {'Mounts': [{**cordon_mount, 'Source': '/tmp', 'RW': False}, state_mount]},
+            'volume mount': {'Mounts': [{**cordon_mount, 'Type': 'volume', 'RW': False}, state_mount]},
+            'no hook env': {'Config': {'Env': ['PATH=/usr/bin']}},
+            'other hook': {'Config': {'Env': ['ACTIONS_RUNNER_HOOK_JOB_STARTED=/tmp/hook.sh']}},
+            'two hooks': {'Config': {'Env': env_hook + ['ACTIONS_RUNNER_HOOK_JOB_STARTED=/tmp/hook.sh']}},
+            'no state mount': {'Mounts': [{**cordon_mount, 'RW': False}]},
+            'renamed': {'Name': '/someone-else'},
+        }
+        for label, change in cases.items():
+            with self.subTest(label):
+                self.container('gha-host-2', **change)
+                code, detail = self.run_program()
+                self.assertEqual(code, 76, detail)
+                self.assertFalse(self.marker.exists())
+        self.container('gha-host-2')
+        (self.fixtures / 'gha-host-2.json').unlink()
+        self.assertEqual(self.run_program()[0], 76)
+
+    def test_old_hook_or_env_override_or_unsafe_directory_is_unsupported(self):
+        (self.fixtures / 'hook.sh').write_text(self.hook.replace(self.runner_drain.HOST_CORDON_CAPABILITY, 'OLD'))
+        self.assertEqual(self.run_program()[0], 76)
+        (self.fixtures / 'hook.sh').write_text(self.hook)
+        (self.state_dir / '.env').write_text('ACTIONS_RUNNER_HOOK_JOB_STARTED=/work/evil.sh\n')
+        self.assertEqual(self.run_program()[0], 76)
+        (self.state_dir / '.env').unlink()
+        self.cordon_dir.chmod(0o777)
+        self.assertEqual(self.run_program()[0], 76)
+        self.cordon_dir.chmod(0o755)
+        self.assertEqual(self.run_program()[0], 10)
+        self.assertEqual(self.run_program(names=[])[0], 76)
+        self.assertEqual(self.run_program(token='')[0], 76)
+
+    def test_release_removes_only_the_owners_marker(self):
+        self.assertEqual(self.run_program(token='rotation-cordon-123')[0], 10)
+        self.assertEqual(self.run_program('release', 'drain-123', []), (0, {'state': 'released'}))
+        self.assertTrue(self.marker.exists())
+        self.assertEqual(self.run_program('release', 'rotation-cordon-123', []), (0, {'state': 'released'}))
+        self.assertFalse(self.marker.exists())
+
+    def test_remote_command_checks_identity_and_holds_the_lock(self):
+        vm = GceVm('oxidex-runners-test', 'asia-south2-a', 'RUNNING', 'n2-standard-32', True, instance_id='123')
+        command = self.runner_drain.host_cordon_command(vm, 'cordon', 'drain-123', ['gha-a-1'])
+        self.assertTrue(command.startswith('sudo flock -w 30 -E 75 /run/gha-runner-cordon.lock sh -c '))
+        self.assertIn('computeMetadata/v1/instance/id', command)
+        self.assertLess(command.index('123'), command.index('python3 -I -c'))
+        with self.assertRaises(ValueError):
+            self.runner_drain.host_cordon_command(replace(vm, instance_id=''), 'cordon', 'drain-123', ['gha-a-1'])
+
+    def test_ssh_exit_codes_map_to_cordon_states(self):
+        vm = GceVm('oxidex-runners-test', 'asia-south2-a', 'RUNNING', 'n2-standard-32', True, instance_id='123')
+        args = SimpleNamespace(project='homelab-424523')
+        for code, expected in ((0, 'idle'), (10, 'placed'), (75, 'busy'), (76, 'unsupported'), (77, 'identity'),
+                               (255, 'unreachable'), (1, 'unreachable')):
+            with patch('lib.runner_drain.subprocess.run',
+                       return_value=SimpleNamespace(returncode=code, stdout='noise\n{"reason": "x"}\n')) as run:
+                state, detail = self.runner_drain.cordon_runner_host(vm, args, 'drain-123', ['gha-a-1'])
+            self.assertEqual((state, detail), (expected, {'reason': 'x'}))
+            self.assertEqual(run.call_args.args[0][:3], ['gcloud', 'compute', 'ssh'])
+        with patch('lib.runner_drain.subprocess.run', side_effect=subprocess.TimeoutExpired('gcloud', 120)):
+            self.assertEqual(self.runner_drain.cordon_runner_host(vm, args, 't', ['n'])[0], 'unreachable')
+        with patch('lib.runner_drain.subprocess.run', side_effect=AssertionError('no SSH without names')):
+            self.assertEqual(self.runner_drain.cordon_runner_host(vm, args, 't', [])[0], 'unsupported')
+            with self.assertRaisesRegex(RuntimeError, 'held'):
+                self.runner_drain.cordon_runner_host(vm, args, 't', ['n'],
+                                                     mutation_guard=lambda: (_ for _ in ()).throw(RuntimeError('held')))
+        with patch('lib.runner_drain.subprocess.run',
+                   return_value=SimpleNamespace(returncode=0, stdout='{"state": "released"}')):
+            self.assertTrue(self.runner_drain.release_runner_host_cordon(vm, args, 't'))
+        with patch('lib.runner_drain.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='')):
+            self.assertFalse(self.runner_drain.release_runner_host_cordon(vm, args, 't'))
+
+
+class JobStartedHookCordonTests(unittest.TestCase):
+    """The runner image's job-started hook refuses a job while the host cordon marker exists."""
+
+    def setUp(self):
+        from lib import runner_drain
+        self.runner_drain = runner_drain
+        root = Path(__file__).resolve().parents[1]
+        self.hook = (root / 'runner' / 'job-started.sh').read_text()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.marker = Path(self.tmp.name) / 'draining'
+        self.script = Path(self.tmp.name) / 'job-started.sh'
+        self.assertEqual(self.hook.count(runner_drain.HOST_CORDON_MARKER), 1)
+        self.script.write_text(self.hook.replace(runner_drain.HOST_CORDON_MARKER, str(self.marker)))
+
+    def run_hook(self, admission='0'):
+        import os
+        return subprocess.run(['bash', str(self.script)], capture_output=True, text=True, timeout=30,
+                              env={**os.environ, 'GHA_ADMISSION_REQUIRED': admission})
+
+    def test_marker_refuses_the_job_before_admission(self):
+        self.marker.write_text('drain-123')
+        result = self.run_hook(admission='1')  # admission would otherwise exec the (absent) admission client
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('::error title=Runner host is being retired::', result.stderr)
+        self.assertIn('Re-run the job', result.stderr)
+
+    def test_without_marker_the_hook_proceeds(self):
+        self.assertEqual(self.run_hook().returncode, 0)
+
+    def test_hook_carries_the_capability_and_checks_before_admission(self):
+        self.assertIn(self.runner_drain.HOST_CORDON_CAPABILITY, self.hook)
+        self.assertLess(self.hook.index(self.runner_drain.HOST_CORDON_MARKER), self.hook.index('gha-host-admission.py'))
+
+    def test_runner_containers_mount_the_cordon_directory_read_only(self):
+        from lib.runner_assets import RUNNER_DOCKERFILE, STARTUP_SCRIPT
+        directory = self.runner_drain.HOST_CORDON_DIR
+        mount = f'-v {directory}:{directory}:ro'
+        self.assertEqual(STARTUP_SCRIPT.count(mount), 1)
+        loop = STARTUP_SCRIPT.index('for i in $(seq 1 "$RUNNER_COUNT"); do')
+        self.assertLess(STARTUP_SCRIPT.index(f'install -d -o root -g root -m 0755 {directory}'), loop)
+        # Only the long-running listener container gets it, not the one-shot configure container.
+        args_start = STARTUP_SCRIPT.index('docker_args=(-d --restart unless-stopped')
+        self.assertLess(args_start, STARTUP_SCRIPT.index(mount))
+        self.assertLess(STARTUP_SCRIPT.index(mount), STARTUP_SCRIPT.index('docker run "${docker_args[@]}"'))
+        self.assertIn(f'ENV ACTIONS_RUNNER_HOOK_JOB_STARTED={self.runner_drain.JOB_STARTED_HOOK}', RUNNER_DOCKERFILE)

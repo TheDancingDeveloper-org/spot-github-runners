@@ -181,6 +181,10 @@ RUNNER_CPU_LIMIT='{{RUNNER_CPU_LIMIT}}'
 # on the mounted persistent data disk. Stop if it did not mount as expected.
 docker_root=$(docker info --format=json | jq -r .DockerRootDir)
 [[ "$docker_root" == "$MOUNT_POINT/docker" ]] || { echo "Docker root is $docker_root, expected $MOUNT_POINT/docker" >&2; exit 1; }
+# Root-owned job-start cordon directory, bind-mounted read-only into every runner container. The
+# controller places /run/gha-runner-cordon/draining while it retires this host, and the job-started hook
+# refuses each new job while it exists. Docker recreates the empty directory after a reboot.
+install -d -o root -g root -m 0755 /run/gha-runner-cordon
 for i in $(seq 1 "$RUNNER_COUNT"); do
   name="${RUNNER_PREFIX}-$(hostname -s)-${i}"
   state="$MOUNT_POINT/instances/$name"
@@ -203,7 +207,8 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
   docker_args=(-d --restart unless-stopped --cpu-shares=1024 --memory="${RUNNER_MEMORY_GB}g" \
     --name "$name" -e RUNNER_NAME="$name" -e RUNNER_LABELS="$runner_labels" \
     -e RUNNER_GROUP_NAME="$RUNNER_GROUP" -e GITHUB_RUNNER_URL="$ORG_URL" \
-    -e RUNNER_STATE=/runner-state -v "$state:/runner-state" -v "$work:/work")
+    -e RUNNER_STATE=/runner-state -v "$state:/runner-state" -v "$work:/work" \
+    -v /run/gha-runner-cordon:/run/gha-runner-cordon:ro)
   if [[ "$TIERED" == 1 ]]; then
     docker_args+=(-e GHA_ADMISSION_REQUIRED=1 -v /run/gha-admission:/run/gha-admission:ro)
   fi

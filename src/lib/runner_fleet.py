@@ -19,11 +19,127 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from .log_format import error_detail
+from .target_config import TARGET_LABEL_KEY
 
 LOG = logging.getLogger("spot_runner_autoscaler")
+
+# Name prefixes of the runner hosts this project provisions, current and earlier fleets. A host created before
+# the ``spot-target`` label and patch recording existed is recognizable only by its name.
+RUNNER_HOST_NAME_PREFIXES = ("oxidex-runners-", "newznab-spot-runners-", "spot-runners-", "oxidex-spot-runners-")
+
+# Which spot-runner-patch-v1 patch a runner host runs, recorded by runner_manager as instance metadata at
+# provisioning and after a confirmed live patch. ``spot-runner-patch`` holds the canonical manifest JSON (omitted
+# when larger than MAX_PATCH_METADATA_BYTES), ``spot-runner-patch-sha256`` its sha256 or ``none`` (no patch), and
+# ``spot-runner-patch-target`` the owner/repo the patch belongs to. The ``spot-runner-patch`` label carries a sha
+# prefix for filtering. Hosts provisioned before this existed have none of these keys.
+#
+# Those applied keys and the label are written only after the host confirmed the patch: a completed bootstrap
+# (runner_manager.main) or LIVE_PATCH_APPLIED. While a startup script is still applying a patch, or after it
+# failed, the requested patch sits under the PENDING keys instead, and consumers must treat the host's patch as
+# unknown (the applied keys, if any, describe an earlier state and may be stale).
+PATCH_METADATA_KEY = "spot-runner-patch"
+PATCH_SHA_METADATA_KEY = "spot-runner-patch-sha256"
+PATCH_PENDING_METADATA_KEY = "spot-runner-patch-pending"
+PATCH_PENDING_SHA_METADATA_KEY = "spot-runner-patch-pending-sha256"
+# The GCE ``lastStartTimestamp`` of the boot in which the applied patch was confirmed. A reboot can bring the
+# runners back without a live patch's changes, so an applied record whose boot differs from the instance's current
+# lastStartTimestamp (or that has no boot) is stale.
+PATCH_BOOT_METADATA_KEY = "spot-runner-patch-boot"
+PATCH_TARGET_METADATA_KEY = "spot-runner-patch-target"
+PATCH_LABEL_KEY = "spot-runner-patch"
+# Deployment details apply_live_patch needs to hot-patch a host found by inventory (not secrets).
+RUNNER_PREFIX_METADATA_KEY = "spot-runner-prefix"
+RUNNER_COUNT_METADATA_KEY = "spot-runner-count"
+RUNNER_LABEL_METADATA_KEY = "spot-runner-label"
+RUNNER_REGION_METADATA_KEY = "spot-runner-region"
+RUNNER_HEAVY_POOL_METADATA_KEY = "spot-runner-heavy-pool"
+# The GitHub scope the runners registered with (an org such as swack-tools, or owner/repo) and, for org scopes, the
+# runner group; these can differ from spot-runner-patch-target (the patch's repository).
+RUNNER_REGISTRATION_TARGET_METADATA_KEY = "spot-runner-registration-target"
+RUNNER_GROUP_METADATA_KEY = "spot-runner-group-id"
+PATCH_LABEL_SHA_CHARS = 16
+NO_PATCH = "none"
+# GCE allows 256 KiB per metadata value and 512 KiB in total, and the startup script (with the patch embedded)
+# shares that budget; a larger manifest is recorded by sha only.
+MAX_PATCH_METADATA_BYTES = 64 * 1024
+
+
+def gce_metadata_items(item: dict) -> dict[str, str]:
+    """``{key: value}`` from a GCE instance's ``metadata.items`` (missing or malformed entries are skipped)."""
+    metadata = item.get("metadata") if isinstance(item, dict) else None
+    entries = metadata.get("items") if isinstance(metadata, dict) else None
+    out: dict[str, str] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and isinstance(entry.get("key"), str) and isinstance(entry.get("value"), str):
+            out[entry["key"]] = entry["value"]
+    return out
+
+
+def _pending_patch_sha(metadata: dict[str, str]) -> str:
+    """The pending (requested, unconfirmed) patch sha; ``invalid`` when a pending key is present but malformed."""
+    if PATCH_PENDING_SHA_METADATA_KEY not in metadata and PATCH_PENDING_METADATA_KEY not in metadata:
+        return ""
+    sha = metadata.get(PATCH_PENDING_SHA_METADATA_KEY, "").strip().lower()
+    if sha == NO_PATCH or (len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)):
+        return sha
+    return "invalid"  # Still pending: a damaged pending record never reads as confirmed.
+
+
+def gce_timestamp(value: Any) -> str:
+    """A GCE RFC 3339 timestamp such as ``lastStartTimestamp``, or an empty string when absent or malformed."""
+    text = str(value or "").strip()
+    return text if 0 < len(text) <= 40 and all(c.isdigit() or c in "TZ:.+-" for c in text) else ""
+
+
+def patch_record_from_gce_item(item: dict) -> dict[str, str]:
+    """The recorded runner patch of a GCE instance resource: ``patch_sha256``, ``patch_manifest_json``,
+    ``patch_target`` (empty strings when not recorded), and ``patch_pending_sha256`` (non-empty while a
+    requested patch is unconfirmed). The values are not trusted further than their shape; consumers verify the
+    manifest against its sha before using it."""
+    metadata = gce_metadata_items(item)
+    pending = _pending_patch_sha(metadata)
+    sha = metadata.get(PATCH_SHA_METADATA_KEY, "").strip().lower()
+    if sha != NO_PATCH and not (len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)):
+        sha = ""
+    manifest = metadata.get(PATCH_METADATA_KEY, "") if sha and sha != NO_PATCH else ""
+    if len(manifest.encode("utf-8")) > MAX_PATCH_METADATA_BYTES:
+        manifest = ""
+    target = metadata.get(PATCH_TARGET_METADATA_KEY, "").strip() if sha or pending else ""
+    boot = gce_timestamp(metadata.get(PATCH_BOOT_METADATA_KEY)) if sha else ""
+    return {"patch_sha256": sha, "patch_manifest_json": manifest, "patch_target": target,
+            "patch_pending_sha256": pending, "patch_boot": boot}
+
+
+def runner_deployment_from_gce_item(item: dict) -> dict[str, Any]:
+    """Recorded ``runner_prefix`` and ``runners_count`` of a runner host (absent keys are omitted)."""
+    metadata = gce_metadata_items(item)
+    out: dict[str, Any] = {}
+    prefix = metadata.get(RUNNER_PREFIX_METADATA_KEY, "").strip()
+    if prefix and all(c.isalnum() or c in "-_" for c in prefix):
+        out["runner_prefix"] = prefix
+    count = metadata.get(RUNNER_COUNT_METADATA_KEY, "").strip()
+    if count.isdigit() and 0 < int(count) <= 64:
+        out["runners_count"] = int(count)
+    label = metadata.get(RUNNER_LABEL_METADATA_KEY, "").strip()
+    if label and len(label) <= 64 and all(c.isalnum() or c in "._-" for c in label):
+        out["runner_label"] = label
+    region = metadata.get(RUNNER_REGION_METADATA_KEY, "").strip()
+    if region and len(region) <= 40 and all(c.islower() or c.isdigit() or c == "-" for c in region):
+        out["runner_region"] = region
+    heavy = metadata.get(RUNNER_HEAVY_POOL_METADATA_KEY, "").strip()
+    if heavy in ("2", "3"):
+        out["heavy_runner_pool"] = int(heavy)
+    registration = metadata.get(RUNNER_REGISTRATION_TARGET_METADATA_KEY, "").strip()
+    parts = registration.split("/")
+    if registration and len(parts) <= 2 and all(p and all(c.isalnum() or c in "._-" for c in p) for p in parts):
+        out["registration_target"] = registration
+    group = metadata.get(RUNNER_GROUP_METADATA_KEY, "").strip()
+    if group.isdigit() and int(group) > 0:
+        out["runner_group_id"] = int(group)
+    return out
 
 
 @dataclass(frozen=True)
@@ -54,6 +170,17 @@ class GceVm:
     specs_last_known: bool = False
     cpu_platform: str = ""
     requested_cpu_platform: str = ""
+    # Value of the GCE ``spot-target`` label; empty for hosts launched before target labels.
+    target_label: str = ""
+    # Recorded runner patch (see PATCH_*_METADATA_KEY); empty for hosts provisioned before patch recording.
+    patch_sha256: str = ""
+    patch_manifest_json: str = ""
+    patch_target: str = ""
+    # Requested at provisioning but not yet confirmed by a completed bootstrap; the patch is unknown while set.
+    patch_pending_sha256: str = ""
+    # The boot the applied record was confirmed in, and the instance's current GCE lastStartTimestamp.
+    patch_boot: str = ""
+    last_start_timestamp: str = ""
 
     @property
     def running(self) -> bool:
@@ -113,56 +240,80 @@ def _command_json(args: Sequence[str]) -> object:
 
 
 def count_active_github_runners(
-    org: str = "swack-tools",
+    org: str | Any = "swack-tools",
     *,
+    target: str | Any | None = None,
     label: str | None = None,
     gh_binary: str = "gh",
 ) -> int:
-    """Count online organization self-hosted runners, optionally by label."""
+    """Count online organization or repository self-hosted runners, optionally by label."""
     return sum(
         runner.online
-        for runner in list_github_runners(org, gh_binary=gh_binary)
+        for runner in list_github_runners(org, target=target, gh_binary=gh_binary)
         if label is None or label in runner.labels
     )
 
 
-def list_github_runners(org: str = "swack-tools", *, gh_binary: str = "gh") -> tuple[GitHubRunner, ...]:
-    """List all organization self-hosted runners using the authenticated gh command-line tool."""
-    command = [gh_binary, "api", "--paginate", "--slurp",
-               f"orgs/{org}/actions/runners?per_page=100"]
+def list_github_runners(
+    org: str | Any = "swack-tools",
+    *,
+    target: str | Any | None = None,
+    gh_binary: str = "gh",
+) -> tuple[GitHubRunner, ...]:
+    """List all organization or repository self-hosted runners using the authenticated gh command-line tool."""
+    target_val = target if target is not None else org
+    if hasattr(target_val, "runners_url"):
+        endpoint = f"{target_val.runners_url}?per_page=100"
+        target_name = getattr(target_val, "name", str(target_val))
+    elif hasattr(target_val, "api_path"):
+        endpoint = f"{target_val.api_path}/actions/runners?per_page=100"
+        target_name = getattr(target_val, "name", str(target_val))
+    else:
+        target_name = str(target_val).strip()
+        if target_name.startswith(("repos/", "orgs/")):
+            if target_name.endswith("/actions/runners"):
+                endpoint = f"{target_name}?per_page=100"
+            else:
+                endpoint = f"{target_name}/actions/runners?per_page=100"
+        elif "/" in target_name:
+            endpoint = f"repos/{target_name}/actions/runners?per_page=100"
+        else:
+            endpoint = f"orgs/{target_name}/actions/runners?per_page=100"
+
+    command = [gh_binary, "api", "--paginate", "--slurp", endpoint]
     try:
         result = subprocess.run(command, check=True, text=True, capture_output=True, timeout=60)
-        if result.stderr.strip():raise ValueError("GitHub inventory diagnostic")
-        pages=json.loads(result.stdout)
-        if not isinstance(pages,list) or not pages or not isinstance(pages[0],dict):
+        if result.stderr.strip(): raise ValueError("GitHub inventory diagnostic")
+        pages = json.loads(result.stdout)
+        if not isinstance(pages, list) or not pages or not isinstance(pages[0], dict):
             raise ValueError("Missing runner pages")
-        total=pages[0].get('total_count')
-        if type(total) is not int or total<0:raise ValueError("Invalid runner total")
-        items=[]
+        total = pages[0].get('total_count')
+        if type(total) is not int or total < 0: raise ValueError("Invalid runner total")
+        items = []
         for page in pages:
-            if (not isinstance(page,dict) or page.get('total_count')!=total
-                or not isinstance(page.get('runners'),list)):
+            if (not isinstance(page, dict) or page.get('total_count') != total
+                or not isinstance(page.get('runners'), list)):
                 raise ValueError("Incomplete runner page")
             items.extend(page['runners'])
-        if (len(items)!=total or len(pages)!=max(1,(total+99)//100)
-            or any(len(page['runners'])!=min(100,max(0,total-index*100))
-                   for index,page in enumerate(pages))):
+        if (len(items) != total or len(pages) != max(1, (total + 99) // 100)
+            or any(len(page['runners']) != min(100, max(0, total - index * 100))
+                   for index, page in enumerate(pages))):
             raise ValueError("Partial runner inventory")
-        runners=[];seen=set()
+        runners = []; seen = set()
         for item in items:
-            if (not isinstance(item,dict) or type(item.get('id')) is not int
+            if (not isinstance(item, dict) or type(item.get('id')) is not int
                 or item['id'] in seen or type(item.get('name')) is not str
-                or item.get('status') not in ('online','offline')
-                or type(item.get('busy')) is not bool or not isinstance(item.get('labels'),list)
-                or any(not isinstance(label,dict) or type(label.get('name')) is not str
+                or item.get('status') not in ('online', 'offline')
+                or type(item.get('busy')) is not bool or not isinstance(item.get('labels'), list)
+                or any(not isinstance(label, dict) or type(label.get('name')) is not str
                        for label in item['labels'])):
                 raise ValueError("Malformed or duplicate runner")
             seen.add(item['id'])
-            runners.append(GitHubRunner(item['id'],item['name'],item['status'],item['busy'],
+            runners.append(GitHubRunner(item['id'], item['name'], item['status'], item['busy'],
                                         tuple(label['name'] for label in item['labels'])))
         return tuple(runners)
-    except (FileNotFoundError,subprocess.SubprocessError,ValueError,TypeError,KeyError) as exc:
-        raise RuntimeError(f"Complete GitHub runner inventory unavailable for {org}") from exc
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError(f"Complete GitHub runner inventory unavailable for {target_name}") from exc
 
 
 
@@ -230,6 +381,10 @@ def list_gcloud_vms(
                 instance_id=str(item.get("id", "")),
                 cpu_platform=str(item.get("cpuPlatform", "")),
                 requested_cpu_platform=str(item.get("minCpuPlatform", "")),
+                target_label=str((item.get("labels") or {}).get(TARGET_LABEL_KEY, "")
+                                 if isinstance(item.get("labels"), dict) else ""),
+                **patch_record_from_gce_item(item),
+                last_start_timestamp=gce_timestamp(item.get("lastStartTimestamp")),
             )
         )
     return tuple(vms)
@@ -247,7 +402,8 @@ def count_running_gcloud_vms(
 
 def observe_fleet(
     *,
-    org: str = "swack-tools",
+    org: str | Any = "swack-tools",
+    target: str | Any | None = None,
     project: str = "homelab-424523",
     label: str | None = None,
     vm_name_prefix: str | None = None,
@@ -255,8 +411,9 @@ def observe_fleet(
     gcloud_binary: str = "gcloud",
 ) -> FleetSnapshot:
     """Fetch GitHub and GCE state concurrently and return a single snapshot."""
+    target_val = target if target is not None else org
     with ThreadPoolExecutor(max_workers=2) as pool:
-        runners_future = pool.submit(list_github_runners, org, gh_binary=gh_binary)
+        runners_future = pool.submit(list_github_runners, target_val, gh_binary=gh_binary)
         vms_future = pool.submit(list_gcloud_vms, project, name_prefix=vm_name_prefix, gcloud_binary=gcloud_binary)
         runners = runners_future.result()
         vms = vms_future.result()
@@ -291,7 +448,8 @@ def plan_scale_out(
 def reconcile_minimum_runners(
     launch_hosts: Callable[[int], None],
     *,
-    org: str = "swack-tools",
+    org: str | Any = "swack-tools",
+    target: str | Any | None = None,
     project: str = "homelab-424523",
     label: str | None = None,
     vm_name_prefix: str | None = None,
@@ -312,6 +470,7 @@ def reconcile_minimum_runners(
     """
     snapshot = observe_fleet(
         org=org,
+        target=target,
         project=project,
         label=label,
         vm_name_prefix=vm_name_prefix,
@@ -337,6 +496,7 @@ def reconcile_minimum_runners(
         time.sleep(poll_interval_seconds)
         snapshot = observe_fleet(
             org=org,
+            target=target,
             project=project,
             label=label,
             vm_name_prefix=vm_name_prefix,
@@ -366,6 +526,7 @@ def _print_status(snapshot: FleetSnapshot, *, floor: int, runners_per_vm: int) -
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default="swack-tools")
+    parser.add_argument("--target", help="Optional target repository (owner/repo) or organization")
     parser.add_argument("--project", default="homelab-424523")
     parser.add_argument("--label", help="Optional runner label to count only a subset")
     parser.add_argument("--vm-name-prefix", help="Optional GCE VM name prefix filter")
@@ -375,8 +536,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--gcloud-binary", default="gcloud")
     args = parser.parse_args(argv)
     try:
+        target = args.target or args.org
         snapshot = observe_fleet(
-            org=args.org,
+            target=target,
             project=args.project,
             label=args.label,
             vm_name_prefix=args.vm_name_prefix,

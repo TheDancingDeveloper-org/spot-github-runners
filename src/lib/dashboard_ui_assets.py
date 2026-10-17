@@ -601,6 +601,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <button class="tab-btn" data-tab="tab-rust" onclick="switchTab('tab-rust')">
         🦀 Rust Builders Telemetry &amp; IP Intel <span class="tab-badge" id="badge-rust-count">5 builds</span>
       </button>
+      <button class="tab-btn" data-tab="tab-patches" onclick="switchTab('tab-patches')">
+        🧩 Runner Patches <span class="tab-badge" id="badge-patches">config repo</span>
+      </button>
     </nav>
   </header>
 
@@ -1457,6 +1460,52 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </section>
+
+    <section id="tab-patches" class="tab-pane">
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">🧩 Runner Patches (spot-runner-patch-v1)</div>
+            <div class="panel-subtitle">Per-organization <code class="mono">defaults.yaml</code> and per-repository <code class="mono">repos/&lt;owner&gt;/&lt;repo&gt;.yaml</code> manifests from the config repository. Saving opens a pull request; it never writes to the default branch.</div>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-sm btn-secondary" id="rp-refresh">Load manifests</button>
+          </div>
+        </div>
+        <p class="mono" id="rp-source" style="font-size:12px;"></p>
+        <p id="rp-status" role="status" aria-live="polite" style="font-size:12.5px;"></p>
+        <div style="display:grid; grid-template-columns:minmax(180px,240px) 1fr; gap:14px;">
+          <ul id="rp-list" style="list-style:none; padding:0; margin:0;"></ul>
+          <div>
+            <div class="mono" id="rp-path" style="font-size:12.5px; margin-bottom:6px;"></div>
+            <textarea id="rp-editor" rows="18" class="mono" style="font-size:12px; line-height:1.45; width:100%;" aria-label="Manifest editor"></textarea>
+            <ul id="rp-errors" style="color:#fda4af; font-size:12.5px;"></ul>
+            <div class="field">
+              <label for="rp-message">Pull request title</label>
+              <input type="text" id="rp-message" placeholder="Update runner patch" />
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin:8px 0;">
+              <button class="btn btn-sm btn-secondary" id="rp-validate">Validate</button>
+              <button class="btn btn-sm btn-secondary" id="rp-preview">Preview rollout impact</button>
+              <button class="btn btn-sm btn-emerald" id="rp-save">Save as pull request</button>
+            </div>
+            <div class="mono" id="rp-effective-sha" style="font-size:12px;"></div>
+            <pre class="mono" id="rp-effective" style="font-size:11.5px; max-height:220px; overflow:auto;"></pre>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Runner host</th><th>Zone</th><th>Current patch</th><th>Rollout impact</th><th>Detail</th></tr></thead>
+                <tbody id="rp-hosts"></tbody>
+              </table>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px;">
+              <label style="font-size:12.5px;"><input type="checkbox" id="rp-confirm" /> I confirm hot-patching the running hosts listed above</label>
+              <button class="btn btn-sm btn-danger" id="rp-hotpatch" disabled>Hot-patch running fleet</button>
+            </div>
+            <p id="rp-executor" style="font-size:12px;"></p>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <div id="toast-container"></div>
@@ -1575,8 +1624,149 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
     })();
 
+    const CONTROL_VM_UNAVAILABLE = "control_vm_unavailable";
+    const CONTROL_VM_POLL_MS = 5000;
+    const CONTROL_VM_BANNER_TEXT = "The control VM is restarting or being replaced — waiting. Your change will be retried automatically.";
+    let CONTROL_VM_WAIT = null;
+
+    function newIdempotencyKey() {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+      }
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+
+    function setControlVmBanner(visible) {
+      let banner = document.getElementById("control-vm-banner");
+      if (!visible) {
+        if (banner) banner.hidden = true;
+        return;
+      }
+      if (!banner) {
+        banner = document.createElement("div");
+        banner.id = "control-vm-banner";
+        banner.setAttribute("role", "status");
+        banner.setAttribute("aria-live", "polite");
+        banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:10000;padding:10px 16px;" +
+          "background:#7c2d12;color:#fff7ed;font-weight:600;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.35);";
+        banner.textContent = CONTROL_VM_BANNER_TEXT;
+        (document.body || document.documentElement).appendChild(banner);
+      }
+      banner.hidden = false;
+    }
+
+    function waitForControlVm() {
+      // One shared wait: every blocked request resumes when /api/health returns 200.
+      if (!CONTROL_VM_WAIT) {
+        setControlVmBanner(true);
+        CONTROL_VM_WAIT = (async () => {
+          for (;;) {
+            await new Promise(resolve => setTimeout(resolve, CONTROL_VM_POLL_MS));
+            try {
+              const health = await NATIVE_FETCH("/api/health", { cache: "no-store", credentials: "same-origin" });
+              if (health.status === 200) return;
+            } catch (_err) {
+              // Still unreachable; keep polling.
+            }
+          }
+        })().finally(() => {
+          CONTROL_VM_WAIT = null;
+          setControlVmBanner(false);
+        });
+      }
+      return CONTROL_VM_WAIT;
+    }
+
+    async function isControlVmUnavailable(res) {
+      if (!res || res.status !== 503) return false;
+      try {
+        const data = await res.clone().json();
+        return Boolean(data && data.error === CONTROL_VM_UNAVAILABLE);
+      } catch (_err) {
+        return false;
+      }
+    }
+
+    async function oauthSignInNeeded() {
+      // True when GitHub sign-in is enabled and this browser has no usable session: an expired session
+      // (401) or one that a target-policy change no longer covers (403). Waits out a control VM outage.
+      try {
+        const res = await fetchWithControlVmRetry("/api/auth/status", { cache: "no-store", credentials: "same-origin" });
+        const data = res.ok ? await res.json() : {};
+        return Boolean(data && data.oauth && data.oauth.enabled && !data.authenticated);
+      } catch (_err) {
+        return false;
+      }
+    }
+
+    async function externalChangePendingSeconds(res) {
+      if (!res || res.status !== 202) return null;
+      try {
+        const data = await res.clone().json();
+        if (!data || data.status !== "pending" || data.pending_retry !== true) return null;
+        return Math.min(30, Math.max(1, Number(data.retry_after_seconds) || 3));
+      } catch (_err) {
+        return null;
+      }
+    }
+
+    // Delays (seconds) between automatic retries of a change whose outcome GitHub did not confirm.
+    const SAME_KEY_RETRY_DELAYS = [2, 5, 10];
+
+    async function sameKeyRetryRequested(res) {
+      if (!res || res.status !== 424) return false;
+      try {
+        const data = await res.clone().json();
+        return Boolean(data && data.retry_same_key === true);
+      } catch (_err) {
+        return false;
+      }
+    }
+
+    async function fetchWithControlVmRetry(input, reqInit) {
+      // Retries the SAME request (same Idempotency-Key) after the control VM comes back.
+      let sameKeyRetries = 0;
+      for (;;) {
+        let res;
+        try {
+          res = await NATIVE_FETCH(input, reqInit);
+        } catch (err) {
+          if (err instanceof TypeError) {
+            await waitForControlVm();
+            continue;
+          }
+          throw err;
+        }
+        if (await isControlVmUnavailable(res)) {
+          await waitForControlVm();
+          continue;
+        }
+        const pendingSeconds = await externalChangePendingSeconds(res);
+        if (pendingSeconds !== null) {
+          // A change with this Idempotency-Key is still running (for example the edge timed out a long save or
+          // hot-patch): keep asking with the same key until the stored result comes back.
+          await new Promise(resolve => setTimeout(resolve, pendingSeconds * 1000));
+          continue;
+        }
+        if (sameKeyRetries < SAME_KEY_RETRY_DELAYS.length && reqInit && reqInit.headers &&
+            reqInit.headers.has && reqInit.headers.has("Idempotency-Key") && await sameKeyRetryRequested(res)) {
+          // GitHub did not confirm the outcome: the same key lets the dashboard reconcile instead of repeating.
+          await new Promise(resolve => setTimeout(resolve, SAME_KEY_RETRY_DELAYS[sameKeyRetries] * 1000));
+          sameKeyRetries += 1;
+          continue;
+        }
+        return res;
+      }
+    }
+
     window.fetch = async function dashboardAuthorizedFetch(input, init = {}) {
-      const reqInit = { ...init, credentials: init.credentials || "same-origin" };
+      const method = String(init.method || (input && input.method) || "GET").toUpperCase();
+      const reqInit = { ...init, method, credentials: init.credentials || "same-origin" };
       const headers = new Headers(init.headers || {});
       const token = getDashboardAuthToken();
       if (token && !headers.has("Authorization")) {
@@ -1585,18 +1775,37 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       if (token && !headers.has("X-Dashboard-Token")) {
         headers.set("X-Dashboard-Token", token);
       }
+      if (method !== "GET" && method !== "HEAD" && !headers.has("Idempotency-Key")) {
+        headers.set("Idempotency-Key", newIdempotencyKey());
+      }
       reqInit.headers = headers;
-      let res = await NATIVE_FETCH(input, reqInit);
-      if (res.status === 401 && typeof window.prompt === "function") {
-        const prompted = window.prompt("Dashboard authentication required. Enter your dashboard token:");
-        if (prompted && prompted.trim()) {
-          const ok = await authenticateDashboardToken(prompted.trim());
-          if (ok) {
-            const retryHeaders = new Headers(init.headers || {});
-            const fresh = getDashboardAuthToken();
-            retryHeaders.set("Authorization", `Bearer ${fresh}`);
-            retryHeaders.set("X-Dashboard-Token", fresh);
-            res = await NATIVE_FETCH(input, { ...reqInit, headers: retryHeaders });
+      let res = await fetchWithControlVmRetry(input, reqInit);
+      if (res.status === 401 && token && !new Headers(init.headers || {}).has("Authorization")) {
+        // A stored bearer token is checked before the session cookie, so a stale one masks a valid
+        // GitHub or token session: drop it and retry once (same Idempotency-Key) with the cookie alone.
+        storeDashboardAuthToken("");
+        const cookieOnly = new Headers(headers);
+        cookieOnly.delete("Authorization");
+        cookieOnly.delete("X-Dashboard-Token");
+        res = await fetchWithControlVmRetry(input, { ...reqInit, headers: cookieOnly });
+      }
+      if ((res.status === 401 || res.status === 403) && await oauthSignInNeeded()) {
+        // The login gate at "/" offers every sign-in method (including the dashboard token).
+        window.location.assign("/");
+        return res;
+      }
+      if (res.status === 401) {
+        if (typeof window.prompt === "function") {
+          const prompted = window.prompt("Dashboard authentication required. Enter your dashboard token:");
+          if (prompted && prompted.trim()) {
+            const ok = await authenticateDashboardToken(prompted.trim());
+            if (ok) {
+              const retryHeaders = new Headers(headers);
+              const fresh = getDashboardAuthToken();
+              retryHeaders.set("Authorization", `Bearer ${fresh}`);
+              retryHeaders.set("X-Dashboard-Token", fresh);
+              res = await fetchWithControlVmRetry(input, { ...reqInit, headers: retryHeaders });
+            }
           }
         }
       }
@@ -2962,7 +3171,180 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       await loadOverview();
     }
 
+    // --- runner patches panel ---
+    // Renders server data with textContent and createElement only (no HTML parsing). Requests go through the
+    // dashboard fetch wrapper, so every POST carries an Idempotency-Key and waits out control VM restarts.
+    const RunnerPatches = (function () {
+      const S = { list: null, current: null, preview: null, dirty: false, pendingExternal: null };
+      function el(id) { return document.getElementById(id); }
+      function node(tag, text) {
+        const n = document.createElement(tag);
+        if (text !== undefined && text !== null) n.textContent = String(text);
+        return n;
+      }
+      function clear(n) { while (n && n.firstChild) n.removeChild(n.firstChild); }
+      function setStatus(text) { el("rp-status").textContent = text || ""; }
+      async function api(url, init) {
+        const res = await fetch(url, init || {});
+        let data = {};
+        try { data = await res.json(); } catch (_e) { data = {}; }
+        return [res, data || {}];
+      }
+      function postJson(url, body, extraHeaders) {
+        return api(url, { method: "POST", headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
+                          body: JSON.stringify(body) });
+      }
+      // One Idempotency-Key per pending external change: reused for the same payload (also when the user clicks
+      // again) until a final result arrives, so the dashboard can reconcile instead of opening a second PR.
+      async function postExternal(url, body) {
+        const fingerprint = url + "\n" + JSON.stringify(body);
+        if (!S.pendingExternal || S.pendingExternal.fingerprint !== fingerprint) {
+          S.pendingExternal = { fingerprint, key: newIdempotencyKey() };
+        }
+        const result = await postJson(url, body, { "Idempotency-Key": S.pendingExternal.key });
+        const [res, d] = result;
+        if (!(d && (d.retry_same_key === true || d.pending_retry === true)) && res.status !== 0) {
+          S.pendingExternal = null;  // a final answer: the next change gets a new key
+        }
+        return result;
+      }
+      function renderErrors(errors) {
+        const box = el("rp-errors");
+        clear(box);
+        (errors || []).forEach(e => box.appendChild(node("li", `${e.field}: ${e.message}`)));
+      }
+      function renderEffective(data) {
+        el("rp-effective-sha").textContent = data && data.patch_sha256 ? `Effective patch sha256: ${data.patch_sha256}` : "";
+        el("rp-effective").textContent = data && data.effective ? JSON.stringify(data.effective, null, 2) : "";
+      }
+      function updateHotPatchButton() {
+        const p = S.preview;
+        el("rp-hotpatch").disabled = !(p && p.hot_patch_allowed === true && !p.source.draft && !S.dirty && el("rp-confirm").checked);
+      }
+      function renderPreview(data) {
+        S.preview = data;
+        const body = el("rp-hosts");
+        clear(body);
+        (data.hosts || []).forEach(h => {
+          const tr = node("tr");
+          [h.name, h.zone, h.current_patch_sha256 ? h.current_patch_sha256.slice(0, 12) : "none",
+           h.result ? `${h.classification} -> ${h.result}` : h.classification, h.detail || ""].forEach(v => tr.appendChild(node("td", v)));
+          body.appendChild(tr);
+        });
+        if (!(data.hosts || []).length) {
+          const tr = node("tr");
+          tr.appendChild(node("td", "No running runner hosts are recorded for this repository."));
+          body.appendChild(tr);
+        }
+        const ex = data.executor || {};
+        el("rp-executor").textContent = ex.available ? "" : (ex.reason || "");
+        updateHotPatchButton();
+      }
+      function renderList(data) {
+        S.list = data;
+        el("rp-source").textContent = `${data.config_repo} @ ${data.default_branch} ${String(data.head_sha || "").slice(0, 12)}`;
+        const list = el("rp-list");
+        clear(list);
+        const entries = [{ label: "defaults.yaml" + (data.defaults && data.defaults.present ? "" : " (new)"), path: "defaults.yaml" }]
+          .concat((data.repositories || []).map(r => ({ label: r.repository, path: r.path })));
+        entries.forEach(entry => {
+          const li = node("li");
+          const b = node("button", entry.label);
+          b.className = "btn btn-sm btn-secondary";
+          b.addEventListener("click", () => load(entry.path));
+          li.appendChild(b);
+          list.appendChild(li);
+        });
+        el("rp-executor").textContent = data.executor && !data.executor.available ? (data.executor.reason || "") : "";
+      }
+      async function refresh() {
+        setStatus("Loading manifests...");
+        const [res, d] = await api("/api/patches");
+        if (!res.ok) { setStatus(d.error || `Could not list manifests (HTTP ${res.status})`); return; }
+        renderList(d);
+        setStatus("");
+      }
+      async function load(path) {
+        setStatus(`Loading ${path}...`);
+        const [res, d] = await api(`/api/patches/manifest?path=${encodeURIComponent(path)}`);
+        if (!res.ok) { setStatus(d.error || `Could not load ${path} (HTTP ${res.status})`); return; }
+        S.current = d; S.dirty = false; S.preview = null;
+        el("rp-path").textContent = `${d.path} @ ${String(d.base_sha || "").slice(0, 12)}${d.exists ? "" : " (new file)"}`;
+        el("rp-editor").value = d.content || "";
+        renderErrors(d.errors);
+        renderEffective(d);
+        clear(el("rp-hosts"));
+        updateHotPatchButton();
+        setStatus("");
+      }
+      async function validate() {
+        if (!S.current) return;
+        const [res, d] = await postJson("/api/patches/validate", { path: S.current.path, content: el("rp-editor").value });
+        if (!res.ok) { setStatus(d.error || `Validation failed (HTTP ${res.status})`); return; }
+        renderErrors(d.errors);
+        renderEffective(d);
+        setStatus(d.valid ? (d.warning || "The manifest is valid.") : "The manifest has errors.");
+      }
+      async function preview() {
+        if (!S.current || !S.current.repository) { setStatus("Rollout impact applies to repository manifests."); return; }
+        const body = { repository: S.current.repository };
+        if (S.dirty) body.content = el("rp-editor").value;
+        const [res, d] = await postJson("/api/patches/preview", body);
+        if (!res.ok) { renderErrors(d.errors); setStatus(d.error || `Preview failed (HTTP ${res.status})`); return; }
+        renderPreview(d);
+        setStatus(d.source && d.source.draft ? "Preview of your unsaved draft; save it and merge the pull request before hot-patching." : "");
+      }
+      async function save() {
+        if (!S.current) return;
+        const [res, d] = await postExternal("/api/patches/save", {
+          path: S.current.path, content: el("rp-editor").value, base_sha: S.current.base_sha,
+          message: el("rp-message").value,
+        });
+        if (d.retry_same_key === true) {
+          setStatus((d.error || "GitHub did not confirm the save.") + " Click Save again to finish it safely.");
+          return;
+        }
+        if (res.status === 409) { setStatus(d.error || "The config repository changed; reload the manifest."); return; }
+        if (!res.ok) { renderErrors(d.errors); setStatus(d.error || `Save failed (HTTP ${res.status})`); return; }
+        renderErrors([]);
+        const status = el("rp-status");
+        clear(status);
+        status.appendChild(node("span", `Opened pull request #${d.pull_request && d.pull_request.number} on ${d.branch}. `));
+        const url = d.pull_request && d.pull_request.url;
+        if (typeof url === "string" && url.startsWith("https://github.com/")) {
+          const a = node("a", "Review it on GitHub");
+          a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+          status.appendChild(a);
+        }
+      }
+      async function hotPatch() {
+        updateHotPatchButton();
+        if (el("rp-hotpatch").disabled || !S.preview) return;
+        el("rp-hotpatch").disabled = true;
+        const [res, d] = await postExternal("/api/patches/hot-patch", {
+          repository: S.preview.repository, patch_sha256: S.preview.patch_sha256, confirm: true,
+        });
+        el("rp-confirm").checked = false;
+        if (d.hosts) renderPreview({ ...S.preview, hosts: d.hosts, hot_patch_allowed: false });
+        setStatus(res.ok ? `Hot-patch ${d.status}.` : (d.error || `Hot-patch refused (HTTP ${res.status})`));
+        updateHotPatchButton();
+      }
+      function init() {
+        el("rp-refresh").addEventListener("click", refresh);
+        el("rp-validate").addEventListener("click", validate);
+        el("rp-preview").addEventListener("click", preview);
+        el("rp-save").addEventListener("click", save);
+        el("rp-hotpatch").addEventListener("click", hotPatch);
+        el("rp-confirm").addEventListener("change", updateHotPatchButton);
+        el("rp-editor").addEventListener("input", () => { S.dirty = true; updateHotPatchButton(); });
+      }
+      return { init, refresh, load, validate, preview, save, hotPatch, renderErrors, renderPreview, updateHotPatchButton, state: S };
+    })();
+    window.RunnerPatches = RunnerPatches;
+    // --- end runner patches panel ---
+
     window.addEventListener("DOMContentLoaded", async () => {
+      RunnerPatches.init();
       const params = new URLSearchParams(window.location.search);
       if (params.get("show_deleted") === "1") {
         const cb = document.getElementById("inst-show-deleted");

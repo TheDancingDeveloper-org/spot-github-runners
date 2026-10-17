@@ -23,6 +23,15 @@ class StrictPoolStartup(unittest.TestCase):
         with self.assertRaises(RuntimeError):manager.strict_pool_settings(args)
         args.cpu=32;args.ram=64
         with self.assertRaises(RuntimeError):manager.strict_pool_settings(args)
+    def test_repository_target_refused_before_provisioning(self):
+        """Codex M4 round 7: a repo-scoped strict pool must fail before any VM exists."""
+        args=self.args();args.target='xbmc4lyfe/newznab-tmux'
+        with self.assertRaisesRegex(RuntimeError,'organization runner group'):manager.strict_pool_settings(args)
+        with patch.object(manager,'configure_storage'),patch.object(manager,'configure_cpu_platform'):
+            with self.assertRaisesRegex(RuntimeError,'organization runner group'):manager.select_sizing(args)
+        args=self.args();args.runner_group_id=None
+        with self.assertRaisesRegex(RuntimeError,'runner-group-id'):manager.strict_pool_settings(args)
+        self.assertEqual(manager.strict_pool_settings(self.args()),2)  # org target with a group is fine
     def test_no_builder_or_tier_override(self):
         args=self.args();args.remote_builder=True
         with self.assertRaises(RuntimeError):manager.strict_pool_settings(args)

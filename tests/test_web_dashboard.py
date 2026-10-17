@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -1742,7 +1743,17 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                 "lib.spot_pricing.load_catalog_rates",
                 new=AsyncMock(return_value={("us-south1", "n2", "CPU", "SPOT"): 0.0085}),
             ) as mock_load_rates,
+            # Keep the case hermetic: without these stubs, live gcloud credentials
+            # return real capacityHistory prices and flip the source.
+            patch("lib.compute_api.get_auth") as mock_api_key_auth,
+            patch(
+                "lib.spot_pricing.spot_price",
+                new=AsyncMock(return_value=("us-south1", "n2-standard-16", None)),
+            ),
         ):
+            mock_api_key_auth.return_value = type(
+                "AuthStub", (), {"token": "gcloud-oauth-token", "project": "homelab-424523"}
+            )()
             live_api_key = fetch_live_spot_pricing(project="homelab-424523", force_refresh=True)
             self.assertEqual(live_api_key["source"], "gcp_billing_catalog")
             self.assertEqual(live_api_key["component_rates"][("us-south1", "n2", "CPU", "SPOT")], 0.0085)
@@ -2994,7 +3005,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                         timeout=2.0,
                     ) as resp:
                         health_payload = json.loads(resp.read().decode("utf-8"))
-                    self.assertEqual(health_payload["status"], "healthy")
+                    self.assertEqual(health_payload["status"], "ok")
                     stalled_peer.settimeout(1.5)
                     try:
                         eof_data = stalled_peer.recv(16)
@@ -3650,6 +3661,183 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         # 11. CPU scope trims whitespace
         scope_ok, _ = evaluate_cpu_scope([85.0, 30.0, 20.0], 50.0, " any ")
         self.assertTrue(scope_ok)
+
+
+class PublicOriginBehindWorkerTests(unittest.TestCase):
+    """The Worker forwards to the tunnel hostname, so Host differs from the browser's Origin."""
+
+    PUBLIC = "https://spot.swacktech.com"
+    TUNNEL_HOST = "spot-origin-a.swacktech.com"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = unittest.mock.patch(
+            "lib.dashboard_server.fetch_live_spot_pricing",
+            return_value={"source": "catalog_baseline", "fetched_at": 0.0, "component_rates": {},
+                          "machine_hourly": {}, "disk_monthly_gib": {}},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = unittest.mock.patch.dict("os.environ", {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("DASHBOARD_PUBLIC_ORIGIN", None)
+        os.environ.pop("GITHUB_OAUTH_REDIRECT_URI", None)
+
+    def start(self, **kwargs):
+        server, store = create_dashboard_server(
+            host="127.0.0.1", port=0, state_path=Path(self.tmp.name) / "state.json", **kwargs
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(stop)
+        self.port = server.server_address[1]
+        return server, store
+
+    def post(self, path, origin=None, host=None, extra=None):
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Content-Type": "application/json", "Host": host or self.TUNNEL_HOST,
+                   "X-Forwarded-Proto": "https", "X-Forwarded-Host": "spot.swacktech.com"}
+        if origin is not None:
+            headers["Origin"] = origin
+        headers.update(extra or {})
+        try:
+            conn.request("POST", path, body=b"{}", headers=headers)
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read() or b"null")
+        finally:
+            conn.close()
+
+    def test_proxied_posts_from_public_origin_are_accepted(self):
+        self.start(public_origin=self.PUBLIC)
+        for path in ("/auth/logout", "/api/auth/logout"):
+            status, body = self.post(path, origin=self.PUBLIC)
+            self.assertEqual((status, body["authenticated"]), (200, False), path)
+        status, _ = self.post("/api/budget", origin=self.PUBLIC)
+        self.assertNotEqual(status, 403)
+
+    def test_own_host_origin_still_accepted(self):
+        self.start(public_origin=self.PUBLIC)
+        status, _ = self.post("/auth/logout", origin=f"https://{self.TUNNEL_HOST}")
+        self.assertEqual(status, 200)
+
+    def test_other_origins_rejected_and_forwarded_host_not_trusted(self):
+        self.start(public_origin=self.PUBLIC)
+        for origin in ("https://evil.example", "http://spot.swacktech.com", "https://spot.swacktech.com:8443",
+                       "https://spot.swacktech.com.evil.example", "null"):
+            status, _ = self.post("/api/auth/logout", origin=origin)
+            self.assertEqual(status, 403, origin)
+        status, _ = self.post("/api/auth/logout", origin="https://evil.example",
+                              extra={"X-Forwarded-Host": "evil.example"})
+        self.assertEqual(status, 403)
+        status, _ = self.post("/api/auth/logout", origin=self.PUBLIC, extra={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(status, 403)
+
+    def test_without_public_origin_proxied_post_is_rejected(self):
+        self.start()
+        status, _ = self.post("/api/auth/logout", origin=self.PUBLIC)
+        self.assertEqual(status, 403)
+
+    def test_public_origin_defaults_to_redirect_uri_origin(self):
+        os.environ["GITHUB_OAUTH_REDIRECT_URI"] = "https://Spot.SwackTech.com/auth/github/callback"
+        self.start()
+        status, _ = self.post("/api/auth/logout", origin=self.PUBLIC)
+        self.assertEqual(status, 200)
+
+    def test_public_origin_env_and_validation(self):
+        from lib.dashboard_server import args_parser, normalize_public_origin, resolve_public_origin
+
+        self.assertEqual(normalize_public_origin("HTTPS://Spot.SwackTech.com:443/"), self.PUBLIC)
+        self.assertEqual(normalize_public_origin("http://localhost:8787"), "http://localhost:8787")
+        self.assertIsNone(normalize_public_origin(""))
+        for bad in ("spot.swacktech.com", "https://spot.swacktech.com/app", "https://u:p@spot.swacktech.com",
+                    "https://spot.swacktech.com/?x=1", "ftp://spot.swacktech.com", "https://"):
+            with self.assertRaises(ValueError, msg=bad):
+                normalize_public_origin(bad)
+        self.assertEqual(resolve_public_origin(None, environ={"DASHBOARD_PUBLIC_ORIGIN": self.PUBLIC + "/"}),
+                         self.PUBLIC)
+        self.assertEqual(resolve_public_origin("https://a.example", environ={"DASHBOARD_PUBLIC_ORIGIN": self.PUBLIC}),
+                         "https://a.example")
+        self.assertEqual(resolve_public_origin(None, redirect_uri=self.PUBLIC + "/auth/github/callback", environ={}),
+                         self.PUBLIC)
+        self.assertIsNone(resolve_public_origin(None, environ={}))
+        with self.assertRaises(ValueError):
+            create_dashboard_server(host="127.0.0.1", port=0, public_origin="https://x.example/path")
+        self.assertEqual(args_parser().parse_args(["--public-origin", self.PUBLIC]).public_origin, self.PUBLIC)
+
+    def test_oauth_redirect_falls_back_to_public_origin(self):
+        import http.client
+        import urllib.parse
+
+        from lib.dashboard_auth import GitHubOAuthManager
+
+        manager = GitHubOAuthManager("Iv1.testclientid", "client-secret",
+                                     None, "test-session-secret-0123456789-abcdefghijklmnopqrstuvwxyz")
+        self.start(public_origin=self.PUBLIC, oauth_manager=manager, config_targets_provider=lambda: [])
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", "/auth/github/login", headers={"Host": self.TUNNEL_HOST})
+            resp = conn.getresponse()
+            resp.read()
+            location = resp.getheader("Location")
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 302)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)
+        self.assertEqual(query["redirect_uri"], [self.PUBLIC + "/auth/github/callback"])
+
+
+class ConfigRepoSelectionTests(unittest.TestCase):
+    def test_resolution_order_and_validation(self):
+        from lib.dashboard_server import args_parser, resolve_config_repo
+
+        self.assertEqual(resolve_config_repo(org="swack-tools", environ={}), "swack-tools/spot-runners-config")
+        self.assertEqual(resolve_config_repo(org="acme", environ={}), "acme/spot-runners-config")
+        self.assertEqual(resolve_config_repo(org="acme", environ={"SPOT_CONFIG_REPO": "ops/runner-config"}),
+                         "ops/runner-config")
+        self.assertEqual(resolve_config_repo("x/y", org="acme", environ={"SPOT_CONFIG_REPO": "ops/runner-config"}),
+                         "x/y")
+        for bad in ("noslash", "a/b/c", "a/..", "-bad/repo", "a/ b"):
+            with self.assertRaises(ValueError, msg=bad):
+                resolve_config_repo(org="acme", environ={"SPOT_CONFIG_REPO": bad})
+        self.assertEqual(args_parser().parse_args(["--config-repo", "o/r"]).config_repo, "o/r")
+
+    def test_authorization_provider_uses_the_resolved_repo(self):
+        from lib.dashboard_auth import GitHubOAuthManager
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        manager = GitHubOAuthManager("Iv1.testclientid", "client-secret", None,
+                                     "test-session-secret-0123456789-abcdefghijklmnopqrstuvwxyz")
+        seen = []
+
+        class Recorder:
+            def __init__(self, repo):
+                seen.append(repo)
+
+        cases = ((dict(org="acme"), {}, "acme/spot-runners-config"),
+                 (dict(org="acme"), {"SPOT_CONFIG_REPO": "ops/runner-config"}, "ops/runner-config"),
+                 (dict(org="acme", config_repo="x/y"), {"SPOT_CONFIG_REPO": "ops/runner-config"}, "x/y"))
+        for kwargs, env, expected in cases:
+            with unittest.mock.patch("lib.dashboard_server.ConfigRepoTargets", Recorder), \
+                    unittest.mock.patch.dict("os.environ", env, clear=False):
+                if "SPOT_CONFIG_REPO" not in env:
+                    os.environ.pop("SPOT_CONFIG_REPO", None)
+                server, store = create_dashboard_server(host="127.0.0.1", port=0,
+                                                        state_path=Path(tmp.name) / "s.json",
+                                                        oauth_manager=manager, **kwargs)
+                server.server_close()
+                store.close()
+            self.assertEqual(seen[-1], expected)
 
 
 if __name__ == "__main__":

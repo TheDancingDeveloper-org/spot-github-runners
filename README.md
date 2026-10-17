@@ -36,6 +36,9 @@ For the simplification target and remaining work, see
 | Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
 | Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
 | Run the Web UI control plane and telemetry dashboard | `src/web_dashboard.py` | Updates local dashboard state file |
+| Inspect, plan, or manage the Spot control VM that hosts the dashboard | `src/control_vm.py` | Only with `--apply` |
+
+To host the dashboard on a Spot control VM behind Cloudflare, with GitHub sign-in and state that survives preemption, see [Edge dashboard](docs/edge-dashboard.md).
 
 Keep the distinction between registered listeners and active jobs. Twenty
 registered runners do not mean that twenty jobs can each use 32 GiB at once.
@@ -242,6 +245,13 @@ It can restart an existing host. Drain active work and verify the adoption scope
 before using it. Do not use the fresh dedicated builder bootstrap on an occupied
 runner or benchmark host.
 
+Adopting an unlabeled host with `--target` first lists the GitHub runners named
+for that VM under the new target, the default organization, and any registration
+scope recorded on the VM. The runner data disk keeps each runner's registration,
+so the command refuses the adoption when any of those runners belongs to another
+scope, or when a scope can't be listed. Drain the host and remove those
+registrations, or reprovision it, before you adopt it for the new target.
+
 ### Understand runner limits
 
 For manual deployments without `--tier`, automatic sizing uses:
@@ -407,6 +417,32 @@ the source. Repository scheduling is isolated during runner drain, while already
 assigned jobs finish. Dedicated builder drain follows active builds, admission
 leases, source/cache locks, and export activity; it does not use GitHub runner
 idleness as proof that a build is finished.
+
+Repository-target runners keep GitHub's read-only `self-hosted`, `linux`, and
+`X64` labels, and personal repositories have no runner groups. Removing custom
+labels therefore doesn't stop a workflow that selects only built-in labels. Before
+any GitHub change, the controller cordons the host over identity-checked SSH. It
+places the root-owned `/run/gha-runner-cordon/draining` marker, which every
+runner container mounts read-only. While the marker exists, the job-started hook
+refuses each new job before admission and before any job step runs.
+
+The controller deregisters a runner only after a later observation finds the
+marker still in place and no `Runner.Worker` process on the host. An idle
+listener can still accept an assignment during the drain. That job fails before
+its first step runs, with a "Runner host is being retired" error. GitHub reports the
+failure and doesn't reassign the job, so re-run it to schedule it on another
+runner. A host whose containers lack the read-only mount or the cordon-aware hook
+can't refuse jobs. The controller holds its retirement and logs `Retirement held`.
+That host keeps its labels and registrations until a cordon-capable host replaces
+it. A rotation that rolls back removes only the marker that it placed.
+
+Organization-target runners keep the same built-in labels, so label removal alone
+never isolates them either. An organization drain moves its runners into an
+isolated runner group with no repository access. When the rotation can't create
+or verify that group, it cordons the host the same way as for a repository
+target, and holds the rotation if the host can't refuse jobs. A drain that starts
+in `label_only` mode, as legacy scaling does, also cordons the host first. If that
+host can't refuse jobs, the drain switches to an isolated runner group.
 
 ## Provision a dedicated Rust builder
 
@@ -701,6 +737,8 @@ cgroup `cpu.max`, `memory.max`, and `memory.swap.max` values.
 | No memory observations | Check service-account role/scope, Ops Agent status, timestamps, and boot identity |
 | Registration timeout | Inspect the exact deployment marker, startup log, token scope, group, and expected runner names |
 | Admission denied or exit 75 | Check draining state, owned leases, limits, and full container inventory; wait for active work |
+| Job failed with "Runner host is being retired" | The host was cordoned for retirement after GitHub assigned the job; re-run the job |
+| `Retirement held: the host cannot refuse new jobs` | Replace the repository host with one whose runners mount `/run/gha-runner-cordon` read-only; don't remove its runners by hand |
 | Transfer permission denied | Verify the approved uploader identity and group; do not broaden permissions |
 | Exit 137 | Join kernel/cgroup OOM evidence to the actual job interval before assigning a cause |
 | Compiler/header failure | Repair source or toolchain inputs; do not retry on another VM as a capacity workaround |

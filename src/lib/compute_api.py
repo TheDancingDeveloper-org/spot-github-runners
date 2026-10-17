@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
@@ -98,8 +100,62 @@ async def wait_for_quota_cooldown(project: str) -> None:
         await asyncio.sleep(remaining)
 
 
+METADATA_HOST = "metadata.google.internal"
+METADATA_TOKEN_URL = (
+    f"http://{METADATA_HOST}/computeMetadata/v1/instance/service-accounts/default/token"
+)
+METADATA_PROJECT_URL = f"http://{METADATA_HOST}/computeMetadata/v1/project/project-id"
+ENV_TOKEN_SOURCE = "SPOT_GCP_TOKEN_SOURCE"
+METADATA_TIMEOUT_SECONDS = 5.0
+MAX_METADATA_RESPONSE_BYTES = 65_536
+
+
+def _metadata_get(url: str, timeout: float = METADATA_TIMEOUT_SECONDS) -> str:
+    """GET a GCE metadata server URL (never through a proxy) and return the decoded body."""
+    request = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310 - fixed metadata URL
+            if int(getattr(response, "status", 200)) != 200:
+                raise RuntimeError(f"GCE metadata server returned HTTP {response.status}")
+            if response.headers.get("Metadata-Flavor", "Google") != "Google":
+                raise RuntimeError("GCE metadata response is missing Metadata-Flavor: Google")
+            return response.read(MAX_METADATA_RESPONSE_BYTES).decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"GCE metadata server returned HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"GCE metadata server is unreachable: {type(exc).__name__}") from exc
+
+
+def metadata_access_token(timeout: float = METADATA_TIMEOUT_SECONDS) -> str:
+    """Return the default service account access token from the GCE metadata server."""
+    raw = _metadata_get(METADATA_TOKEN_URL, timeout)
+    try:
+        token = json.loads(raw).get("access_token")
+    except (ValueError, AttributeError) as exc:
+        raise RuntimeError("GCE metadata server returned an invalid token response") from exc
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("GCE metadata server returned an empty access token")
+    return token.strip()
+
+
+def metadata_project_id(timeout: float = METADATA_TIMEOUT_SECONDS) -> str:
+    return _metadata_get(METADATA_PROJECT_URL, timeout).strip()
+
+
+def token_source_is_metadata(env: dict[str, str] | None = None) -> bool:
+    source = (os.environ if env is None else env).get(ENV_TOKEN_SOURCE, "")
+    return source.strip().lower() == "metadata"
+
+
 def get_auth(project_arg: str | None) -> Auth:
-    """Get active project and user access token from the logged-in gcloud command-line tool."""
+    """Get the active project and an access token.
+
+    Uses the logged-in gcloud command-line tool. When gcloud is not on PATH, or
+    ``SPOT_GCP_TOKEN_SOURCE=metadata`` is set, uses the GCE metadata server's default service account.
+    """
+    if token_source_is_metadata():
+        return _metadata_auth(project_arg)
     try:
         project = project_arg or subprocess.run(
             ["gcloud", "config", "get", "project"], check=True,
@@ -110,7 +166,12 @@ def get_auth(project_arg: str | None) -> Auth:
             check=True, capture_output=True, text=True, timeout=15,
         ).stdout.strip()
     except FileNotFoundError as exc:
-        raise RuntimeError("gcloud is required for Application Default Credentials") from exc
+        try:
+            return _metadata_auth(project_arg)
+        except RuntimeError as meta_exc:
+            raise RuntimeError(
+                f"gcloud is not installed and the GCE metadata server fallback failed: {meta_exc}"
+            ) from exc
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.strip() or "No Application Default Credentials found"
         raise RuntimeError(f"Unable to read project or access token from gcloud: {detail}") from exc
@@ -120,6 +181,14 @@ def get_auth(project_arg: str | None) -> Auth:
         raise RuntimeError("No active project; use --project PROJECT_ID or `gcloud config set project PROJECT_ID`")
     if not token:
         raise RuntimeError("gcloud returned an empty ADC access token")
+    return Auth(token, project)
+
+
+def _metadata_auth(project_arg: str | None) -> Auth:
+    token = metadata_access_token()
+    project = project_arg or metadata_project_id()
+    if not project:
+        raise RuntimeError("No active project; use --project PROJECT_ID (metadata server returned none)")
     return Auth(token, project)
 
 
@@ -251,6 +320,83 @@ async def list_regions(api: AsyncGoogleApi, project: str) -> list[dict]:
         token = data.get("nextPageToken")
         if not token:
             return rows
+
+
+async def list_instances(api: AsyncGoogleApi, project: str) -> tuple[list[dict], list[str]]:
+    """List every VM instance (name, zone, status, machine type, labels, metadata items) with one aggregated
+    stream. Callers keep only the metadata keys they need; startup scripts are never stored."""
+    path = f"{API_ROOT}/projects/{quote(project, safe='')}/aggregated/instances"
+    query = {
+        "maxResults": "500",
+        "returnPartialSuccess": "true",
+        "fields": ("nextPageToken,unreachables,"
+                   "items/*/instances(name,zone,status,machineType,cpuPlatform,lastStartTimestamp,labels,metadata/items)"),
+    }
+    rows: list[dict] = []
+    unreachables: list[str] = []
+    while True:
+        data = await api.get_json(path, query)
+        for scoped in data.get("items", {}).values():
+            rows.extend(scoped.get("instances", []))
+        unreachables.extend(data.get("unreachables", []))
+        token = data.get("nextPageToken")
+        if not token:
+            return rows, unreachables
+        query["pageToken"] = token
+
+
+def runner_host_records(items: list[dict]) -> list[dict]:
+    """Dashboard host records for runner hosts in a GCE instance listing.
+
+    A runner host carries the ``spot-target`` label or recorded patch metadata. A host provisioned before either
+    existed is recognized by its runner-host name prefix (``RUNNER_HOST_NAME_PREFIXES``) and marked
+    ``unrecorded_host``: its target and patch are unknown, so the patch console lists it for every repository as
+    ``unknown`` and refuses to hot-patch until it is reprovisioned or patched with ``--patch-live``. VMs with
+    another ``spot-role`` (control VMs) and VMs outside those prefixes are never runner hosts. Only the recorded
+    patch and deployment keys are kept (see runner_fleet); every other metadata value, including startup
+    scripts, is dropped.
+    """
+    from .runner_fleet import (RUNNER_HOST_NAME_PREFIXES, gce_timestamp, patch_record_from_gce_item,
+                               runner_deployment_from_gce_item)
+    from .target_config import TARGET_LABEL_KEY
+
+    hosts = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
+        record = patch_record_from_gce_item(item)
+        target_label = str(labels.get(TARGET_LABEL_KEY, "") or "")
+        unrecorded = not target_label and not record["patch_sha256"] and not record["patch_pending_sha256"]
+        if unrecorded and (not item["name"].startswith(RUNNER_HOST_NAME_PREFIXES) or labels.get("spot-role")):
+            continue
+        host = {
+            "name": item["name"],
+            "zone": str(item.get("zone", "")).rsplit("/", 1)[-1],
+            "status": str(item.get("status", "UNKNOWN")),
+            "machine_type": str(item.get("machineType", "")).rsplit("/", 1)[-1],
+            "cpu_platform": str(item.get("cpuPlatform", "") or ""),
+            "last_start_timestamp": gce_timestamp(item.get("lastStartTimestamp")),
+            "role": "cicd_runner",
+            "target_label": target_label,
+            **runner_deployment_from_gce_item(item),
+            **record,
+        }
+        if unrecorded:
+            host["unrecorded_host"] = True
+        hosts.append(host)
+    return hosts
+
+
+async def machine_type_capacity(api: AsyncGoogleApi, project: str, zone: str, machine_type: str) -> dict:
+    """``{"vcpu": int, "ram_gib": float}`` for one machine type in one zone."""
+    path = (f"{API_ROOT}/projects/{quote(project, safe='')}/zones/{quote(zone, safe='')}/machineTypes/"
+            f"{quote(machine_type, safe='')}")
+    data = await api.get_json(path, {"fields": "guestCpus,memoryMb"})
+    vcpu, memory_mb = data.get("guestCpus"), data.get("memoryMb")
+    if not isinstance(vcpu, int) or not isinstance(memory_mb, int) or vcpu <= 0 or memory_mb <= 0:
+        raise RuntimeError(f"machine type {machine_type} in {zone} returned no capacity")
+    return {"vcpu": vcpu, "ram_gib": memory_mb / 1024}
 
 
 async def list_machines(api: AsyncGoogleApi, project: str,

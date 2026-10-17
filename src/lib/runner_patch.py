@@ -9,8 +9,10 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
+import urllib.parse
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -168,6 +170,7 @@ class RunnerPatch:
     schema: str = SCHEMA_VERSION
     repository: str = ""
     source_commit: str = ""
+    source_branch: str = ""
     hardware: HardwarePatch = field(default_factory=HardwarePatch)
     host: HostPatch = field(default_factory=HostPatch)
     container: ContainerPatch = field(default_factory=ContainerPatch)
@@ -204,6 +207,7 @@ class RunnerPatch:
     def to_canonical_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("source_commit", None)
+        payload.pop("source_branch", None)
         return payload
 
     @property
@@ -442,6 +446,19 @@ def parse_manifest_text(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if not stripped:
         raise ValueError("Runner patch manifest is empty")
+    if stripped.startswith("{"):
+        loaded = json.loads(stripped)
+        if not isinstance(loaded, dict):
+            raise ValueError("Manifest root must be a mapping")
+        return loaded
+    # Stdlib-only parsing keeps the patch SHA independent of optional packages.
+    try:
+        import tomllib
+        loaded = tomllib.loads(stripped)
+        if isinstance(loaded, dict) and loaded:
+            return loaded
+    except Exception:
+        pass
     return _parse_simple_yaml(stripped)
 
 
@@ -540,7 +557,12 @@ def _validate_mounts(mounts_list: Any) -> tuple[PatchMountSpec, ...]:
     return tuple(out)
 
 
-def validate_patch_dict(data: dict[str, Any], *, source_commit: str = "") -> RunnerPatch:
+def validate_patch_dict(
+    data: dict[str, Any],
+    *,
+    source_commit: str = "",
+    source_branch: str = "",
+) -> RunnerPatch:
     """Validate a parsed dictionary against spot-runner-patch-v1 and return a RunnerPatch."""
     if not isinstance(data, dict):
         raise ValueError("Runner patch manifest must be a mapping")
@@ -619,6 +641,7 @@ def validate_patch_dict(data: dict[str, Any], *, source_commit: str = "") -> Run
         schema=SCHEMA_VERSION,
         repository=repository,
         source_commit=source_commit,
+        source_branch=source_branch,
         hardware=HardwarePatch(
             arch=arch,
             isa=tuple(isa_list),
@@ -707,13 +730,86 @@ def load_patch_from_file(path: Path) -> RunnerPatch:
     return validate_patch_dict(parse_manifest_text(raw))
 
 
+GITHUB_API_BASE = "https://api.github.com"
+GH_API_TIMEOUT_SECONDS = 30.0
+MAX_GH_API_RESPONSE_BYTES = 16 * 1024 * 1024
+# Unreserved and delimiter characters, plus WELL-FORMED percent-escapes only: a git ref is sent percent-encoded
+# (see _ref_component), so '#', '%', '?', spaces, '/' and non-ASCII never appear raw in an endpoint.
+_ENDPOINT_RE = re.compile(r"^(?:[A-Za-z0-9._~/?=&:+,@-]|%[0-9A-Fa-f]{2})+$")
+
+
+def _ref_component(ref: str) -> str:
+    """Percent-encode a git ref as ONE URL path segment or query value.
+
+    Without this a valid branch such as ``fix#1`` turns ``#1`` into a URL fragment, ``a?b`` starts a query, and
+    ``feature/x`` or ``a b`` change or break the request path. Every byte outside the unreserved set is escaped
+    (``safe=""`` also escapes '/'), for the gh and urllib transports alike.
+    """
+    return urllib.parse.quote(ref, safe="")
+
+
+def _endpoint_is_safe(endpoint: str) -> bool:
+    """Accept only allowlisted endpoint text whose path segments never decode to '.' or '..'.
+
+    Decoding catches an escaped traversal such as ``%2E%2E`` or ``a%2F..%2Fb`` that a server could normalize.
+    Git forbids '..' in ref names, so no valid encoded ref is refused.
+    """
+    if not _ENDPOINT_RE.match(endpoint):
+        return False
+    for segment in endpoint.split("?", 1)[0].split("/"):
+        if any(part in (".", "..") for part in urllib.parse.unquote(segment).split("/")):
+            return False
+    return True
+
+
+def _gh_token(run_env: dict[str, str]) -> str:
+    return run_env.get("SPOT_CONFIG_GH_TOKEN") or run_env.get("GH_TOKEN") or ""
+
+
+def _gh_api_json_urllib(endpoint: str, token: str) -> Any:
+    """REST fallback used when the ``gh`` command-line tool is not installed (for example in a container)."""
+    import urllib.error
+    import urllib.request
+
+    clean = endpoint.lstrip("/")
+    if not _endpoint_is_safe(clean):
+        raise RuntimeError(f"gh api {endpoint} failed: refusing unexpected endpoint")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "spot-runner-patch/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(f"{GITHUB_API_BASE}/{clean}", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=GH_API_TIMEOUT_SECONDS) as response:  # noqa: S310 - fixed HTTPS host
+            body = response.read(MAX_GH_API_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        reason = "Not Found" if exc.code == 404 else (exc.reason or "error")
+        exc.close()
+        raise RuntimeError(f"gh api {endpoint} failed (HTTP {exc.code}): {reason}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"gh api {endpoint} failed: {type(exc).__name__}") from exc
+    if len(body) > MAX_GH_API_RESPONSE_BYTES:
+        raise RuntimeError(f"gh api {endpoint} failed: response exceeded the size limit")
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"gh api {endpoint} failed: non-JSON response") from exc
+
+
 def _gh_api_json(endpoint: str, *, env: dict[str, str] | None = None) -> Any:
     run_env = dict(os.environ)
     if env:
         run_env.update(env)
-    token = run_env.get("SPOT_CONFIG_GH_TOKEN") or run_env.get("GH_TOKEN")
+    token = _gh_token(run_env)
     if token:
         run_env["GH_TOKEN"] = token
+    if not _endpoint_is_safe(endpoint.lstrip("/")):
+        raise RuntimeError(f"gh api {endpoint} failed: refusing unexpected endpoint")
+    if shutil.which("gh", path=run_env.get("PATH")) is None:
+        return _gh_api_json_urllib(endpoint, token)
     result = subprocess.run(
         ["gh", "api", endpoint],
         text=True,
@@ -725,13 +821,55 @@ def _gh_api_json(endpoint: str, *, env: dict[str, str] | None = None) -> Any:
     return json.loads(result.stdout)
 
 
+_CONFIG_REPO_TARGET_RE = re.compile(r"^repos/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})\.yaml$")
+
+
+def list_config_repo_targets(
+    config_repo: str | None = None,
+    *,
+    org: str = "swack-tools",
+    env: dict[str, str] | None = None,
+) -> tuple[list[str], str]:
+    """List ``owner/repo`` for every ``repos/<owner>/<repo>.yaml`` in the config repo at its default-branch HEAD.
+
+    Returns ``(sorted targets, commit_sha)``. Raises RuntimeError when the listing cannot be read completely,
+    so callers can fail closed.
+    """
+    resolved = config_repo or f"{org}/{DEFAULT_CONFIG_REPO_NAME}"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", resolved):
+        raise ValueError(f"config_repo must be in OWNER/REPO format, got {resolved!r}")
+    _branch, sha = resolve_repo_default_branch(resolved, env=env)
+    tree = _gh_api_json(f"repos/{resolved}/git/trees/{sha}?recursive=1", env=env)
+    if not isinstance(tree, dict) or not isinstance(tree.get("tree"), list):
+        raise RuntimeError(f"Unexpected git tree payload for {resolved}@{sha}")
+    if tree.get("truncated"):
+        raise RuntimeError(f"Git tree listing for {resolved}@{sha} was truncated; refusing a partial target list")
+    targets: set[str] = set()
+    for entry in tree["tree"]:
+        if not isinstance(entry, dict) or entry.get("type") != "blob":
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str) or not path.startswith("repos/"):
+            continue
+        match = _CONFIG_REPO_TARGET_RE.match(path)
+        if match is None:
+            if path.endswith(".yaml") and path.count("/") == 2:
+                raise RuntimeError(f"Config repo {resolved} has an invalid repository manifest path {path!r}")
+            continue
+        repo = match.group(2)
+        if repo in (".", ".."):
+            raise RuntimeError(f"Config repo {resolved} has an invalid repository manifest path {path!r}")
+        targets.add(f"{match.group(1)}/{repo}")
+    return sorted(targets, key=str.lower), sha
+
+
 def resolve_repo_default_branch(repo_full_name: str, *, env: dict[str, str] | None = None) -> tuple[str, str]:
     """Query GitHub settings for the repository's default_branch and its current HEAD SHA."""
     meta = _gh_api_json(f"repos/{repo_full_name}", env=env)
     default_branch = meta.get("default_branch")
     if not isinstance(default_branch, str) or not default_branch.strip():
         raise RuntimeError(f"Repository {repo_full_name} does not report a valid default_branch")
-    commit = _gh_api_json(f"repos/{repo_full_name}/commits/{default_branch}", env=env)
+    commit = _gh_api_json(f"repos/{repo_full_name}/commits/{_ref_component(default_branch)}", env=env)
     sha = commit.get("sha")
     if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise RuntimeError(f"Could not resolve HEAD commit SHA for {repo_full_name}@{default_branch}")
@@ -740,7 +878,9 @@ def resolve_repo_default_branch(repo_full_name: str, *, env: dict[str, str] | No
 
 def _fetch_repo_file_at_ref(repo_full_name: str, file_path: str, ref: str, *, env: dict[str, str] | None = None) -> str | None:
     try:
-        payload = _gh_api_json(f"repos/{repo_full_name}/contents/{file_path}?ref={ref}", env=env)
+        payload = _gh_api_json(
+            f"repos/{repo_full_name}/contents/{urllib.parse.quote(file_path, safe='/')}?ref={_ref_component(ref)}",
+            env=env)
     except RuntimeError as exc:
         if "404" in str(exc) or "Not Found" in str(exc):
             return None
@@ -761,7 +901,7 @@ def fetch_patch_from_config_repo(
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target_repository):
         raise ValueError(f"target_repository must be in OWNER/REPO format, got {target_repository!r}")
     resolved_config_repo = config_repo or f"{org}/{DEFAULT_CONFIG_REPO_NAME}"
-    _, commit_sha = resolve_repo_default_branch(resolved_config_repo, env=env)
+    default_branch, commit_sha = resolve_repo_default_branch(resolved_config_repo, env=env)
 
     defaults_text = _fetch_repo_file_at_ref(resolved_config_repo, "defaults.yaml", commit_sha, env=env)
     defaults_dict = parse_manifest_text(defaults_text) if defaults_text else {}
@@ -771,10 +911,21 @@ def fetch_patch_from_config_repo(
     if repo_text is None:
         raise RuntimeError(f"No runner patch manifest found at {resolved_config_repo}:{repo_path}@{commit_sha}")
     repo_dict = parse_manifest_text(repo_text)
+    # A declared repository must be the target (case-insensitively, as the dashboard validator requires): a
+    # manifest naming another repository is never returned as this repository's patch.
+    for source, manifest in (("defaults.yaml", defaults_dict), (repo_path, repo_dict)):
+        declared = manifest.get("repository") if isinstance(manifest, dict) else None
+        if declared in (None, ""):
+            continue
+        if not isinstance(declared, str) or declared.lower() != target_repository.lower():
+            raise ValueError(f"{resolved_config_repo}:{source}@{commit_sha} declares repository {declared!r}, "
+                             f"not {target_repository!r}")
     merged = merge_patch_dicts(defaults_dict, repo_dict)
     if not merged.get("repository"):
         merged["repository"] = target_repository
-    return validate_patch_dict(merged, source_commit=commit_sha)
+    if str(merged["repository"]).lower() != target_repository.lower():
+        raise ValueError(f"Effective runner patch names repository {merged['repository']!r}, not {target_repository!r}")
+    return validate_patch_dict(merged, source_commit=commit_sha, source_branch=default_branch)
 
 
 def render_dockerfile(base_dockerfile: str, patch: RunnerPatch | None) -> str:
@@ -868,7 +1019,40 @@ def render_host_patch_script(patch: RunnerPatch | None) -> str:
         qual_b64 = base64.b64encode(patch.hardware.qualify_command.encode("utf-8")).decode("ascii")
         lines.append(f"printf '%s' '{qual_b64}' | base64 -d | bash -euo pipefail")
 
+    # No receipt here: the caller writes the pending marker before these steps and the completion receipt only
+    # after every later step (image build, containers) succeeded. See render_patch_receipt_commands.
+    return "\n".join(lines) + "\n"
+
+
+# Host-side patch state. ``pending.json`` names a patch whose application started and has not completed;
+# ``state.json`` is the completion receipt of the last patch that fully applied, bound to the boot it applied in
+# (``/proc/sys/kernel/random/boot_id``). Both are replaced by atomic rename. Only a completion receipt from the
+# current boot, with no pending marker, proves which patch a host runs.
+PATCH_STATE_DIR = "/var/lib/gha-runner-patch"
+RECEIPT_SCHEMA = "gha-runner-patch-receipt-v2"
+# Prints the state, the pending marker (base64, empty when absent), and the current boot id, one per line.
+PATCH_RECEIPT_READ_COMMAND = (
+    "sudo -n sh -c 'd=" + PATCH_STATE_DIR + "; printf \"state:\"; base64 -w0 \"$d/state.json\" 2>/dev/null; echo; "
+    "printf \"pending:\"; base64 -w0 \"$d/pending.json\" 2>/dev/null; echo; "
+    "printf \"boot:\"; cat /proc/sys/kernel/random/boot_id'"
+)
+
+
+def render_patch_pending_commands(patch: RunnerPatch) -> list[str]:
+    """Shell lines that mark ``patch`` as being applied, before any patch step changes the host."""
+    marker = {"receipt_schema": RECEIPT_SCHEMA, "pending_patch_sha256": patch.patch_sha256}
+    marker_b64 = base64.b64encode(json.dumps(marker, sort_keys=True).encode("utf-8")).decode("ascii")
+    return [
+        f"install -d -m 0755 {PATCH_STATE_DIR}",
+        f"printf '%s' '{marker_b64}' | base64 -d >{PATCH_STATE_DIR}/pending.json.tmp",
+        f"mv -f {PATCH_STATE_DIR}/pending.json.tmp {PATCH_STATE_DIR}/pending.json",
+    ]
+
+
+def render_patch_receipt_commands(patch: RunnerPatch) -> list[str]:
+    """Shell lines that write the completion receipt for ``patch``; they must run after every patch step."""
     receipt = {
+        "receipt_schema": RECEIPT_SCHEMA,
         "schema": patch.schema,
         "repository": patch.repository,
         "source_commit": patch.source_commit,
@@ -876,10 +1060,73 @@ def render_host_patch_script(patch: RunnerPatch | None) -> str:
         "manifest": patch.to_canonical_dict(),
     }
     receipt_b64 = base64.b64encode(json.dumps(receipt, sort_keys=True).encode("utf-8")).decode("ascii")
-    lines.append("install -d -m 0755 /var/lib/gha-runner-patch")
-    lines.append(f"printf '%s' '{receipt_b64}' | base64 -d >/var/lib/gha-runner-patch/state.json")
-    lines.append("chmod 0644 /var/lib/gha-runner-patch/state.json")
-    return "\n".join(lines) + "\n"
+    return [
+        f"install -d -m 0755 {PATCH_STATE_DIR}",
+        'patch_boot_id="$(cat /proc/sys/kernel/random/boot_id)"',
+        '[[ "$patch_boot_id" =~ ^[0-9a-f-]{36}$ ]] || { echo "Cannot read the boot id for the patch receipt" >&2; exit 1; }',
+        f"{{ printf '{{\"boot_id\":\"%s\",\"receipt\":' \"$patch_boot_id\"; printf '%s' '{receipt_b64}' | base64 -d; "
+        f"printf '}}'; }} >{PATCH_STATE_DIR}/state.json.tmp",
+        f"chmod 0644 {PATCH_STATE_DIR}/state.json.tmp",
+        f"mv -f {PATCH_STATE_DIR}/state.json.tmp {PATCH_STATE_DIR}/state.json",
+        f"rm -f {PATCH_STATE_DIR}/pending.json",
+    ]
+
+
+@dataclass(frozen=True)
+class HostPatchReceipt:
+    """What a host's patch state proves. ``manifest`` is the last completed (or legacy) patch, None for none;
+    ``proof`` is True only for a completion receipt from the current boot with no pending attempt.
+    ``pending_sha256`` names the attempt in the host's pending marker (``unknown`` when unreadable, empty when
+    there is none): its partial effects are on the host too (see classify_patch_diff)."""
+
+    manifest: dict[str, Any] | None
+    proof: bool
+    detail: str
+    pending_sha256: str = ""
+
+
+def parse_patch_receipt(output: str) -> HostPatchReceipt:
+    """Parse PATCH_RECEIPT_READ_COMMAND output; raises ValueError when the state can't be read or trusted."""
+    fields: dict[str, str] = {}
+    for line in str(output or "").splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key in ("state", "pending", "boot"):
+            fields[key] = value.strip()
+    boot = fields.get("boot", "")
+    if not re.fullmatch(r"[0-9a-f-]{36}", boot):
+        raise ValueError("the host's boot id is unreadable")
+
+    def decode(name: str) -> Any:
+        raw = fields.get(name, "")
+        return json.loads(base64.b64decode(raw, validate=True).decode("utf-8")) if raw else None
+
+    state, pending = decode("state"), decode("pending")
+    problems: list[str] = []
+    pending_sha = ""
+    if pending is not None:
+        sha = pending.get("pending_patch_sha256") if isinstance(pending, dict) else None
+        pending_sha = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha) else "unknown"
+        problems.append(f"an attempt to apply patch {str(sha or 'unknown')[:12]} has not completed")
+    manifest: dict[str, Any] | None = None
+    detail = "no patch receipt on the host"
+    if state is None:
+        pass
+    elif isinstance(state, dict) and isinstance(state.get("receipt"), dict):
+        receipt = state["receipt"]
+        manifest = receipt.get("manifest")
+        if (not isinstance(manifest, dict) or receipt.get("receipt_schema") != RECEIPT_SCHEMA
+                or validate_patch_dict(manifest).patch_sha256 != receipt.get("patch_sha256")):
+            raise ValueError("the host's patch receipt does not match its manifest")
+        if state.get("boot_id") != boot:
+            problems.append("the host rebooted since the completion receipt was written")
+        detail = "completion receipt"
+    elif isinstance(state, dict) and isinstance(state.get("manifest"), dict):
+        manifest = state["manifest"]
+        validate_patch_dict(manifest)
+        problems.append("the receipt predates completion receipts, so it may name a patch that failed part way")
+    else:
+        raise ValueError("the host's patch state is not a receipt")
+    return HostPatchReceipt(manifest, not problems, "; ".join(problems) or detail, pending_sha)
 
 
 def render_docker_run_args(patch: RunnerPatch | None) -> list[str]:
@@ -906,6 +1153,7 @@ def inject_startup_patch(startup_script: str, patch: RunnerPatch | None) -> str:
     if host_script:
         host_b64 = base64.b64encode(host_script.encode("utf-8")).decode("ascii")
         host_hook = (
+            "\n".join(render_patch_pending_commands(patch)) + "\n"
             f"printf '%s' '{host_b64}' | base64 -d >/opt/gha-runners/repo-host-patch.sh\n"
             "chmod 0755 /opt/gha-runners/repo-host-patch.sh\n"
             "/opt/gha-runners/repo-host-patch.sh\n"
@@ -914,6 +1162,13 @@ def inject_startup_patch(startup_script: str, patch: RunnerPatch | None) -> str:
         if build_anchor not in startup_script:
             raise RuntimeError("Startup script is missing build entrypoint anchor for host patch injection")
         startup_script = startup_script.replace(build_anchor, host_hook + build_anchor, 1)
+
+    receipt_anchor = "unset REGISTRATION_TOKEN\n"
+    if startup_script.count(receipt_anchor) != 1:
+        raise RuntimeError("Startup script is missing the registration-token anchor for the patch receipt")
+    # After every runner container started and right before the bootstrap completion marker.
+    startup_script = startup_script.replace(
+        receipt_anchor, receipt_anchor + "\n".join(render_patch_receipt_commands(patch)) + "\n", 1)
 
     extra_docker_flags = render_docker_run_args(patch)
     if extra_docker_flags:
@@ -929,13 +1184,102 @@ def inject_startup_patch(startup_script: str, patch: RunnerPatch | None) -> str:
     return startup_script
 
 
-def classify_patch_diff(current_manifest: dict[str, Any] | None, target: RunnerPatch) -> str:
-    """Classify the transition from a deployed manifest to target into noop, hot_patch, recreate_containers, or replace_vm."""
+_ARM64_FAMILIES = frozenset(
+    family for cap in ISA_CAPABILITIES.values() if cap["arch"] == "arm64" for family, _platform in cap["gce_platforms"]
+)
+
+
+def host_capacity_problems(
+    patch: RunnerPatch,
+    *,
+    machine_type: str,
+    vcpu: Any,
+    ram_gib: Any,
+    cpu_platform: str = "",
+) -> tuple[list[str], list[str]]:
+    """Check a host's observed capacity against every hardware constraint of ``patch``.
+
+    Returns ``(violations, unknowns)``: a violation means the host can never run the patch (a different VM is
+    needed); an unknown means a constraint could not be verified from what was observed. Both block a live patch.
+    """
+    violations: list[str] = []
+    unknowns: list[str] = []
+    hw = patch.hardware
+    family = str(machine_type or "").split("-", 1)[0]
+    if not family:
+        unknowns.append("the machine type is unknown, so the architecture cannot be checked")
+    else:
+        host_arch = "arm64" if family in _ARM64_FAMILIES else "x86_64"
+        if host_arch != hw.arch:
+            violations.append(f"{machine_type} is {host_arch}; the patch requires {hw.arch}")
+    if hw.min_vcpu is not None:
+        if not isinstance(vcpu, (int, float)) or isinstance(vcpu, bool) or vcpu <= 0:
+            unknowns.append(f"the host's vCPU count is unknown (the patch requires at least {hw.min_vcpu})")
+        elif vcpu < hw.min_vcpu:
+            violations.append(f"{machine_type} has {vcpu:g} vCPU; the patch requires at least {hw.min_vcpu}")
+    if hw.min_ram_gib is not None:
+        if not isinstance(ram_gib, (int, float)) or isinstance(ram_gib, bool) or ram_gib <= 0:
+            unknowns.append(f"the host's RAM is unknown (the patch requires at least {hw.min_ram_gib} GiB)")
+        elif ram_gib < hw.min_ram_gib:
+            violations.append(f"{machine_type} has {ram_gib:g} GiB RAM; the patch requires at least {hw.min_ram_gib} GiB")
+    allowed = patch.allowed_gce_platforms()
+    if allowed is not None and family:
+        if not cpu_platform:
+            unknowns.append(f"the host's CPU platform is unknown (the patch requires {', '.join(hw.isa)})")
+        elif (family, cpu_platform) not in allowed:
+            violations.append(f"{family} on {cpu_platform} does not provide {', '.join(hw.isa)}")
+    return violations, unknowns
+
+
+def destructive_patch_changes(current: RunnerPatch, target: RunnerPatch) -> list[str]:
+    """What moving from ``current`` (applied) to ``target`` would have to UNDO on the host or in its containers.
+
+    The live script only installs and writes; it never uninstalls a package, deletes a file or directory, resets
+    a sysctl, or reverses a script. So a host can hot-patch only to a target whose effects contain every applied
+    effect: a package, file path, sysctl key, or boot directory may be added, a file or sysctl rewritten in place
+    (the live script overwrites it whole), but none may be dropped, and a script that already ran must stay
+    byte-identical. ``hardware`` is excluded: labels are synced in full, and size/ISA are checked separately.
+    """
+    problems: list[str] = []
+    for section, cur, tgt in (("host", current.host, target.host), ("container", current.container, target.container)):
+        removed = [pkg for pkg in cur.apt_packages if pkg not in tgt.apt_packages]
+        if removed:
+            problems.append(f"{section}.apt_packages drops {', '.join(removed)}")
+        removed = sorted(set(cur.sysctl) - set(tgt.sysctl))
+        if removed:
+            problems.append(f"{section}.sysctl drops {', '.join(removed)}")
+        removed = sorted({f.path for f in cur.files} - {f.path for f in tgt.files})
+        if removed:
+            problems.append(f"{section}.files drops {', '.join(removed)}")
+    removed = [d for d in current.host.boot_mkdirs if d not in target.host.boot_mkdirs]
+    if removed:
+        problems.append(f"host.boot_mkdirs drops {', '.join(removed)}")
+    if current.host.boot_script.strip() and current.host.boot_script != target.host.boot_script:
+        problems.append("host.boot_script changes a script that already ran")
+    if current.container.dockerfile_run.strip() and current.container.dockerfile_run != target.container.dockerfile_run:
+        problems.append("container.dockerfile_run changes a script that already ran")
+    return problems
+
+
+def classify_patch_diff(current_manifest: dict[str, Any] | None, target: RunnerPatch, *,
+                        pending_sha256: str = "") -> str:
+    """Classify the transition from a deployed manifest to target into noop, hot_patch, recreate_containers, or replace_vm.
+
+    ``current_manifest`` is the last fully applied patch (None: the host never applied one). ``pending_sha256`` names
+    an attempt that started and never completed (empty: none; ``none``: a bootstrap that requested no patch). Its
+    partial effects are unknown unless it is the target itself, so anything else fails closed to ``replace_vm``.
+    Only additions and in-place rewrites are hot-patchable; any effect the target drops needs a new VM
+    (destructive_patch_changes), because neither the live script nor a container restart removes it.
+    """
+    if pending_sha256 and pending_sha256 not in ("none", target.patch_sha256):
+        return "replace_vm"
     if current_manifest is not None:
         current = validate_patch_dict(current_manifest)
         if current.patch_sha256 == target.patch_sha256:
             return "noop"
         if current.hardware.arch != target.hardware.arch or set(target.hardware.isa) - set(current.hardware.isa):
+            return "replace_vm"
+        if destructive_patch_changes(current, target):
             return "replace_vm"
         if current.container.mounts != target.container.mounts:
             return "recreate_containers"
@@ -984,6 +1328,7 @@ def render_live_hot_patch_script(
     lines = [
         "#!/usr/bin/env bash",
         "set -Eeuo pipefail",
+        *render_patch_pending_commands(patch),
         host_script.strip(),
         f"if [[ -d /opt/gha-runners/build ]]; then",
         f"  printf '%s' '{dockerfile_b64}' | base64 -d >/opt/gha-runners/build/Dockerfile",
@@ -998,10 +1343,12 @@ def render_live_hot_patch_script(
             f"  printf '%s' '{container_exec_b64}' | base64 -d | docker exec -i -u root \"$cid\" bash -euo pipefail"
         )
     for k, v in sorted(patch.container.sysctl.items()):
-        lines.append('  pid="$(docker inspect -f "{{.State.Pid}}" "$cid")"' )
+        lines.append('  pid="$(docker inspect -f "{{.State.Pid}}" "$cid")"')
         lines.append(f'  nsenter -t "$pid" -n sysctl -w {shlex.quote(f"{k}={v}")} >/dev/null')
     lines.extend([
         "done",
+        # Only after the host steps, the image build, and every container succeeded (set -e stops earlier).
+        *render_patch_receipt_commands(patch),
         f"echo 'LIVE_PATCH_APPLIED:{patch.patch_sha256}'",
     ])
     return "\n".join(lines) + "\n"
