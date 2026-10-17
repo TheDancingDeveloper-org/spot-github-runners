@@ -1173,13 +1173,25 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
 
     fleet = spot_instances(vms)
     overpriced = check_running_prices(fleet, args.project, args.max_daily_usd)
+    use_rotation = (
+        getattr(args, "make_before_break", False)
+        or getattr(args, "target", None) is not None
+        or getattr(args, "price_rotation", False)
+    )
+    if overpriced and use_rotation:
+        # A patched host this controller cannot relaunch with its patch is skipped, not allowed to
+        # stall the whole price path: restoration and normal scaling must keep running.
+        rotatable = []
+        for candidate in overpriced:
+            why = patched_rotation_hold(candidate, args)
+            if why:
+                LOG.warning("Make-before-break rotation held for %s: %s; keeping it running over the cap",
+                            vm_details(candidate), why)
+            else:
+                rotatable.append(candidate)
+        overpriced = rotatable
     if overpriced:
         vm = overpriced[0]
-        use_rotation = (
-            getattr(args, "make_before_break", False)
-            or getattr(args, "target", None) is not None
-            or getattr(args, "price_rotation", False)
-        )
         if use_rotation:
             LOG.info("Price exceeds cap for %s ($%s cap); initiating make-before-break rotation",
                      vm_details(vm), args.max_daily_usd)
@@ -1240,6 +1252,12 @@ def retire_completed_recoveries(state, state_path, only=None) -> None:
         write_scale_state(state_path, state)
 
 
+def _patch_recorded(value) -> bool:
+    """A recorded patch sha (or "invalid"), as opposed to absent or the NO_PATCH sentinel."""
+    from .runner_fleet import NO_PATCH
+    return bool(value) and str(value).lower() != NO_PATCH
+
+
 def patched_rotation_hold(outgoing_vm: GceVm, args: argparse.Namespace) -> str:
     """Why a patched host cannot be rotated automatically, or "" when it can.
 
@@ -1248,8 +1266,10 @@ def patched_rotation_hold(outgoing_vm: GceVm, args: argparse.Namespace) -> str:
     host would be retired for an unpatched one. Rotation needs this controller to launch with the
     same patch source (--patch-repo) the host was recorded with.
     """
-    patched = bool(getattr(outgoing_vm, "patch_sha256", "") or getattr(outgoing_vm, "patch_pending_sha256", "")
-                   or getattr(outgoing_vm, "patch_target", ""))
+    # patch_target alone is recorded for every repository target, patched or not, and "none" is
+    # the explicit no-patch record: neither means the host runs a patch.
+    patched = (_patch_recorded(getattr(outgoing_vm, "patch_sha256", ""))
+               or _patch_recorded(getattr(outgoing_vm, "patch_pending_sha256", "")))
     if not patched:
         return ""
     patch_repo = getattr(args, "patch_repo", None)
@@ -1275,9 +1295,10 @@ def begin_price_rotation(outgoing_vm: GceVm, vms: list[GceVm], runners: list[Git
 
     held = patched_rotation_hold(outgoing_vm, args)
     if held:
+        # Defensive: reconcile_prices already skips held hosts. No price work happened.
         LOG.warning("Make-before-break rotation held for %s: %s; keeping running host undisturbed",
                     vm_details(outgoing_vm), held)
-        return True
+        return False
 
     if offer is None:
         refresh = offer_refresher(args)

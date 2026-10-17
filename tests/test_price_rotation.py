@@ -2438,13 +2438,19 @@ class PatchedRotationHoldTests(unittest.TestCase):
         from lib.spot_runner_autoscaler import patched_rotation_hold
         args = SimpleNamespace(patch_repo=None)
         self.assertEqual(patched_rotation_hold(self.vm(), args), "")  # unpatched: rotate freely
+        # Review round 21: the explicit no-patch record and a bare repo target are not patches.
+        for fields in ({"patch_sha256": "none"}, {"patch_pending_sha256": "none"},
+                       {"patch_sha256": "none", "patch_target": "xbmc4lyfe/newznab-tmux"}):
+            with self.subTest(unpatched=fields):
+                self.assertEqual(patched_rotation_hold(self.vm(**fields), args), "")
         for fields in ({"patch_sha256": "a" * 64}, {"patch_pending_sha256": "b" * 64},
-                       {"patch_target": "xbmc4lyfe/newznab-tmux"}):
+                       {"patch_pending_sha256": "invalid"}):
             with self.subTest(fields=fields):
                 self.assertIn("no --patch-repo", patched_rotation_hold(self.vm(**fields), args))
         args.patch_repo = "swack-tools/oxidex"
         self.assertIn("comes from xbmc4lyfe/newznab-tmux",
-                      patched_rotation_hold(self.vm(patch_target="xbmc4lyfe/newznab-tmux"), args))
+                      patched_rotation_hold(self.vm(patch_sha256="a" * 64, patch_target="xbmc4lyfe/newznab-tmux"),
+                                            args))
         args.patch_repo = "XBMC4LYFE/newznab-tmux"
         self.assertEqual(patched_rotation_hold(self.vm(patch_sha256="a" * 64, patch_target="xbmc4lyfe/newznab-tmux"),
                                                args), "")
@@ -2454,7 +2460,23 @@ class PatchedRotationHoldTests(unittest.TestCase):
         args = SimpleNamespace(target="xbmc4lyfe/newznab-tmux", org="swack-tools", patch_repo=None)
         state = {}
         with patch("lib.spot_runner_autoscaler.offer_refresher") as refresher:
-            self.assertTrue(begin_price_rotation(self.vm(patch_sha256="a" * 64), [], [], args, state,
-                                                 Path("/tmp/unused.json")))
+            self.assertFalse(begin_price_rotation(self.vm(patch_sha256="a" * 64), [], [], args, state,
+                                                  Path("/tmp/unused.json")))
         refresher.assert_not_called()
         self.assertNotIn("price_rotation", state)
+
+    def test_held_host_does_not_stall_price_path_and_next_host_rotates(self):
+        """Review round 21: skip a held host instead of returning 'work done' for the whole price path."""
+        from lib import spot_runner_autoscaler as controller
+        patched = self.vm(patch_sha256="a" * 64)
+        plain = replace_vm(GceVm("oxidex-runners-other", "z", "RUNNING", "n4-highcpu-16", True, instance_id="o"),
+                           patch_sha256="none")
+        args = SimpleNamespace(target="xbmc4lyfe/newznab-tmux", org="swack-tools", patch_repo=None,
+                               project="p", max_daily_usd=Decimal("1"), make_before_break=True)
+        with patch.object(controller, "check_running_prices", return_value=[patched, plain]), \
+                patch.object(controller, "begin_price_rotation", return_value=True) as begin, \
+                patch.object(controller, "protected_heavy_routes", return_value={}), \
+                patch.object(controller, "heavy_route_capacity_hold", return_value=False), \
+                patch.object(controller, "runner_inventory_stale", return_value=False):
+            controller.reconcile_prices([patched, plain], [], args, {}, Path("/tmp/unused.json"))
+        self.assertIs(begin.call_args.args[0], plain)
