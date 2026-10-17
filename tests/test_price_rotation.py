@@ -1716,6 +1716,7 @@ class ReadinessTimeoutPreservesWorkTests(unittest.TestCase):
         delete_new.assert_not_called()
         quiesce.assert_not_called()
         self.assertNotIn("asia-east2-a/oxidex-runners-new", saved.get("intentional_deletions", []))
+        self.assertTrue(saved["replacement_cleanups"]["asia-east2-a/oxidex-runners-new"]["drain"])
 
     def test_idle_quiesced_replacement_is_deleted_intentionally(self):
         runners = [GitHubRunner(1, "gha-oxidex-runners-new-1", "offline", False, ("spot",))]
@@ -1985,8 +1986,8 @@ class ReplacementCleanupRetryTests(unittest.TestCase):
         write_scale_state(path, state)
         return key, state, path
 
-    def test_retry_hands_back_replacement_that_took_listeners_or_jobs(self):
-        """Codex M4 P1: a retry must re-check workload safety, not delete by identity alone."""
+    def test_retry_drains_replacement_that_took_listeners_or_jobs(self):
+        """Codex M4 rounds 1 and 9: never delete by identity alone, and never abandon the surplus host."""
         from lib.spot_runner_autoscaler import reconcile_replacement_cleanups
         repl = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new")
         args = SimpleNamespace(project="p")
@@ -1994,14 +1995,20 @@ class ReplacementCleanupRetryTests(unittest.TestCase):
                        GitHubRunner(9, "gha-oxidex-runners-new-1", "online", True, ("spot",))):
             with self.subTest(busy=runner.busy), tempfile.TemporaryDirectory() as tmpdir:
                 key, state, path = self._pending_cleanup(tmpdir, repl)
+                state["replacement_cleanups"][key]["target"] = "swack-tools"
+
+                def github(target, method, path_, body=None, **kwargs):
+                    return {"name": runner.name, "busy": runner.busy} if method == "GET" else {}
+
                 with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                        patch("lib.runner_drain.api", side_effect=github) as api, \
                         patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True):
                     reconcile_replacement_cleanups([repl], [runner], args, state, path)
-                delete.assert_not_called()
+                delete.assert_not_called()  # listeners were online this check
+                deletes = [c.args[2] for c in api.call_args_list if c.args[1] == "DELETE"]
+                self.assertEqual(deletes, [] if runner.busy else ["orgs/swack-tools/actions/runners/9"])
                 saved = read_scale_state(path)
-                self.assertEqual(saved["replacement_cleanups"], {})
-                self.assertNotIn(key, saved["intentional_deletions"])  # normal draining owns it now
-                self.assertNotIn(key, saved["intentional_deletion_ids"])
+                self.assertTrue(saved["replacement_cleanups"][key]["drain"])  # obligation kept
 
     def test_retry_keeps_replacement_with_active_remote_build(self):
         from lib.spot_runner_autoscaler import reconcile_replacement_cleanups
@@ -2012,6 +2019,34 @@ class ReplacementCleanupRetryTests(unittest.TestCase):
                     patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=False):
                 reconcile_replacement_cleanups([repl], [], SimpleNamespace(project="p"), state, path)
             delete.assert_not_called()
+            self.assertIn(key, read_scale_state(path)["replacement_cleanups"])  # retried, not abandoned
+
+    def test_kept_replacement_is_drained_and_deleted_across_checks(self):
+        from lib.spot_runner_autoscaler import _abort_runner_rotation, reconcile_replacement_cleanups
+        outgoing = GceVm("oxidex-runners-old", "z", "RUNNING", "n4-highcpu-16", True, instance_id="old")
+        repl = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new")
+        online = GitHubRunner(9, "gha-oxidex-runners-new-1", "online", False, ("spot",))
+        args = SimpleNamespace(project="p")
+        state = {"runner_inventory_observed_at": __import__("time").time(),
+                 "price_rotation": {"phase": "verify_readiness", "target": "swack-tools",
+                                    "outgoing_vm": {"name": outgoing.name, "zone": "z", "instance_id": "old"},
+                                    "replacement_vm": {"name": repl.name, "zone": "z", "instance_id": "new"}}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True), \
+                    patch("lib.runner_drain.api",
+                          side_effect=lambda t, m, p_, b=None, **k: {"name": online.name, "busy": False}
+                          if m == "GET" else {}):
+                _abort_runner_rotation(state["price_rotation"], [outgoing, repl], args, state, path,
+                                       "timeout", [online])
+                delete.assert_not_called()
+                self.assertTrue(state["replacement_cleanups"]["z/oxidex-runners-new"]["drain"])
+                reconcile_replacement_cleanups([outgoing, repl], [online], args, state, path)  # deregisters
+                delete.assert_not_called()
+                reconcile_replacement_cleanups([outgoing, repl], [], args, state, path)  # listener gone
+                delete.assert_called_once_with(repl, "p")
+                reconcile_replacement_cleanups([outgoing], [], args, state, path)  # absence confirmed
             self.assertEqual(read_scale_state(path)["replacement_cleanups"], {})
 
     def test_retry_waits_for_fresh_runner_inventory(self):
