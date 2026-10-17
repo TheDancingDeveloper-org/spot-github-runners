@@ -1542,6 +1542,92 @@ class TransferredVersionFloorTests(unittest.TestCase):
         self.assertEqual(h.transition["step"], "propagate")
 
 
+class CarryBackCurrentVersionTests(unittest.TestCase):
+    """Codex P1 round 23: the rollback compares against the outgoing VM's current state, not frozen_version."""
+
+    setup_rotation = ResumeFromPersistedStepTests.setup_rotation
+    with_new_vm = ResumeFromPersistedStepTests.with_new_vm
+    rollback_setup = ResumeFromPersistedStepTests.rollback_setup
+
+    def setup(self, old_version):
+        h = self.rollback_setup()  # frozen_version 7, cutover attempted, replacement unready past the grace
+        self.with_new_vm(h, healthy=False)  # the replacement holds v7
+        h.http.unhealthy("b")
+        h.http.versions["a"] = old_version
+        return h
+
+    def test_outgoing_vm_below_frozen_version_gets_the_replacement_state_before_deletion(self):
+        h = self.setup(old_version=5)  # it restarted mid-rotation and recovered an older KV snapshot
+        h.tick()
+        self.assertEqual(h.mutations(), [("freeze", "b"), ("import", "a"), ("unfreeze", "a"), ("origin", "a"),
+                                         ("delete", "spot-control-b")])
+        self.assertEqual(h.http.versions["a"], 7)
+        self.assertIn("--delete-disks=all", delete_call(h, "spot-control-b"))
+        self.assertEqual(h.state[cv.STATE_KEY].get("retained_disks", []), [])
+
+    def test_unconfirmable_outgoing_vm_keeps_replacement_disk(self):
+        h = self.setup(old_version=5)
+        h.http.health.pop("a")  # health unreachable: the import cannot be confirmed
+        h.gcloud.delete_rc = 1
+        with self.assertLogs(cv.LOG, level="ERROR"):
+            for _ in range(cv.STEP_RETRY_LIMIT):
+                h.tick()
+        self.assertEqual(h.events.count(("import", "a")), cv.STEP_RETRY_LIMIT)
+        self.assertIn("--keep-disks=boot", delete_call(h, "spot-control-b"))
+        manager = h.manager()
+        status = manager.status(manager.observe(want_offers=False))
+        self.assertIn("state_version None", status["carry_back_unconfirmed"])
+        h.gcloud.delete_rc = 0
+        h.tick()
+        self.assertIsNone(h.transition)
+        retained = h.state[cv.STATE_KEY]["retained_disks"]
+        self.assertEqual([d["disk"] for d in retained], ["spot-control-b"])
+        self.assertIn("state_version None", retained[0]["reason"])
+
+    def test_outgoing_vm_below_floor_without_importable_snapshot_keeps_replacement_disk(self):
+        h = self.setup(old_version=5)
+        h.gcloud.status("b", "TERMINATED")  # no replacement snapshot; KV only has v6 (below the floor 7)
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 6, "b", now=1))
+        h.state[cv.STATE_KEY]["last_start_at"] = {"b": h.clock[0]}  # just asked to start it: no restart now
+        h.tick()
+        self.assertNotIn(("import", "a"), h.events)
+        self.assertIn("--keep-disks=boot", delete_call(h, "spot-control-b"))
+        self.assertIn("no snapshot at or above", h.state[cv.STATE_KEY]["retained_disks"][0]["reason"])
+        self.assertIsNone(h.transition)
+
+    def test_outgoing_vm_at_frozen_version_needs_no_import(self):
+        h = self.setup(old_version=7)
+        h.tick()
+        self.assertEqual(h.mutations(), [("freeze", "b"), ("unfreeze", "a"), ("origin", "a"),
+                                         ("delete", "spot-control-b")])
+        self.assertIn("--delete-disks=all", delete_call(h, "spot-control-b"))
+
+    def test_misrouted_outgoing_health_is_not_its_version(self):
+        h = self.setup(old_version=7)
+        h.http.health["a"][1]["slot"] = "b"  # the old slot's hostname answered as another VM
+        h.tick()
+        self.assertNotIn(("delete", "spot-control-b"), h.events)
+        self.assertIn("state_version None", h.transition["error"])
+
+    def test_import_reply_alone_does_not_confirm(self):
+        h = self.setup(old_version=5)
+        real = h.http.__call__
+
+        def lying_import(method, url, headers, body, timeout):
+            status, raw = real(method, url, headers, body, timeout)
+            if url.endswith("/api/control/import") and "spot-origin-a" in url:
+                h.http.versions["a"] = 5  # claims success, still holds v5
+                return 200, b'{"state_version": 7, "imported": true}'
+            return status, raw
+
+        manager = cv.ControlVmManager(h.config, h.state, h.save, gcloud=h.gcloud, kv=h.kv, requester=lying_import,
+                                      offer_source=lambda: list(h.offers), clock=lambda: h.clock[0])
+        manager.tick(apply=True)
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertNotIn(("delete", "spot-control-b"), h.events)
+        self.assertIn("state_version 5", h.transition["error"])
+
+
 class InstanceIdentityTests(unittest.TestCase):
     """Codex P1: a VM recreated under a transition's slot name is never stopped, deleted, or reactivated."""
 

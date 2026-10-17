@@ -1737,8 +1737,11 @@ class ControlVmManager:
         snapshot (taken after freezing it) and the KV snapshot, so changes the replacement accepted are not
         lost even when write-behind lagged. True when the fallback may proceed.
 
-        Sets ``replacement_state_transferred`` only when the replacement's snapshot was captured and the
-        old VM confirmed holding at least that version; otherwise the replacement's boot disk is kept.
+        The old VM's *current* state_version comes from fresh health, never from the recorded
+        frozen_version: it may have restarted during the rotation and recovered an older KV snapshot.
+        Sets ``replacement_state_transferred`` only when the replacement's snapshot was captured and fresh
+        health shows the old VM holding at least the newest snapshot (and the frozen version); otherwise
+        the replacement's boot disk is kept, with the reason in ``carry_back_unconfirmed``.
         """
         if t.get("fallback_import_done"):
             return True
@@ -1754,24 +1757,47 @@ class ControlVmManager:
         if kv_snapshot is not None:
             candidates.append(kv_snapshot)
         newest = max(candidates, key=lambda s: s["state_version"], default=None)
-        confirmed = newest is None or newest["state_version"] <= floor
-        if not confirmed:
+        target = max(floor, newest["state_version"] if newest else 0)
+        current = self._old_state_version(t)
+        confirmed = current is not None and current >= target
+        importable = newest is not None and newest["state_version"] >= target  # i.e. not below the floor
+        problem = None
+        if not confirmed and importable:
+            # Below the best snapshot (or unknown): import it, then confirm with fresh health.
             status, body = self._control(t["old_slot"], "import", "POST", newest)
-            version = body.get("state_version") if isinstance(body, dict) else None
-            confirmed = (status == 200 and isinstance(version, int) and not isinstance(version, bool)
-                         and version >= newest["state_version"])
+            current = self._old_state_version(t)
+            confirmed = status == 200 and current is not None and current >= target
             if confirmed:
-                self._note("carried state_version %d back to old slot %s", version, t["old_slot"])
-            elif not self._fail_attempt(t, f"fallback import into slot {t['old_slot']} returned {status}"):
-                return False  # retry next tick
+                self._note("carried state_version %d back to old slot %s", current, t["old_slot"])
             else:
-                # A reachable old VM with older state beats no dashboard; the replacement's disk is kept.
-                self._note("could not confirm state transfer to slot %s; continuing rollback", t["old_slot"],
-                           level=logging.ERROR)
-        t["replacement_state_transferred"] = bool(confirmed and replacement is not None)
+                problem = (f"fallback import into slot {t['old_slot']} returned {status}; fresh health reports "
+                           f"state_version {current}, need >= {target}")
+        elif not confirmed:
+            problem = (f"old slot {t['old_slot']} reports state_version {current}, below {target}, and no "
+                       f"snapshot at or above it is available")
+        if not confirmed:
+            if importable and not self._fail_attempt(t, problem):
+                return False  # retry next tick
+            # A reachable old VM with older state beats no dashboard; the replacement's disk is kept.
+            self._note("could not confirm state transfer to slot %s (%s); continuing rollback and keeping the "
+                       "replacement's boot disk", t["old_slot"], problem, level=logging.ERROR)
+        if replacement is None and confirmed:
+            problem = f"replacement slot {t['new_slot']} could not be frozen for its own snapshot"
+        transferred = bool(confirmed and replacement is not None)
+        t["replacement_state_transferred"] = transferred
+        if not transferred and t.get("cutover_attempted"):
+            t["carry_back_unconfirmed"] = (f"rollback could not confirm the replacement's state reached slot "
+                                           f"{t['old_slot']}: {problem}")
         t["fallback_import_done"] = True
         self.save()
         return True
+
+    def _old_state_version(self, t: dict) -> int | None:
+        """The outgoing VM's current state_version from fresh health (frozen counts), or None if unknown."""
+        result = probe_health(self.requester, self.config, t["old_slot"])
+        if result.slot != t["old_slot"] or not result.hydrated:
+            return None
+        return result.state_version
 
     def _fence_replacement(self, t: dict, obs: Observation) -> bool:
         """True once the replacement can no longer write: confirmed frozen, or confirmed stopped or gone.
@@ -1855,7 +1881,8 @@ class ControlVmManager:
             # After a cutover attempt the replacement may hold changes that never reached the old VM.
             keep = bool(t.get("cutover_attempted")) and not t.get("replacement_state_transferred")
             if not self._delete_vm(t, new, role="new", keep_boot_disk=keep,
-                                   reason="rollback could not confirm its state reached the old VM"):
+                                   reason=t.get("carry_back_unconfirmed")
+                                   or "rollback could not confirm its state reached the old VM"):
                 return "wait"
         self.cstate["transition"] = None
         self.cstate["last_abort_at"] = self.clock()
@@ -1879,6 +1906,7 @@ class ControlVmManager:
             "last_transition_end_at": self.cstate.get("last_transition_end_at"),
             "last_abort_at": self.cstate.get("last_abort_at"),
             "retained_disks": self.cstate.get("retained_disks", []),
+            "carry_back_unconfirmed": (self.cstate.get("transition") or {}).get("carry_back_unconfirmed"),
             "old_state_unconfirmed": ((self.cstate.get("transition") or {}).get("old_state_unconfirmed_reason")
                                       if (self.cstate.get("transition") or {}).get("old_state_unconfirmed")
                                       else None),

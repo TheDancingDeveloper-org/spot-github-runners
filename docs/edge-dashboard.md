@@ -318,11 +318,14 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   state again, up to 5 times, and continues only after fresh health confirms the version. This can
   happen when the new VM restarts and loads an older KV snapshot. Until then the old VM and its disk
   stay. If the new VM disappears, or stays unready for 5 minutes while the old VM still runs, the
-  autoscaler rolls back. It first fences the new VM: a
-  confirmed freeze, or, when the freeze fails, a stop confirmed by fresh inventory. Only then does it import
-  the newer of its snapshot and the KV snapshot into the old VM, unfreezes the old VM, points
-  `origin:active` back at it, and deletes the new VM. Without a running old VM, it waits and deletes
-  nothing.
+  autoscaler rolls back. It first fences the new VM: a confirmed freeze, or, when the freeze fails, a
+  stop confirmed by fresh inventory. Next it reads the old VM's current `state_version` from fresh health
+  and compares it with the newer of the new VM's snapshot and the KV snapshot. The old VM can hold less
+  when it restarted and loaded an older KV snapshot. In that case the autoscaler imports the newer
+  snapshot into the old VM and confirms it with fresh health. If it can't confirm the transfer, it keeps
+  the new VM's boot disk and reports the reason as `carry_back_unconfirmed` in the `status` output. Then
+  it unfreezes the old VM, points `origin:active` back at it, and deletes the new VM. Without a running
+  old VM, it waits and deletes nothing.
 - **Uncertain creates**: if `gcloud` reports a failed create without a capacity or quota error, the
   autoscaler checks that zone for the instance before it tries another zone, and adopts the instance if
   it exists. If it can't tell, it waits.
