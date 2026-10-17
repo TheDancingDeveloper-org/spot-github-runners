@@ -3980,6 +3980,11 @@ def make_handler(
                 self._send_json({"status": "denied", "error": "GitHub authorization was denied"},
                                 status=HTTPStatus.FORBIDDEN)
                 return True
+            if result == "error" and polled.get("error") == "github_unavailable":
+                # The handshake is kept for retry; tell the browser to keep polling until the code expires.
+                self._send_json({"status": "retry", "retryable": True, "error": "GitHub is temporarily unreachable"},
+                                status=HTTPStatus.SERVICE_UNAVAILABLE, extra_headers={"Retry-After": "10"})
+                return True
             if result != "success":
                 self._send_json({"status": "error", "error": "GitHub device token request failed"},
                                 status=HTTPStatus.BAD_GATEWAY)

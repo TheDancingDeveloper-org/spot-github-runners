@@ -77,6 +77,7 @@ class FakeGitHub:
         self.code_challenges: dict[str, str] = {}
         self.calls: list[dict] = []
         self.raise_on_api = False
+        self.device_poll_errors = 0  # number of device-token polls that fail at the transport level
         self.on_api_call = None  # optional hook(path) run before answering a REST call
 
     def add_user(self, token: str, login: str, uid: int = 1000) -> None:
@@ -110,6 +111,9 @@ class FakeGitHub:
         if url == GITHUB_ACCESS_TOKEN_URL:
             form = urllib.parse.parse_qs((body or b"").decode())
             if form.get("grant_type") == ["urn:ietf:params:oauth:grant-type:device_code"]:
+                if self.device_poll_errors > 0:
+                    self.device_poll_errors -= 1
+                    raise GitHubApiError("simulated GitHub timeout")
                 resp = self.device_polls.pop(0) if self.device_polls else {"error": "authorization_pending"}
                 return 200, json.dumps(resp).encode()
             code = form.get("code", [""])[0]
@@ -190,6 +194,10 @@ global.fetch = async (url) => {
   }
   polls += 1;
   if (polls <= cfg.poll_failures) throw new TypeError("network reset");
+  if (polls <= cfg.poll_failures + (cfg.upstream_failures || 0)) {
+    return {ok: false, status: 503, headers: new Headers({"Retry-After": "10"}),
+      json: async () => ({status: "retry", retryable: true})};
+  }
   return {ok: true, status: 200, headers: new Headers(), json: async () => ({status: "authorized"})};
 };
 new Function(script)();
@@ -208,9 +216,11 @@ const out = {calls: [], assigned: null, prompted: false, resolved: null};
 const NATIVE_FETCH = async (url, init) => {
   out.calls.push(url);
   if (url === "/api/auth/status") {
-    return {ok: true, status: 200, json: async () => ({oauth: {enabled: cfg.oauth}})};
+    return {ok: true, status: 200, json: async () => ({oauth: {enabled: cfg.oauth},
+      authenticated: Boolean(cfg.authenticated)})};
   }
-  return {ok: false, status: 401, json: async () => ({error: "Unauthorized"})};
+  const code = cfg.code || 401;
+  return {ok: false, status: code, json: async () => ({error: "denied"})};
 };
 function getDashboardAuthToken() { return ""; }
 function storeDashboardAuthToken() { return ""; }
@@ -1441,6 +1451,24 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         recovered = _run_node(_DEVICE_HARNESS, script, {"code_fails": False, "poll_failures": 2})
         self.assertEqual(recovered["calls"].count("/auth/device/token"), 3)
         self.assertEqual(recovered["assigned"], "/")
+        upstream = _run_node(_DEVICE_HARNESS, script, {"code_fails": False, "poll_failures": 0, "upstream_failures": 2})
+        self.assertEqual(upstream["calls"].count("/auth/device/token"), 3)
+        self.assertEqual(upstream["assigned"], "/")
+
+    def test_transient_github_device_poll_failure_is_retryable(self):
+        self.start(client_secret="")
+        status, _, raw = self.request("POST", "/auth/device/code", body={})
+        handle = json.loads(raw)["device_handle"]
+        self.fake.device_poll_errors = 1
+        self.clock.now += 5
+        status, msg, raw = self.request("POST", "/auth/device/token", body={"device_handle": handle})
+        body = json.loads(raw)
+        self.assertEqual((status, body["status"], body["retryable"]), (503, "retry", True))
+        self.assertEqual(msg.get("Retry-After"), "10")
+        self.fake.device_polls = [{"access_token": "tok-admin"}]
+        self.clock.now += 10
+        status, _, raw = self.request("POST", "/auth/device/token", body={"device_handle": handle})
+        self.assertEqual((status, json.loads(raw)["status"]), (200, "authorized"))  # same code still works
 
     @unittest.skipUnless(shutil.which("node"), "node is required to execute the dashboard fetch wrapper")
     def test_expired_oauth_session_returns_to_login_gate(self):
@@ -1452,6 +1480,12 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         self.assertEqual((oauth["assigned"], oauth["prompted"], oauth["resolved"]), ("/", False, None))
         legacy = _run_node(_FETCH_WRAPPER_HARNESS, source, {"oauth": False})
         self.assertEqual((legacy["assigned"], legacy["prompted"], legacy["resolved"]), (None, True, 401))
+        # A session that a target-policy change no longer covers gets 403 and must re-sign in.
+        policy = _run_node(_FETCH_WRAPPER_HARNESS, source, {"oauth": True, "code": 403})
+        self.assertEqual((policy["assigned"], policy["resolved"]), ("/", None))
+        # A 403 for another reason (still authenticated) is returned to the caller unchanged.
+        other = _run_node(_FETCH_WRAPPER_HARNESS, source, {"oauth": True, "code": 403, "authenticated": True})
+        self.assertEqual((other["assigned"], other["prompted"], other["resolved"]), (None, False, 403))
 
     def test_unchanged_targets_need_no_reauth(self):
         self.start()

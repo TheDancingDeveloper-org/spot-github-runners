@@ -1423,7 +1423,7 @@ def render_login_gate_html(
       if (Date.now() > deadline) { status.textContent = "Code expired. Request a new one."; start.disabled = false; return; }
       const [pr, pd] = await postJson("/auth/device/token", {device_handle: d.device_handle});
       if (pr.ok && pd.status === "authorized") { window.location.assign("/"); return; }
-      if (pr.status === 0) {  // Transient network failure: keep polling until the code expires.
+      if (pr.status === 0 || pd.retryable === true) {  // Transient failure: keep polling until the code expires.
         status.textContent = "Connection lost; retrying...";
         setTimeout(poll, interval * 1000); return;
       }

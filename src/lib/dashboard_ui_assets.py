@@ -1593,18 +1593,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         storeDashboardAuthToken("");
         res = await NATIVE_FETCH(input, { ...reqInit, headers: new Headers(init.headers || {}) });
       }
-      if (res.status === 401) {
+      if (res.status === 401 || res.status === 403) {
         // With GitHub sign-in enabled the login gate at "/" offers every method (including the
-        // dashboard token); send an expired session there instead of prompting for a token.
-        let oauthEnabled = false;
+        // dashboard token). Send expired sessions (401) and sessions a target-policy change no longer
+        // covers (403) there for fresh sign-in, instead of prompting for a token.
+        let signInNeeded = false;
         try {
           const st = await NATIVE_FETCH("/api/auth/status", { credentials: "same-origin" });
           const info = st.ok ? await st.json() : {};
-          oauthEnabled = Boolean(info && info.oauth && info.oauth.enabled);
+          signInNeeded = Boolean(info && info.oauth && info.oauth.enabled && !info.authenticated);
         } catch (_err) {
-          oauthEnabled = false;
+          signInNeeded = false;
         }
-        if (oauthEnabled) {
+        if (signInNeeded) {
           window.location.assign("/");
           return new Promise(() => {});  // The page is navigating away; never hand callers the 401.
         }
