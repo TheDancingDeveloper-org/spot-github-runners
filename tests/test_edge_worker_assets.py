@@ -52,6 +52,8 @@ class WorkerSourceTests(unittest.TestCase):
         self.assertEqual(_js_string_constant(self.source, "SESSION_COOKIE_NAME"), vector["cookie_name"])
         self.assertEqual(_js_string_constant(self.source, "SESSION_COOKIE_NAME"), dashboard_auth.SESSION_COOKIE_NAME)
         self.assertEqual(_js_string_constant(self.source, "CLIENT_IP_HEADER"), dashboard_server.CLIENT_IP_HEADER)
+        self.assertEqual(_js_string_constant(self.source, "ORIGIN_MARKER_HEADER"), dashboard_server.ORIGIN_MARKER_HEADER)
+        self.assertEqual(_js_string_constant(self.source, "ORIGIN_MARKER_VALUE"), dashboard_server.ORIGIN_MARKER_VALUE)
         self.assertEqual(_js_string_constant(self.source, "KV_ORIGIN_KEY"), edge_state.KV_ORIGIN_KEY)
         self.assertEqual(_js_string_constant(self.source, "DEFAULT_ORIGIN_HOST_SUFFIX"),
                          "." + edge_state.DEFAULT_ORIGIN_DOMAIN)

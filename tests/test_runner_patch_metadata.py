@@ -91,6 +91,7 @@ class ProvisioningMetadataTests(unittest.TestCase):
             "spot-runner-patch-target": REPO, "spot-runner-prefix": "oxidex",
             "spot-runner-count": str(args.runner_count),  # the count select_sizing settled on
             "spot-runner-label": args.runner_label, "spot-runner-region": args.region,
+            "spot-runner-registration-target": REPO,  # repo-registered: no runner group
             "spot-runner-patch-sha256": TARGET.patch_sha256})
         [files] = cloud.files
         self.assertEqual(set(files), {"startup-script", "spot-runner-patch"})
@@ -101,6 +102,13 @@ class ProvisioningMetadataTests(unittest.TestCase):
         self.assertIn(f"spot-runner-patch={TARGET.patch_sha256[:16]}", labels)
         self.assertIn(f"spot-target={target_label_value(REPO)}", labels)
         self.assert_no_secret(cloud)
+
+    def test_org_registration_scope_and_group_are_recorded_apart_from_the_patch_repo(self):
+        args = args_for(TARGET)
+        args.target = "swack-tools"
+        plain, _manifest, _label = manager.runner_patch_record(args, TARGET)
+        self.assertEqual((plain["spot-runner-registration-target"], plain["spot-runner-group-id"],
+                          plain["spot-runner-patch-target"]), ("swack-tools", str(args.runner_group_id), REPO))
 
     def test_create_without_patch_records_none(self):
         _, cloud = self.provision(None)
@@ -149,7 +157,8 @@ class LivePatchMetadataTests(unittest.TestCase):
         cloud = GcloudRecorder(respond)
         with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
                 mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
-                mock.patch("lib.runner_manager.sync_runner_labels"):
+                mock.patch("lib.runner_manager.sync_runner_labels"), \
+                    mock.patch("lib.runner_manager.runner_label_sync_plan"):
             try:
                 result = manager.apply_live_patch(args, "us-central1-a")
             except RuntimeError as exc:
@@ -173,6 +182,40 @@ class LivePatchMetadataTests(unittest.TestCase):
         self.assertEqual(plain_metadata(cloud.calls[apply_index + 1])["spot-runner-patch-sha256"], TARGET.patch_sha256)
         self.assertEqual(cloud.files[-1]["spot-runner-patch"], canonical_json(TARGET))
 
+    def test_label_sync_preflight_failure_stops_before_the_host_changes(self):
+        args = args_for(TARGET, "--patch-live")
+        vm = runner_fleet.GceVm(args.instance_name, "us-central1-a", "RUNNING", "c4d-standard-32", True,
+                                instance_id="1", cpu_platform="AMD Turin")
+        cloud = GcloudRecorder(lambda c: json.dumps({"manifest": OLD.to_canonical_dict()})
+                               if c[:2] == ["compute", "ssh"] else "")
+        with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
+                mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
+                mock.patch("lib.runner_manager.runner_label_sync_plan",
+                           side_effect=RuntimeError("Runner group 10 is not enabled for swack-tools/oxidex")), \
+                mock.patch("lib.runner_manager.sync_runner_labels") as sync:
+            with self.assertRaisesRegex(RuntimeError, "Runner group"):
+                manager.apply_live_patch(args, "us-central1-a")
+        self.assertEqual(len([c for c in cloud.calls if c[:2] == ["compute", "ssh"]]), 1)  # only the receipt read
+        self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
+        sync.assert_not_called()
+        self.assertIs(args.deployment_vm, vm)  # strict pools verify cached identities against the observed VM
+
+    def test_label_sync_plan_checks_without_writing(self):
+        args = args_for(TARGET, "--patch-live")
+        rows = [{"id": n, "name": f"oxidex-{args.instance_name}-{n}", "labels": []} for n in range(1, args.runner_count + 1)]
+        commands = []
+
+        def run(cmd, **_kw):
+            commands.append(cmd)
+            return "\n".join(json.dumps(r) for r in rows)
+
+        with mock.patch("lib.runner_manager.run", side_effect=run):
+            manager.runner_label_sync_plan(args)
+            self.assertTrue(all("PUT" not in c for c in commands))
+            rows.pop()
+            with self.assertRaisesRegex(RuntimeError, "did not list all expected runners"):
+                manager.runner_label_sync_plan(args)
+
     def test_noop_backfills_from_the_hosts_own_receipt(self):
         result, cloud = self.run_live(TARGET, "")
         self.assertEqual(result, "noop")
@@ -191,7 +234,8 @@ class LivePatchMetadataTests(unittest.TestCase):
         ex = pc.GcloudHotPatchExecutor("proj", which=lambda _n: "/usr/bin/gcloud")
         host = {"name": "oxidex-runners-1", "zone": "us-central1-a", "machine_type": "c4d-standard-32",
                 "runner_prefix": "oxidex", "runners_count": 3, "runner_label": "oxidex-spot-ci",
-                "runner_region": "us-central1", "patch_target": REPO}
+                "runner_region": "us-central1", "patch_target": REPO,
+                "registration_target": "swack-tools", "runner_group_id": 10}
         vm = runner_fleet.GceVm("oxidex-runners-1", "us-central1-a", "RUNNING", "c4d-standard-32", True)
         for output, expect_metadata in (("no marker", False), (f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}", True)):
             def respond(command, _output=output):
@@ -202,7 +246,8 @@ class LivePatchMetadataTests(unittest.TestCase):
             cloud = GcloudRecorder(respond)
             with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
                     mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
-                    mock.patch("lib.runner_manager.sync_runner_labels"):
+                    mock.patch("lib.runner_manager.sync_runner_labels"), \
+                    mock.patch("lib.runner_manager.runner_label_sync_plan"):
                 if expect_metadata:
                     self.assertEqual(ex.apply(host, TARGET), {"result": "applied"})
                 else:
@@ -221,6 +266,8 @@ def gce_item(name, *, sha=None, manifest=None, target=REPO, label=True, status="
         items.append({"key": "spot-runner-label", "value": "oxidex-spot-ci"})
         items.append({"key": "spot-runner-region", "value": "us-central1"})
         items.append({"key": "spot-runner-heavy-pool", "value": "3"})
+        items.append({"key": "spot-runner-registration-target", "value": "swack-tools"})
+        items.append({"key": "spot-runner-group-id", "value": "10"})
     if manifest is not None:
         items.append({"key": "spot-runner-patch", "value": manifest})
     labels = {"spot-target": target_label_value(target)} if label else {}
@@ -282,8 +329,10 @@ class InventoryTests(unittest.TestCase):
         hosts = compute_api.runner_host_records(items)
         self.assertEqual([h["name"] for h in hosts], ["h1", "legacy"])  # the control VM is not a runner host
         self.assertEqual((hosts[0]["zone"], hosts[0]["machine_type"], hosts[0]["runner_prefix"], hosts[0]["runners_count"],
-                          hosts[0]["runner_label"], hosts[0]["runner_region"], hosts[0]["heavy_runner_pool"]),
-                         ("us-central1-a", "c4d-standard-32", "oxidex", 3, "oxidex-spot-ci", "us-central1", 3))
+                          hosts[0]["runner_label"], hosts[0]["runner_region"], hosts[0]["heavy_runner_pool"],
+                          hosts[0]["registration_target"], hosts[0]["runner_group_id"]),
+                         ("us-central1-a", "c4d-standard-32", "oxidex", 3, "oxidex-spot-ci", "us-central1", 3,
+                          "swack-tools", 10))
         self.assertNotIn("runner_label", hosts[1])  # legacy host: refused by the executor, never defaulted
         bad = gce_item("bad", sha=OLD.patch_sha256, extra=())
         for entry in bad["metadata"]["items"]:

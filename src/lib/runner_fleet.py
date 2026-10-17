@@ -41,6 +41,10 @@ RUNNER_COUNT_METADATA_KEY = "spot-runner-count"
 RUNNER_LABEL_METADATA_KEY = "spot-runner-label"
 RUNNER_REGION_METADATA_KEY = "spot-runner-region"
 RUNNER_HEAVY_POOL_METADATA_KEY = "spot-runner-heavy-pool"
+# The GitHub scope the runners registered with (an org such as swack-tools, or owner/repo) and, for org scopes, the
+# runner group; these can differ from spot-runner-patch-target (the patch's repository).
+RUNNER_REGISTRATION_TARGET_METADATA_KEY = "spot-runner-registration-target"
+RUNNER_GROUP_METADATA_KEY = "spot-runner-group-id"
 PATCH_LABEL_SHA_CHARS = 16
 NO_PATCH = "none"
 # GCE allows 256 KiB per metadata value and 512 KiB in total, and the startup script (with the patch embedded)
@@ -93,6 +97,13 @@ def runner_deployment_from_gce_item(item: dict) -> dict[str, Any]:
     heavy = metadata.get(RUNNER_HEAVY_POOL_METADATA_KEY, "").strip()
     if heavy in ("2", "3"):
         out["heavy_runner_pool"] = int(heavy)
+    registration = metadata.get(RUNNER_REGISTRATION_TARGET_METADATA_KEY, "").strip()
+    parts = registration.split("/")
+    if registration and len(parts) <= 2 and all(p and all(c.isalnum() or c in "._-" for c in p) for p in parts):
+        out["registration_target"] = registration
+    group = metadata.get(RUNNER_GROUP_METADATA_KEY, "").strip()
+    if group.isdigit() and int(group) > 0:
+        out["runner_group_id"] = int(group)
     return out
 
 

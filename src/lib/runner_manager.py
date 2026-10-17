@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from typing import Any
 from datetime import datetime, timezone
 from dataclasses import asdict
 from decimal import Decimal
@@ -36,8 +37,10 @@ from .runner_fleet import (
     RUNNER_COUNT_METADATA_KEY,
     RUNNER_HEAVY_POOL_METADATA_KEY,
     RUNNER_LABEL_METADATA_KEY,
+    RUNNER_GROUP_METADATA_KEY,
     RUNNER_PREFIX_METADATA_KEY,
     RUNNER_REGION_METADATA_KEY,
+    RUNNER_REGISTRATION_TARGET_METADATA_KEY,
     GceVm,
     gce_metadata_items,
     list_gcloud_vms,
@@ -466,6 +469,12 @@ def runner_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) -> 
     heavy = getattr(args, "heavy_runner_pool", None)
     if heavy in (2, 3):
         plain[RUNNER_HEAVY_POOL_METADATA_KEY] = str(heavy)
+    # The scope the runners registered with (org or repo) and its runner group, which label sync needs.
+    registration = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    plain[RUNNER_REGISTRATION_TARGET_METADATA_KEY] = registration.name
+    group = getattr(args, "runner_group_id", None)
+    if registration.is_org and isinstance(group, int) and not isinstance(group, bool) and group > 0:
+        plain[RUNNER_GROUP_METADATA_KEY] = str(group)
     if patch is None:
         plain[PATCH_SHA_METADATA_KEY] = NO_PATCH
         return plain, None, NO_PATCH
@@ -751,8 +760,9 @@ def verify_strict_identities(args,org_rows=None):
     validate_strict_identity_join(group_ids,cached,org_rows)
 
 
-def sync_runner_labels(args: argparse.Namespace) -> None:
-    """Ensure every Spot VM runner has the common scheduling labels."""
+def runner_label_sync_plan(args: argparse.Namespace) -> tuple[Any, list[dict], list[str], dict[str, int]]:
+    """Every read-only check label sync depends on: group and strict-pool verification, and that GitHub lists
+    every expected runner. Returns (target, runner rows, desired labels, expected names); raises otherwise."""
     target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
     if getattr(args, 'heavy_runner_pool', None):
         verify_runner_group(args)
@@ -761,13 +771,20 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
                       for n in range(1, args.runner_count + 1)}
     output = run(["gh", "api", "--paginate", target.runners_url,
                   "--jq", ".runners[] | @json"], quiet=True)
-    if getattr(args, 'heavy_runner_pool', None):verify_strict_identities(args,[json.loads(line)for line in output.splitlines()if line.strip()])
+    rows = [json.loads(line) for line in output.splitlines() if line.strip()]
+    if getattr(args, 'heavy_runner_pool', None):
+        verify_strict_identities(args, rows)
+    missing = sorted(set(expected_names) - {row.get("name") for row in rows})
+    if missing:
+        raise RuntimeError(f"GitHub did not list all expected runners for label sync: {missing}")
+    return target, rows, _desired_runner_labels(args), expected_names
+
+
+def sync_runner_labels(args: argparse.Namespace) -> None:
+    """Ensure every Spot VM runner has the common scheduling labels."""
+    target, rows, desired, expected_names = runner_label_sync_plan(args)
     seen: set[str] = set()
-    desired = _desired_runner_labels(args)
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        runner = json.loads(line)
+    for runner in rows:
         name = runner.get("name")
         if name not in expected_names:
             continue
@@ -791,6 +808,7 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     if patch is None:
         raise RuntimeError("Live patching requires --patch-repo or --patch-file")
     vm = observed_deployment_vm(args, zone)
+    args.deployment_vm = vm  # Strict pools verify cached runner identities against this VM.
     if not vm.running:
         raise RuntimeError(f"Cannot hot-patch non-running VM: {vm_details(vm)}")
     if vm.machine_type and vm.machine_type != args.instance_type:
@@ -817,6 +835,8 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
             f"Patch {patch.patch_sha256[:12]} modifies container bind mounts; "
             "containers must be drained and recreated instead of --patch-live"
         )
+    # Everything label sync needs is checked BEFORE the host changes, so nothing fails after the patch applied.
+    runner_label_sync_plan(args)
     prefix = f"{args.runner_prefix}-"
     live_script = render_live_hot_patch_script(
         patch,

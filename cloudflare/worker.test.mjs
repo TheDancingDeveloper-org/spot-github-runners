@@ -8,6 +8,8 @@ import { dirname, join } from "node:path";
 
 import worker, {
   CLIENT_IP_HEADER,
+  ORIGIN_MARKER_HEADER,
+  ORIGIN_MARKER_VALUE,
   SESSION_COOKIE_NAME,
   SESSION_PURPOSE_LABEL,
   UNAVAILABLE_ERROR,
@@ -386,6 +388,27 @@ test("backend's own 503 wait body passes through for API clients", async () => {
   await assertWaitHtml(await handleRequest(authed("/", { headers: htmlNav }), makeEnv(), { fetch: f, now: NOW }));
 });
 
+test("dashboard-marked 5xx application errors pass through instead of becoming an outage", async () => {
+  const marked = { "Content-Type": "application/json", [ORIGIN_MARKER_HEADER]: ORIGIN_MARKER_VALUE };
+  for (const [status, body] of [[502, '{"error":"GitHub device authorization is unavailable"}'],
+                                [503, '{"status":"retry","retryable":true}'], [504, '{"error":"x"}']]) {
+    const f = fakeFetch(() => new Response(body, { status, headers: marked }));
+    const res = await handleRequest(authed("/api/patches/save", { method: "POST", body: "{}" }), makeEnv(),
+      { fetch: f, now: NOW });
+    assert.equal(res.status, status);
+    assert.equal(await res.text(), body);
+    assert.equal(res.headers.get("Cache-Control"), "no-store");
+  }
+  // The dashboard's own wait body still means "wait", and an unmarked 502 (cloudflared, edge) is still an outage.
+  const wait = fakeFetch(() => new Response(JSON.stringify({ error: UNAVAILABLE_ERROR }), { status: 503, headers: marked }));
+  const res = await handleRequest(authed("/api/overview"), makeEnv(), { fetch: wait, now: NOW });
+  assert.equal((await res.json()).error, UNAVAILABLE_ERROR);
+  const bare = fakeFetch(() => new Response('{"error":"x"}', { status: 502, headers: { "Content-Type": "application/json" } }));
+  await assertWaitJson(await handleRequest(authed("/api/overview"), makeEnv(), { fetch: bare, now: NOW }));
+  const spoofed = fakeFetch(() => new Response("<html>", { status: 502, headers: { [ORIGIN_MARKER_HEADER]: "other" } }));
+  await assertWaitJson(await handleRequest(authed("/api/overview"), makeEnv(), { fetch: spoofed, now: NOW }));
+});
+
 test("classifyOriginResponse", () => {
   const wait = JSON.stringify({ error: UNAVAILABLE_ERROR });
   assert.equal(classifyOriginResponse(200, "application/json", ""), "pass");
@@ -396,6 +419,8 @@ test("classifyOriginResponse", () => {
   assert.equal(classifyOriginResponse(503, "text/html", wait), "unavailable");
   assert.equal(classifyOriginResponse(530, "text/html", "<html>"), "unavailable");
   assert.equal(classifyOriginResponse(502, "application/json", "{"), "unavailable");
+  assert.equal(classifyOriginResponse(502, "application/json", "{}", true), "application_error");
+  assert.equal(classifyOriginResponse(503, "application/json", wait, true), "backend_wait");
 });
 
 test("default export fetch handler wires env through", async () => {

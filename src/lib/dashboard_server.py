@@ -140,6 +140,8 @@ EXTERNAL_MUTATION_PATHS = frozenset({"/api/patches/save", "/api/patches/hot-patc
 # client-supplied X-Spot-* header. It is trusted only from a loopback peer (the local cloudflared), and
 # only for rate-limit bucketing.
 CLIENT_IP_HEADER = "X-Spot-Client-Ip"
+ORIGIN_MARKER_HEADER = "X-Spot-Origin"
+ORIGIN_MARKER_VALUE = "dashboard"
 FORWARDED_CLIENT_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "X-Forwarded-For", CLIENT_IP_HEADER)
 MAX_CONTROLLED_TARGETS_HISTORY = 50
 SESSION_TOO_LARGE_ERROR = (
@@ -158,6 +160,7 @@ FREEZE_MARKER_SUFFIX = ".frozen"
 # How long a freeze waits for in-flight external changes (pull requests, hot-patches) to finish and persist
 # their idempotency records; kept under the control VM manager's 60-second control-call timeout.
 FREEZE_EXTERNAL_DRAIN_SECONDS = 45.0
+EXTERNAL_PENDING_RETRY_SECONDS = 3
 
 LOG = logging.getLogger("spot_dashboard")
 
@@ -1057,7 +1060,8 @@ class DashboardStore:
         # with KV before it accepts a change or publishes.
         self._writer_synced = False
         self._defer: dict[str, Any] | None = None
-        self._external_inflight: set[str] = set()
+        # Idempotency-Key -> (method, path, body fingerprint) of external changes that are still running.
+        self._external_inflight: dict[str, tuple[str, str, str]] = {}
         # Signalled whenever an external change finishes, so a freeze can wait for in-flight ones to persist.
         self._external_done = threading.Condition(self._lock)
         self.freeze_drain_seconds = FREEZE_EXTERNAL_DRAIN_SECONDS
@@ -1929,15 +1933,19 @@ class DashboardStore:
         except (TypeError, ValueError):
             return {"status": "ok" if status < 400 else "error"}
 
-    def run_external(self, key: str, method: str, path: str, fn: Any) -> tuple[int, Any, bool]:
+    def run_external(self, key: str, method: str, path: str, fn: Any, *, fingerprint: str = "") -> tuple[int, Any, bool]:
         """Run a change whose side effect is outside dashboard state (GitHub, runner hosts) exactly once per key.
 
         The same gates as :meth:`run_request` apply (raises DashboardFrozenError), but ``fn`` runs WITHOUT the
-        store lock, because it makes slow network calls. A concurrent request with the same key gets 409, a
-        later one replays the stored response (``replayed`` True). Responses below 500 are stored.
+        store lock, because it makes slow network calls. ``fingerprint`` identifies the request body.
+        - A retry of the same request while the first is still running gets 202 ``{"status": "pending"}`` (the
+          browser waits and retries with the same key, for example after the edge Worker timed out).
+        - A later retry replays the stored response (``replayed`` True). Responses below 500 are stored.
+        - The same key with a different method, path, or body gets 422, running or finished.
         """
         if not key:
             raise ValueError("an Idempotency-Key is required")
+        mismatch = (422, {"error": "Idempotency-Key was already used for a different request"}, False)
         self._mutation_preflight()
         with self._lock:
             self._mutation_locked_checks()
@@ -1946,17 +1954,22 @@ class DashboardStore:
             records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, now)
             existing = records.get(key)
             if existing is not None:
-                if existing.get("m") != method or existing.get("p") != path:
-                    return 422, {"error": "Idempotency-Key was already used for a different request"}, False
+                if existing.get("m") != method or existing.get("p") != path or existing.get("f", fingerprint) != fingerprint:
+                    return mismatch
                 return int(existing.get("s", 200)), copy.deepcopy(existing.get("b")), True
-            if key in self._external_inflight:
-                return 409, {"error": "A request with this Idempotency-Key is still running"}, False
-            self._external_inflight.add(key)
+            running = self._external_inflight.get(key)
+            if running is not None:
+                if running != (method, path, fingerprint):
+                    return mismatch
+                return 202, {"status": "pending", "pending_retry": True,
+                             "retry_after_seconds": EXTERNAL_PENDING_RETRY_SECONDS,
+                             "message": "Still running; retry with the same Idempotency-Key for the result"}, False
+            self._external_inflight[key] = (method, path, fingerprint)
         try:
             status, body = fn()
         except BaseException:
             with self._lock:
-                self._external_inflight.discard(key)
+                self._external_inflight.pop(key, None)
                 self._external_done.notify_all()
             raise
         with self._lock:
@@ -1965,8 +1978,8 @@ class DashboardStore:
                     return status, body, False
                 raw_records = self.state.get(IDEMPOTENCY_STATE_KEY)
                 records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, self._clock())
-                records[key] = {"m": method, "p": path, "s": int(status), "b": self._replay_copy(status, body),
-                                "t": self._clock()}
+                records[key] = {"m": method, "p": path, "f": fingerprint, "s": int(status),
+                                "b": self._replay_copy(status, body), "t": self._clock()}
                 # Recorded in memory first and kept there even if the write fails: a completed external result
                 # is never dropped, and the next successful save or a freeze snapshot carries it.
                 self.state[IDEMPOTENCY_STATE_KEY] = self._prune_idempotency(records, self._clock())
@@ -1979,7 +1992,7 @@ class DashboardStore:
                 return status, body, False
             finally:
                 # Released only after the record is in state, so a waiting freeze snapshots it.
-                self._external_inflight.discard(key)
+                self._external_inflight.pop(key, None)
                 self._external_done.notify_all()
 
     def _normalize_project_derived_fields(self) -> None:
@@ -4670,6 +4683,9 @@ def make_handler(
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            # Marks a response the dashboard itself produced, so the edge Worker never mistakes an application
+            # 5xx (for example a GitHub permission error) for the control VM being down.
+            self.send_header(ORIGIN_MARKER_HEADER, ORIGIN_MARKER_VALUE)
             if extra_headers:
                 for k, v in extra_headers.items():
                     self.send_header(k, v)
@@ -4690,6 +4706,9 @@ def make_handler(
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            # Marks a response the dashboard itself produced, so the edge Worker never mistakes an application
+            # 5xx (for example a GitHub permission error) for the control VM being down.
+            self.send_header(ORIGIN_MARKER_HEADER, ORIGIN_MARKER_VALUE)
             if extra_headers:
                 for k, v in extra_headers.items():
                     self.send_header(k, v)
@@ -4703,6 +4722,9 @@ def make_handler(
             self.send_header("Location", location)
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
+            # Marks a response the dashboard itself produced, so the edge Worker never mistakes an application
+            # 5xx (for example a GitHub permission error) for the control VM being down.
+            self.send_header(ORIGIN_MARKER_HEADER, ORIGIN_MARKER_VALUE)
             for cookie_hdr in cookies or []:
                 self.send_header("Set-Cookie", cookie_hdr)
             self.end_headers()
@@ -5770,18 +5792,23 @@ def make_handler(
                     if path == "/api/patches/save":
                         return HTTPStatus.OK, patch_console.save(
                             str(payload.get("path") or ""), payload.get("content"), payload.get("base_sha"),
-                            payload.get("message"))
+                            payload.get("message"), idempotency_key=key)
                     return patch_console.hot_patch(str(payload.get("repository") or ""),
                                                    payload.get("patch_sha256"), self._fleet_instances())
                 except PatchConsoleError as exc:
                     return exc.status, {"error": str(exc), **exc.body}
 
+            fingerprint = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
             try:
-                status, body, replayed = store.run_external(key, "POST", path, run)
+                status, body, replayed = store.run_external(key, "POST", path, run, fingerprint=fingerprint)
             except DashboardFrozenError:
                 self._send_unavailable()
                 return
-            self._send_json(body, status=status, extra_headers={"Idempotent-Replay": "true"} if replayed else None)
+            headers = {"Idempotent-Replay": "true"} if replayed else {}
+            if status == HTTPStatus.ACCEPTED and isinstance(body, dict) and body.get("pending_retry"):
+                headers["Retry-After"] = str(body.get("retry_after_seconds", EXTERNAL_PENDING_RETRY_SECONDS))
+            self._send_json(body, status=status, extra_headers=headers or None)
 
         def _reject_method(self, method: str) -> None:
             parsed = urlparse(self.path)

@@ -350,7 +350,8 @@ container:
 
         with patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
              patch("lib.runner_manager.gcloud", side_effect=fake_gcloud), \
-             patch("lib.runner_manager.sync_runner_labels") as sync_labels:
+             patch("lib.runner_manager.sync_runner_labels") as sync_labels, \
+             patch("lib.runner_manager.runner_label_sync_plan") as preflight:
             result = manager.apply_live_patch(args, "asia-south2-a")
 
         self.assertEqual(result, "hot_patch")
@@ -359,6 +360,7 @@ container:
         self.assertEqual([c[:3] for c in ssh_commands[2:]],
                          [["compute", "instances", "add-metadata"], ["compute", "instances", "add-labels"]])
         sync_labels.assert_called_once_with(args)
+        preflight.assert_called_once_with(args)  # checked before the live script ran
 
         live_script = render_live_hot_patch_script(updated, base_dockerfile=RUNNER_DOCKERFILE, runner_prefix="oxidex-asia-")
         self.assertIn('docker exec -i -u root "$cid" bash -euo pipefail', live_script)

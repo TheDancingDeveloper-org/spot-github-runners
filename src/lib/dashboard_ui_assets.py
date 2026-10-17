@@ -1704,6 +1704,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    async function externalChangePendingSeconds(res) {
+      if (!res || res.status !== 202) return null;
+      try {
+        const data = await res.clone().json();
+        if (!data || data.status !== "pending" || data.pending_retry !== true) return null;
+        return Math.min(30, Math.max(1, Number(data.retry_after_seconds) || 3));
+      } catch (_err) {
+        return null;
+      }
+    }
+
     async function fetchWithControlVmRetry(input, reqInit) {
       // Retries the SAME request (same Idempotency-Key) after the control VM comes back.
       for (;;) {
@@ -1719,6 +1730,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
         if (await isControlVmUnavailable(res)) {
           await waitForControlVm();
+          continue;
+        }
+        const pendingSeconds = await externalChangePendingSeconds(res);
+        if (pendingSeconds !== null) {
+          // A change with this Idempotency-Key is still running (for example the edge timed out a long save or
+          // hot-patch): keep asking with the same key until the stored result comes back.
+          await new Promise(resolve => setTimeout(resolve, pendingSeconds * 1000));
           continue;
         }
         return res;

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 import re
@@ -70,10 +71,12 @@ class PatchConsoleError(RuntimeError):
 
 
 class GitHubRestError(PatchConsoleError):
-    status = 502
+    # 424 Failed Dependency, not 502: GitHub (or Compute Engine) failed, not the control VM. The edge Worker
+    # treats a gateway 5xx as an outage and would retry it forever.
+    status = 424
 
     def __init__(self, message: str, *, http_status: int = 0) -> None:
-        super().__init__(message)
+        super().__init__(message, body={"code": "upstream_error", "upstream_status": http_status})
         self.http_status = http_status
 
 
@@ -83,6 +86,10 @@ class ConflictError(PatchConsoleError):
 
 class InvalidRequestError(PatchConsoleError):
     status = 400
+
+
+class IdempotencyMismatchError(PatchConsoleError):
+    status = 422
 
 
 class HostRefusedError(PatchConsoleError):
@@ -208,6 +215,24 @@ class ConfigRepoClient:
         except (ValueError, UnicodeDecodeError) as exc:
             raise GitHubRestError(f"{self.repo}:{path}@{ref} is not UTF-8 text") from exc
         return text, payload["sha"]
+
+    def branch_head_or_none(self, branch: str) -> str | None:
+        try:
+            return self.branch_head(branch)
+        except GitHubRestError as exc:
+            if exc.http_status == 404:
+                return None
+            raise
+
+    def find_pull_request(self, branch: str) -> dict[str, Any] | None:
+        """The pull request (open or closed) whose head is ``branch`` in this repository, or None."""
+        owner = self.repo.split("/", 1)[0]
+        head = urllib.parse.quote(f"{owner}:{branch}", safe="")
+        _, prs = self._call("GET", f"repos/{self.repo}/pulls?head={head}&state=all")
+        if not isinstance(prs, list) or not prs:
+            return None
+        pr = prs[0] if isinstance(prs[0], dict) else {}
+        return {"number": pr.get("number"), "url": pr.get("html_url"), "state": pr.get("state")}
 
     def create_branch(self, branch: str, sha: str) -> None:
         self._call("POST", f"repos/{self.repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": sha}, ok=(201,))
@@ -454,8 +479,11 @@ class GcloudHotPatchExecutor:
         from . import runner_manager
 
         required = ("name", "zone", "machine_type", "runner_prefix", "runners_count", "runner_label",
-                    "runner_region", "patch_target")
+                    "runner_region", "patch_target", "registration_target")
         missing = [k for k in required if not host.get(k)]
+        registration = str(host.get("registration_target") or "")
+        if registration and "/" not in registration and not host.get("runner_group_id"):
+            missing.append("runner_group_id")  # org-registered runners: label sync needs the group
         if missing:
             raise HostRefusedError(f"refused: the host record does not carry {', '.join(missing)} "
                                    "(provisioned before deployment details were recorded)")
@@ -466,7 +494,9 @@ class GcloudHotPatchExecutor:
             raise HostRefusedError(f"refused: the host belongs to {host['patch_target']}, not {patch.repository}")
         heavy = host.get("heavy_runner_pool")
         args = runner_manager.args_parser().parse_args([
-            "--max-cost", "0", "--project", self.project, "--target", str(host["patch_target"]),
+            # --target is the registration scope (for example the org swack-tools), not the patch repository.
+            "--max-cost", "0", "--project", self.project, "--target", registration,
+            *(["--runner-group-id", str(int(host["runner_group_id"]))] if "/" not in registration else []),
             "--instance-name", str(host["name"]), "--region", region, "--zone", zone,
             "--instance-type", str(host["machine_type"]), "--runner-prefix", str(host["runner_prefix"]),
             "--runner-count", str(int(host["runners_count"])), "--runner-label", str(host["runner_label"]),
@@ -703,12 +733,45 @@ class PatchConsole:
             "executor": {"available": self.executor.available, "reason": self.executor.reason},
         }
 
-    def save(self, path: str, content: Any, base_sha: Any, message: Any = None) -> dict[str, Any]:
+    @staticmethod
+    def branch_for(path: str, idempotency_key: str | None) -> str:
+        """``spot-dashboard/<slug>-<digest>``: derived from the Idempotency-Key and path, so a retry after a lost
+        response (even on a replacement VM) finds the branch and pull request it already created."""
+        repository = repository_for_path(path)
+        slug = re.sub(r"[^a-z0-9-]+", "-", (repository or "defaults").lower()).strip("-")[:60]
+        suffix = (hashlib.sha256(f"{idempotency_key}\0{path}".encode("utf-8")).hexdigest()[:16]
+                  if idempotency_key else secrets.token_hex(8))
+        return f"{BRANCH_PREFIX}{slug}-{suffix}"
+
+    def save(self, path: str, content: Any, base_sha: Any, message: Any = None,
+             idempotency_key: str | None = None) -> dict[str, Any]:
         repository = repository_for_path(path)
         if not isinstance(base_sha, str) or not _SHA_RE.match(base_sha):
             raise InvalidRequestError("base_sha must be the 40-hex commit the manifest was loaded from")
         client = self.client()
         branch, head = client.resolve()
+        new_branch = self.branch_for(path, idempotency_key)
+        if new_branch == branch or not new_branch.startswith(BRANCH_PREFIX):
+            raise InvalidRequestError("Refusing to write to the default branch")
+        title = str(message or "").strip()[:200] or f"Update {path} from the Spot dashboard"
+        # Reconcile first: an earlier attempt with this key may have created the branch, the commit, or the PR.
+        existing_head = client.branch_head_or_none(new_branch) if idempotency_key else None
+        if existing_head is not None and existing_head != base_sha:
+            on_branch = client.read_file(path, new_branch)
+            if on_branch is None or on_branch[0] != content:
+                raise IdempotencyMismatchError(
+                    "This Idempotency-Key was already used for a different change to this file")
+            defaults = self._defaults(client, base_sha) if repository else None
+            patch, errors, _ = validate_manifest(content, path=path, defaults=defaults)
+            if patch is None:
+                raise InvalidRequestError("The manifest is invalid", body={"errors": errors})
+            pr = client.find_pull_request(new_branch) or client.open_pull_request(
+                new_branch, branch, title,
+                f"Edited in the Spot dashboard from {branch}@{base_sha[:12]}.\n\n"
+                f"Effective patch sha256: `{patch.patch_sha256}`")
+            return {"status": "pull_request_opened", "reconciled": True, "path": path, "branch": new_branch,
+                    "base_branch": branch, "base_sha": base_sha, "commit_sha": existing_head, "pull_request": pr,
+                    **patch_summary(patch)}
         if head != base_sha:
             raise ConflictError(
                 f"{branch} moved from {base_sha[:12]} to {head[:12]} since this manifest was loaded; reload and edit again",
@@ -722,12 +785,8 @@ class PatchConsole:
         blob = found[1] if found is not None else None
         if found is not None and found[0] == content:
             raise InvalidRequestError("The manifest is unchanged; nothing to save")
-        slug = re.sub(r"[^a-z0-9-]+", "-", (repository or "defaults").lower()).strip("-")[:60]
-        new_branch = f"{BRANCH_PREFIX}{slug}-{base_sha[:7]}-{secrets.token_hex(3)}"
-        if new_branch == branch or not new_branch.startswith(BRANCH_PREFIX):
-            raise InvalidRequestError("Refusing to write to the default branch")
-        title = str(message or "").strip()[:200] or f"Update {path} from the Spot dashboard"
-        client.create_branch(new_branch, base_sha)
+        if existing_head is None:
+            client.create_branch(new_branch, base_sha)
         try:
             commit = client.put_file(path, new_branch, content, title, blob)
             pr = client.open_pull_request(
@@ -776,7 +835,10 @@ class PatchConsole:
         for h in hosts:
             entry = h.to_dict()
             if h.classification == "noop":
+                # Re-derived from the host, so a retry after a lost response never re-runs a host that already
+                # applied this patch (its receipt and recorded sha already match).
                 entry["result"] = "noop"
+                entry["detail"] = f"already at this patch ({h.detail})"
             else:
                 try:
                     entry.update(self.executor.apply(h.host, patch))

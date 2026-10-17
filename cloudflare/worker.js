@@ -25,6 +25,10 @@ export const SESSION_COOKIE_NAME = "__Host-spot_session";
 // Set on every proxied request from the browser's CF-Connecting-IP (any client copy is stripped with the
 // other x-spot-* headers). The dashboard uses it only to rate-limit sign-in routes per client.
 export const CLIENT_IP_HEADER = "X-Spot-Client-Ip";
+// Set by the dashboard on every response it produces (dashboard_server.ORIGIN_MARKER_HEADER). A 5xx that carries
+// it is an application error and passes through; only unmarked 5xx (cloudflared, edge) or a timeout is an outage.
+export const ORIGIN_MARKER_HEADER = "X-Spot-Origin";
+export const ORIGIN_MARKER_VALUE = "dashboard";
 export const SESSION_PURPOSE_LABEL = "spot-dashboard/session/v1";
 export const KV_ORIGIN_KEY = "origin:active";
 export const UNAVAILABLE_ERROR = "control_vm_unavailable";
@@ -318,10 +322,12 @@ export function isWaitBody(text) {
 }
 
 // "pass": forward untouched; "backend_wait": the backend's own wait body; "unavailable": origin down.
-export function classifyOriginResponse(status, contentType, bodyText) {
+export function classifyOriginResponse(status, contentType, bodyText, fromDashboard = false) {
   if (!isUnavailableStatus(status)) return "pass";
   const json = typeof contentType === "string" && contentType.toLowerCase().includes("application/json");
-  return json && isWaitBody(bodyText) ? "backend_wait" : "unavailable";
+  if (json && isWaitBody(bodyText)) return "backend_wait";
+  // The dashboard answered: an application error, not an outage. Waiting would retry it forever.
+  return fromDashboard ? "application_error" : "unavailable";
 }
 
 async function readBoundedText(response) {
@@ -469,8 +475,15 @@ export async function handleRequest(request, env, options = {}) {
   try {
     if (!isUnavailableStatus(upstream.status)) return withNoStore(upstream);
     const contentType = upstream.headers.get("Content-Type") || "";
+    const fromDashboard = upstream.headers.get(ORIGIN_MARKER_HEADER) === ORIGIN_MARKER_VALUE;
     const text = await readBoundedText(upstream);
-    const kind = classifyOriginResponse(upstream.status, contentType, text);
+    const kind = classifyOriginResponse(upstream.status, contentType, text, fromDashboard);
+    if (kind === "application_error") {
+      const headers = new Headers(upstream.headers);
+      headers.set("Cache-Control", "no-store");
+      headers.delete("Content-Length");
+      return new Response(method === "HEAD" ? null : text, { status: upstream.status, headers });
+    }
     if (kind === "backend_wait" && !isHtmlNavigation(request)) {
       const headers = new Headers(upstream.headers);
       headers.set("Cache-Control", "no-store");

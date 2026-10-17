@@ -131,6 +131,9 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   - `spot-runner-patch-target`: the repository.
   - `spot-runner-prefix`, `spot-runner-count`, `spot-runner-label`, `spot-runner-region`, and
     `spot-runner-heavy-pool`: the deployment details that a live patch needs.
+  - `spot-runner-registration-target` and `spot-runner-group-id`: the GitHub scope that the runners
+    registered with, and its runner group. The scope can be an organization such as `swack-tools`,
+    even when the patch belongs to `swack-tools/oxidex`.
 - The `spot-runner-patch` label holds the first 16 characters of the sha256, or `none`, for filtering.
 - On the control VM, `DASHBOARD_FLEET_INVENTORY=gce` makes the preview list runner hosts from Compute
   Engine. A runner host carries the `spot-target` label or the patch metadata. The control VM's
@@ -151,7 +154,23 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`. That path takes the region, runner label, repository, runner
   count, and heavy pool size from the host's recorded metadata. It refuses a host that's missing any
   of them, because the live patch would otherwise reset the host's GitHub scheduling labels to the
-  `spot_runner_manager.py` defaults.
+  `spot_runner_manager.py` defaults. An org-registered host also needs its runner group.
+- A live patch first checks everything that label sync needs: the runner group, strict-pool membership,
+  and that GitHub lists every expected runner. Only then does it change the host, so label sync can't
+  fail after the patch applied.
+- Saving and hot-patching survive a lost response:
+  - The save branch name comes from the `Idempotency-Key` and the manifest path. A retry finds that branch
+    and returns its pull request instead of opening another, even on a replacement VM. It completes an
+    attempt that stopped halfway, and answers HTTP 422 when the same key is reused for a different
+    change.
+  - A hot-patch retry classifies each host again from its receipt and recorded patch. Hosts already at
+    the patch report `noop` and aren't patched again.
+- A retry with the same `Idempotency-Key` while the first request still runs gets HTTP 202 with
+  `"status": "pending"` and `Retry-After`. That happens, for example, after the Worker's 30-second
+  timeout. The browser keeps asking with the same key until it gets the stored result.
+- GitHub and Compute Engine failures answer HTTP 424 with `"code": "upstream_error"`. Every dashboard
+  response carries `X-Spot-Origin: dashboard`. The Worker passes a marked 5xx response through
+  unchanged, and treats only unmarked 5xx responses and timeouts as an outage.
 - A freeze waits up to 45 seconds for running saves and hot-patches to finish, so the handover snapshot
   includes their results. If they're still running after that, the freeze answers HTTP 409 with
   `"retryable": true`, and the autoscaler tries again.

@@ -102,6 +102,10 @@ class FakeGitHubRepo:
             self.files[new_sha] = {**self.files[base], file_path: base64.b64decode(payload["content"]).decode()}
             self.branches[branch] = new_sha
             return 200, json.dumps({"commit": {"sha": new_sha}}).encode()
+        if method == "GET" and route == prefix + "/pulls":
+            owner_branch = params["head"][0]
+            branch = owner_branch.split(":", 1)[1]
+            return 200, json.dumps([pr for pr in self.prs if pr["head"] == branch]).encode()
         if method == "POST" and route == prefix + "/pulls":
             pr = {"number": len(self.prs) + 1, "html_url": f"https://github.com/{REPO}/pull/{len(self.prs) + 1}",
                   "state": "open", **payload}
@@ -148,7 +152,8 @@ class FakeExecutor:
 def host(name, **extra):
     return {"name": name, "zone": "us-central1-a", "role": "cicd_runner", "status": "RUNNING",
             "patch_target": "swack-tools/oxidex", "machine_type": "n2-standard-8", "runner_prefix": "oxidex",
-            "runners_count": 2, "runner_label": "oxidex-spot-ci", "runner_region": "us-central1", **extra}
+            "runners_count": 2, "runner_label": "oxidex-spot-ci", "runner_region": "us-central1",
+            "registration_target": "swack-tools", "runner_group_id": 10, **extra}
 
 
 def console(fake=None, executor=None):
@@ -238,9 +243,12 @@ class ConsoleTests(unittest.TestCase):
     def test_save_opens_pull_request_from_new_branch(self):
         fake = FakeGitHubRepo()
         new_text = OXIDEX.replace("ripgrep", "fd-find")
-        result = console(fake).save(OXIDEX_PATH, new_text, HEAD, "Add fd")
+        result = console(fake).save(OXIDEX_PATH, new_text, HEAD, "Add fd", idempotency_key="save-key-0001")
         self.assertEqual(result["status"], "pull_request_opened")
-        self.assertTrue(result["branch"].startswith("spot-dashboard/swack-tools-oxidex-aaaaaaa-"))
+        self.assertEqual(result["branch"], pc.PatchConsole.branch_for(OXIDEX_PATH, "save-key-0001"))
+        self.assertTrue(result["branch"].startswith("spot-dashboard/swack-tools-oxidex-"))
+        self.assertNotEqual(result["branch"], pc.PatchConsole.branch_for(OXIDEX_PATH, "save-key-0002"))
+        self.assertNotEqual(result["branch"], pc.PatchConsole.branch_for("defaults.yaml", "save-key-0001"))
         self.assertEqual(fake.branches["main"], HEAD)  # default branch untouched
         self.assertEqual(fake.files[fake.branches[result["branch"]]][OXIDEX_PATH], new_text)
         [pr] = fake.prs
@@ -251,6 +259,65 @@ class ConsoleTests(unittest.TestCase):
         new_file = console(fake).save("repos/swack-tools/new-repo.yaml", json.dumps({"host": {"apt_packages": ["jq"]}}),
                                       HEAD)
         self.assertEqual(new_file["pull_request"]["number"], 2)
+
+    def test_save_retry_after_lost_response_reconciles_instead_of_opening_a_second_pr(self):
+        fake = FakeGitHubRepo()
+        new_text = OXIDEX.replace("ripgrep", "fd-find")
+        first = console(fake).save(OXIDEX_PATH, new_text, HEAD, "Add fd", idempotency_key="lost-key-0001")
+        # The process died before persisting the result; even if main moved on, the retry finds the same PR.
+        fake.branches["main"] = NEXT
+        fake.files[NEXT] = dict(fake.files[HEAD])
+        again = console(fake).save(OXIDEX_PATH, new_text, HEAD, "Add fd", idempotency_key="lost-key-0001")
+        self.assertEqual((again["reconciled"], again["pull_request"], again["branch"]),
+                         (True, first["pull_request"], first["branch"]))
+        self.assertEqual(len(fake.prs), 1)
+        self.assertEqual(len([c for c in fake.calls if c[0] == "PUT"]), 1)
+        with self.assertRaises(pc.IdempotencyMismatchError):  # same key, different change
+            console(fake).save(OXIDEX_PATH, OXIDEX.replace("ripgrep", "bat"), HEAD, idempotency_key="lost-key-0001")
+        self.assertEqual(len(fake.prs), 1)
+
+    def test_save_retry_completes_a_partial_attempt(self):
+        new_text = OXIDEX.replace("ripgrep", "fd-find")
+        branch = pc.PatchConsole.branch_for(OXIDEX_PATH, "part-key-0001")
+        # Crashed after creating the branch, before the commit: the retry commits and opens the PR once.
+        fake = FakeGitHubRepo()
+        fake.branches[branch] = HEAD
+        result = console(fake).save(OXIDEX_PATH, new_text, HEAD, idempotency_key="part-key-0001")
+        self.assertEqual((len(fake.prs), result["branch"]), (1, branch))
+        self.assertNotIn("reconciled", result)
+        # Crashed after the commit, before the PR: the retry opens the PR without committing again.
+        fake = FakeGitHubRepo()
+        console(fake).save(OXIDEX_PATH, new_text, HEAD, idempotency_key="part-key-0002")
+        pr_branch = fake.prs.pop()["head"]
+        puts = len([c for c in fake.calls if c[0] == "PUT"])
+        result = console(fake).save(OXIDEX_PATH, new_text, HEAD, idempotency_key="part-key-0002")
+        self.assertEqual((result["reconciled"], result["branch"], len(fake.prs)), (True, pr_branch, 1))
+        self.assertEqual(len([c for c in fake.calls if c[0] == "PUT"]), puts)
+
+    def test_hot_patch_retry_rederives_results_from_the_hosts(self):
+        executor = FakeExecutor()
+        real_apply = executor.apply
+
+        def apply_and_record(h, patch):
+            executor.manifests[h["name"]] = patch.to_canonical_dict()  # the host's receipt now shows the patch
+            return real_apply(h, patch)
+
+        executor.apply = apply_and_record
+        c = console(executor=executor)
+        c.hot_patch("swack-tools/oxidex", TARGET_SHA, [host("h1"), host("h2")])
+        self.assertEqual(len(executor.applied), 2)
+        status, body = c.hot_patch("swack-tools/oxidex", TARGET_SHA, [host("h1"), host("h2")])  # a lost response
+        self.assertEqual((status, body["status"]), (200, "noop"))
+        self.assertTrue(all(h["result"] == "noop" and "already at this patch" in h["detail"] for h in body["hosts"]))
+        self.assertEqual(len(executor.applied), 2)  # nothing ran twice
+
+    def test_github_errors_use_424_not_a_gateway_status(self):
+        fake = FakeGitHubRepo()
+        fake.fail[("GET", f"repos/{REPO}")] = 403
+        with self.assertRaises(pc.GitHubRestError) as ctx:
+            console(fake).list_manifests()
+        self.assertEqual((ctx.exception.status, ctx.exception.body["code"], ctx.exception.body["upstream_status"]),
+                         (424, "upstream_error", 403))
 
     def test_save_conflicts_when_the_base_moved(self):
         fake = FakeGitHubRepo()
@@ -379,16 +446,19 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual((seen, runner_manager.PROJECT), (["proj"], before))  # scoped, then restored
         args, zone = apply.call_args[0]
         self.assertEqual((args.instance_name, args.zone, args.region, args.instance_type, args.runner_prefix,
-                          args.runner_count, args.runner_label, args.target, args.heavy_runner_pool, zone),
+                          args.runner_count, args.runner_label, args.target, args.runner_group_id,
+                          args.heavy_runner_pool, zone),
                          ("h1", "us-central1-a", "us-central1", "n2-standard-8", "oxidex", 2, "oxidex-spot-ci",
-                          "swack-tools/oxidex", None, "us-central1-a"))
+                          "swack-tools", 10, None, "us-central1-a"))  # the org scope, not the patch repo
         # Never the runner_manager defaults (asia-south2, oxidex-spot-7x27), which sync_runner_labels would apply.
         defaults = runner_manager.args_parser().parse_args(["--max-cost", "0"])
         self.assertNotEqual((args.region, args.runner_label), (defaults.region, defaults.runner_label))
         self.assertIs(args.runner_patch, patch)
         with mock.patch.object(runner_manager, "apply_live_patch", return_value="hot_patch") as apply:
             ex.apply(host("h2", heavy_runner_pool=3), patch)
-        self.assertEqual(apply.call_args[0][0].heavy_runner_pool, 3)
+            ex.apply(host("h3", registration_target="swack-tools/oxidex", runner_group_id=None), patch)
+        self.assertEqual(apply.call_args_list[0][0][0].heavy_runner_pool, 3)
+        self.assertEqual(apply.call_args_list[1][0][0].target, "swack-tools/oxidex")  # repo-registered runners
 
     def test_gcloud_executor_refuses_hosts_without_recorded_deployment_details(self):
         from lib import runner_manager
@@ -396,7 +466,8 @@ class ExecutorTests(unittest.TestCase):
         ex = pc.GcloudHotPatchExecutor("proj", which=lambda _n: "/usr/bin/gcloud")
         patch = validate_patch_dict(json.loads(OXIDEX))
         with mock.patch.object(runner_manager, "apply_live_patch") as apply:
-            for key in ("runner_label", "runner_region", "patch_target", "runners_count", "runner_prefix", "zone"):
+            for key in ("runner_label", "runner_region", "patch_target", "runners_count", "runner_prefix", "zone",
+                        "registration_target", "runner_group_id"):
                 bad = host("h1")
                 bad.pop(key)
                 with self.subTest(missing=key), self.assertRaisesRegex(pc.HostRefusedError, key):
@@ -600,13 +671,38 @@ class PatchApiTests(unittest.TestCase):
             self.request("POST", "/api/patches/hot-patch", self.hot_patch_body(), key="race-key-0001")))
         worker.start()
         self.assertTrue(self.executor.started.wait(5))
-        status, _, body = self.request("POST", "/api/patches/hot-patch", self.hot_patch_body(), key="race-key-0001")
-        self.assertEqual(status, 409)
-        self.assertIn("still running", body["error"])
+        status, msg, body = self.request("POST", "/api/patches/hot-patch", self.hot_patch_body(), key="race-key-0001")
+        self.assertEqual((status, body["status"], body["pending_retry"]), (202, "pending", True))
+        self.assertEqual(msg["Retry-After"], str(body["retry_after_seconds"]))
+        # The same key with a different body is still rejected, while running and afterwards.
+        other = self.hot_patch_body(repository="swack-tools/other")
+        self.assertEqual(self.request("POST", "/api/patches/hot-patch", other, key="race-key-0001")[0], 422)
         self.executor.gate.set()
         worker.join(10)
         self.assertEqual(results[0][0], 200)
         self.assertEqual(len(self.executor.applied), 2)
+        status, msg, replay = self.request("POST", "/api/patches/hot-patch", self.hot_patch_body(), key="race-key-0001")
+        self.assertEqual((status, replay, msg.get("Idempotent-Replay")), (200, results[0][2], "true"))
+        self.assertEqual(self.request("POST", "/api/patches/hot-patch", other, key="race-key-0001")[0], 422)
+        self.assertEqual(len(self.executor.applied), 2)
+
+    def test_save_survives_losing_the_stored_result(self):
+        store = self.start()
+        body = {"path": OXIDEX_PATH, "content": OXIDEX.replace("ripgrep", "fd-find"), "base_sha": HEAD}
+        status, _, first = self.request("POST", "/api/patches/save", body, key="loss-key-0001")
+        self.assertEqual(status, 200)
+        with store._lock:  # simulate a replacement VM that never received the idempotency record
+            store.state["idempotency"] = {}
+        status, msg, again = self.request("POST", "/api/patches/save", body, key="loss-key-0001")
+        self.assertEqual((status, again["reconciled"], again["pull_request"]), (200, True, first["pull_request"]))
+        self.assertIsNone(msg.get("Idempotent-Replay"))
+        self.assertEqual(len(self.fake.prs), 1)
+
+    def test_upstream_errors_are_424_and_marked_as_dashboard_responses(self):
+        self.start()
+        self.fake.fail[("GET", f"repos/{REPO}")] = 403
+        status, msg, body = self.request("GET", "/api/patches")
+        self.assertEqual((status, body["code"], msg["X-Spot-Origin"]), (424, "upstream_error", "dashboard"))
 
 
 _UI_HARNESS = r"""
@@ -734,6 +830,55 @@ class PatchPanelUiTests(unittest.TestCase):
         edited = self.run_ui(self.replies(), edit=True)
         self.assertTrue(edited["disabled_after_edit"])
         self.assertEqual(len([p for p in edited["posts"] if p[0] == "/api/patches/hot-patch"]), 0)
+
+    def test_upstream_errors_are_shown_not_retried(self):
+        message = "GitHub PUT repos/x/contents/y returned HTTP 403: Resource not accessible by integration"
+        out = self.run_ui(self.replies(save={"status": 424, "body": {"error": message, "code": "upstream_error"}}))
+        self.assertIn(message, out["status"])
+        self.assertEqual(len([p for p in out["posts"] if p[0] == "/api/patches/save"]), 1)
+
+    def test_fetch_wrapper_polls_a_pending_change_with_the_same_key(self):
+        from lib.dashboard_ui_assets import render_dashboard_html
+
+        html = render_dashboard_html()
+        script = html[html.index("<script>") + len("<script>"):html.rindex("</script>")]
+        block = script[script.index("    function getDashboardAuthToken()"):script.index("    function showToast(msg)")]
+        program = r"""
+const AUTH_STORAGE_KEY = "dashboard_auth_token";
+const out = {keys: [], waits: []};
+globalThis.sessionStorage = {getItem: () => null, setItem() {}, removeItem() {}};
+globalThis.localStorage = globalThis.sessionStorage;
+globalThis.setTimeout = (fn, ms) => { out.waits.push(ms); fn(); return 0; };
+globalThis.document = {getElementById: () => null, createElement: () => ({setAttribute() {}, style: {}}),
+  body: {appendChild() {}}};
+globalThis.window = {crypto: globalThis.crypto, location: {assign() {}}, prompt: undefined};
+const json = (status, body) => new Response(JSON.stringify(body), {status, headers: {"Content-Type": "application/json"}});
+let calls = 0;
+const NATIVE_FETCH = async (url, init) => {
+  out.keys.push(init.headers.get("Idempotency-Key"));
+  calls += 1;
+  if (calls > 100) return json(202, {status: "reauth_required"});
+  if (calls <= 2) return json(202, {status: "pending", pending_retry: true, retry_after_seconds: 3});
+  return json(200, {status: "pull_request_opened"});
+};
+""" + block + r"""
+(async () => {
+  const res = await window.fetch("/api/patches/save", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+  out.final = [res.status, (await res.json()).status];
+  // A 202 that is not a pending external change (for example reauth_required) is returned as is.
+  calls = 100;
+  const other = await window.fetch("/api/auth/targets", {method: "POST", body: "{}"});
+  out.other = [other.status, (await other.json()).status, calls];
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+        proc = subprocess.run(["node", "-e", program], capture_output=True, text=True, timeout=30, check=True)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["final"], [200, "pull_request_opened"])
+        self.assertEqual(len(out["keys"]), 4)
+        self.assertEqual(len(set(out["keys"][:3])), 1)  # the same Idempotency-Key for every poll of the save
+        self.assertEqual(out["waits"], [3000, 3000])
+        self.assertEqual(out["other"], [202, "reauth_required", 101])  # not a pending change: returned once
 
     def test_save_conflict_and_untrusted_links(self):
         out = self.run_ui(self.replies(save={"status": 409, "body": {"error": "main moved; reload"}}))
