@@ -60,6 +60,7 @@ class FakeGcloud:
         self.calls: list[list[str]] = []
         self.fail_create_zones: set[str] = set()
         self.start_rc = 0
+        self.stop_rc = 0
         self.delete_rc = 0
         self.scripts: list[str] = []
         self.land_but_fail_zones: set[str] = set()  # create succeeds in GCE but gcloud exits nonzero
@@ -114,6 +115,11 @@ class FakeGcloud:
             if self.start_rc == 0:
                 self.vms[name]["status"] = "STAGING"
             return SimpleNamespace(returncode=self.start_rc, stdout="", stderr="stockout" if self.start_rc else "")
+        if verb == ["instances", "stop"]:
+            self.events.append(("stop", name))
+            if self.stop_rc == 0:
+                self.vms[name]["status"] = "STOPPING"
+            return SimpleNamespace(returncode=self.stop_rc, stdout="", stderr="")
         if verb == ["instances", "delete"]:
             self.events.append(("delete", name))
             if self.delete_rc == 0:
@@ -245,7 +251,7 @@ class Harness:
         return self.state.get(cv.STATE_KEY, {}).get("transition")
 
     def mutations(self):
-        return [e for e in self.events if e[0] in ("create", "start", "delete", "origin", "freeze", "import",
+        return [e for e in self.events if e[0] in ("create", "start", "stop", "delete", "origin", "freeze", "import",
                                                     "unfreeze")]
 
 
@@ -907,8 +913,36 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         for _ in range(cv.STEP_RETRY_LIMIT):
             h.tick()
         self.assertIn(("snapshot", "a"), h.events)
-        self.assertEqual(h.mutations()[-2:], [("import", "b"), ("origin", "b")])
+        # The old VM is running but did not freeze: it must be stopped before the replacement writes.
+        self.assertEqual(h.mutations()[-2:], [("import", "b"), ("stop", "spot-control-a")])
+        self.assertEqual(h.kv.origin_slot(), "a")
+        h.gcloud.status("a", "TERMINATED")
+        h.tick()
+        self.assertEqual(h.mutations()[-1], ("origin", "b"))
         self.assertEqual(h.http.versions["b"], 7)
+
+    def test_recovery_never_cuts_over_while_unfrozen_old_vm_runs(self):
+        """Codex M4 round 11: an unreachable old writer is fenced (stopped) before cutover."""
+        h = self.setup_rotation("cutover", mode=cv.MODE_RECOVER, import_skipped=True, kv_caught_up=True)
+        h.http.unhealthy("a")  # running but unreachable
+        self.with_new_vm(h)
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertIn(("stop", "spot-control-a"), h.events)
+        h.tick()  # still STOPPING: keep waiting, do not stop again yet
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertEqual(h.events.count(("stop", "spot-control-a")), 1)
+        h.gcloud.status("a", "TERMINATED")
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "b")
+
+    def test_frozen_old_vm_needs_no_stop(self):
+        h = self.setup_rotation("cutover", mode=cv.MODE_RECOVER, freeze_requested=True, frozen_version=7,
+                                old_frozen=True)
+        self.with_new_vm(h)
+        h.tick()
+        self.assertNotIn(("stop", "spot-control-a"), h.events)
+        self.assertEqual(h.kv.origin_slot(), "b")
 
     def test_recovery_cutover_imports_newer_kv_state_first(self):
         h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER)

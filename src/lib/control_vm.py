@@ -132,6 +132,7 @@ FAILED_ZONE_TTL_SECONDS = 1800     # A zone that failed a create is retried afte
 MAX_STEPS_PER_TICK = 12
 
 STOPPED_STATES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED"})
+STOP_RETRY_SECONDS = 120
 BOOTING_STATES = frozenset({"PROVISIONING", "STAGING", "RUNNING"})
 
 MODE_BOOTSTRAP = "bootstrap"
@@ -600,6 +601,11 @@ def zones_command(project: str) -> list[str]:
 
 def start_command(vm: ControlVm, project: str) -> list[str]:
     return ["gcloud", "compute", "instances", "start", vm.name, f"--zone={vm.zone}",
+            f"--project={project}", "--quiet"]
+
+
+def stop_command(vm: ControlVm, project: str) -> list[str]:
+    return ["gcloud", "compute", "instances", "stop", vm.name, f"--zone={vm.zone}",
             f"--project={project}", "--quiet"]
 
 
@@ -1214,6 +1220,7 @@ class ControlVmManager:
         version = body.get("state_version") if isinstance(body, dict) else None
         if status == 200 and isinstance(version, int) and not isinstance(version, bool):
             t["frozen_version"] = version
+            t["old_frozen"] = True
             self._snapshot = parse_snapshot(body.get("snapshot"))
             self._note("froze slot %s at state_version %d", t["old_slot"], version)
             return self._advance_step(t)
@@ -1302,6 +1309,31 @@ class ControlVmManager:
         result = obs.health.get(t["new_slot"]) or probe_health(self.requester, self.config, t["new_slot"])
         return (True, "") if result.ok else (False, f"slot {t['new_slot']} not healthy ({result.detail})")
 
+    def _fence_old_writer(self, t: dict, obs: Observation) -> bool:
+        """True once the old slot can no longer accept writes: confirmed frozen, or confirmed stopped.
+
+        KV is eventually consistent, so re-reading origin:active cannot give exclusive ownership. A
+        recovery that could not freeze the old VM (it was unreachable) must stop it, and see it
+        stopped in fresh inventory, before the replacement becomes the writer; otherwise an old VM
+        that comes back while KV still names it could accept and publish competing changes.
+        """
+        if t["mode"] != MODE_RECOVER or not t.get("old_slot") or t.get("old_frozen"):
+            return True
+        old = obs.vm(t["old_slot"])
+        if old is None or old.status in STOPPED_STATES:
+            return True
+        if not t.get("old_stop_requested_at"):
+            t["old_stop_requested_at"] = self.clock()
+            self.save()
+            result = self.gcloud(stop_command(old, self.config.project))
+            self._note("stopping unreachable old slot %s before cutover (exit %s)", t["old_slot"],
+                       getattr(result, "returncode", None), level=logging.WARNING)
+        elif self.clock() - t["old_stop_requested_at"] >= STOP_RETRY_SECONDS:
+            t["old_stop_requested_at"] = None  # ask again on the next tick
+        t["error"] = f"waiting for old slot {t['old_slot']} ({old.status}) to stop before cutover"
+        self.save()
+        return False
+
     def _step_cutover(self, t: dict, obs: Observation) -> str:
         # Never point users at a replacement that was preempted or went unhealthy after import, or
         # when resuming a saved cutover step: recheck it immediately before the origin write.
@@ -1314,6 +1346,8 @@ class ControlVmManager:
                 return self._abort(t, "old VM is healthy again; keeping it")
             self._note("replacement not ready at cutover (%s); waiting for it again", why, level=logging.WARNING)
             self._goto(t, "wait_health")
+            return "wait"
+        if not self._fence_old_writer(t, obs):
             return "wait"
         if t["mode"] == MODE_RECOVER and t.get("import_skipped") and not self._catch_up_with_kv(t):
             if self._old_back(t, obs):

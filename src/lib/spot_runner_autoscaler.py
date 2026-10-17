@@ -1525,6 +1525,20 @@ def _deregister_replacement_runners(record, runners, state, state_path) -> bool:
     return not pending
 
 
+def _schedule_replacement_drain(repl_vm, rotation, runners, state) -> None:
+    """Persist a drain-then-delete obligation for a replacement an abort has to keep.
+
+    Callers persist state afterwards. reconcile_replacement_cleanups deregisters its idle
+    listeners, waits for busy ones and builds, deletes the VM, then confirms registrations are gone.
+    """
+    LOG.warning("Keeping replacement %s until its listeners and builds drain", repl_vm.name)
+    key = f"{repl_vm.zone}/{repl_vm.name}"
+    state.setdefault("replacement_cleanups", {})[key] = {
+        "name": repl_vm.name, "zone": repl_vm.zone, "instance_id": repl_vm.instance_id,
+        "target": rotation.get("target"), "drain": True,
+        "runners": {str(r.runner_id): r.name for r in _replacement_runners(runners, repl_vm.name)}}
+
+
 def _drain_replacement_listeners(record, vm, runners, state, state_path) -> None:
     """Deregister an aborted replacement's idle listeners so it can be deleted without losing jobs.
 
@@ -1623,6 +1637,9 @@ def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, 
         LOG.error("%s; outgoing listeners were removed, so the rotation keeps provisioning capacity", reason)
         if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True):
             _delete_replacement(repl_vm, args, state, state_path, target=rotation.get("target"), runners=runners)
+        elif repl_vm:
+            # Partially ready: keep it, but never abandon it as an uncounted surplus host.
+            _schedule_replacement_drain(repl_vm, rotation, runners, state)
         _restart_replacement(rotation, state, state_path)
         return True
     LOG.error("%s; aborting replacement to preserve old capacity", reason)
@@ -1634,12 +1651,7 @@ def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, 
         # Online, busy or building: never delete it now. Persist a drain-then-delete obligation so
         # the surplus host is removed once its listeners are idle and deregistered and its builds
         # are quiesced (reconcile_replacement_cleanups); otherwise it could outlive the rotation.
-        LOG.warning("Keeping replacement %s until its listeners and builds drain", repl_vm.name)
-        key = f"{repl_vm.zone}/{repl_vm.name}"
-        state.setdefault("replacement_cleanups", {})[key] = {
-            "name": repl_vm.name, "zone": repl_vm.zone, "instance_id": repl_vm.instance_id,
-            "target": rotation.get("target"), "drain": True,
-            "runners": {str(r.runner_id): r.name for r in _replacement_runners(runners, repl_vm.name)}}
+        _schedule_replacement_drain(repl_vm, rotation, runners, state)
     state.pop("price_rotation", None)
     write_scale_state(state_path, state)
     return True

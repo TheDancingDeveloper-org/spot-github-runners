@@ -2115,6 +2115,28 @@ class ReplacementCleanupRetryTests(unittest.TestCase):
             api.assert_not_called()
             self.assertIn("z/oxidex-runners-new", state["replacement_cleanups"])
 
+    def test_lost_capacity_abort_schedules_drain_for_partial_replacement(self):
+        """Codex M4 round 11: a kept, partially ready replacement must not become an uncounted surplus."""
+        from lib.spot_runner_autoscaler import _abort_runner_rotation
+        outgoing = GceVm("oxidex-runners-old", "z", "RUNNING", "n4-highcpu-16", True, instance_id="old")
+        repl = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new")
+        online = GitHubRunner(9, "gha-oxidex-runners-new-1", "online", False, ("spot",))
+        rotation = {"phase": "verify_readiness", "target": "swack-tools", "capacity_lost": True,
+                    "deregistered_runner_ids": [99],
+                    "outgoing_vm": {"name": outgoing.name, "zone": "z", "instance_id": "old"},
+                    "replacement_vm": {"name": repl.name, "zone": "z", "instance_id": "new"}}
+        state = {"price_rotation": rotation}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                    patch("lib.spot_runner_autoscaler._outgoing_capacity_lost", return_value=True):
+                _abort_runner_rotation(rotation, [outgoing, repl], SimpleNamespace(project="p"), state, path,
+                                       "timeout", [online])
+            delete.assert_not_called()
+            saved = read_scale_state(path)
+        self.assertTrue(saved["replacement_cleanups"]["z/oxidex-runners-new"]["drain"])
+        self.assertEqual(saved["price_rotation"]["phase"], "select")  # still provisioning fresh capacity
+
     def test_controller_loop_runs_cleanup_each_check(self):
         import inspect
         from lib import spot_runner_autoscaler as controller
