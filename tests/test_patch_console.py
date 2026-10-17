@@ -669,11 +669,11 @@ class PatchApiTests(unittest.TestCase):
         self.fake = FakeGitHubRepo()
         self.executor = FakeExecutor()
 
-    def start(self, executor="fake"):
+    def start(self, executor="fake", requester=None):
         ex = self.executor if executor == "fake" else executor
         server, store = create_dashboard_server(
             host="127.0.0.1", port=0, state_path=Path(self.tmp.name) / "state.json", auth_token=self.TOKEN,
-            patch_console=console(self.fake, ex),
+            patch_console=console(requester or self.fake, ex),
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -836,6 +836,50 @@ class PatchApiTests(unittest.TestCase):
         self.assertEqual((status, replay, msg.get("Idempotent-Replay")), (200, results[0][2], "true"))
         self.assertEqual(self.request("POST", "/api/patches/hot-patch", other, key="race-key-0001")[0], 422)
         self.assertEqual(len(self.executor.applied), 2)
+
+    def test_ambiguous_save_is_not_cached_and_the_same_key_reconciles(self):
+        lossy = LossyGitHub(self.fake)
+        lossy.lose("POST", "/pulls", "before")  # GitHub's answer to the PR creation is lost
+        self.start(requester=lossy)
+        body = {"path": OXIDEX_PATH, "content": OXIDEX.replace("ripgrep", "fd-find"), "base_sha": HEAD}
+        status, msg, first = self.request("POST", "/api/patches/save", body, key="ambig-key-0001")
+        self.assertEqual((status, first["retry_same_key"]), (424, True))
+        self.assertIsNone(msg.get("Idempotent-Replay"))
+        status, msg, second = self.request("POST", "/api/patches/save", body, key="ambig-key-0001")
+        self.assertEqual((status, second["status"], second["pull_request"]["number"]), (200, "pull_request_opened", 1))
+        self.assertIsNone(msg.get("Idempotent-Replay"))  # it ran again and reconciled, not a replay of the 424
+        self.assertEqual(len(self.fake.prs), 1)
+        status, msg, third = self.request("POST", "/api/patches/save", body, key="ambig-key-0001")
+        self.assertEqual((status, third, msg.get("Idempotent-Replay")), (200, second, "true"))  # final: cached
+        self.assertEqual(len(self.fake.prs), 1)
+        # A definitive failure is still cached: the same key replays it.
+        self.fake.fail[("PUT", f"repos/{REPO}/contents/")] = 403
+        bad = {**body, "content": OXIDEX.replace("ripgrep", "bat")}
+        status, _, refused = self.request("POST", "/api/patches/save", bad, key="ambig-key-0002")
+        self.assertEqual(status, 424)
+        self.assertNotIn("retry_same_key", refused)
+        del self.fake.fail[("PUT", f"repos/{REPO}/contents/")]
+        status, msg, _ = self.request("POST", "/api/patches/save", bad, key="ambig-key-0002")
+        self.assertEqual((status, msg.get("Idempotent-Replay")), (424, "true"))
+
+    def test_retryable_outcomes_are_never_stored(self):
+        store = self.start()
+        outcomes = iter([(424, {"error": "lost", "retry_same_key": True}),
+                         (202, {"status": "pending", "pending_retry": True}),
+                         (200, {"status": "done"})])
+        calls = []
+
+        def fn():
+            calls.append(1)
+            return next(outcomes)
+
+        for expected in (424, 202, 200):
+            status, _, replayed = store.run_external("retry-key-0001", "POST", "/api/patches/save", fn, fingerprint="f")
+            self.assertEqual((status, replayed), (expected, False))
+            self.assertEqual(store._external_inflight, {})  # released, so the key can run again
+        self.assertEqual(store.run_external("retry-key-0001", "POST", "/api/patches/save", fn, fingerprint="f"),
+                         (200, {"status": "done"}, True))
+        self.assertEqual(len(calls), 3)
 
     def test_save_survives_losing_the_stored_result(self):
         store = self.start()

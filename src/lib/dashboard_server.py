@@ -1933,6 +1933,12 @@ class DashboardStore:
         except (TypeError, ValueError):
             return {"status": "ok" if status < 400 else "error"}
 
+    @staticmethod
+    def _retry_with_same_key(body: Any) -> bool:
+        """True for an outcome the client is told to retry with the same Idempotency-Key (an ambiguous GitHub
+        result marked ``retry_same_key``, or a ``pending_retry`` answer); such outcomes are never stored."""
+        return isinstance(body, dict) and (body.get("retry_same_key") is True or body.get("pending_retry") is True)
+
     def run_external(self, key: str, method: str, path: str, fn: Any, *, fingerprint: str = "") -> tuple[int, Any, bool]:
         """Run a change whose side effect is outside dashboard state (GitHub, runner hosts) exactly once per key.
 
@@ -1940,7 +1946,9 @@ class DashboardStore:
         store lock, because it makes slow network calls. ``fingerprint`` identifies the request body.
         - A retry of the same request while the first is still running gets 202 ``{"status": "pending"}`` (the
           browser waits and retries with the same key, for example after the edge Worker timed out).
-        - A later retry replays the stored response (``replayed`` True). Responses below 500 are stored.
+        - A later retry replays the stored response (``replayed`` True). Final responses below 500 are stored;
+          outcomes marked for a same-key retry (``retry_same_key``, ``pending_retry``) are not, so the retry
+          runs again and reconciles.
         - The same key with a different method, path, or body gets 422, running or finished.
         """
         if not key:
@@ -1974,7 +1982,8 @@ class DashboardStore:
             raise
         with self._lock:
             try:
-                if status >= 500:
+                if status >= 500 or self._retry_with_same_key(body):
+                    # Not a final result: a retry with this key must run again (and reconcile), not replay it.
                     return status, body, False
                 raw_records = self.state.get(IDEMPOTENCY_STATE_KEY)
                 records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, self._clock())

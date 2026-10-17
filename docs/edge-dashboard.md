@@ -167,6 +167,8 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
     the branch, its commit, and any pull request first. If GitHub didn't confirm the step, the save
     answers HTTP 424 with `"retry_same_key": true`. It deletes the branch only after GitHub rejects the
     commit outright while the branch still holds no commit.
+  - Results marked for a same-key retry (`"retry_same_key": true`, or the pending 202) are never stored
+    as final. A retry with the same key runs again and reconciles; final results are stored and replayed.
   - A hot-patch retry classifies each host again from its receipt and recorded patch. Hosts already at
     the patch report `noop` and aren't patched again.
 - A retry with the same `Idempotency-Key` while the first request still runs gets HTTP 202 with
