@@ -758,6 +758,13 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             cmd = mock_sub.call_args[0][0]
             self.assertIn("--target", cmd)
             self.assertEqual(cmd[cmd.index("--target") + 1], "xbmc4lyfe/newznab-tmux")
+            self.assertNotIn("--patch-repo", cmd)
+            args_with_target.patch_repo = "xbmc4lyfe/newznab-tmux"
+            args_with_target.config_repo = "swack-tools/spot-runners-config"
+            launch_offer(offer, args_with_target, state={}, state_path=Path("/tmp/state.json"))
+            cmd = mock_sub.call_args[0][0]
+            self.assertEqual(cmd[cmd.index("--patch-repo") + 1], "xbmc4lyfe/newznab-tmux")
+            self.assertEqual(cmd[cmd.index("--config-repo") + 1], "swack-tools/spot-runners-config")
 
     def test_provisioning_failure_falls_back_to_select_after_max_attempts(self):
         rotation = {
@@ -2418,3 +2425,36 @@ class RecreatedReplacementCleanupTests(unittest.TestCase):
             delete.assert_not_called()
             deletes = [c.args[2] for c in api.call_args_list if c.args[1] == "DELETE"]
             self.assertEqual(deletes, ["orgs/swack-tools/actions/runners/111"])  # recorded only, never 222
+
+
+class PatchedRotationHoldTests(unittest.TestCase):
+    """Codex M4 round 20: a patched host is never rotated onto an unpatched replacement."""
+
+    def vm(self, **patch_fields):
+        return replace_vm(GceVm("oxidex-runners-old", "z", "RUNNING", "n4-highcpu-16", True, instance_id="old"),
+                          **patch_fields)
+
+    def test_hold_rules(self):
+        from lib.spot_runner_autoscaler import patched_rotation_hold
+        args = SimpleNamespace(patch_repo=None)
+        self.assertEqual(patched_rotation_hold(self.vm(), args), "")  # unpatched: rotate freely
+        for fields in ({"patch_sha256": "a" * 64}, {"patch_pending_sha256": "b" * 64},
+                       {"patch_target": "xbmc4lyfe/newznab-tmux"}):
+            with self.subTest(fields=fields):
+                self.assertIn("no --patch-repo", patched_rotation_hold(self.vm(**fields), args))
+        args.patch_repo = "swack-tools/oxidex"
+        self.assertIn("comes from xbmc4lyfe/newznab-tmux",
+                      patched_rotation_hold(self.vm(patch_target="xbmc4lyfe/newznab-tmux"), args))
+        args.patch_repo = "XBMC4LYFE/newznab-tmux"
+        self.assertEqual(patched_rotation_hold(self.vm(patch_sha256="a" * 64, patch_target="xbmc4lyfe/newznab-tmux"),
+                                               args), "")
+
+    def test_begin_rotation_holds_patched_host_without_patch_source(self):
+        from lib.spot_runner_autoscaler import begin_price_rotation
+        args = SimpleNamespace(target="xbmc4lyfe/newznab-tmux", org="swack-tools", patch_repo=None)
+        state = {}
+        with patch("lib.spot_runner_autoscaler.offer_refresher") as refresher:
+            self.assertTrue(begin_price_rotation(self.vm(patch_sha256="a" * 64), [], [], args, state,
+                                                 Path("/tmp/unused.json")))
+        refresher.assert_not_called()
+        self.assertNotIn("price_rotation", state)

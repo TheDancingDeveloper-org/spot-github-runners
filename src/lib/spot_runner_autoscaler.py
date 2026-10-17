@@ -1240,6 +1240,27 @@ def retire_completed_recoveries(state, state_path, only=None) -> None:
         write_scale_state(state_path, state)
 
 
+def patched_rotation_hold(outgoing_vm: GceVm, args: argparse.Namespace) -> str:
+    """Why a patched host cannot be rotated automatically, or "" when it can.
+
+    A replacement launched without the outgoing host's runner patch would lack its packages,
+    files, mounts and extra labels, yet still pass the listener readiness gate, so the patched
+    host would be retired for an unpatched one. Rotation needs this controller to launch with the
+    same patch source (--patch-repo) the host was recorded with.
+    """
+    patched = bool(getattr(outgoing_vm, "patch_sha256", "") or getattr(outgoing_vm, "patch_pending_sha256", "")
+                   or getattr(outgoing_vm, "patch_target", ""))
+    if not patched:
+        return ""
+    patch_repo = getattr(args, "patch_repo", None)
+    if not patch_repo:
+        return "the host runs a runner patch but this controller has no --patch-repo to give its replacement"
+    recorded = getattr(outgoing_vm, "patch_target", "")
+    if recorded and recorded.lower() != patch_repo.lower():
+        return f"the host's patch comes from {recorded}, not this controller's --patch-repo {patch_repo}"
+    return ""
+
+
 def begin_price_rotation(outgoing_vm: GceVm, vms: list[GceVm], runners: list[GitHubRunner],
                          args: argparse.Namespace, state: dict, state_path: Path,
                          reason: str = "price_cap_exceeded", offer=None) -> bool:
@@ -1251,6 +1272,12 @@ def begin_price_rotation(outgoing_vm: GceVm, vms: list[GceVm], runners: list[Git
     target_name = getattr(args, "target", None) or getattr(args, "org", "swack-tools")
     target_type = "repo" if ("/" in target_name or getattr(args, "target_type", "") == "repo") else "org"
     cordon_mode = "labels" if target_type == "repo" else "isolated_group"
+
+    held = patched_rotation_hold(outgoing_vm, args)
+    if held:
+        LOG.warning("Make-before-break rotation held for %s: %s; keeping running host undisturbed",
+                    vm_details(outgoing_vm), held)
+        return True
 
     if offer is None:
         refresh = offer_refresher(args)
@@ -2512,6 +2539,12 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         ]
         if getattr(args, "target", None):
             command.extend(["--target", args.target])
+        # Every host this controller launches gets the same verified effective patch, so a
+        # replacement never comes up without the manifest its predecessor ran.
+        if getattr(args, "patch_repo", None):
+            command.extend(["--patch-repo", args.patch_repo])
+        if getattr(args, "config_repo", None):
+            command.extend(["--config-repo", args.config_repo])
         if tier:
             command.extend(['--tier',tier.name,'--tier-slots',str(slots),
                             '--tier-job-memory-gib',str(job_memory)])
@@ -2756,6 +2789,10 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
         plist['ProgramArguments'].append('--manage-control-vm')
     if getattr(args, 'target', None):
         plist['ProgramArguments'].extend(['--target', args.target])
+    if getattr(args, 'patch_repo', None):
+        plist['ProgramArguments'].extend(['--patch-repo', args.patch_repo])
+    if getattr(args, 'config_repo', None):
+        plist['ProgramArguments'].extend(['--config-repo', args.config_repo])
     if getattr(args, 'make_before_break', False):
         plist['ProgramArguments'].append('--make-before-break')
     plist_path.write_bytes(plistlib.dumps(plist))
@@ -2801,6 +2838,11 @@ def args_parser() -> argparse.ArgumentParser:
                         default=Path.home() / "Library" / "Application Support"
                         / "Spot Runner Autoscaler" / "state.json")
     parser.add_argument("--install-launch-agent", action="store_true")
+    parser.add_argument("--patch-repo", default=None,
+                        help="OWNER/REPO whose spot-runner-patch manifest every launched host gets (required to "
+                             "rotate hosts that run a patch)")
+    parser.add_argument("--config-repo", default=None,
+                        help="Central runner configuration repository (default <org>/spot-runners-config)")
     parser.add_argument("--job-repository", action="append", default=None,
                         help="Repository whose crash jobs are tracked/rerun; repeat for multiple repos (default: ORG/oxidex)")
     parser.add_argument("--once", action="store_true", help="Check and scale once, then exit")
