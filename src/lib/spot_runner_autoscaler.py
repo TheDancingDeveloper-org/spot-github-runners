@@ -1482,12 +1482,14 @@ def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, 
         _restart_replacement(rotation, state, state_path)
         return True
     LOG.error("%s; aborting replacement to preserve old capacity", reason)
-    if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args):
+    # Online listeners stay schedulable during the builder check and deletion, so a replacement with
+    # any online listener is kept and drained normally rather than deleted with jobs landing on it.
+    if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True):
         _delete_replacement(repl_vm, args, state, state_path)
     elif repl_vm:
-        # Busy or building: keep it as ordinary fleet capacity; normal draining (cordon, wait for
-        # jobs and builds, deregister) owns any later removal.
-        LOG.warning("Keeping replacement %s as fleet capacity: it is running jobs or remote builds",
+        # Online, busy or building: keep it as ordinary fleet capacity; normal draining (cordon,
+        # wait for jobs and builds, deregister) owns any later removal.
+        LOG.warning("Keeping replacement %s as fleet capacity: it has online listeners, jobs or remote builds",
                     repl_vm.name)
     state.pop("price_rotation", None)
     write_scale_state(state_path, state)

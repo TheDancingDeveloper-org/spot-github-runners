@@ -1588,13 +1588,21 @@ class ReadinessTimeoutPreservesWorkTests(unittest.TestCase):
         self.assertNotIn("asia-east2-a/oxidex-runners-new", saved.get("intentional_deletions", []))
 
     def test_active_remote_build_keeps_replacement(self):
-        runners = [GitHubRunner(1, "gha-oxidex-runners-new-1", "online", False, ("spot",))]
+        runners = [GitHubRunner(1, "gha-oxidex-runners-new-1", "offline", False, ("spot",))]
         delete_new, quiesce, _ = self.timeout(runners, builders_quiet=False)
         quiesce.assert_called_once_with(self.replacement_vm, self.args)
         delete_new.assert_not_called()
 
-    def test_idle_quiesced_replacement_is_deleted_intentionally(self):
+    def test_online_idle_listener_keeps_replacement_for_normal_draining(self):
+        """Codex M4 round 2: online listeners stay schedulable, so abort never deletes their host."""
         runners = [GitHubRunner(1, "gha-oxidex-runners-new-1", "online", False, ("spot",))]
+        delete_new, quiesce, saved = self.timeout(runners)
+        delete_new.assert_not_called()
+        quiesce.assert_not_called()
+        self.assertNotIn("asia-east2-a/oxidex-runners-new", saved.get("intentional_deletions", []))
+
+    def test_idle_quiesced_replacement_is_deleted_intentionally(self):
+        runners = [GitHubRunner(1, "gha-oxidex-runners-new-1", "offline", False, ("spot",))]
         delete_new, quiesce, saved = self.timeout(runners)
         quiesce.assert_called_once()
         delete_new.assert_called_once_with(self.replacement_vm, "homelab-424523")

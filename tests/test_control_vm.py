@@ -756,6 +756,28 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.assertEqual(h.kv.origin_slot(), "b")
         self.assertEqual(h.transition["step"], "propagate")
 
+    def test_price_cutover_aborts_when_replacement_unhealthy(self):
+        """Codex M4 round 2: recheck the replacement right before switching the origin."""
+        for status, healthy in (("TERMINATED", False), ("RUNNING", False)):
+            with self.subTest(status=status):
+                h = self.setup_rotation("cutover", freeze_requested=True, frozen_version=7)
+                self.with_new_vm(h, status=status, healthy=healthy)
+                if status == "RUNNING":
+                    h.http.unhealthy("b")
+                h.tick()
+                self.assertEqual(h.kv.origin_slot(), "a")  # users stay on the old VM
+                self.assertNotIn(("delete", "spot-control-a"), h.events)
+
+    def test_recovery_cutover_waits_for_preempted_replacement(self):
+        h = self.setup_rotation("cutover", mode=cv.MODE_RECOVER, freeze_requested=True, frozen_version=7)
+        h.gcloud.status("a", "TERMINATED")
+        h.http.unhealthy("a")
+        self.with_new_vm(h, status="TERMINATED", healthy=False)
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "a")  # never switched to a dead VM
+        self.assertIsNotNone(h.transition)
+        self.assertNotEqual(h.transition["step"], "propagate")
+
     def test_resume_propagate_waits_full_interval(self):
         h = self.setup_rotation("propagate", cutover_attempted=True, cutover_at=h_now() - 30)
         h.clock[0] = h_now()

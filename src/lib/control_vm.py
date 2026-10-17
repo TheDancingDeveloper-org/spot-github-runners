@@ -1285,7 +1285,29 @@ class ControlVmManager:
         self.save()
         return True
 
+    def _replacement_ready(self, t: dict, obs: Observation) -> tuple[bool, str]:
+        """Fresh readiness of the new slot: RUNNING and passing health right now."""
+        vm = obs.vm(t["new_slot"])
+        if vm is None:
+            return False, f"slot {t['new_slot']} VM is missing"
+        if not vm.running:
+            return False, f"slot {t['new_slot']} VM is {vm.status}"
+        result = obs.health.get(t["new_slot"]) or probe_health(self.requester, self.config, t["new_slot"])
+        return (True, "") if result.ok else (False, f"slot {t['new_slot']} not healthy ({result.detail})")
+
     def _step_cutover(self, t: dict, obs: Observation) -> str:
+        # Never point users at a replacement that was preempted or went unhealthy after import, or
+        # when resuming a saved cutover step: recheck it immediately before the origin write.
+        ready, why = self._replacement_ready(t, obs)
+        if not ready:
+            if t["mode"] == MODE_PRICE:
+                # The old VM is still active (only frozen); abort unfreezes it and keeps it serving.
+                return self._abort(t, f"replacement not ready at cutover: {why}")
+            if self._old_back(t, obs):
+                return self._abort(t, "old VM is healthy again; keeping it")
+            self._note("replacement not ready at cutover (%s); waiting for it again", why, level=logging.WARNING)
+            self._goto(t, "wait_health")
+            return "wait"
         if t["mode"] == MODE_RECOVER and t.get("import_skipped") and not self._catch_up_with_kv(t):
             if self._old_back(t, obs):
                 return self._abort(t, "old VM is healthy again; keeping it")
