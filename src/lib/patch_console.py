@@ -406,6 +406,16 @@ UNRECORDED_REASON = (
 )
 
 
+def pending_patch_reason(pending: str) -> str:
+    """Why a host whose provisioning patch is still pending classifies as ``unknown``."""
+    requested = ("no patch" if pending == "none" else "an unreadable patch record" if len(pending) != 64
+                 else f"patch {pending[:12]}")
+    return (f"pending, unconfirmed: provisioning requested {requested} (spot-runner-patch-pending-sha256), but "
+            "the bootstrap has not confirmed it, so the patch this host runs is unknown. It may still be "
+            "bootstrapping, or its package install or patch step failed. It stays unknown until "
+            "src/spot_runner_manager.py confirms a completed bootstrap, or until --patch-live applies a patch")
+
+
 def runner_hosts(instances: Iterable[Mapping[str, Any]], repository: str) -> list[dict[str, Any]]:
     """Running CI runner hosts of ``repository``: recorded ``patch_target``, or the host's ``spot-target`` label."""
     from .target_config import target_label_value
@@ -641,6 +651,11 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
         if unknowns:
             out.append(HostClassification(host, "unknown", _recorded_sha(host),
                                           "cannot verify the patch's hardware constraints: " + "; ".join(unknowns)))
+            continue
+        pending = str(host.get("patch_pending_sha256") or "")
+        if pending:
+            # Never noop: neither the applied record nor a host receipt proves that a pending bootstrap finished.
+            out.append(HostClassification(host, "unknown", None, pending_patch_reason(pending)))
             continue
         try:
             if executor.available:

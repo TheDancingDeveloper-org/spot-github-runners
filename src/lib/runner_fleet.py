@@ -31,8 +31,15 @@ LOG = logging.getLogger("spot_runner_autoscaler")
 # when larger than MAX_PATCH_METADATA_BYTES), ``spot-runner-patch-sha256`` its sha256 or ``none`` (no patch), and
 # ``spot-runner-patch-target`` the owner/repo the patch belongs to. The ``spot-runner-patch`` label carries a sha
 # prefix for filtering. Hosts provisioned before this existed have none of these keys.
+#
+# Those applied keys and the label are written only after the host confirmed the patch: a completed bootstrap
+# (runner_manager.main) or LIVE_PATCH_APPLIED. While a startup script is still applying a patch, or after it
+# failed, the requested patch sits under the PENDING keys instead, and consumers must treat the host's patch as
+# unknown (the applied keys, if any, describe an earlier state and may be stale).
 PATCH_METADATA_KEY = "spot-runner-patch"
 PATCH_SHA_METADATA_KEY = "spot-runner-patch-sha256"
+PATCH_PENDING_METADATA_KEY = "spot-runner-patch-pending"
+PATCH_PENDING_SHA_METADATA_KEY = "spot-runner-patch-pending-sha256"
 PATCH_TARGET_METADATA_KEY = "spot-runner-patch-target"
 PATCH_LABEL_KEY = "spot-runner-patch"
 # Deployment details apply_live_patch needs to hot-patch a host found by inventory (not secrets).
@@ -63,19 +70,32 @@ def gce_metadata_items(item: dict) -> dict[str, str]:
     return out
 
 
+def _pending_patch_sha(metadata: dict[str, str]) -> str:
+    """The pending (requested, unconfirmed) patch sha; ``invalid`` when a pending key is present but malformed."""
+    if PATCH_PENDING_SHA_METADATA_KEY not in metadata and PATCH_PENDING_METADATA_KEY not in metadata:
+        return ""
+    sha = metadata.get(PATCH_PENDING_SHA_METADATA_KEY, "").strip().lower()
+    if sha == NO_PATCH or (len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)):
+        return sha
+    return "invalid"  # Still pending: a damaged pending record never reads as confirmed.
+
+
 def patch_record_from_gce_item(item: dict) -> dict[str, str]:
     """The recorded runner patch of a GCE instance resource: ``patch_sha256``, ``patch_manifest_json``,
-    ``patch_target`` (empty strings when not recorded). The values are not trusted further than their shape;
-    consumers verify the manifest against its sha before using it."""
+    ``patch_target`` (empty strings when not recorded), and ``patch_pending_sha256`` (non-empty while a
+    requested patch is unconfirmed). The values are not trusted further than their shape; consumers verify the
+    manifest against its sha before using it."""
     metadata = gce_metadata_items(item)
+    pending = _pending_patch_sha(metadata)
     sha = metadata.get(PATCH_SHA_METADATA_KEY, "").strip().lower()
     if sha != NO_PATCH and not (len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)):
         sha = ""
     manifest = metadata.get(PATCH_METADATA_KEY, "") if sha and sha != NO_PATCH else ""
     if len(manifest.encode("utf-8")) > MAX_PATCH_METADATA_BYTES:
         manifest = ""
-    target = metadata.get(PATCH_TARGET_METADATA_KEY, "").strip() if sha else ""
-    return {"patch_sha256": sha, "patch_manifest_json": manifest, "patch_target": target}
+    target = metadata.get(PATCH_TARGET_METADATA_KEY, "").strip() if sha or pending else ""
+    return {"patch_sha256": sha, "patch_manifest_json": manifest, "patch_target": target,
+            "patch_pending_sha256": pending}
 
 
 def runner_deployment_from_gce_item(item: dict) -> dict[str, Any]:
@@ -141,6 +161,8 @@ class GceVm:
     patch_sha256: str = ""
     patch_manifest_json: str = ""
     patch_target: str = ""
+    # Requested at provisioning but not yet confirmed by a completed bootstrap; the patch is unknown while set.
+    patch_pending_sha256: str = ""
 
     @property
     def running(self) -> bool:

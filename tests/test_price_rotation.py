@@ -1111,7 +1111,8 @@ class TargetOwnershipTests(unittest.TestCase):
                 [labels] = [a for a in create if a.startswith("--labels=")]
                 pairs = dict(p.split("=", 1) for p in labels[len("--labels="):].split(","))
                 self.assertEqual(pairs["spot-target"], expected)
-                self.assertEqual(set(pairs), {"spot-target", "spot-runner-patch"})  # plus the recorded-patch label
+                # The recorded-patch label waits for a confirmed bootstrap (runner_manager.main).
+                self.assertEqual(set(pairs), {"spot-target"})
 
 
 def replace_vm(vm, **changes):

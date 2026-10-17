@@ -32,6 +32,8 @@ from .runner_fleet import (
     PATCH_LABEL_KEY,
     PATCH_LABEL_SHA_CHARS,
     PATCH_METADATA_KEY,
+    PATCH_PENDING_METADATA_KEY,
+    PATCH_PENDING_SHA_METADATA_KEY,
     PATCH_SHA_METADATA_KEY,
     PATCH_TARGET_METADATA_KEY,
     RUNNER_COUNT_METADATA_KEY,
@@ -493,6 +495,18 @@ def runner_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) -> 
     return plain, manifest, patch.patch_sha256[:PATCH_LABEL_SHA_CHARS]
 
 
+def pending_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) -> tuple[dict[str, str], str | None]:
+    """(plain metadata, canonical manifest JSON or None) announcing ``patch`` as requested but not yet applied.
+
+    The deployment keys match runner_patch_record; the patch sha goes under the PENDING key (and the manifest
+    under PATCH_PENDING_METADATA_KEY), never the applied keys or the label. Those wait for
+    record_patch_metadata, after the bootstrap confirms the patch.
+    """
+    plain, manifest, _label = runner_patch_record(args, patch)
+    plain[PATCH_PENDING_SHA_METADATA_KEY] = plain.pop(PATCH_SHA_METADATA_KEY)
+    return plain, manifest
+
+
 def _plain_metadata_flag(plain: dict[str, str]) -> str:
     for key, value in plain.items():
         if any(c in value for c in ",=\n\r") or any(c in key for c in ",=\n\r"):
@@ -501,8 +515,13 @@ def _plain_metadata_flag(plain: dict[str, str]) -> str:
 
 
 def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatch | None, *,
-                          existing_keys: set[str] | None = None) -> None:
-    """Record the patch a running host now runs (instance metadata plus a sha-prefix label)."""
+                          existing_keys: set[str] | None = None, clear_pending: bool = False) -> None:
+    """Record the patch a running host now runs (instance metadata plus a sha-prefix label).
+
+    Call it only after the host confirmed ``patch`` (a completed bootstrap or LIVE_PATCH_APPLIED).
+    ``clear_pending`` then removes the PENDING keys, last, so the host never looks confirmed before the
+    applied record is complete.
+    """
     plain, manifest, label = runner_patch_record(args, patch)
     manifest_path = None
     try:
@@ -519,6 +538,9 @@ def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatc
                     f"--keys={PATCH_METADATA_KEY}"])
         gcloud(["compute", "instances", "add-labels", args.instance_name, f"--zone={zone}",
                 f"--labels={PATCH_LABEL_KEY}={label}"])
+        if clear_pending:
+            gcloud(["compute", "instances", "remove-metadata", args.instance_name, f"--zone={zone}",
+                    f"--keys={PATCH_PENDING_SHA_METADATA_KEY},{PATCH_PENDING_METADATA_KEY}"])
     finally:
         if manifest_path:
             Path(manifest_path).unlink(missing_ok=True)
@@ -607,14 +629,18 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     with tempfile.NamedTemporaryFile("w", prefix="gha-startup-", delete=False) as temp:
         temp.write(script)
         script_path = temp.name
-    # Record the patch this startup script applies (runner_fleet / the dashboard read it back).
-    patch_plain, patch_manifest, patch_label = runner_patch_record(args, resolve_runner_patch(args))
+    # Announce the patch this startup script applies as PENDING only. A VM is RUNNING long before its bootstrap
+    # finishes and stays running when the package install or patch step fails, so the applied keys and label
+    # (which runner_fleet and the dashboard trust) wait for main() to confirm the completed bootstrap.
+    startup_patch = resolve_runner_patch(args)
+    args.startup_patch = startup_patch
+    patch_plain, patch_manifest = pending_patch_record(args, startup_patch)
     patch_path = None
     if patch_manifest is not None:
         with tempfile.NamedTemporaryFile("w", prefix="gha-patch-", suffix=".json", delete=False) as temp:
             temp.write(patch_manifest)
             patch_path = temp.name
-    metadata_files = f"startup-script={script_path}" + (f",{PATCH_METADATA_KEY}={patch_path}" if patch_path else "")
+    metadata_files = f"startup-script={script_path}" + (f",{PATCH_PENDING_METADATA_KEY}={patch_path}" if patch_path else "")
     try:
         if vm:
             if adopt_label:
@@ -636,11 +662,11 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                         f"--zone={zone}", f"--disk={args.disk_device_name}", "--auto-delete", "--quiet"])
             gcloud(["compute", "instances", "add-metadata", args.instance_name, f"--zone={zone}",
                     f"--metadata-from-file={metadata_files}", _plain_metadata_flag(patch_plain)])
-            if patch_path is None and PATCH_METADATA_KEY in gce_metadata_items(vm):
+            if patch_path is None and PATCH_PENDING_METADATA_KEY in gce_metadata_items(vm):
+                # A pending manifest left by an earlier, unconfirmed attempt must not describe this one.
                 gcloud(["compute", "instances", "remove-metadata", args.instance_name, f"--zone={zone}",
-                        f"--keys={PATCH_METADATA_KEY}"])
-            gcloud(["compute", "instances", "add-labels", args.instance_name, f"--zone={zone}",
-                    f"--labels={PATCH_LABEL_KEY}={patch_label}"])
+                        f"--keys={PATCH_PENDING_METADATA_KEY}"])
+            # The applied keys and label keep their previous value; the pending keys mark them unconfirmed.
             if vm.get("status") == "RUNNING":
                 gcloud(["compute", "instances", "reset", args.instance_name, f"--zone={zone}", "--quiet"])
             elif vm.get("status") in {"STOPPED", "TERMINATED"}:
@@ -666,7 +692,7 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                         image_family, "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
                         network, f"--metadata-from-file={metadata_files}", _plain_metadata_flag(patch_plain),
-                        f"--labels={TARGET_LABEL_KEY}={launch_target_label(args)},{PATCH_LABEL_KEY}={patch_label}",
+                        f"--labels={TARGET_LABEL_KEY}={launch_target_label(args)}",
                         "--format=json(id,name,zone,status,disks,cpuPlatform,minCpuPlatform)",
                         "--quiet"], quiet=True)
                 if getattr(args, "deployment_receipt", None):
@@ -862,7 +888,13 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     )
     current_manifest = json.loads(state_raw).get("manifest") if state_raw.strip() else None
     action = classify_patch_diff(current_manifest, patch)
-    if action == "noop":
+    pending = bool(vm.patch_pending_sha256)
+    if action == "noop" and pending:
+        # The receipt matches, but this host's bootstrap never confirmed its patch: re-apply it live so
+        # LIVE_PATCH_APPLIED, not the receipt alone, confirms it before the pending record is cleared.
+        LOG.info("VM %s reports patch %s, but its bootstrap never confirmed it; re-applying it live",
+                 args.instance_name, patch.patch_sha256[:12])
+    elif action == "noop":
         LOG.info("VM %s is already at patch %s", args.instance_name, patch.patch_sha256[:12])
         # The host's own receipt confirms the patch: record it (backfills hosts provisioned before recording).
         record_patch_metadata(args, zone, patch)
@@ -895,7 +927,7 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
         raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
     # Only now, after the host confirmed this exact patch, does the recorded patch change.
-    record_patch_metadata(args, zone, patch)
+    record_patch_metadata(args, zone, patch, clear_pending=pending)
     sync_runner_labels(args)
     LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
     return "hot_patch"
@@ -1034,6 +1066,12 @@ def main() -> int:
         sync_runner_labels(args)
         verify_runner_storage(args, zone)
         online = online_runners(args)
+        if len(online) == args.runner_count:
+            # This deployment's bootstrap marker, every runner online, and verified storage: only now does the
+            # host advertise the patch its startup script applied (and the pending record go away).
+            if not hasattr(args, "startup_patch"):
+                raise RuntimeError("apply_startup did not record which patch the startup script applies")
+            record_patch_metadata(args, zone, args.startup_patch, clear_pending=True)
     except BaseException as exc:
         failure = exc
     finally:

@@ -362,7 +362,7 @@ def runner_host_records(items: list[dict]) -> list[dict]:
         labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
         record = patch_record_from_gce_item(item)
         target_label = str(labels.get(TARGET_LABEL_KEY, "") or "")
-        if not target_label and not record["patch_sha256"]:
+        if not target_label and not record["patch_sha256"] and not record["patch_pending_sha256"]:
             continue
         hosts.append({
             "name": item["name"],

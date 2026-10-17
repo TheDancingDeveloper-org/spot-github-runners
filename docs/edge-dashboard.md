@@ -135,9 +135,10 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   moved, or GitHub reports that the file changed, the dashboard answers HTTP 409. The token in
   `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` needs contents and pull-request write access to the config
   repository.
-- `src/spot_runner_manager.py` records the patch on each runner host as instance metadata. It does this
-  when it provisions the host, and after a live patch, but only once the host confirms
-  `LIVE_PATCH_APPLIED:<sha256>`. The keys are:
+- `src/spot_runner_manager.py` records the patch on each runner host as instance metadata, but only after
+  the host confirms it. A provisioned host confirms it when its bootstrap writes the completion marker
+  for this deployment, every runner is online, and the storage check passes. A live patch confirms it
+  when the host reports `LIVE_PATCH_APPLIED:<sha256>`. The keys are:
   - `spot-runner-patch`: the canonical manifest JSON. It's left out when larger than 64 KiB, and then
     only the sha256 is recorded.
   - `spot-runner-patch-sha256`: the sha256, or `none` when the host has no patch.
@@ -148,6 +149,12 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
     registered with, and its runner group. The scope can be an organization such as `swack-tools`,
     even when the patch belongs to `swack-tools/oxidex`.
 - The `spot-runner-patch` label holds the first 16 characters of the sha256, or `none`, for filtering.
+- Until then, provisioning records the requested patch as pending: `spot-runner-patch-pending-sha256`
+  holds the sha256 or `none`, and `spot-runner-patch-pending` holds the manifest. A VM runs before its
+  bootstrap finishes, and it keeps running when the package install or patch step fails. If the bootstrap
+  fails, the pending keys stay, and the applied keys stay unset or keep their earlier value. Confirmation
+  writes the applied keys and the label, then removes the pending keys. `--patch-live` on a pending host
+  applies the patch again, even when its receipt already matches, so `LIVE_PATCH_APPLIED` confirms it.
 - On the control VM, `DASHBOARD_FLEET_INVENTORY=gce` makes the preview list runner hosts from Compute
   Engine. A runner host carries the `spot-target` label or the patch metadata. The control VM's
   service account needs `compute.instances.list`. Elsewhere the preview uses the host records in the
@@ -158,7 +165,9 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   `unknown`. The hot-patch executor and `--patch-live` refuse such hosts before they change anything.
 - The preview then classifies each host from its recorded manifest, after checking it against the recorded
   sha256. Hosts provisioned before patch recording show as `unknown`, with a reason. They stay that way
-  until they're reprovisioned or hot-patched once with `--patch-live`.
+  until they're reprovisioned or hot-patched once with `--patch-live`. A host with a pending patch is
+  also `unknown`, never `noop`. That holds even when the applied keys match, and even when the receipt
+  matches. The reason names the pending patch.
 - Hot-patching applies the saved effective patch, never a draft. It runs only when every host is
   `hot_patch` or `noop` and the `patch_sha256` from the preview is still current. It reports a result per
   host. A repeated request with the same `Idempotency-Key` returns the stored result without touching
@@ -264,6 +273,11 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   `frozen`, the autoscaler freezes it again, or reads its snapshot, and imports that state before the
   switch. If the old VM is down, the autoscaler imports the latest KV snapshot into the new VM and
   waits until the new VM reports at least that version before it updates `origin:active`.
+  Only a confirmed freeze makes the imported state final. If the old VM answers but never freezes, the
+  autoscaler imports its unfrozen snapshot and stops the old VM before the switch. The old VM may accept
+  changes until it stops, so the autoscaler treats that state as provisional. It logs an error, reports
+  the reason as `old_state_unconfirmed` in the `status` output, and keeps the old boot disk when it
+  deletes the old VM. An old VM that the autoscaler stopped, rather than froze, gets the same treatment.
 - **Price rotation**: the autoscaler creates the other slot, waits for health, freezes the old VM, copies
   its snapshot into the new VM, writes `origin:active` with read-back verification, waits for KV to
   propagate, then deletes the old VM. A failed origin write unfreezes the old VM and deletes the new one.
@@ -286,8 +300,9 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   it deletes the VM with `--keep-disks=boot`. The boot disk keeps the VM's name. The autoscaler logs an
   error and records the disk under `retained_disks` in its controller state, and later creates for that
   slot prefer other zones. Recover the state from the disk, then delete the disk by hand. This happens
-  when a rollback can't freeze the new VM or can't confirm the import, and when a recovery switched
-  slots without importing from the old VM.
+  when a rollback can't freeze the new VM or can't confirm the import, when a recovery switched
+  slots without importing from the old VM, and when a recovery imported state from an old VM that never
+  confirmed a freeze. The `reason` field in `retained_disks` says which case applies.
 
 Recovery depends on the autoscaler running. If the workstation that runs it is off, the dashboard stays
 down until the autoscaler runs again.
