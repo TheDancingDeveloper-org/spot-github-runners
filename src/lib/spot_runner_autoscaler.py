@@ -1407,8 +1407,26 @@ def _delete_replacement(repl_vm, args, state, state_path) -> None:
                   repl_vm.name, error_detail(exc))
 
 
-def reconcile_replacement_cleanups(vms, args, state, state_path) -> None:
-    """Retry deletion of aborted replacements until fresh inventory shows them absent."""
+def _release_replacement_cleanup(key, state, state_path) -> None:
+    """Hand an aborted replacement back to ordinary fleet ownership instead of deleting it."""
+    state.get("replacement_cleanups", {}).pop(key, None)
+    deletions = state.get("intentional_deletions")
+    if isinstance(deletions, list) and key in deletions:
+        deletions.remove(key)
+    ids = state.get("intentional_deletion_ids")
+    if isinstance(ids, dict):
+        ids.pop(key, None)
+    write_scale_state(state_path, state)
+
+
+def reconcile_replacement_cleanups(vms, runners, args, state, state_path) -> None:
+    """Retry deletion of aborted replacements until fresh inventory shows them absent.
+
+    A replacement whose first deletion failed may since have registered listeners, taken jobs,
+    or started a remote build. Every retry therefore re-checks workload safety against this
+    check's fresh inventory: a replacement with online or busy listeners, or an active build, is
+    handed back to the fleet so ordinary draining (cordon, wait, deregister) owns its removal.
+    """
     cleanups = state.get("replacement_cleanups")
     if not isinstance(cleanups, dict) or not cleanups:
         return
@@ -1419,6 +1437,14 @@ def reconcile_replacement_cleanups(vms, args, state, state_path) -> None:
             cleanups.pop(key)
             LOG.info("Confirmed aborted replacement %s is deleted", record.get("name"))
             write_scale_state(state_path, state)
+            continue
+        if runner_inventory_stale(state):
+            LOG.warning("Retry of aborted replacement %s deletion held: runner inventory is stale", current.name)
+            continue
+        if not _replacement_safe_to_delete(current, runners, args, require_offline=True):
+            LOG.warning("Aborted replacement %s now has online listeners, jobs, or builds; keeping it as fleet "
+                        "capacity so normal draining owns its removal", current.name)
+            _release_replacement_cleanup(key, state, state_path)
             continue
         key_ids = state.setdefault("intentional_deletion_ids", {})
         if key not in state.setdefault("intentional_deletions", []):
@@ -2616,7 +2642,7 @@ def _run_controller(args: argparse.Namespace) -> int:
         jobs.poll(vms)
         observe_vms(vms, state)
         write_scale_state(state_path, state)
-        reconcile_replacement_cleanups(vms, args, state, state_path)
+        reconcile_replacement_cleanups(vms, runners, args, state, state_path)
         LOG.info(fleet_summary(vms, runners, state))
         log_hourly_spend(vms, args, state, state_path)
         if getattr(args, 'manage_control_vm', False):

@@ -1839,21 +1839,84 @@ class ReplacementCleanupRetryTests(unittest.TestCase):
                 self.assertNotIn("price_rotation", state)
                 self.assertEqual(read_scale_state(path)["replacement_cleanups"]["z/oxidex-runners-new"],
                                  {"name": dead.name, "zone": "z", "instance_id": "new"})
-                reconcile_replacement_cleanups([outgoing, dead], args, state, path)  # Still failing.
+                reconcile_replacement_cleanups([outgoing, dead], [], args, state, path)  # Still failing.
             self.assertIn("z/oxidex-runners-new", read_scale_state(path)["replacement_cleanups"])
             with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as retry:
-                reconcile_replacement_cleanups([outgoing, dead], args, state, path)
+                reconcile_replacement_cleanups([outgoing, dead], [], args, state, path)
                 retry.assert_called_once_with(dead, "p")
                 self.assertIn("z/oxidex-runners-new", state["replacement_cleanups"])  # Not yet confirmed.
                 # A same-named VM with another identity is not this cleanup's VM: absence is confirmed.
-                reconcile_replacement_cleanups([outgoing, replace_vm(dead, instance_id="other")], args, state, path)
+                reconcile_replacement_cleanups([outgoing, replace_vm(dead, instance_id="other")], [], args, state, path)
                 retry.assert_called_once()
             self.assertEqual(read_scale_state(path)["replacement_cleanups"], {})
+
+    def _pending_cleanup(self, tmpdir, repl):
+        from lib.spot_runner_autoscaler import write_scale_state
+        key = f"{repl.zone}/{repl.name}"
+        state = {"replacement_cleanups": {key: {"name": repl.name, "zone": repl.zone, "instance_id": repl.instance_id}},
+                 "intentional_deletions": [key], "intentional_deletion_ids": {key: repl.instance_id},
+                 "runner_inventory_observed_at": __import__("time").time()}
+        path = Path(tmpdir) / "state.json"
+        write_scale_state(path, state)
+        return key, state, path
+
+    def test_retry_hands_back_replacement_that_took_listeners_or_jobs(self):
+        """Codex M4 P1: a retry must re-check workload safety, not delete by identity alone."""
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups
+        repl = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new")
+        args = SimpleNamespace(project="p")
+        for runner in (GitHubRunner(9, "gha-oxidex-runners-new-1", "online", False, ("spot",)),
+                       GitHubRunner(9, "gha-oxidex-runners-new-1", "online", True, ("spot",))):
+            with self.subTest(busy=runner.busy), tempfile.TemporaryDirectory() as tmpdir:
+                key, state, path = self._pending_cleanup(tmpdir, repl)
+                with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                        patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True):
+                    reconcile_replacement_cleanups([repl], [runner], args, state, path)
+                delete.assert_not_called()
+                saved = read_scale_state(path)
+                self.assertEqual(saved["replacement_cleanups"], {})
+                self.assertNotIn(key, saved["intentional_deletions"])  # normal draining owns it now
+                self.assertNotIn(key, saved["intentional_deletion_ids"])
+
+    def test_retry_keeps_replacement_with_active_remote_build(self):
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups
+        repl = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key, state, path = self._pending_cleanup(tmpdir, repl)
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=False):
+                reconcile_replacement_cleanups([repl], [], SimpleNamespace(project="p"), state, path)
+            delete.assert_not_called()
+            self.assertEqual(read_scale_state(path)["replacement_cleanups"], {})
+
+    def test_retry_waits_for_fresh_runner_inventory(self):
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups
+        repl = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key, state, path = self._pending_cleanup(tmpdir, repl)
+            state["runner_inventory_observed_at"] = 0.0  # stale
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True):
+                reconcile_replacement_cleanups([repl], [], SimpleNamespace(project="p"), state, path)
+            delete.assert_not_called()
+            self.assertIn(key, state["replacement_cleanups"])  # still pending, not released
+
+    def test_retry_deletes_quiescent_replacement_without_listeners(self):
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups
+        repl = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new")
+        offline = GitHubRunner(9, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key, state, path = self._pending_cleanup(tmpdir, repl)
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete, \
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True):
+                reconcile_replacement_cleanups([repl], [offline], SimpleNamespace(project="p"), state, path)
+            delete.assert_called_once_with(repl, "p")
+            self.assertIn(key, state["replacement_cleanups"])  # awaiting confirmed absence
 
     def test_controller_loop_runs_cleanup_each_check(self):
         import inspect
         from lib import spot_runner_autoscaler as controller
-        self.assertIn("reconcile_replacement_cleanups(vms, args, state, state_path)",
+        self.assertIn("reconcile_replacement_cleanups(vms, runners, args, state, state_path)",
                       inspect.getsource(controller._run_controller))
 
 
