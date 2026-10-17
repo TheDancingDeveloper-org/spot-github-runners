@@ -3004,7 +3004,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                         timeout=2.0,
                     ) as resp:
                         health_payload = json.loads(resp.read().decode("utf-8"))
-                    self.assertEqual(health_payload["status"], "healthy")
+                    self.assertEqual(health_payload["status"], "ok")
                     stalled_peer.settimeout(1.5)
                     try:
                         eof_data = stalled_peer.recv(16)

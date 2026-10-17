@@ -1575,8 +1575,108 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
     })();
 
+    const CONTROL_VM_UNAVAILABLE = "control_vm_unavailable";
+    const CONTROL_VM_POLL_MS = 5000;
+    const CONTROL_VM_BANNER_TEXT = "The control VM is restarting or being replaced — waiting. Your change will be retried automatically.";
+    let CONTROL_VM_WAIT = null;
+
+    function newIdempotencyKey() {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+      }
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+
+    function setControlVmBanner(visible) {
+      let banner = document.getElementById("control-vm-banner");
+      if (!visible) {
+        if (banner) banner.hidden = true;
+        return;
+      }
+      if (!banner) {
+        banner = document.createElement("div");
+        banner.id = "control-vm-banner";
+        banner.setAttribute("role", "status");
+        banner.setAttribute("aria-live", "polite");
+        banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:10000;padding:10px 16px;" +
+          "background:#7c2d12;color:#fff7ed;font-weight:600;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.35);";
+        banner.textContent = CONTROL_VM_BANNER_TEXT;
+        (document.body || document.documentElement).appendChild(banner);
+      }
+      banner.hidden = false;
+    }
+
+    function waitForControlVm() {
+      // One shared wait: every blocked request resumes when /api/health returns 200.
+      if (!CONTROL_VM_WAIT) {
+        setControlVmBanner(true);
+        CONTROL_VM_WAIT = (async () => {
+          for (;;) {
+            await new Promise(resolve => setTimeout(resolve, CONTROL_VM_POLL_MS));
+            try {
+              const health = await NATIVE_FETCH("/api/health", { cache: "no-store", credentials: "same-origin" });
+              if (health.status === 200) return;
+            } catch (_err) {
+              // Still unreachable; keep polling.
+            }
+          }
+        })().finally(() => {
+          CONTROL_VM_WAIT = null;
+          setControlVmBanner(false);
+        });
+      }
+      return CONTROL_VM_WAIT;
+    }
+
+    async function isControlVmUnavailable(res) {
+      if (!res || res.status !== 503) return false;
+      try {
+        const data = await res.clone().json();
+        return Boolean(data && data.error === CONTROL_VM_UNAVAILABLE);
+      } catch (_err) {
+        return false;
+      }
+    }
+
+    async function oauthLoginEnabled() {
+      try {
+        const res = await NATIVE_FETCH("/api/auth/status", { cache: "no-store", credentials: "same-origin" });
+        const data = await res.json();
+        return Boolean(data && data.oauth && data.oauth.enabled);
+      } catch (_err) {
+        return false;
+      }
+    }
+
+    async function fetchWithControlVmRetry(input, reqInit) {
+      // Retries the SAME request (same Idempotency-Key) after the control VM comes back.
+      for (;;) {
+        let res;
+        try {
+          res = await NATIVE_FETCH(input, reqInit);
+        } catch (err) {
+          if (err instanceof TypeError) {
+            await waitForControlVm();
+            continue;
+          }
+          throw err;
+        }
+        if (await isControlVmUnavailable(res)) {
+          await waitForControlVm();
+          continue;
+        }
+        return res;
+      }
+    }
+
     window.fetch = async function dashboardAuthorizedFetch(input, init = {}) {
-      const reqInit = { ...init, credentials: init.credentials || "same-origin" };
+      const method = String(init.method || (input && input.method) || "GET").toUpperCase();
+      const reqInit = { ...init, method, credentials: init.credentials || "same-origin" };
       const headers = new Headers(init.headers || {});
       const token = getDashboardAuthToken();
       if (token && !headers.has("Authorization")) {
@@ -1585,18 +1685,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       if (token && !headers.has("X-Dashboard-Token")) {
         headers.set("X-Dashboard-Token", token);
       }
+      if (method !== "GET" && method !== "HEAD" && !headers.has("Idempotency-Key")) {
+        headers.set("Idempotency-Key", newIdempotencyKey());
+      }
       reqInit.headers = headers;
-      let res = await NATIVE_FETCH(input, reqInit);
-      if (res.status === 401 && typeof window.prompt === "function") {
-        const prompted = window.prompt("Dashboard authentication required. Enter your dashboard token:");
-        if (prompted && prompted.trim()) {
-          const ok = await authenticateDashboardToken(prompted.trim());
-          if (ok) {
-            const retryHeaders = new Headers(init.headers || {});
-            const fresh = getDashboardAuthToken();
-            retryHeaders.set("Authorization", `Bearer ${fresh}`);
-            retryHeaders.set("X-Dashboard-Token", fresh);
-            res = await NATIVE_FETCH(input, { ...reqInit, headers: retryHeaders });
+      let res = await fetchWithControlVmRetry(input, reqInit);
+      if (res.status === 401) {
+        if (await oauthLoginEnabled()) {
+          window.location.assign("/");
+          return res;
+        }
+        if (typeof window.prompt === "function") {
+          const prompted = window.prompt("Dashboard authentication required. Enter your dashboard token:");
+          if (prompted && prompted.trim()) {
+            const ok = await authenticateDashboardToken(prompted.trim());
+            if (ok) {
+              const retryHeaders = new Headers(headers);
+              const fresh = getDashboardAuthToken();
+              retryHeaders.set("Authorization", `Bearer ${fresh}`);
+              retryHeaders.set("X-Dashboard-Token", fresh);
+              res = await fetchWithControlVmRetry(input, { ...reqInit, headers: retryHeaders });
+            }
           }
         }
       }

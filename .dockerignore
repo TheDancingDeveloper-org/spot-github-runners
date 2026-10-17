@@ -1,0 +1,32 @@
+# Build context for dashboard/Dockerfile: deny by default, then allow only what the image copies.
+*
+!src/
+!cloud-init/
+!runner/
+!builder/
+!dashboard/Dockerfile
+
+# Never send these, even from inside allowed directories (later rules win).
+**/.git
+**/.github
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/id_rsa*
+**/id_ed25519*
+**/*.json.local
+**/.wrangler
+**/node_modules
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.venv
+**/.DS_Store
+**/*.log
+tests/
+cloudflare/
+docs/

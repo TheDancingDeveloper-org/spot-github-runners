@@ -2,10 +2,11 @@
 
 This module is standard-library only. It provides:
 
-* GitHub OAuth 2.0 Device Flow (RFC 8628), which needs only a client ID.
-* GitHub OAuth 2.0 Authorization Code flow, enabled only when a client secret is configured.
-* Fail-closed authorization: the GitHub login must be on the allowlist AND, for every
-  configured controlled target, the user must be an administrator
+* GitHub OAuth 2.0 Authorization Code flow with PKCE (S256), enabled when a client secret is configured.
+* GitHub OAuth 2.0 Device Flow (RFC 8628), disabled unless ``GITHUB_OAUTH_DEVICE_FLOW=1``.
+* Fail-closed authorization: the GitHub identity must be exactly login ``swackhamer`` with numeric
+  ID 619624 (hardcoded; there is no override) AND, for every configured controlled target, the user
+  must be an administrator
   (``GET /repos/{owner}/{repo}`` -> ``permissions.admin is True``; ``GET /user/memberships/orgs/{org}``
   -> ``state == "active"`` and ``role == "admin"``). Any API error denies access.
 * Stateless HMAC-SHA256 tokens for sessions, CSRF ``state`` values, and device-flow handles.
@@ -19,8 +20,11 @@ edge worker or a replacement VM)::
 
 ``<purpose>`` is ``session``, ``oauth-state``, or ``device``. Session payloads are
 ``{"v": 1, "sub": login, "uid": github_id, "iat": epoch, "exp": epoch, "tgt": [verified target keys]}``.
-A session grants access only while ``exp`` is in the future, ``sub`` is still allowlisted, and every
-currently configured controlled target key appears in ``tgt``.
+A session grants access only while ``iat - 60 <= now < exp``, ``sub == "swackhamer"``, ``uid == 619624``,
+and every currently configured controlled target key appears in ``tgt``.
+
+The PKCE ``code_verifier`` is derived statelessly as ``base64url(HMAC-SHA256(pkce_key, state))`` with
+``pkce_key = HMAC-SHA256(session_secret, "spot-dashboard/pkce/v1")``; it never leaves the server.
 """
 
 from __future__ import annotations
@@ -31,17 +35,22 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import os
 import re
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Iterable, Mapping
 import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_ALLOWED_ADMINS: frozenset[str] = frozenset({"swackhamer", "xbmc4lyfe"})
+# The only identity allowed to sign in. Hardcoded on purpose: there is no environment or CLI override.
+ALLOWED_ADMIN_LOGIN = "swackhamer"
+ALLOWED_ADMIN_ID = 619624
+DEFAULT_ALLOWED_ADMINS: frozenset[str] = frozenset({ALLOWED_ADMIN_LOGIN})
 
 ENV_CLIENT_ID = "GITHUB_OAUTH_CLIENT_ID"
 ENV_CLIENT_SECRET = "GITHUB_OAUTH_CLIENT_SECRET"
@@ -49,8 +58,11 @@ ENV_SCOPES = "GITHUB_OAUTH_SCOPES"
 ENV_REDIRECT_URI = "GITHUB_OAUTH_REDIRECT_URI"
 ENV_SESSION_SECRET = "DASHBOARD_SESSION_SECRET"
 ENV_SESSION_TTL = "DASHBOARD_SESSION_TTL_SECONDS"
-ENV_ALLOWED_ADMINS = "DASHBOARD_ALLOWED_ADMINS"
 ENV_CONTROLLED_TARGETS = "DASHBOARD_CONTROLLED_TARGETS"
+ENV_DEVICE_FLOW = "GITHUB_OAUTH_DEVICE_FLOW"
+DEFAULT_CONFIG_REPO = "swack-tools/spot-runners-config"
+DEFAULT_CONFIG_TARGETS_TTL_SECONDS = 300.0
+MAX_USED_STATE_NONCES = 10_000
 
 SESSION_COOKIE_NAME = "spot_session"
 OAUTH_STATE_COOKIE_NAME = "spot_oauth_state"
@@ -89,6 +101,16 @@ _OPAQUE_RE = re.compile(r"[A-Za-z0-9._~+/=-]{1,512}\Z")
 # requester(method, url, headers, body, timeout) -> (http_status, response_body_bytes)
 HttpRequester = Callable[..., "tuple[int, bytes]"]
 
+AUDIT_LOG = logging.getLogger("spot_dashboard.auth")
+
+
+def audit_login(login: str, uid: Any, result: str, detail: str = "") -> None:
+    """Write one login audit line. Never pass tokens, codes, or secrets here."""
+    clean_login = str(login or "-") if _LOGIN_RE.match(str(login or "")) else "-"
+    clean_uid = str(uid) if _is_int(uid) else "-"
+    clean_detail = re.sub(r"[^A-Za-z0-9 ._:/,'()=-]", "?", str(detail or ""))[:300]
+    AUDIT_LOG.info("dashboard login login=%s uid=%s result=%s detail=%s", clean_login, clean_uid, result, clean_detail)
+
 
 class GitHubApiError(RuntimeError):
     """Raised when a GitHub OAuth or REST call fails or returns an unusable response."""
@@ -112,12 +134,14 @@ def normalize_admin_logins(logins: Iterable[str]) -> frozenset[str]:
     return frozenset(out)
 
 
-def parse_allowed_admins(raw: str | None) -> frozenset[str]:
-    """Parse a comma/whitespace separated allowlist; empty or unset means the default allowlist."""
-    items = _split_list(raw or "")
-    if not items:
-        return DEFAULT_ALLOWED_ADMINS
-    return normalize_admin_logins(items)
+def is_allowed_identity(login: Any, uid: Any) -> bool:
+    """True only for the hardcoded dashboard administrator (login compared case-insensitively, ID exactly)."""
+    return (
+        isinstance(login, str)
+        and login.lower() == ALLOWED_ADMIN_LOGIN
+        and _is_int(uid)
+        and uid == ALLOWED_ADMIN_ID
+    )
 
 
 def is_admin_login(login: str, allowed_admins: Iterable[str]) -> bool:
@@ -288,7 +312,7 @@ class SessionData:
         sub, uid, iat, exp, tgt = data.get("sub"), data.get("uid"), data.get("iat"), data.get("exp"), data.get("tgt")
         if not isinstance(sub, str) or not _LOGIN_RE.match(sub):
             return None
-        if uid is not None and not _is_int(uid):
+        if not _is_int(uid):
             return None
         if not _is_int(iat) or not _is_int(exp) or exp <= iat:
             return None
@@ -516,6 +540,7 @@ class GitHubOAuthManager:
         timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
         verification_cache: TargetVerificationCache | None = None,
         clock: Callable[[], float] = time.time,
+        device_flow: bool = False,
     ) -> None:
         cid = str(client_id or "").strip()
         if not _CLIENT_ID_RE.match(cid):
@@ -528,9 +553,12 @@ class GitHubOAuthManager:
             )
         if len(set(secret_bytes)) < 8:
             raise ValueError(f"{ENV_SESSION_SECRET} has too little variety to be a random secret")
-        admins = DEFAULT_ALLOWED_ADMINS if allowed_admins is None else normalize_admin_logins(allowed_admins)
-        if not admins:
-            raise ValueError("The dashboard admin allowlist cannot be empty")
+        if allowed_admins is not None and normalize_admin_logins(allowed_admins) != DEFAULT_ALLOWED_ADMINS:
+            raise ValueError(
+                f"The dashboard administrator is fixed to GitHub user '{ALLOWED_ADMIN_LOGIN}' (ID {ALLOWED_ADMIN_ID}) "
+                "and cannot be overridden"
+            )
+        admins = DEFAULT_ALLOWED_ADMINS
         ttl = int(session_ttl_seconds)
         if not MIN_SESSION_TTL_SECONDS <= ttl <= MAX_SESSION_TTL_SECONDS:
             raise ValueError(
@@ -554,14 +582,17 @@ class GitHubOAuthManager:
         self._session_key = derive_purpose_key(secret_bytes, "session")
         self._state_key = derive_purpose_key(secret_bytes, "oauth-state")
         self._device_key = derive_purpose_key(secret_bytes, "device")
-        self._used_state_nonces: dict[str, float] = {}
+        self._pkce_key = derive_purpose_key(secret_bytes, "pkce")
+        self._device_flow = bool(device_flow)
+        self._used_state_nonces: OrderedDict[str, float] = OrderedDict()
         self._nonce_lock = threading.Lock()
+        self.max_used_state_nonces = MAX_USED_STATE_NONCES
 
     # -- configuration --
 
     @property
     def device_flow_enabled(self) -> bool:
-        return True
+        return self._device_flow
 
     @property
     def web_flow_enabled(self) -> bool:
@@ -571,14 +602,13 @@ class GitHubOAuthManager:
     def from_environ(
         cls,
         environ: Mapping[str, str] | None = None,
-        *,
-        allowed_admins: Iterable[str] | None = None,
         **kwargs: Any,
     ) -> GitHubOAuthManager | None:
         """Build a manager from the environment, or return None when OAuth is not configured.
 
         OAuth is enabled by ``GITHUB_OAUTH_CLIENT_ID``. When enabled, ``DASHBOARD_SESSION_SECRET`` is
-        mandatory; there is no generated or hardcoded fallback secret.
+        mandatory; there is no generated or hardcoded fallback secret. The device flow is enabled only
+        by ``GITHUB_OAUTH_DEVICE_FLOW=1``.
         """
         env = os.environ if environ is None else environ
         client_id = str(env.get(ENV_CLIENT_ID, "") or "").strip()
@@ -587,11 +617,6 @@ class GitHubOAuthManager:
             if client_secret:
                 raise ValueError(f"{ENV_CLIENT_SECRET} is set but {ENV_CLIENT_ID} is not")
             return None
-        admins = (
-            normalize_admin_logins(allowed_admins)
-            if allowed_admins is not None
-            else parse_allowed_admins(env.get(ENV_ALLOWED_ADMINS))
-        )
         ttl_raw = str(env.get(ENV_SESSION_TTL, "") or "").strip()
         try:
             ttl = int(ttl_raw) if ttl_raw else DEFAULT_DASHBOARD_SESSION_TTL_SECONDS
@@ -601,9 +626,10 @@ class GitHubOAuthManager:
             "scopes": str(env.get(ENV_SCOPES, "") or "") or DEFAULT_SCOPES,
             "redirect_uri": str(env.get(ENV_REDIRECT_URI, "") or ""),
             "session_ttl_seconds": ttl,
+            "device_flow": str(env.get(ENV_DEVICE_FLOW, "") or "").strip() == "1",
         }
         params.update(kwargs)
-        return cls(client_id, client_secret, admins, str(env.get(ENV_SESSION_SECRET, "") or ""), **params)
+        return cls(client_id, client_secret, None, str(env.get(ENV_SESSION_SECRET, "") or ""), **params)
 
     # -- low-level HTTP --
 
@@ -646,7 +672,9 @@ class GitHubOAuthManager:
     # -- Device Flow (RFC 8628) --
 
     def start_device_flow(self, scope: str | None = None) -> dict[str, Any]:
-        """Request a device and user code. Raises GitHubApiError on any failure."""
+        """Request a device and user code. Raises GitHubApiError on any failure or when the flow is disabled."""
+        if not self.device_flow_enabled:
+            raise GitHubApiError(f"GitHub device flow is disabled (set {ENV_DEVICE_FLOW}=1 to enable it)")
         req_scope = " ".join(_split_list(scope)) if scope else self.scopes
         status, data = self._post_form(GITHUB_DEVICE_CODE_URL, {"client_id": self.client_id, "scope": req_scope})
         if status != 200 or "error" in data:
@@ -677,6 +705,8 @@ class GitHubOAuthManager:
 
         Only the ``success`` result carries ``access_token``; callers must never forward it to a browser.
         """
+        if not self.device_flow_enabled:
+            return {"status": "error", "error": "device_flow_disabled"}
         if not isinstance(device_code, str) or not _OPAQUE_RE.match(device_code):
             return {"status": "error", "error": "invalid_request"}
         try:
@@ -705,6 +735,16 @@ class GitHubOAuthManager:
 
     # -- Authorization Code flow --
 
+    def pkce_verifier(self, state: str) -> str:
+        """Stateless PKCE code_verifier bound to the signed ``state``; 43 base64url characters (RFC 7636)."""
+        if not isinstance(state, str) or not state or len(state) > MAX_TOKEN_CHARS:
+            raise ValueError("PKCE requires a non-empty OAuth state")
+        return _b64encode(hmac.new(self._pkce_key, state.encode("utf-8"), hashlib.sha256).digest())
+
+    @staticmethod
+    def pkce_challenge(verifier: str) -> str:
+        return _b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+
     def create_authorize_url(self, redirect_uri: str, state: str) -> str:
         if not self.web_flow_enabled:
             raise ValueError(f"Web login requires {ENV_CLIENT_ID} and {ENV_CLIENT_SECRET}")
@@ -715,16 +755,22 @@ class GitHubOAuthManager:
                 "scope": self.scopes,
                 "state": state,
                 "allow_signup": "false",
+                "code_challenge": self.pkce_challenge(self.pkce_verifier(state)),
+                "code_challenge_method": "S256",
             }
         )
         return f"{GITHUB_AUTHORIZE_URL}?{query}"
 
-    def exchange_code_for_token(self, code: str, redirect_uri: str) -> dict[str, Any]:
-        """Exchange an authorization code. Returns ``{"access_token": ..., "scope": ...}`` or raises."""
+    def exchange_code_for_token(self, code: str, redirect_uri: str, state: str) -> dict[str, Any]:
+        """Exchange an authorization code with its PKCE verifier. Returns ``{"access_token", "scope"}`` or raises."""
         if not self.web_flow_enabled:
             raise GitHubApiError("Web login is not configured")
         if not isinstance(code, str) or not _OPAQUE_RE.match(code):
             raise GitHubApiError("Invalid authorization code")
+        try:
+            verifier = self.pkce_verifier(state)
+        except ValueError as exc:
+            raise GitHubApiError("Missing OAuth state for the PKCE verifier") from exc
         status, data = self._post_form(
             GITHUB_ACCESS_TOKEN_URL,
             {
@@ -732,6 +778,7 @@ class GitHubOAuthManager:
                 "client_secret": self.client_secret,
                 "code": code,
                 "redirect_uri": redirect_uri,
+                "code_verifier": verifier,
             },
         )
         if "error" in data:
@@ -773,6 +820,9 @@ class GitHubOAuthManager:
             if nonce in self._used_state_nonces:
                 return False, "/"
             self._used_state_nonces[nonce] = float(exp)
+            # Bounded LRU: evict the oldest used nonces beyond the cap so the map cannot grow without limit.
+            while len(self._used_state_nonces) > self.max_used_state_nonces:
+                self._used_state_nonces.popitem(last=False)
         return True, safe_return_path(data.get("r"))
 
     # -- Device handle (keeps the browser from submitting arbitrary device codes) --
@@ -825,7 +875,15 @@ class GitHubOAuthManager:
         return TargetCheck(target.name, target.key, target.kind, ok, reason)
 
     def authorize(self, access_token: str, controlled_targets: Iterable[Any] | None) -> AuthorizationDecision:
-        """Fail-closed authorization: allowlisted login AND admin on every controlled target."""
+        """Fail-closed authorization: the hardcoded admin identity AND admin on every controlled target."""
+        decision = self._authorize(access_token, controlled_targets)
+        audit_login(
+            decision.user_login, decision.user_id, "allowed" if decision.authorized else "denied",
+            "" if decision.authorized else decision.message,
+        )
+        return decision
+
+    def _authorize(self, access_token: str, controlled_targets: Iterable[Any] | None) -> AuthorizationDecision:
         if not isinstance(access_token, str) or not access_token.strip():
             return AuthorizationDecision(False, 403, "Forbidden: missing GitHub access token")
         token = access_token.strip()
@@ -838,11 +896,12 @@ class GitHubOAuthManager:
             login, uid = self.fetch_user(token)
         except GitHubApiError as exc:
             return AuthorizationDecision(False, 403, f"Forbidden: could not verify GitHub identity ({exc})", controlled_targets=names)
-        if not is_admin_login(login, self.allowed_admins):
+        if not is_allowed_identity(login, uid):
             return AuthorizationDecision(
                 False, 403, f"Forbidden: GitHub user '{login}' is not an authorized administrator",
                 user_login=login, user_id=uid, controlled_targets=names,
             )
+        login = ALLOWED_ADMIN_LOGIN
         checks = [self.check_target_admin(token, login, t) for t in targets]
         verified = [c.target for c in checks if c.is_admin]
         missing = [c.target for c in checks if not c.is_admin]
@@ -914,10 +973,14 @@ class GitHubOAuthManager:
             return None
         return session
 
+    @staticmethod
+    def _session_identity_ok(session: SessionData) -> bool:
+        return session.user_login == ALLOWED_ADMIN_LOGIN and session.user_id == ALLOWED_ADMIN_ID
+
     def verify_session_cookie_value(self, cookie_val: Any) -> tuple[bool, str]:
-        """Return (True, login) for a correctly signed, unexpired session of an allowlisted user."""
+        """Return (True, login) for a correctly signed, unexpired session of the hardcoded administrator."""
         session = self.decode_session(cookie_val)
-        if session is None or not is_admin_login(session.user_login, self.allowed_admins):
+        if session is None or not self._session_identity_ok(session):
             return False, ""
         return True, session.user_login
 
@@ -925,7 +988,7 @@ class GitHubOAuthManager:
         session = self.decode_session(cookie_val)
         if session is None:
             return SessionCheck("none", message="No valid dashboard session")
-        if not is_admin_login(session.user_login, self.allowed_admins):
+        if not self._session_identity_ok(session):
             return SessionCheck(
                 "forbidden", session, f"Forbidden: GitHub user '{session.user_login}' is not an authorized administrator"
             )
@@ -944,6 +1007,66 @@ class GitHubOAuthManager:
                 missing,
             )
         return SessionCheck("ok", session)
+
+
+# --- Controlled targets from the private config repository ---
+
+
+class ConfigTargetsError(RuntimeError):
+    """The config-repo target listing could not be read; callers must deny access."""
+
+
+class ConfigRepoTargets:
+    """Cached list of ``owner/repo`` targets from ``repos/<owner>/<repo>.yaml`` in the config repo.
+
+    Successful listings are cached for ``ttl_seconds`` (default 5 minutes). Failures are never cached and
+    raise :class:`ConfigTargetsError` so authorization fails closed.
+    """
+
+    def __init__(
+        self,
+        config_repo: str = DEFAULT_CONFIG_REPO,
+        *,
+        lister: Callable[[], Iterable[str]] | None = None,
+        ttl_seconds: float = DEFAULT_CONFIG_TARGETS_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.config_repo = config_repo
+        self.ttl_seconds = float(ttl_seconds)
+        self._lister = lister or self._default_lister
+        self._clock = clock
+        self._cached: tuple[float, list[str]] | None = None
+        self._lock = threading.Lock()
+
+    def _default_lister(self) -> list[str]:
+        from .runner_patch import list_config_repo_targets
+
+        targets, _sha = list_config_repo_targets(self.config_repo)
+        return targets
+
+    def get(self) -> list[str]:
+        with self._lock:
+            now = self._clock()
+            if self._cached is not None and now < self._cached[0]:
+                return list(self._cached[1])
+            try:
+                names = [t.name for t in parse_controlled_targets(list(self._lister()))]
+            except Exception as exc:  # noqa: BLE001 - every failure must deny access
+                self._cached = None
+                raise ConfigTargetsError(
+                    f"could not list controlled repositories from {self.config_repo} "
+                    f"(repos/<owner>/<repo>.yaml at the default branch HEAD): {type(exc).__name__}: {exc}. "
+                    "Access is denied until the listing succeeds; check SPOT_CONFIG_GH_TOKEN or GH_TOKEN"
+                ) from exc
+            self._cached = (now + self.ttl_seconds, names)
+            return list(names)
+
+    def __call__(self) -> list[str]:
+        return self.get()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cached = None
 
 
 # --- Login gate page ---
@@ -984,21 +1107,7 @@ def render_login_gate_html(
         if legacy_token
         else ""
     )
-    script = """
-(function () {
-  const msg = document.getElementById("msg");
-  function show(text) { msg.textContent = text || ""; }
-  async function postJson(url, body) {
-    const res = await fetch(url, {method: "POST", credentials: "same-origin",
-      headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
-    let data = {};
-    try { data = await res.json(); } catch (_e) { data = {}; }
-    return [res, data];
-  }
-  const logout = document.getElementById("logout");
-  if (logout) logout.addEventListener("click", async function () {
-    await postJson("/auth/logout", {}); window.location.assign("/");
-  });
+    device_script = """
   const start = document.getElementById("device-start");
   if (start) start.addEventListener("click", async function () {
     start.disabled = true; show("");
@@ -1023,14 +1132,30 @@ def render_login_gate_html(
     }
     setTimeout(poll, interval * 1000);
   });
-  const form = document.getElementById("token-form");
+""" if device_flow else ""
+    script = """
+(function () {
+  const msg = document.getElementById("msg");
+  function show(text) { msg.textContent = text || ""; }
+  async function postJson(url, body) {
+    const res = await fetch(url, {method: "POST", credentials: "same-origin",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+    let data = {};
+    try { data = await res.json(); } catch (_e) { data = {}; }
+    return [res, data];
+  }
+  const logout = document.getElementById("logout");
+  if (logout) logout.addEventListener("click", async function () {
+    await postJson("/auth/logout", {}); window.location.assign("/");
+  });
+__DEVICE_JS__  const form = document.getElementById("token-form");
   if (form) form.addEventListener("submit", async function (ev) {
     ev.preventDefault();
     const [res, d] = await postJson("/api/auth/login", {token: document.getElementById("token").value});
     if (res.ok) { window.location.assign("/"); } else { show(d.error || "Invalid token"); }
   });
 })();
-"""
+""".replace("__DEVICE_JS__", device_script)
     return (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -1040,7 +1165,8 @@ def render_login_gate_html(
         "border-radius:6px;text-decoration:none}.msg{color:#cf222e}code{font-size:1.4rem}"
         "section{margin-top:1.5rem}</style></head><body>"
         "<h1>Spot Dashboard sign-in</h1>"
-        "<p>Access is limited to allowlisted GitHub administrators of every controlled repository and organization.</p>"
+        "<p>Access is limited to the GitHub account swackhamer, which must be an administrator of every "
+        "controlled repository and organization.</p>"
         f"{msg_html}{who}{web}{device}{legacy}"
         f"<script>{script}</script></body></html>"
     )

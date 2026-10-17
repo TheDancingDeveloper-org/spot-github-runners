@@ -16,6 +16,11 @@
 !builder/standalone/website-package.json
 !builder/standalone/website-package-lock.json
 !docs/builder-runtime-updates.md
+!docs/edge-dashboard.md
+!cloudflare/*.js
+!cloudflare/*.mjs
+!cloudflare/wrangler.toml
+!tests/fixtures/*.json
 
 # Secrets, generated files, and local-only artifacts
 .env

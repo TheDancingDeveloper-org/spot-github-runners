@@ -1,0 +1,82 @@
+name: Dashboard image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "dashboard/**"
+      - "cloud-init/**"
+      - "runner/**"
+      - "builder/**"
+      - ".dockerignore"
+      - ".github/workflows/dashboard-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: dashboard-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/swack-tools/spot-dashboard
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # TODO(review): pin actions/checkout to a full commit SHA once verified.
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          docker build \
+            --pull \
+            --file dashboard/Dockerfile \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
+            --tag "${IMAGE}:main" \
+            .
+
+      - name: Smoke test
+        run: |
+          docker run --rm --entrypoint python3 "${IMAGE}:${GITHUB_SHA}" -B -c \
+            "import lib.dashboard_server, lib.edge_state; print('imports ok')"
+          docker run --rm "${IMAGE}:${GITHUB_SHA}" --help > /dev/null
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Push
+        run: |
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          # A manual run from another branch publishes only the commit tag.
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            docker push "${IMAGE}:main"
+          fi
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${GITHUB_SHA}")"
+          {
+            echo "### Dashboard image"
+            echo
+            echo "| Reference | Value |"
+            echo "| --- | --- |"
+            echo "| Commit tag | \`${IMAGE}:${GITHUB_SHA}\` |"
+            echo "| Branch tag | \`${IMAGE}:main\` |"
+            echo "| Digest | \`${digest}\` |"
+            echo
+            echo "Pin the control VM with metadata \`dashboard-image=${digest}\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io

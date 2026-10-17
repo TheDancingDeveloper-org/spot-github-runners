@@ -13,7 +13,6 @@ from lib.target_config import TargetConfig, resolve_target
 from lib import runner_manager as manager
 from lib.spot_runner_autoscaler import (
     begin_price_rotation,
-    check_dashboard_health,
     guard_fleet_mutation,
     max_allowed_hosts,
     read_scale_state,
@@ -21,7 +20,6 @@ from lib.spot_runner_autoscaler import (
     removable_spot_vms,
     rotation_spend_allowance,
     step_price_rotation,
-    switch_cloudflare_origin,
 )
 from lib import runner_drain
 
@@ -388,67 +386,254 @@ class PriceRotationStateMachineTests(unittest.TestCase):
 
     def test_overpriced_vm_initiates_rotation_without_deleting_old_vm(self):
         state = {"idle_loops": 0}
+        launched = GceVm("oxidex-runners-new", "asia-east2-a", "PROVISIONING", "n4-highcpu-16", True)
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
             with patch("lib.spot_runner_autoscaler.check_running_prices", return_value=[self.outgoing_vm]), \
                     patch("lib.spot_runner_autoscaler.offer_refresher", return_value=lambda: [self.offer]), \
                     patch("lib.spot_runner_autoscaler.delete_overpriced_vm") as mock_delete, \
-                    patch("lib.spot_runner_autoscaler.launch_offer") as mock_launch:
+                    patch("lib.spot_runner_autoscaler.launch_offer", return_value=launched) as mock_launch:
                 result = reconcile_prices([self.outgoing_vm], [], self.args, state, path)
                 self.assertTrue(result)
                 mock_delete.assert_not_called()
                 mock_launch.assert_called_once()
                 recovered = read_scale_state(path)
                 self.assertIn("price_rotation", recovered)
-                self.assertEqual(recovered["price_rotation"]["phase"], "boot_hydrate")
+                self.assertEqual(recovered["price_rotation"]["phase"], "boot")
                 self.assertEqual(recovered["price_rotation"]["outgoing_vm"]["name"], "oxidex-runners-old")
+                self.assertEqual(recovered["price_rotation"]["replacement_vm"]["name"], "oxidex-runners-new")
+                self.assertNotIn("dashboard_healthy", recovered["price_rotation"]["readiness"])
+                self.assertNotIn("origin_switched", recovered["price_rotation"])
 
-    def test_dual_readiness_gate_requires_both_runners_and_dashboard(self):
-        state = {
+    def _readiness_state(self):
+        return {
             "price_rotation": {
                 "phase": "verify_readiness",
                 "target": "swack-tools",
                 "target_type": "org",
                 "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
-                "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456", "ip": "10.0.0.2"},
+                "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
                 "expected_runner_count": 1,
-                "readiness": {"runners_online": False, "dashboard_healthy": False, "state_hydrated": False},
+                "readiness": {"runners_online": False},
                 "phase_started_at": 2000000000.0,
             }
         }
+
+    def test_runner_readiness_gate_needs_only_runners_and_never_touches_dashboard_or_edge(self):
+        state = self._readiness_state()
+        online = GitHubRunner(1, "gha-oxidex-runners-new-1", "online", False, ("spot",))
+        offline = GitHubRunner(1, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
-            runner = GitHubRunner(1, "gha-oxidex-runners-new-1", "online", False, ("spot",))
-            offline_runner = GitHubRunner(1, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
-
-            # Case 1: Runners online, but dashboard unhealthy -> holds in verify_readiness
-            with patch("lib.spot_runner_autoscaler.check_dashboard_health", return_value=None), \
+            with patch("lib.edge_state.write_origin") as mock_origin, \
+                    patch("lib.edge_state.CloudflareKv.put") as mock_put, \
+                    patch("urllib.request.urlopen") as mock_urlopen, \
                     patch("lib.spot_runner_autoscaler.now", return_value=2000000001.0):
-                step_price_rotation([self.outgoing_vm, self.replacement_vm], [runner], self.args, state, path)
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [offline], self.args, state, path)
                 recovered = read_scale_state(path)
                 self.assertEqual(recovered["price_rotation"]["phase"], "verify_readiness")
-                self.assertTrue(recovered["price_rotation"]["readiness"]["runners_online"])
-                self.assertFalse(recovered["price_rotation"]["readiness"]["dashboard_healthy"])
-
-            # Case 2: Dashboard healthy + hydrated, but runner offline -> holds in verify_readiness
-            state["price_rotation"]["readiness"]["runners_online"] = False
-            with patch("lib.spot_runner_autoscaler.check_dashboard_health", return_value={"status": "healthy", "hydrated": True}), \
-                    patch("lib.spot_runner_autoscaler.now", return_value=2000000002.0):
-                step_price_rotation([self.outgoing_vm, self.replacement_vm], [offline_runner], self.args, state, path)
-                recovered = read_scale_state(path)
-                self.assertEqual(recovered["price_rotation"]["phase"], "verify_readiness")
-                self.assertTrue(recovered["price_rotation"]["readiness"]["dashboard_healthy"])
-                self.assertTrue(recovered["price_rotation"]["readiness"]["state_hydrated"])
                 self.assertFalse(recovered["price_rotation"]["readiness"]["runners_online"])
 
-            # Case 3: Both pass -> advances to cordon_drain via origin_cutover
-            with patch("lib.spot_runner_autoscaler.check_dashboard_health", return_value={"status": "healthy", "hydrated": True}), \
-                    patch("lib.spot_runner_autoscaler.switch_cloudflare_origin", return_value=True), \
-                    patch("lib.spot_runner_autoscaler.now", return_value=2000000003.0):
-                step_price_rotation([self.outgoing_vm, self.replacement_vm], [runner], self.args, state, path)
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [online], self.args, state, path)
                 recovered = read_scale_state(path)
                 self.assertEqual(recovered["price_rotation"]["phase"], "cordon_drain")
-                self.assertTrue(recovered["price_rotation"]["origin_switched"])
+                self.assertTrue(recovered["price_rotation"]["readiness"]["runners_online"])
+                self.assertEqual(recovered["price_rotation"]["readiness"], {"runners_online": True})
+                mock_origin.assert_not_called()
+                mock_put.assert_not_called()
+                mock_urlopen.assert_not_called()
+
+    def test_readiness_ignores_runners_of_other_hosts_with_overlapping_names(self):
+        state = self._readiness_state()
+        unrelated = GitHubRunner(2, "gha-oxidex-runners-new2-1", "online", False, ("spot",))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.now", return_value=2000000001.0):
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [unrelated], self.args, state, path)
+            self.assertEqual(read_scale_state(path)["price_rotation"]["phase"], "verify_readiness")
+
+    def test_saved_origin_cutover_phase_resumes_as_cordon_without_edge_write(self):
+        state = self._readiness_state()
+        rotation = state["price_rotation"]
+        rotation.update(phase="origin_cutover", origin_switched=False,
+                        readiness={"runners_online": True, "dashboard_healthy": True, "state_hydrated": True})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.edge_state.write_origin") as mock_origin, \
+                    patch("urllib.request.urlopen") as mock_urlopen, \
+                    patch("lib.runner_drain.isolated_group", return_value="orgs/swack-tools/actions/runner-groups/7"), \
+                    patch("lib.runner_drain.api", return_value={}):
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [], self.args, state, path)
+            recovered = read_scale_state(path)["price_rotation"]
+            self.assertEqual(recovered["phase"], "cordon_drain")
+            self.assertEqual(recovered["readiness"], {"runners_online": True})
+            self.assertNotIn("origin_switched", recovered)
+            mock_origin.assert_not_called()
+            mock_urlopen.assert_not_called()
+
+    def test_saved_boot_hydrate_phase_resumes_as_runner_boot(self):
+        state = self._readiness_state()
+        state["price_rotation"]["phase"] = "boot_hydrate"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("urllib.request.urlopen") as mock_urlopen, \
+                    patch("lib.spot_runner_autoscaler.now", return_value=2000000001.0):
+                step_price_rotation([self.outgoing_vm, self.replacement_vm], [], self.args, state, path)
+            self.assertEqual(read_scale_state(path)["price_rotation"]["phase"], "verify_readiness")
+            mock_urlopen.assert_not_called()
+
+    def test_autoscaler_has_no_dashboard_cutover_or_hardcoded_cloudflare_settings(self):
+        import lib.spot_runner_autoscaler as autoscaler
+        source = Path(autoscaler.__file__).read_text(encoding="utf-8")
+        for forbidden in ("1c34335d7e9216e17699777fccd5fab6", "wrangler", "switch_cloudflare_origin",
+                          "check_dashboard_health", "origin:active", "CLOUDFLARE_API_TOKEN"):
+            self.assertNotIn(forbidden, source)
+        self.assertFalse(hasattr(autoscaler, "switch_cloudflare_origin"))
+        self.assertFalse(hasattr(autoscaler, "check_dashboard_health"))
+
+    def _provision_state(self, **extra):
+        rotation = {
+            "phase": "provision",
+            "target": "swack-tools",
+            "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
+            "replacement_offer": {
+                "machine_type": "n4-highcpu-16", "zone": "asia-east2-a", "region": "asia-east2",
+                "vcpu": 16, "ram_gib": 32.0, "hourly_usd": 0.15, "total_daily_usd": 3.60,
+            },
+            "pending_replacement": None,
+            "replacement_vm": None,
+            "phase_started_at": 1000.0,
+            "attempt_count": 0,
+        }
+        rotation.update(extra)
+        return {"price_rotation": rotation}
+
+    def test_provision_never_adopts_an_unrelated_spot_vm(self):
+        unrelated = GceVm("oxidex-runners-unrelated", "asia-east2-b", "RUNNING", "n4-highcpu-16", True,
+                          instance_id="other-1")
+        state = self._provision_state()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.guard_fleet_mutation"), \
+                    patch("lib.spot_runner_autoscaler.launch_offer", return_value=None), \
+                    patch("lib.spot_runner_autoscaler.now", return_value=1010.0):
+                step_price_rotation([self.outgoing_vm, unrelated], [], self.args, state, path)
+            recovered = read_scale_state(path)["price_rotation"]
+            self.assertEqual(recovered["phase"], "provision")
+            self.assertIsNone(recovered["replacement_vm"])
+            self.assertEqual(recovered["attempt_count"], 1)
+
+    def test_provision_records_the_name_its_own_launch_persisted(self):
+        unrelated = GceVm("oxidex-runners-unrelated", "asia-east2-b", "RUNNING", "n4-highcpu-16", True,
+                          instance_id="other-1")
+        state = self._provision_state()
+
+        def fake_launch(offer, args, launch_state, launch_path):
+            launch_state["price_rotation"]["pending_replacement"] = {
+                "name": "oxidex-runners-asiaeast2-a-1010", "zone": "asia-east2-a"}
+            return GceVm("oxidex-runners-asiaeast2-a-1010", "asia-east2-a", "PROVISIONING", "n4-highcpu-16", True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.guard_fleet_mutation"), \
+                    patch("lib.spot_runner_autoscaler.launch_offer", side_effect=fake_launch), \
+                    patch("lib.spot_runner_autoscaler.now", return_value=1010.0):
+                step_price_rotation([self.outgoing_vm, unrelated], [], self.args, state, path)
+            recovered = read_scale_state(path)["price_rotation"]
+            self.assertEqual(recovered["phase"], "boot")
+            self.assertEqual(recovered["replacement_vm"]["name"], "oxidex-runners-asiaeast2-a-1010")
+            self.assertEqual(recovered["replacement_vm"]["zone"], "asia-east2-a")
+
+    def test_provision_rejects_launch_result_that_differs_from_persisted_intent(self):
+        state = self._provision_state()
+
+        def fake_launch(offer, args, launch_state, launch_path):
+            launch_state["price_rotation"]["pending_replacement"] = {"name": "oxidex-runners-mine", "zone": "asia-east2-a"}
+            return GceVm("oxidex-runners-someone-else", "asia-east2-a", "RUNNING", "n4-highcpu-16", True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.guard_fleet_mutation"), \
+                    patch("lib.spot_runner_autoscaler.launch_offer", side_effect=fake_launch):
+                step_price_rotation([self.outgoing_vm], [], self.args, state, path)
+            recovered = read_scale_state(path)["price_rotation"]
+            self.assertIsNone(recovered["replacement_vm"])
+            self.assertEqual(recovered["phase"], "provision")
+
+    def test_provision_resume_adopts_only_its_pending_launch(self):
+        mine = GceVm("oxidex-runners-mine", "asia-east2-a", "RUNNING", "n4-highcpu-16", True, instance_id="m-1")
+        unrelated = GceVm("oxidex-runners-unrelated", "asia-east2-a", "RUNNING", "n4-highcpu-16", True)
+        state = self._provision_state(pending_replacement={"name": "oxidex-runners-mine", "zone": "asia-east2-a"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.launch_offer") as mock_launch:
+                step_price_rotation([self.outgoing_vm, unrelated, mine], [], self.args, state, path)
+                mock_launch.assert_not_called()
+            recovered = read_scale_state(path)["price_rotation"]
+            self.assertEqual(recovered["phase"], "boot")
+            self.assertEqual(recovered["replacement_vm"]["name"], "oxidex-runners-mine")
+            self.assertEqual(recovered["replacement_vm"]["instance_id"], "m-1")
+
+    def test_provision_resume_waits_for_its_pending_host_operation(self):
+        state = self._provision_state(pending_replacement={"name": "oxidex-runners-mine", "zone": "asia-east2-a"})
+        state["host_operation"] = {"kind": "launch", "vm": {"name": "oxidex-runners-mine", "zone": "asia-east2-a"}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.launch_offer") as mock_launch:
+                self.assertTrue(step_price_rotation([self.outgoing_vm], [], self.args, state, path))
+                mock_launch.assert_not_called()
+            self.assertEqual(state["price_rotation"]["phase"], "provision")
+
+    def test_launch_offer_persists_rotation_intent_with_host_operation_and_returns_vm(self):
+        from lib.spot_runner_autoscaler import launch_offer
+        offer = SimpleNamespace(machine_type="n2-standard-2", vcpu=2, ram_gib=8.0, hourly_usd=0.05,
+                                total_daily_usd=Decimal("1.20"), region="asia-east2", zone="asia-east2-a",
+                                cpu_platform="Intel Cascade Lake")
+        args = SimpleNamespace(project="homelab-424523", org="swack-tools", target=None,
+                               max_daily_usd=Decimal("4.00"), maximum_hosts=5, disk_size_gb=100, label="spot")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            args.state_file = path
+            state = self._provision_state()
+            writes = []
+            real_write = __import__("lib.spot_runner_autoscaler", fromlist=["write_scale_state"]).write_scale_state
+
+            def record_write(target, value):
+                writes.append(json.loads(json.dumps(value)))
+                real_write(target, value)
+
+            with patch("lib.spot_runner_autoscaler.guard_fleet_mutation"), \
+                    patch("lib.spot_runner_autoscaler.write_scale_state", side_effect=record_write), \
+                    patch("lib.spot_runner_autoscaler.platform_preferences", return_value=[(1, "Intel Cascade Lake")]), \
+                    patch("lib.spot_runner_autoscaler.machine_profile", return_value=SimpleNamespace(disk_type="pd-standard")), \
+                    patch("lib.spot_runner_autoscaler.subprocess.run",
+                          return_value=SimpleNamespace(returncode=0, stdout="", stderr="")):
+                launched = launch_offer(offer, args, state=state, state_path=path)
+            self.assertIsInstance(launched, GceVm)
+            intent = next(w for w in writes if w.get("host_operation"))
+            self.assertEqual(intent["price_rotation"]["pending_replacement"]["name"], intent["host_operation"]["vm"]["name"])
+            self.assertEqual(launched.name, intent["host_operation"]["vm"]["name"])
+            self.assertEqual(launched.zone, "asia-east2-a")
+
+    def test_boot_timeout_never_deletes_a_same_named_vm_with_another_identity(self):
+        from lib.spot_runner_autoscaler import _step_rotation_boot
+        impostor = GceVm("oxidex-runners-new", "asia-east2-a", "PROVISIONING", "n4-highcpu-16", True,
+                         instance_id="someone-else")
+        rotation = {
+            "phase": "boot",
+            "target": "swack-tools",
+            "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a"},
+            "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+            "phase_started_at": 1000.0,
+        }
+        state = {"price_rotation": rotation}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as mock_delete, \
+                    patch("lib.spot_runner_autoscaler.now", return_value=1700.0):
+                _step_rotation_boot([self.outgoing_vm, impostor], [], self.args, state, path, rotation)
+            mock_delete.assert_not_called()
+            self.assertNotIn("price_rotation", read_scale_state(path))
 
     def test_cordon_drain_target_aware_repo_vs_org(self):
         # Target repo: label removal only, runnergroup never touched
@@ -597,7 +782,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             instance_id="new-456"
         )
         rotation = {
-            "phase": "boot_hydrate",
+            "phase": "boot",
             "target": "swack-tools",
             "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a"},
             "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a"},
@@ -706,46 +891,6 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 recovered = read_scale_state(path)
                 self.assertTrue(recovered["price_rotation"]["cordon_complete"])
                 self.assertEqual(recovered["price_rotation"]["cordon_mode"], "labels")
-
-
-class DashboardHealthEndpointTests(unittest.TestCase):
-    def setUp(self):
-        import urllib.request
-        import threading
-        from lib.dashboard_server import create_dashboard_server
-
-        self.tmp = tempfile.TemporaryDirectory()
-        self.state_file = Path(self.tmp.name) / "dashboard-state.json"
-        self.server, self.store = create_dashboard_server(
-            host="127.0.0.1",
-            port=0,
-            state_path=self.state_file,
-            auth_token="secret-auth-token",
-        )
-        self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-
-    def tearDown(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-        self.tmp.cleanup()
-
-    def test_health_endpoint_unauthenticated_and_hydrated(self):
-        import urllib.request
-        url = f"http://127.0.0.1:{self.port}/api/health"
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            self.assertEqual(resp.status, 200)
-            data = json.loads(resp.read().decode("utf-8"))
-            self.assertIn("status", data)
-            self.assertTrue(data.get("hydrated", False))
-
-    def test_check_dashboard_health_helper(self):
-        result = check_dashboard_health("127.0.0.1", port=self.port, timeout=5)
-        self.assertIsNotNone(result)
-        self.assertTrue(result.get("hydrated"))
 
 
 class EntrypointParityTests(unittest.TestCase):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import json
 from pathlib import Path
@@ -12,16 +13,20 @@ import unittest
 import urllib.parse
 
 from lib.dashboard_auth import (
+    ALLOWED_ADMIN_ID,
+    ALLOWED_ADMIN_LOGIN,
     DEFAULT_ALLOWED_ADMINS,
     GITHUB_ACCESS_TOKEN_URL,
     GITHUB_AUTHORIZE_URL,
     GITHUB_DEVICE_CODE_URL,
     MAX_GITHUB_RESPONSE_BYTES,
+    ConfigRepoTargets,
+    ConfigTargetsError,
     GitHubApiError,
     GitHubOAuthManager,
     default_http_request,
     format_session_cookie,
-    parse_allowed_admins,
+    normalize_admin_logins,
     parse_controlled_target,
     parse_controlled_targets,
     parse_cookie_header,
@@ -31,6 +36,8 @@ from lib.dashboard_server import build_oauth_config, create_dashboard_server
 
 SECRET = "test-session-secret-0123456789-abcdefghijklmnopqrstuvwxyz"
 CLIENT_ID = "Iv1.testclientid"
+ADMIN_ID = 619624
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "session_vector.json"
 
 
 class FakeClock:
@@ -57,6 +64,8 @@ class FakeGitHub:
         }
         self.device_code_status = 200
         self.code_tokens: dict[str, str] = {}
+        self.code_verifiers: list[str] = []
+        self.expected_challenges: set[str] | None = None
         self.calls: list[dict] = []
         self.raise_on_api = False
 
@@ -84,6 +93,12 @@ class FakeGitHub:
                 resp = self.device_polls.pop(0) if self.device_polls else {"error": "authorization_pending"}
                 return 200, json.dumps(resp).encode()
             code = form.get("code", [""])[0]
+            verifier = form.get("code_verifier", [""])[0]
+            self.code_verifiers.append(verifier)
+            if self.expected_challenges is not None:
+                challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+                if challenge not in self.expected_challenges:
+                    return 200, json.dumps({"error": "invalid_grant"}).encode()
             if code in self.code_tokens and form.get("client_secret") == ["web-secret"]:
                 return 200, json.dumps({"access_token": self.code_tokens[code], "token_type": "bearer"}).encode()
             return 200, json.dumps({"error": "bad_verification_code"}).encode()
@@ -116,29 +131,45 @@ def decode_payload(token: str) -> dict:
 
 class ConfigurationTests(unittest.TestCase):
     def test_default_admins_and_empty_targets(self):
-        self.assertEqual(DEFAULT_ALLOWED_ADMINS, frozenset({"swackhamer", "xbmc4lyfe"}))
+        self.assertEqual(DEFAULT_ALLOWED_ADMINS, frozenset({"swackhamer"}))
+        self.assertEqual((ALLOWED_ADMIN_LOGIN, ALLOWED_ADMIN_ID), ("swackhamer", 619624))
         mgr = make_manager()
-        self.assertEqual(mgr.allowed_admins, frozenset({"swackhamer", "xbmc4lyfe"}))
+        self.assertEqual(mgr.allowed_admins, frozenset({"swackhamer"}))
         manager, targets = build_oauth_config(environ={"GITHUB_OAUTH_CLIENT_ID": CLIENT_ID, "DASHBOARD_SESSION_SECRET": SECRET})
         self.assertIsNotNone(manager)
         self.assertEqual(targets, [])
         self.assertEqual(manager.allowed_admins, DEFAULT_ALLOWED_ADMINS)
+        self.assertFalse(manager.device_flow_enabled)
 
-    def test_env_and_cli_overrides(self):
+    def test_admin_allowlist_cannot_be_overridden(self):
         env = {
             "GITHUB_OAUTH_CLIENT_ID": CLIENT_ID,
             "DASHBOARD_SESSION_SECRET": SECRET,
-            "DASHBOARD_ALLOWED_ADMINS": "Alice, bob",
+            "DASHBOARD_ALLOWED_ADMINS": "Alice, bob, xbmc4lyfe",
             "DASHBOARD_CONTROLLED_TARGETS": "swack-tools, xbmc4lyfe/newznab-tmux",
         }
         manager, targets = build_oauth_config(environ=env)
-        self.assertEqual(manager.allowed_admins, frozenset({"alice", "bob"}))
+        self.assertEqual(manager.allowed_admins, frozenset({"swackhamer"}))
         self.assertEqual(targets, ["swack-tools", "xbmc4lyfe/newznab-tmux"])
-        manager, targets = build_oauth_config(environ=env, allowed_admins="carol", controlled_targets="Appz4Fun")
-        self.assertEqual(manager.allowed_admins, frozenset({"carol"}))
+        manager, targets = build_oauth_config(environ=env, controlled_targets="Appz4Fun")
         self.assertEqual(targets, ["Appz4Fun"])
         self.assertFalse(manager.web_flow_enabled)
-        self.assertTrue(manager.device_flow_enabled)
+        for bad in (["xbmc4lyfe"], ["swackhamer", "xbmc4lyfe"], []):
+            with self.assertRaises(ValueError):
+                GitHubOAuthManager(CLIENT_ID, "", bad, SECRET)
+        self.assertEqual(GitHubOAuthManager(CLIENT_ID, "", ["Swackhamer"], SECRET).allowed_admins, DEFAULT_ALLOWED_ADMINS)
+        with self.assertRaises(ValueError):
+            normalize_admin_logins(["good", "bad/login"])
+
+    def test_device_flow_requires_explicit_env(self):
+        base = {"GITHUB_OAUTH_CLIENT_ID": CLIENT_ID, "DASHBOARD_SESSION_SECRET": SECRET}
+        for value, enabled in (("", False), ("0", False), ("true", False), ("1", True)):
+            manager = GitHubOAuthManager.from_environ({**base, "GITHUB_OAUTH_DEVICE_FLOW": value})
+            self.assertEqual(manager.device_flow_enabled, enabled, value)
+        disabled = GitHubOAuthManager(CLIENT_ID, "", None, SECRET, http_requester=FakeGitHub())
+        with self.assertRaises(GitHubApiError):
+            disabled.start_device_flow()
+        self.assertEqual(disabled.poll_device_token("abc123")["status"], "error")
 
     def test_oauth_disabled_without_client_id(self):
         manager, targets = build_oauth_config(environ={})
@@ -154,9 +185,7 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             GitHubOAuthManager.from_environ({"GITHUB_OAUTH_CLIENT_ID": CLIENT_ID})
 
-    def test_invalid_allowlist_and_targets_rejected(self):
-        with self.assertRaises(ValueError):
-            parse_allowed_admins("good, bad/login")
+    def test_invalid_targets_rejected(self):
         for bad in ("", "a/b/c", "-org", "owner/..", "owner/re po", "org?x=1"):
             with self.assertRaises(ValueError):
                 parse_controlled_target(bad)
@@ -172,7 +201,7 @@ class SessionCookieTests(unittest.TestCase):
         self.mgr = make_manager(clock=self.clock)
 
     def test_sign_and_verify_roundtrip(self):
-        token = self.mgr.create_session_cookie_value("swackhamer", 3600, user_id=42, verified_targets=["Org"])
+        token = self.mgr.create_session_cookie_value("swackhamer", 3600, user_id=ADMIN_ID, verified_targets=["Org"])
         self.assertEqual(self.mgr.verify_session_cookie_value(token), (True, "swackhamer"))
         payload = decode_payload(token)
         self.assertEqual(set(payload), {"v", "sub", "uid", "iat", "exp", "tgt"})
@@ -180,14 +209,38 @@ class SessionCookieTests(unittest.TestCase):
         self.assertNotIn("access_token", json.dumps(payload))
 
     def test_verifiable_by_another_instance_with_same_secret(self):
-        token = self.mgr.create_session_cookie_value("xbmc4lyfe", 3600)
+        token = self.mgr.create_session_cookie_value("swackhamer", 3600, user_id=ADMIN_ID)
         other = make_manager(clock=self.clock)
-        self.assertEqual(other.verify_session_cookie_value(token), (True, "xbmc4lyfe"))
+        self.assertEqual(other.verify_session_cookie_value(token), (True, "swackhamer"))
         different = GitHubOAuthManager(CLIENT_ID, "", None, SECRET + "-other", clock=self.clock)
         self.assertEqual(different.verify_session_cookie_value(token), (False, ""))
 
+    def test_session_identity_must_be_hardcoded_admin(self):
+        for login, uid in (("xbmc4lyfe", ADMIN_ID), ("swackhamer", 167585258), ("Swackhamer", ADMIN_ID), ("swackhamer", None)):
+            token = self.mgr.create_session_cookie_value(login, 3600, user_id=uid)
+            self.assertEqual(self.mgr.verify_session_cookie_value(token), (False, ""), (login, uid))
+            self.assertNotEqual(self.mgr.check_session(token, []).status, "ok", (login, uid))
+
+    def test_session_test_vector(self):
+        vector = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        clock = FakeClock(vector["valid_session"]["now"])
+        mgr = GitHubOAuthManager(CLIENT_ID, "", None, vector["secret"], clock=clock)
+        token = vector["valid_session"]["token"]
+        self.assertEqual(decode_payload(token), vector["valid_session"]["payload"])
+        self.assertEqual(mgr.verify_session_cookie_value(token), (True, "swackhamer"))
+        self.assertEqual(mgr.check_session(token, ["swack-tools/oxidex"]).status, "ok")
+        self.assertEqual(mgr.verify_session_cookie_value(vector["tampered_session_token"]), (False, ""))
+        clock.now = vector["expired_now"]
+        self.assertEqual(mgr.verify_session_cookie_value(token), (False, ""))
+        # A token minted by this code with the vector secret and payload is byte-identical.
+        clock.now = vector["valid_session"]["payload"]["iat"]
+        minted = mgr.create_session_cookie_value(
+            "swackhamer", 43200, user_id=ADMIN_ID, verified_targets=["swack-tools/oxidex"]
+        )
+        self.assertEqual(minted, token)
+
     def test_tampered_cookie_rejected(self):
-        token = self.mgr.create_session_cookie_value("swackhamer", 3600)
+        token = self.mgr.create_session_cookie_value("swackhamer", 3600, user_id=ADMIN_ID)
         body, sig = token.split(".")
         forged_payload = decode_payload(token)
         forged_payload["sub"] = "xbmc4lyfe"
@@ -197,7 +250,7 @@ class SessionCookieTests(unittest.TestCase):
             self.assertEqual(self.mgr.verify_session_cookie_value(bad), (False, ""), bad)
 
     def test_expired_cookie_rejected(self):
-        token = self.mgr.create_session_cookie_value("swackhamer", 120)
+        token = self.mgr.create_session_cookie_value("swackhamer", 120, user_id=ADMIN_ID)
         self.clock.now += 119
         self.assertTrue(self.mgr.verify_session_cookie_value(token)[0])
         self.clock.now += 2
@@ -208,10 +261,10 @@ class SessionCookieTests(unittest.TestCase):
         self.assertEqual(self.mgr.verify_session_cookie_value(state), (False, ""))
 
     def test_removed_admin_and_new_target_forbid_session(self):
-        token = self.mgr.create_session_cookie_value("eve", 3600)
+        token = self.mgr.create_session_cookie_value("eve", 3600, user_id=7)
         self.assertEqual(self.mgr.verify_session_cookie_value(token), (False, ""))
         self.assertEqual(self.mgr.check_session(token, []).status, "forbidden")
-        token = self.mgr.create_session_cookie_value("swackhamer", 3600, verified_targets=["swack-tools"])
+        token = self.mgr.create_session_cookie_value("swackhamer", 3600, user_id=ADMIN_ID, verified_targets=["swack-tools"])
         self.assertEqual(self.mgr.check_session(token, ["Swack-Tools"]).status, "ok")
         check = self.mgr.check_session(token, ["swack-tools", "o/r"])
         self.assertEqual(check.status, "forbidden")
@@ -255,6 +308,15 @@ class CsrfStateTests(unittest.TestCase):
         self.clock.now += 601
         self.assertEqual(self.mgr.validate_state(state, state), (False, "/"))
 
+    def test_used_nonce_map_is_bounded(self):
+        self.mgr.max_used_state_nonces = 5
+        states = [self.mgr.create_state("/") for _ in range(12)]
+        for state in states:
+            self.assertTrue(self.mgr.validate_state(state, state)[0])
+        self.assertEqual(len(self.mgr._used_state_nonces), 5)
+        # The most recent nonces are still remembered, so their replay is refused.
+        self.assertEqual(self.mgr.validate_state(states[-1], states[-1]), (False, "/"))
+
     def test_open_redirects_sanitized(self):
         for bad in ("https://evil.example", "//evil.example", "/\\evil", "javascript:alert(1)", "/a\nb", ""):
             self.assertEqual(safe_return_path(bad), "/")
@@ -266,7 +328,8 @@ class DeviceFlowTests(unittest.TestCase):
     def setUp(self):
         self.fake = FakeGitHub()
         self.clock = FakeClock()
-        self.mgr = GitHubOAuthManager(CLIENT_ID, "", None, SECRET, http_requester=self.fake, clock=self.clock)
+        self.mgr = GitHubOAuthManager(CLIENT_ID, "", None, SECRET, http_requester=self.fake, clock=self.clock,
+                                      device_flow=True)
 
     def test_start_uses_client_id_only(self):
         started = self.mgr.start_device_flow()
@@ -311,7 +374,7 @@ class DeviceFlowTests(unittest.TestCase):
             def broken(*_args, _exc=exc):
                 raise _exc
 
-            mgr = GitHubOAuthManager(CLIENT_ID, "", None, SECRET, http_requester=broken)
+            mgr = GitHubOAuthManager(CLIENT_ID, "", None, SECRET, http_requester=broken, device_flow=True)
             self.assertEqual(mgr.poll_device_token("abc123")["status"], "error")
             self.assertFalse(mgr.authorize("tok", []).authorized)
             with self.assertRaises(GitHubApiError):
@@ -339,17 +402,29 @@ class CodeExchangeTests(unittest.TestCase):
         self.assertEqual(q["client_id"], [CLIENT_ID])
         self.assertEqual(q["state"], ["st.ate"])
         self.assertEqual(q["redirect_uri"], ["https://spot.example/auth/github/callback"])
+        self.assertEqual(q["code_challenge_method"], ["S256"])
+        verifier = self.mgr.pkce_verifier("st.ate")
+        self.assertRegex(verifier, r"^[A-Za-z0-9_-]{43}$")
+        expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        self.assertEqual(q["code_challenge"], [expected])
+        self.assertNotIn(verifier, url)
+        self.assertNotEqual(self.mgr.pkce_verifier("other"), verifier)
+        other_secret = GitHubOAuthManager(CLIENT_ID, "web-secret", None, SECRET + "-x")
+        self.assertNotEqual(other_secret.pkce_verifier("st.ate"), verifier)
 
     def test_exchange_success_and_failure(self):
         self.fake.code_tokens["code123"] = "gho_web"
-        self.assertEqual(self.mgr.exchange_code_for_token("code123", "https://x/cb")["access_token"], "gho_web")
+        self.assertEqual(self.mgr.exchange_code_for_token("code123", "https://x/cb", "st.ate")["access_token"], "gho_web")
         form = urllib.parse.parse_qs(self.fake.calls[-1]["body"].decode())
         self.assertEqual(form["client_secret"], ["web-secret"])
         self.assertEqual(form["redirect_uri"], ["https://x/cb"])
+        self.assertEqual(form["code_verifier"], [self.mgr.pkce_verifier("st.ate")])
         with self.assertRaises(GitHubApiError):
-            self.mgr.exchange_code_for_token("wrong", "https://x/cb")
+            self.mgr.exchange_code_for_token("wrong", "https://x/cb", "st.ate")
         with self.assertRaises(GitHubApiError):
-            self.mgr.exchange_code_for_token("", "https://x/cb")
+            self.mgr.exchange_code_for_token("", "https://x/cb", "st.ate")
+        with self.assertRaises(GitHubApiError):
+            self.mgr.exchange_code_for_token("code123", "https://x/cb", "")
 
     def test_web_flow_requires_secret(self):
         mgr = GitHubOAuthManager(CLIENT_ID, "", None, SECRET, http_requester=self.fake)
@@ -357,21 +432,36 @@ class CodeExchangeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mgr.create_authorize_url("https://x/cb", "s")
         with self.assertRaises(GitHubApiError):
-            mgr.exchange_code_for_token("code123", "https://x/cb")
+            mgr.exchange_code_for_token("code123", "https://x/cb", "s")
 
 
 class AuthorizationTests(unittest.TestCase):
     def setUp(self):
         self.fake = FakeGitHub()
-        self.fake.add_user("tok-admin", "Swackhamer", 167585258)
+        self.fake.add_user("tok-admin", "Swackhamer", ADMIN_ID)
         self.fake.add_user("tok-eve", "eve", 7)
         self.mgr = make_manager(self.fake)
 
     def test_allowlisted_user_with_empty_targets(self):
-        ok, msg, data = self.mgr.verify_and_authorize_token("tok-admin", [])
+        with self.assertLogs("spot_dashboard.auth", level="INFO") as logs:
+            ok, msg, data = self.mgr.verify_and_authorize_token("tok-admin", [])
         self.assertTrue(ok, msg)
-        self.assertEqual(data["user"], "Swackhamer")
+        self.assertEqual(data["user"], "swackhamer")
         self.assertEqual(self.fake.api_paths(), ["/user"])
+        line = "\n".join(logs.output)
+        self.assertIn("login=swackhamer uid=619624 result=allowed", line)
+        self.assertNotIn("tok-admin", line)
+
+    def test_identity_requires_login_and_numeric_id(self):
+        self.fake.add_user("tok-impostor-id", "swackhamer", 167585258)
+        self.fake.add_user("tok-other-login", "xbmc4lyfe", ADMIN_ID)
+        for token in ("tok-impostor-id", "tok-other-login"):
+            with self.assertLogs("spot_dashboard.auth", level="INFO") as logs:
+                decision = self.mgr.authorize(token, [])
+            self.assertFalse(decision.authorized, token)
+            self.assertEqual(decision.status_code, 403)
+            self.assertIn("result=denied", "\n".join(logs.output))
+            self.assertNotIn(token, "\n".join(logs.output))
 
     def test_non_allowlisted_user_denied_without_target_calls(self):
         ok, msg, data = self.mgr.verify_and_authorize_token("tok-eve", ["swack-tools"])
@@ -466,11 +556,22 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.fake = FakeGitHub()
-        self.fake.add_user("tok-admin", "swackhamer", 167585258)
+        self.fake.add_user("tok-admin", "swackhamer", ADMIN_ID)
         self.fake.add_user("tok-eve", "eve", 7)
+        self.config_targets: list[str] = []
+        self.config_error: Exception | None = None
+        self.config_calls = 0
 
-    def start(self, *, client_secret="web-secret", auth_token=None, controlled_targets=None):
-        mgr = GitHubOAuthManager(CLIENT_ID, client_secret, None, SECRET, http_requester=self.fake)
+    def config_lister(self):
+        self.config_calls += 1
+        if self.config_error is not None:
+            raise self.config_error
+        return list(self.config_targets)
+
+    def start(self, *, client_secret="web-secret", auth_token=None, controlled_targets=None, device_flow=True):
+        mgr = GitHubOAuthManager(CLIENT_ID, client_secret, None, SECRET, http_requester=self.fake,
+                                 device_flow=device_flow)
+        self.provider = ConfigRepoTargets(lister=self.config_lister, ttl_seconds=0)
         server, store = create_dashboard_server(
             host="127.0.0.1",
             port=0,
@@ -478,6 +579,7 @@ class OAuthServerIntegrationTests(unittest.TestCase):
             auth_token=auth_token,
             oauth_manager=mgr,
             controlled_targets=controlled_targets,
+            config_targets_provider=self.provider,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -527,7 +629,7 @@ class OAuthServerIntegrationTests(unittest.TestCase):
     def test_health_401_and_login_gate(self):
         self.start(auth_token=self.LEGACY_TOKEN)
         status, _, raw = self.request("GET", "/api/health")
-        self.assertEqual((status, json.loads(raw)["status"]), (200, "healthy"))
+        self.assertEqual((status, json.loads(raw)["status"]), (200, "ok"))
         status, msg, _ = self.request("GET", "/api/overview")
         self.assertEqual(status, 401)
         self.assertIn("Bearer", msg.get("WWW-Authenticate", ""))
@@ -582,16 +684,119 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         _, msg, _ = self.device_login("tok-admin")
         pair, _ = self.cookie_pair(msg, "spot_session")
         bearer = {"Authorization": f"Bearer {self.LEGACY_TOKEN}"}
-        status, _, raw = self.request("POST", "/api/auth/targets", headers=bearer, body={"targets": ["swack-tools"]})
+        # The legacy token can no longer change controlled targets; only an OAuth session can.
+        status, _, _ = self.request("POST", "/api/auth/targets", headers=bearer, body={"targets": ["swack-tools"]})
+        self.assertEqual(status, 403)
+        cookie = {"Cookie": pair}
+        status, _, raw = self.request("POST", "/api/auth/targets", headers=cookie, body={"targets": ["swack-tools"]})
         self.assertEqual((status, json.loads(raw)["controlled_targets"]), (200, ["swack-tools"]))
-        status, _, raw = self.request("GET", "/api/overview", headers={"Cookie": pair})
+        status, _, raw = self.request("GET", "/api/overview", headers=cookie)
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(raw)["missing_targets"], ["swack-tools"])
-        status, _, raw = self.request("GET", "/", headers={"Cookie": pair})
+        status, _, raw = self.request("GET", "/", headers=cookie)
         self.assertEqual(status, 403)
         self.assertIn("Sign out", raw.decode())
-        status, _, _ = self.request("POST", "/api/auth/targets", headers=bearer, body={"targets": ["bad/t/x"]})
+        self.fake.set_org("tok-admin", "swack-tools")
+        _, msg, _ = self.device_login("tok-admin")
+        fresh = {"Cookie": self.cookie_pair(msg, "spot_session")[0]}
+        status, _, _ = self.request("POST", "/api/auth/targets", headers=fresh, body={"targets": ["bad/t/x"]})
         self.assertEqual(status, 400)
+
+    def test_config_repo_targets_are_required_and_locked(self):
+        self.config_targets = ["swack-tools/oxidex"]
+        self.fake.set_repo("tok-admin", "swack-tools/oxidex", admin=True)
+        self.start()
+        status, msg, _ = self.device_login("tok-admin")
+        self.assertEqual(status, 200)
+        cookie = {"Cookie": self.cookie_pair(msg, "spot_session")[0]}
+        status, _, raw = self.request("GET", "/api/auth/targets", headers=cookie)
+        body = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["config_targets"], ["swack-tools/oxidex"])
+        self.assertIn("swack-tools/oxidex", body["locked_targets"])
+        # Saving an empty dynamic list cannot drop a config-repo target.
+        status, _, raw = self.request("POST", "/api/auth/targets", headers=cookie, body={"targets": []})
+        self.assertEqual((status, json.loads(raw)["controlled_targets"]), (200, ["swack-tools/oxidex"]))
+        # A new repo in the config repo forces a fresh login.
+        self.config_targets = ["swack-tools/oxidex", "swack-tools/other"]
+        status, _, raw = self.request("GET", "/api/overview", headers=cookie)
+        self.assertEqual((status, json.loads(raw)["missing_targets"]), (403, ["swack-tools/other"]))
+
+    def test_config_repo_admin_missing_is_forbidden(self):
+        self.config_targets = ["swack-tools/oxidex"]
+        self.fake.set_repo("tok-admin", "swack-tools/oxidex", admin=False)
+        self.start()
+        status, _, raw = self.device_login("tok-admin")
+        self.assertEqual((status, json.loads(raw)["missing_targets"]), (403, ["swack-tools/oxidex"]))
+
+    def test_config_repo_listing_failure_fails_closed(self):
+        self.start()
+        _, msg, _ = self.device_login("tok-admin")
+        cookie = {"Cookie": self.cookie_pair(msg, "spot_session")[0]}
+        self.assertEqual(self.request("GET", "/api/overview", headers=cookie)[0], 200)
+        self.config_error = RuntimeError("gh api failed (HTTP 404): Not Found")
+        status, _, raw = self.request("GET", "/api/overview", headers=cookie)
+        self.assertEqual(status, 403)
+        self.assertIn("swack-tools/spot-runners-config", json.loads(raw)["error"])
+        status, _, raw = self.request("GET", "/", headers=cookie)
+        self.assertEqual(status, 403)
+        self.assertIn("spot-runners-config", raw.decode())
+        status, _, raw = self.device_login("tok-admin")
+        self.assertEqual(status, 403)
+        self.assertIn("could not list controlled repositories", json.loads(raw)["error"])
+
+    def test_config_targets_cache(self):
+        clock = FakeClock(100.0)
+        calls = []
+
+        def lister():
+            calls.append(1)
+            return ["Swack-Tools/oxidex"]
+
+        provider = ConfigRepoTargets(lister=lister, ttl_seconds=300, clock=clock)
+        self.assertEqual(provider.get(), ["Swack-Tools/oxidex"])
+        clock.now += 299
+        provider.get()
+        self.assertEqual(len(calls), 1)
+        clock.now += 2
+        provider.get()
+        self.assertEqual(len(calls), 2)
+
+        def broken():
+            raise RuntimeError("boom")
+
+        failing = ConfigRepoTargets(lister=broken)
+        with self.assertRaisesRegex(ConfigTargetsError, "spot-runners-config"):
+            failing.get()
+        bad_names = ConfigRepoTargets(lister=lambda: ["not/a/valid/name"])
+        with self.assertRaises(ConfigTargetsError):
+            bad_names.get()
+
+    def test_device_flow_routes_404_when_disabled(self):
+        self.start(device_flow=False)
+        for path in ("/auth/device/code", "/auth/device/token"):
+            status, _, _ = self.request("POST", path, body={})
+            self.assertEqual(status, 404, path)
+        status, _, raw = self.request("GET", "/")
+        self.assertNotIn("/auth/device/code", raw.decode())
+        self.assertIn('href="/auth/github/login"', raw.decode())
+        self.assertFalse(json.loads(self.request("GET", "/auth/status")[2])["oauth"]["device_flow"])
+
+    def test_legacy_token_rejected_when_proxied(self):
+        self.start(auth_token=self.LEGACY_TOKEN)
+        bearer = {"Authorization": f"Bearer {self.LEGACY_TOKEN}"}
+        self.assertEqual(self.request("GET", "/api/overview", headers=bearer)[0], 200)
+        for proxy_header in ({"Cf-Connecting-Ip": "203.0.113.9"}, {"Cf-Ray": "8abc-IAD"},
+                             {"X-Forwarded-For": "203.0.113.9"}):
+            status, _, _ = self.request("GET", "/api/overview", headers={**bearer, **proxy_header})
+            self.assertEqual(status, 401, proxy_header)
+            status, _, _ = self.request("POST", "/api/auth/login", headers=proxy_header, body={"token": self.LEGACY_TOKEN})
+            self.assertEqual(status, 401, proxy_header)
+        status, msg, _ = self.request("POST", "/api/auth/login", body={"token": self.LEGACY_TOKEN})
+        pair, _ = self.cookie_pair(msg, "dashboard_session")
+        self.assertEqual(self.request("GET", "/api/overview", headers={"Cookie": pair})[0], 200)
+        status, _, _ = self.request("GET", "/api/overview", headers={"Cookie": pair, "Cf-Ray": "x"})
+        self.assertEqual(status, 401)
 
     def test_forged_session_is_unauthenticated(self):
         self.start()
@@ -601,13 +806,15 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         self.assertEqual(status, 401)
 
     def test_web_code_flow(self):
-        self.start()
+        self.start(device_flow=False)
         self.fake.code_tokens["goodcode"] = "tok-admin"
+        self.fake.expected_challenges = set()
         status, msg, _ = self.request("GET", "/auth/github/login?next=/index.html", headers={"Host": "spot.example"})
         self.assertEqual(status, 302)
         location = urllib.parse.urlsplit(msg["Location"])
         self.assertEqual(f"{location.scheme}://{location.netloc}{location.path}", GITHUB_AUTHORIZE_URL)
         query = urllib.parse.parse_qs(location.query)
+        self.assertEqual(query["code_challenge_method"], ["S256"])
         self.assertEqual(query["redirect_uri"], ["http://spot.example/auth/github/callback"])
         state = query["state"][0]
         state_pair, state_header = self.cookie_pair(msg, "spot_oauth_state")
@@ -618,8 +825,10 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         status, _, _ = self.request("GET", f"/auth/github/callback?{qs}", headers={"Host": "spot.example"})
         self.assertEqual(status, 400)  # no browser-bound state cookie
 
-        state2 = urllib.parse.parse_qs(urllib.parse.urlsplit(
-            self.request("GET", "/auth/github/login", headers={"Host": "spot.example"})[1]["Location"]).query)["state"][0]
+        query2 = urllib.parse.parse_qs(urllib.parse.urlsplit(
+            self.request("GET", "/auth/github/login", headers={"Host": "spot.example"})[1]["Location"]).query)
+        state2 = query2["state"][0]
+        self.fake.expected_challenges.add(query2["code_challenge"][0])
         qs = urllib.parse.urlencode({"code": "goodcode", "state": state2})
         status, msg, _ = self.request(
             "GET", f"/auth/github/callback?{qs}",
@@ -627,7 +836,10 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status, 302)
         self.assertEqual(msg["Location"], "/")
+        self.assertTrue(self.fake.code_verifiers[-1])
         pair, _ = self.cookie_pair(msg, "spot_session")
+        payload = decode_payload(pair.split("=", 1)[1])
+        self.assertEqual((payload["sub"], payload["uid"]), ("swackhamer", ADMIN_ID))
         status, _, _ = self.request("GET", "/api/overview", headers={"Cookie": pair})
         self.assertEqual(status, 200)
 
@@ -649,6 +861,18 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
         self.assertIn("not an authorized administrator", raw.decode())
+        self.assertIsNone(self.cookie_pair(msg, "spot_session")[0])
+
+    def test_web_code_flow_rejects_wrong_pkce_verifier(self):
+        self.start(device_flow=False)
+        self.fake.code_tokens["goodcode"] = "tok-admin"
+        self.fake.expected_challenges = {"not-the-real-challenge"}
+        _, msg, _ = self.request("GET", "/auth/github/login", headers={"Host": "spot.example"})
+        state = urllib.parse.parse_qs(urllib.parse.urlsplit(msg["Location"]).query)["state"][0]
+        qs = urllib.parse.urlencode({"code": "goodcode", "state": state})
+        status, msg, _ = self.request("GET", f"/auth/github/callback?{qs}",
+                                      headers={"Host": "spot.example", "Cookie": f"spot_oauth_state={state}"})
+        self.assertEqual(status, 403)
         self.assertIsNone(self.cookie_pair(msg, "spot_session")[0])
 
     def test_web_flow_disabled_without_secret(self):

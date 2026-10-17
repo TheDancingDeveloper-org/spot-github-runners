@@ -1,0 +1,103 @@
+# Edge dashboard on a spot control VM
+
+The web dashboard runs on one small Spot VM, the control VM, behind a Cloudflare Worker at
+`https://spot.swacktech.com`. Only GitHub user `swackhamer` can sign in, and only when that account
+administers every controlled repository.
+
+## Architecture
+
+| Component | Location | Role |
+| --- | --- | --- |
+| Cloudflare Worker | `cloudflare/worker.js` | Verifies the session cookie, proxies to the active control VM, and returns a wait response while the control VM is down. |
+| Workers KV | Binding `SPOT_KV` | `origin:active` names the active slot. `dashboard:state` holds the latest dashboard state snapshot. |
+| Control VM | `spot-control-a` or `spot-control-b` | Runs the dashboard container and a `cloudflared` tunnel. Created by `src/control_vm.py`. |
+| Tunnel hostnames | `spot-origin-a.swacktech.com`, `spot-origin-b.swacktech.com` | One Cloudflare Tunnel per slot, protected by a Cloudflare Access service token. |
+| Startup script | `cloud-init/control-vm-startup.sh` | Fetches secrets, pulls or builds the image, and starts both containers on every boot. |
+| Dashboard image | `dashboard/Dockerfile` | Built on the VM from a pinned commit, or pulled from `ghcr.io/swack-tools/spot-dashboard`. |
+
+The dashboard listens only on `127.0.0.1:8787`. The control VM has no inbound firewall rule for it.
+
+## Sign-in
+
+The dashboard uses a GitHub OAuth 2.0 app with the authorization-code flow and PKCE. Sign-in succeeds only
+when all of these are true:
+
+- The GitHub login is `swackhamer` and the numeric user ID is `619624`.
+- The user has administrator permission on every controlled target. Targets are the union of
+  `DASHBOARD_CONTROLLED_TARGETS`, targets saved in the dashboard, and every `repos/<owner>/<repo>.yaml`
+  file in `swack-tools/spot-runners-config`.
+- The dashboard can list the config repository. If the listing fails, sign-in fails closed with a 403.
+
+The session cookie is HMAC-signed with `DASHBOARD_SESSION_SECRET`. The Worker and every control VM share
+that secret, so sessions survive VM replacement.
+
+## State durability
+
+- The dashboard writes state atomically to `/var/lib/spot-dashboard/state.json` on the boot disk.
+  Control VMs use the `STOP` termination action, so a preemption keeps the boot disk.
+- Every save increments `state_version`. The active slot copies each save to KV about one second later.
+- At startup the dashboard loads the newer of the local file and the KV snapshot, then reports
+  `hydrated`.
+- The browser sends an `Idempotency-Key` header with every change. The dashboard stores the response in
+  the same atomic save as the change, so a retried request never applies twice.
+
+## Outages and recovery
+
+While the control VM is down, the Worker answers with HTTP 503 and the body
+`{"error": "control_vm_unavailable", ...}`. Page loads get a waiting page that polls `/api/health`.
+The dashboard page shows a banner, keeps its in-memory state, and retries the failed request with the
+same idempotency key after `/api/health` returns 200.
+
+The autoscaler handles the control VM when you run it with `--manage-control-vm`:
+
+- **Preempted VM**: the autoscaler starts it again. If the start keeps failing, it creates the other slot,
+  which loads state from KV, then points `origin:active` at it.
+- **Price rotation**: the autoscaler creates the other slot, waits for health, freezes the old VM, copies
+  its snapshot into the new VM, writes `origin:active` with read-back verification, waits for KV to
+  propagate, then deletes the old VM. A failed origin write unfreezes the old VM and deletes the new one.
+
+Recovery depends on the autoscaler running. If the workstation that runs it is off, the dashboard stays
+down until the autoscaler runs again.
+
+## Configuration
+
+Set these in the autoscaler's environment file outside the Git checkout. See `.env.example` for the full
+list.
+
+| Variable | Purpose |
+| --- | --- |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_KV_NAMESPACE_ID`, `CLOUDFLARE_KV_API_TOKEN` | KV access for `origin:active` and snapshots. |
+| `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` | Access service token for the tunnel hostnames. |
+| `DASHBOARD_CONTROL_SECRET` | Signs control calls (`freeze`, `unfreeze`, `snapshot`, `import`). |
+| `SPOT_DASHBOARD_IMAGE` or `SPOT_DASHBOARD_SOURCE_REF` | A digest-pinned image, or a 40-character commit to build on the VM. |
+
+The control VM reads its secrets from Secret Manager at boot: `spot-dashboard-session-secret`,
+`spot-dashboard-oauth-client-id`, `spot-dashboard-oauth-client-secret`, `spot-dashboard-control-secret`,
+`spot-dashboard-cloudflare-kv-token`, `spot-dashboard-github-token`, `spot-dashboard-tunnel-token-a`, and
+`spot-dashboard-tunnel-token-b`.
+
+## Commands
+
+Preview the next lifecycle step without changing anything:
+
+```bash
+PYTHONPATH=src python3 src/control_vm.py plan
+```
+
+Write the startup script for review:
+
+```bash
+PYTHONPATH=src python3 src/control_vm.py render-startup --output "$HOME/oxidex-ops/control-vm-startup.sh"
+```
+
+Run one lifecycle step. This command creates, starts, or deletes VMs:
+
+```bash
+PYTHONPATH=src python3 src/control_vm.py ensure --apply
+```
+
+Run the Worker tests:
+
+```bash
+node --test cloudflare/
+```

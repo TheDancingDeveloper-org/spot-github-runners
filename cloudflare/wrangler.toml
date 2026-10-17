@@ -1,0 +1,36 @@
+# Cloudflare Worker that fronts the Spot dashboard on https://spot.swacktech.com.
+#
+# The Worker checks the dashboard session cookie and proxies to the control VM named by the KV key
+# `origin:active` (a Cloudflare Tunnel hostname behind Cloudflare Access). See cloudflare/worker.js.
+#
+# Before the first deploy:
+#   1. Create the KV namespace and replace REPLACE_WITH_SPOT_KV_NAMESPACE_ID below with its id.
+#   2. Set the Worker secrets (never commit them, never put them in [vars]):
+#        wrangler secret put SESSION_SECRET            # same value as DASHBOARD_SESSION_SECRET on the VM
+#        wrangler secret put CF_ACCESS_CLIENT_ID       # Access service token for spot-origin-*.swacktech.com
+#        wrangler secret put CF_ACCESS_CLIENT_SECRET
+#   3. Set CLOUDFLARE_ACCOUNT_ID in the deploying shell instead of adding account_id here.
+#
+# Run the unit tests with: node --test cloudflare/
+
+name = "spot-dashboard-edge"
+main = "worker.js"
+compatibility_date = "2026-06-01"
+workers_dev = false
+preview_urls = false
+
+routes = [
+  { pattern = "spot.swacktech.com", custom_domain = true },
+]
+
+kv_namespaces = [
+  { binding = "SPOT_KV", id = "REPLACE_WITH_SPOT_KV_NAMESPACE_ID" },
+]
+
+[vars]
+ALLOWED_ADMIN_LOGIN = "swackhamer"
+ALLOWED_ADMIN_ID = "619624"
+ORIGIN_HOST_SUFFIX = ".swacktech.com"
+
+[observability]
+enabled = true
