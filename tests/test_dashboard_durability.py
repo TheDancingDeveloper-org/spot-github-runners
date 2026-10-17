@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
+import unittest.mock as mock
 import urllib.parse
 
 from lib import billing_catalog, compute_api

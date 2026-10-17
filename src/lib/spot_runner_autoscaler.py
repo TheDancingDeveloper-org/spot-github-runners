@@ -1996,9 +1996,6 @@ def _step_rotation_boot(vms, runners, args, state, state_path, rotation):
     return _step_rotation_verify_readiness(vms, runners, args, state, state_path, rotation)
 
 
-# Kept so callers importing the old name still reach the runner-only boot step.
-_step_rotation_boot_hydrate = _step_rotation_boot
-
 
 def _step_rotation_verify_readiness(vms, runners, args, state, state_path, rotation):
     """Phase 4: Gate on the replacement's own runners being registered and online."""

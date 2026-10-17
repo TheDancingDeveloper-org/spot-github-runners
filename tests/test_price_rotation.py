@@ -798,7 +798,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             self.assertNotIn("replacement_offer", recovered["price_rotation"])
 
     def test_boot_hydrate_timeout_on_non_running_vm_aborts_cleanly(self):
-        from lib.spot_runner_autoscaler import _step_rotation_boot_hydrate
+        from lib.spot_runner_autoscaler import _step_rotation_boot
         stuck_repl_vm = GceVm(
             "oxidex-runners-new", "asia-east2-a", "PROVISIONING", "n4-highcpu-16", True,
             instance_id="new-456"
@@ -815,7 +815,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             path = Path(tmpdir) / "state.json"
             with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as mock_delete, \
                  patch("lib.spot_runner_autoscaler.now", return_value=1700.0):
-                result = _step_rotation_boot_hydrate(
+                result = _step_rotation_boot(
                     [self.outgoing_vm, stuck_repl_vm], [], self.args, state, path, rotation
                 )
                 self.assertTrue(result)
@@ -823,7 +823,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 self.assertNotIn("price_rotation", read_scale_state(path))
 
     def test_boot_hydrate_timeout_survives_gcloud_deletion_error(self):
-        from lib.spot_runner_autoscaler import _step_rotation_boot_hydrate
+        from lib.spot_runner_autoscaler import _step_rotation_boot
         new_vm = GceVm("oxidex-runners-new", "asia-east2-a", "PROVISIONING", "n2-standard-2", True)
         state = {
             "price_rotation": {
@@ -836,7 +836,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             path = Path(tmp) / "state.json"
             with patch("lib.spot_runner_autoscaler.delete_vm_and_disks", side_effect=subprocess.CalledProcessError(1, ["gcloud"])), \
                  patch("lib.spot_runner_autoscaler.now", return_value=1700.0):
-                res = _step_rotation_boot_hydrate([new_vm], [], self.args, state, path, state["price_rotation"])
+                res = _step_rotation_boot([new_vm], [], self.args, state, path, state["price_rotation"])
                 self.assertTrue(res)
                 recovered = read_scale_state(path)
                 self.assertNotIn("price_rotation", recovered)
