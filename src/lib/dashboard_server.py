@@ -991,6 +991,9 @@ class DashboardStore:
         self._reconcile_next_at = 0.0
         self._reconcile_delay = HYDRATE_BACKOFF_INITIAL_SECONDS
         self.kv_writer = False
+        # True when the last successful read of origin:active named the other slot: a Worker with a cached
+        # origin may still send requests here, but changes would never reach the active dashboard.
+        self.known_inactive = False
         self.hydration_source = ""
         self._writer_checked_at: float | None = None
         self._kv_dirty = False
@@ -1298,9 +1301,11 @@ class DashboardStore:
             return self.kv_writer
         if raw is None:
             writer = True
+            self.known_inactive = False
         else:
             record = OriginRecord.from_json(raw)
             writer = record is not None and record.slot == self.control_slot
+            self.known_inactive = record is not None and record.slot != self.control_slot
         if not writer:
             self._writer_synced = False
         self.kv_writer = writer
@@ -1389,6 +1394,7 @@ class DashboardStore:
                     if record is None or record.slot != self.control_slot:
                         self.kv_writer = False
                         self._writer_synced = False
+                        self.known_inactive = record is not None
                         self._writer_checked_at = self._clock()
                         LOG.warning("Skipping dashboard KV write: origin:active names slot %s, not %s",
                                     record.slot if record else None, self.control_slot)
@@ -1537,6 +1543,7 @@ class DashboardStore:
                 "hydrated": hydrated,
                 "frozen": frozen,
                 "reconciled": reconciled,
+                "active": not self.known_inactive,
                 "state_version": self.state_version(),
                 "slot": self.control_slot,
                 "kv_writer": bool(self.kv_writer),
@@ -1564,6 +1571,10 @@ class DashboardStore:
             return status, body, False
         if self.hydrated and not self.frozen and not self.sync_with_kv_as_writer():
             raise DashboardFrozenError("Dashboard became the active slot but cannot read Cloudflare KV yet")
+        if self.known_inactive:
+            # sync_with_kv_as_writer re-read origin:active just now (unless KV is unreachable, in which case
+            # the last successful read stands).
+            raise DashboardFrozenError("This control VM is not the active slot; changes go to the active one")
         with self._lock:
             if self.frozen:
                 raise DashboardFrozenError("Dashboard is frozen for a control VM handover")

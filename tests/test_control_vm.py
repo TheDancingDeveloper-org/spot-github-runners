@@ -1155,7 +1155,9 @@ class StartupScriptTests(unittest.TestCase):
         self.assertIn("readonly TUNNEL_CONTAINER=spot-cloudflared", self.text)
         self.assertEqual(self.text.count("--restart unless-stopped --network host"), 2)
         self.assertIn('--env-file "$ENV_FILE" -v "$STATE_DIR:/state"', self.text)
-        self.assertIn('--host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT"',
+        self.assertIn('--host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \\\n'
+                      '    --project "$PROJECT"', self.text)
+        self.assertIn('(umask 022 && git -C "$workdir" -c advice.detachedHead=false checkout -q FETCH_HEAD)',
                       self.text)
         self.assertIn("tunnel --no-autoupdate run", self.text)
         self.assertIn("readonly CONTAINER_UID=10001", self.text)

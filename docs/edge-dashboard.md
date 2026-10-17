@@ -64,6 +64,10 @@ startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` 
   writes to KV, and adopts a newer KV snapshot. If it can't read KV, it answers changes with the wait
   response.
 - Stored idempotent responses are independent copies, so later changes never alter a replay.
+- A control VM whose last successful read of `origin:active` names the other slot keeps serving pages
+  and reports `"active": false` in `/api/health`, which can still return 200. It answers changes with the
+  wait response, because a Worker with a cached origin could otherwise send it changes that never reach
+  the active dashboard.
 - When the local file is newer than the KV copy at startup, for example because a preemption cut off a
   write after a local save, the active slot publishes the local copy.
 - The browser sends an `Idempotency-Key` header with every change. The dashboard stores the response in

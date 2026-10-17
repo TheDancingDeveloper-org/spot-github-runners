@@ -32,6 +32,11 @@ COPY --chown=root:root src/ /app/src/
 COPY --chown=root:root cloud-init/ /app/cloud-init/
 COPY --chown=root:root runner/ /app/runner/
 COPY --chown=root:root builder/ /app/builder/
+# COPY keeps the build context's modes, and a checkout made under umask 077 leaves 0700/0600 files the
+# runtime user cannot read. Normalize to root-owned, world-readable, not world-writable: directories
+# 0755, files 0644, and files that were executable 0755.
+RUN chown -R root:root /app \
+    && chmod -R u=rwX,go=rX /app
 
 USER 10001:10001
 

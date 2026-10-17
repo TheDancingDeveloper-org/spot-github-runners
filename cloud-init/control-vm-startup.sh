@@ -161,7 +161,9 @@ build_from_source() {
   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader \
     GIT_CONFIG_VALUE_0="Authorization: Basic $auth" GIT_TERMINAL_PROMPT=0 \
     git -C "$workdir" fetch -q --depth 1 origin "$SOURCE_REF" || fail "could not fetch $SOURCE_REF"
-  git -C "$workdir" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  # Check out world-readable files (the script runs under umask 077). The Dockerfile also normalizes
+  # modes, so the image is correct either way. The build directory itself stays 0700 (mktemp -d).
+  (umask 022 && git -C "$workdir" -c advice.detachedHead=false checkout -q FETCH_HEAD)
   head="$(git -C "$workdir" rev-parse HEAD)"
   [[ "$head" == "$SOURCE_REF" ]] || fail "checked out $head instead of $SOURCE_REF"
   log "building $image"
@@ -209,7 +211,8 @@ run_containers() {
   docker run -d --name "$DASHBOARD_CONTAINER" --restart unless-stopped --network host \
     --user "$CONTAINER_UID:$CONTAINER_UID" --cap-drop ALL --security-opt no-new-privileges \
     --env-file "$ENV_FILE" -v "$STATE_DIR:/state" "$DASHBOARD_IMAGE_REF" \
-    --host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" >/dev/null
+    --host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \
+    --project "$PROJECT" >/dev/null
 
   image_present "$CLOUDFLARED_IMAGE" || docker pull "$CLOUDFLARED_IMAGE" >/dev/null
   docker rm -f "$TUNNEL_CONTAINER" >/dev/null 2>&1 || true

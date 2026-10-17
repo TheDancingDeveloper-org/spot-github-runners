@@ -1545,6 +1545,94 @@ class ExpectedListenerCountTests(unittest.TestCase):
         self.assertIsNone(_replacement_live_failure([self.replacement_vm], self.runners(8), rotation))
 
 
+class ReadinessTimeoutPreservesWorkTests(unittest.TestCase):
+    """Round 6: a timed-out replacement is deleted only when idle and remote-builder quiesced."""
+
+    def setUp(self):
+        self.outgoing_vm = GceVm("oxidex-runners-old", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                                 instance_id="old-123")
+        self.replacement_vm = GceVm("oxidex-runners-new", "asia-east2-a", "RUNNING", "n4-highcpu-16", True,
+                                    instance_id="new-456")
+        self.args = SimpleNamespace(project="homelab-424523", org="swack-tools", target="swack-tools")
+
+    def timeout(self, runners, builders_quiet=True):
+        from lib.spot_runner_autoscaler import _step_rotation_verify_readiness
+        rotation = {"phase": "verify_readiness", "target": "swack-tools", "target_type": "org",
+                    "outgoing_vm": {"name": "oxidex-runners-old", "zone": "asia-east2-a", "instance_id": "old-123"},
+                    "replacement_vm": {"name": "oxidex-runners-new", "zone": "asia-east2-a", "instance_id": "new-456"},
+                    "expected_runner_count": 2, "expected_runner_count_source": "launch_sizing",
+                    "phase_started_at": 1000.0}
+        state = {"price_rotation": rotation}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            with patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete_new, \
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=builders_quiet) as quiesce, \
+                    patch("lib.spot_runner_autoscaler.now", return_value=1000.0 + 10_000):
+                _step_rotation_verify_readiness([self.outgoing_vm, self.replacement_vm], runners,
+                                                self.args, state, path, rotation)
+            saved = read_scale_state(path)
+        self.assertNotIn("price_rotation", saved)
+        return delete_new, quiesce, saved
+
+    def test_busy_listener_keeps_replacement_without_quiescing_it(self):
+        runners = [GitHubRunner(1, "gha-oxidex-runners-new-1", "online", True, ("spot",)),
+                   GitHubRunner(2, "gha-oxidex-runners-new-2", "offline", False, ("spot",))]
+        delete_new, quiesce, saved = self.timeout(runners)
+        delete_new.assert_not_called()
+        quiesce.assert_not_called()  # Never mark a host draining while it is kept as capacity.
+        self.assertNotIn("asia-east2-a/oxidex-runners-new", saved.get("intentional_deletions", []))
+
+    def test_active_remote_build_keeps_replacement(self):
+        runners = [GitHubRunner(1, "gha-oxidex-runners-new-1", "online", False, ("spot",))]
+        delete_new, quiesce, _ = self.timeout(runners, builders_quiet=False)
+        quiesce.assert_called_once_with(self.replacement_vm, self.args)
+        delete_new.assert_not_called()
+
+    def test_idle_quiesced_replacement_is_deleted_intentionally(self):
+        runners = [GitHubRunner(1, "gha-oxidex-runners-new-1", "online", False, ("spot",))]
+        delete_new, quiesce, saved = self.timeout(runners)
+        quiesce.assert_called_once()
+        delete_new.assert_called_once_with(self.replacement_vm, "homelab-424523")
+        self.assertIn("asia-east2-a/oxidex-runners-new", saved["intentional_deletions"])
+
+
+class RotationLossAccountingTests(unittest.TestCase):
+    """Round 6: rotation overlap and replacement losses never inflate restoration targets."""
+
+    def setUp(self):
+        self.other = GceVm("oxidex-runners-other", "z", "RUNNING", "n4-highcpu-16", True, instance_id="o-1")
+        self.outgoing = GceVm("oxidex-runners-old", "z", "RUNNING", "n4-highcpu-16", True, instance_id="old-1")
+        self.replacement = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="new-1")
+        self.rotation = {"phase": "cordon_drain",
+                         "outgoing_vm": {"name": "oxidex-runners-old", "zone": "z", "instance_id": "old-1"},
+                         "replacement_vm": {"name": "oxidex-runners-new", "zone": "z", "instance_id": "new-1"}}
+
+    def record(self, vms, lost, rotation=True):
+        from dataclasses import asdict
+        from lib.vm_recovery import record_loss_restoration_target
+        state = {"pending_vm_recovery": {f"z/{lost.name}": asdict(lost)}}
+        if rotation:
+            state["price_rotation"] = self.rotation
+        with tempfile.TemporaryDirectory() as tmpdir:
+            record_loss_restoration_target(vms, state, Path(tmpdir) / "state.json")
+        self.assertTrue(state["pending_vm_recovery"][f"z/{lost.name}"]["_target_recorded"])
+        return state.get("price_replacement_target", 0)
+
+    def test_preempted_rotation_replacement_requests_no_restoration(self):
+        self.assertEqual(self.record([self.other, self.outgoing], self.replacement), 0)
+
+    def test_outgoing_loss_during_rotation_ignores_overlap_host(self):
+        self.assertEqual(self.record([self.other, self.replacement], self.outgoing), 2)
+
+    def test_pending_launch_replacement_is_rotation_owned(self):
+        self.rotation["replacement_vm"] = None
+        self.rotation["pending_replacement"] = {"name": "oxidex-runners-new", "zone": "z"}
+        self.assertEqual(self.record([self.other, self.outgoing], self.replacement), 0)
+
+    def test_ordinary_losses_are_unchanged_without_rotation(self):
+        self.assertEqual(self.record([self.other, self.replacement], self.outgoing, rotation=False), 3)
+
+
 class LaunchAgentArgumentTests(unittest.TestCase):
     """Finding 3: the LaunchAgent restarts the controller with the same target and rotation mode."""
 

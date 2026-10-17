@@ -820,8 +820,9 @@ class HealthAndGateTests(ServerHarness):
         self.start()
         status, msg, body = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
-        self.assertEqual(set(body), {"status", "hydrated", "frozen", "reconciled", "state_version", "slot",
-                                     "kv_writer"})
+        self.assertEqual(set(body), {"status", "hydrated", "frozen", "reconciled", "active", "state_version",
+                                     "slot", "kv_writer"})
+        self.assertTrue(body["active"])
         self.assertTrue(body["reconciled"])
         self.assertEqual((body["status"], body["hydrated"], body["frozen"], body["slot"], body["kv_writer"]),
                          ("ok", True, False, None, False))
@@ -877,6 +878,71 @@ class HealthAndGateTests(ServerHarness):
         self.assertEqual(status, 200)
         self.assertEqual((body["state_version"], body["slot"], body["kv_writer"]), (6, "b", True))
         self.assertEqual(store.get_controlled_targets(), ["kv/repo"])
+
+
+class InactiveSlotTests(unittest.TestCase):
+    """A slot that origin:active does not name keeps serving reads but refuses browser changes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = FakeKvRequester()
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=1).to_json()
+        self.store = DashboardStore(Path(self.tmp.name) / "state.json", control_slot="a", kv=make_kv(self.fake),
+                                    clock=FakeClock(), sleep=lambda _s: None)
+        self.store.hydrate()
+
+    def change(self):
+        return self.store.run_request("k" * 16, "POST", "/api/targets",
+                                      lambda: (200, {"t": self.store.set_controlled_targets(["o/x"])}))
+
+    def test_known_inactive_slot_rejects_changes_but_reports_healthy(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        self.assertTrue(self.store.known_inactive)
+        health = self.store.health()
+        self.assertEqual((health["status"], health["active"]), ("ok", False))  # controller probes still pass
+        with self.assertRaises(DashboardFrozenError):
+            self.change()
+        self.assertEqual(self.store.get_controlled_targets(), [])
+
+    def test_cutover_to_this_slot_is_seen_on_the_next_change(self):
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=2).to_json()
+        self.assertEqual(self.change()[0], 200)
+        self.assertFalse(self.store.known_inactive)
+        self.assertTrue(self.store.health()["active"])
+
+    def test_unset_or_malformed_origin_is_not_known_inactive(self):
+        for raw in (None, "garbage"):
+            if raw is None:
+                self.fake.values.pop(KV_ORIGIN_KEY, None)
+            else:
+                self.fake.values[KV_ORIGIN_KEY] = raw
+            self.store.refresh_writer()
+            self.assertFalse(self.store.known_inactive, raw)
+
+    def test_unreachable_kv_keeps_last_successful_reading(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        self.fake.fail = True
+        with self.assertRaises(DashboardFrozenError):
+            self.change()
+
+
+class InactiveSlotServerTests(ServerHarness):
+    def test_browser_change_on_inactive_slot_gets_wait_body_and_health_stays_200(self):
+        fake = FakeKvRequester()
+        fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=1).to_json()
+        store = self.start(control_slot="a", kv=make_kv(fake))
+        deadline = time.time() + 5
+        while not store.hydrated and time.time() < deadline:
+            time.sleep(0.01)
+        status, _, body = self.request("GET", "/api/health")
+        self.assertEqual((status, body["active"]), (200, False))
+        self.assertEqual(self.request("GET", "/api/overview")[0], 200)
+        status, msg, payload = self.request("POST", "/api/targets", body={"targets": ["o/x"]},
+                                            headers={"Idempotency-Key": "k" * 16})
+        self.assert_wait_response(status, msg, payload)
 
 
 class IdempotencyTests(ServerHarness):

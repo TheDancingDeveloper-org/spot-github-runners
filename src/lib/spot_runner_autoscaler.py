@@ -1376,19 +1376,37 @@ def _delete_replacement(repl_vm, args, state, state_path) -> None:
         LOG.error("Failed to delete replacement VM %s: %s", repl_vm.name, error_detail(exc))
 
 
+def _replacement_safe_to_delete(repl_vm, runners, args, *, require_offline=False) -> bool:
+    """Return whether an aborted replacement can be deleted without losing work.
+
+    A replacement with a busy listener (or, when ``require_offline``, any online listener) is
+    kept. A RUNNING replacement must also pass the same remote-builder quiescence check that
+    ordinary draining uses, so an active build is never deleted.
+    """
+    assigned = _replacement_runners(runners, repl_vm.name)
+    if any(r.busy for r in assigned) or (require_offline and any(r.online for r in assigned)):
+        return False
+    return not repl_vm.running or quiesce_remote_builder(repl_vm, args)
+
+
 def _abort_runner_rotation(rotation, vms, args, state, state_path, reason: str, runners=()) -> bool:
     repl_vm = _replacement_from_inventory(vms, rotation.get("replacement_vm"))
     if _outgoing_capacity_lost(rotation):
         # The outgoing host no longer has its listeners, so dropping the transaction would leave
         # no usable capacity. Keep it pending and try another fresh replacement instead.
         LOG.error("%s; outgoing listeners were removed, so the rotation keeps provisioning capacity", reason)
-        if repl_vm and not any(r.online for r in _replacement_runners(runners, repl_vm.name)):
+        if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args, require_offline=True):
             _delete_replacement(repl_vm, args, state, state_path)
         _restart_replacement(rotation, state, state_path)
         return True
     LOG.error("%s; aborting replacement to preserve old capacity", reason)
-    if repl_vm:
+    if repl_vm and _replacement_safe_to_delete(repl_vm, runners, args):
         _delete_replacement(repl_vm, args, state, state_path)
+    elif repl_vm:
+        # Busy or building: keep it as ordinary fleet capacity; normal draining (cordon, wait for
+        # jobs and builds, deregister) owns any later removal.
+        LOG.warning("Keeping replacement %s as fleet capacity: it is running jobs or remote builds",
+                    repl_vm.name)
     state.pop("price_rotation", None)
     write_scale_state(state_path, state)
     return True
@@ -1408,6 +1426,23 @@ def _expected_replacement_listeners(rotation, args=None) -> int:
         else:
             count = max(count, 8)
     return max(1, count)
+
+
+def rotation_host_identities(state) -> tuple[dict | None, list[dict]]:
+    """Return the active rotation's outgoing host and every replacement identity it owns."""
+    rotation = state.get("price_rotation")
+    if not isinstance(rotation, dict):
+        return None, []
+    replacements = [row for row in (rotation.get("pending_replacement"), rotation.get("replacement_vm"),
+                                    *(rotation.get("failed_replacements") or []))
+                    if isinstance(row, dict) and row.get("name")]
+    outgoing = rotation.get("outgoing_vm") if isinstance(rotation.get("outgoing_vm"), dict) else None
+    return outgoing, replacements
+
+
+def identity_matches(row, name, zone, instance_id) -> bool:
+    return (isinstance(row, dict) and row.get("name") == name and row.get("zone", zone) == zone
+            and (not row.get("instance_id") or not instance_id or row.get("instance_id") == instance_id))
 
 
 def _replacement_runners(runners, name: str):
@@ -1567,15 +1602,9 @@ def _recover_failed_replacement(vms, runners, args, state, state_path, rotation,
         # Nothing on the outgoing host can take work, so the replacement is the only capacity.
         LOG.error("Outgoing host %s has no online listeners after uncordon", out_name)
         return _recover_lost_capacity(vms, runners, args, state, state_path, rotation)
-    repl = rotation.get("replacement_vm") or {}
-    if any(r.busy for r in _replacement_runners(runners, repl.get("name", ""))):
-        # Never kill jobs that already landed on a partially healthy replacement.
-        LOG.warning("Keeping replacement %s: it is running jobs; rotation aborted", repl.get("name"))
-        state.pop("price_rotation", None)
-        write_scale_state(state_path, state)
-        return True
+    # The abort path keeps a busy or building replacement and deletes only an idle, quiesced one.
     return _abort_runner_rotation(rotation, vms, args, state, state_path,
-                                  f"Rotation for {out_name} aborted: {rotation['recovering']}")
+                                  f"Rotation for {out_name} aborted: {rotation['recovering']}", runners)
 
 
 def _step_rotation_boot(vms, runners, args, state, state_path, rotation):

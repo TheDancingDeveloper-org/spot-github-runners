@@ -111,6 +111,13 @@ class DockerfileTests(unittest.TestCase):
         self.assertIn("--gid 10001", self.text)
         self.assertNotRegex(self.text, r"(?m)^USER (root|0)\b")
 
+    def test_copied_files_are_normalized_for_the_runtime_user(self) -> None:
+        # A checkout under umask 077 must still produce readable, root-owned, non-writable app files.
+        normalize = "RUN chown -R root:root /app \\\n    && chmod -R u=rwX,go=rX /app"
+        self.assertIn(normalize, self.text)
+        self.assertLess(self.text.rindex("COPY --chown=root:root"), self.text.index(normalize))
+        self.assertLess(self.text.index(normalize), self.text.index("USER 10001:10001"))
+
     def test_runtime_settings(self) -> None:
         self.assertRegex(self.text, r"(?m)^WORKDIR /app$")
         self.assertIn("PYTHONPATH=/app/src", self.text)

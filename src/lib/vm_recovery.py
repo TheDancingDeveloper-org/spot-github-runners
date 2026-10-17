@@ -97,14 +97,25 @@ def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
 
 def record_loss_restoration_target(vms, state, state_path):
     """Record all new losses together so a launch transition cannot undercount."""
-    from .spot_runner_autoscaler import spot_instances, write_scale_state
+    from .spot_runner_autoscaler import (identity_matches, rotation_host_identities, spot_instances,
+                                        write_scale_state)
 
     pending = state.get('pending_vm_recovery', {})
-    new_losses = sum(not record.get('_target_recorded') for record in pending.values())
-    if not new_losses:
+    new = [record for record in pending.values() if not record.get('_target_recorded')]
+    if not new:
         return
-    state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
-                                            len(spot_instances(vms)) + new_losses)
+    # A make-before-break rotation owns its replacement: that host is temporary overlap, and the
+    # rotation relaunches it itself. Count neither its loss nor the overlap toward restoration.
+    outgoing, replacements = rotation_host_identities(state)
+    def owned(row):
+        return any(identity_matches(rep, row.get('name'), row.get('zone'), row.get('instance_id'))
+                   for rep in replacements)
+    survivors = [vm for vm in spot_instances(vms)
+                 if not owned({'name': vm.name, 'zone': vm.zone, 'instance_id': vm.instance_id})]
+    new_losses = sum(not owned(record) for record in new)
+    if new_losses:
+        state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
+                                                len(survivors) + new_losses)
     for record in pending.values():
         record['_target_recorded'] = True
     write_scale_state(state_path, state)
