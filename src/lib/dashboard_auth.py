@@ -233,6 +233,30 @@ def normalize_admin_logins(logins: Iterable[str]) -> frozenset[str]:
     return frozenset(out)
 
 
+ENV_GLOBAL_ADMINS = "DASHBOARD_GLOBAL_ADMINS"
+DEFAULT_GLOBAL_ADMINS = f"{ALLOWED_ADMIN_LOGIN}:{ALLOWED_ADMIN_ID}"
+
+
+def parse_global_admins(raw: str | None) -> frozenset[tuple[str, int]]:
+    """Parse ``login:uid`` entries (comma or whitespace separated) into pinned identities.
+
+    Global administrators may sign in without being an administrator of every controlled target.
+    Each entry is pinned to the numeric GitHub user ID so a renamed or recycled login never
+    inherits the exception. Unset or empty means the default (the hardcoded administrator), so an
+    empty line copied from .env.example changes nothing; ``none`` disables global administrators.
+    """
+    text = str(raw or "").strip() or DEFAULT_GLOBAL_ADMINS
+    if text.lower() == "none":
+        return frozenset()
+    out = set()
+    for item in _split_list(text):
+        login, sep, uid = item.partition(":")
+        if not sep or not _LOGIN_RE.match(login) or not uid.isdigit() or int(uid) <= 0:
+            raise ValueError(f"{ENV_GLOBAL_ADMINS} entries must be login:numeric_id, got {item!r}")
+        out.add((login.lower(), int(uid)))
+    return frozenset(out)
+
+
 def is_allowed_identity(login: Any, uid: Any) -> bool:
     """True only for the hardcoded dashboard administrator (login compared case-insensitively, ID exactly)."""
     return (
@@ -711,6 +735,7 @@ class GitHubOAuthManager:
         clock: Callable[[], float] = time.time,
         device_flow: bool = False,
         session_not_before: int = 0,
+        global_admins: Iterable[tuple[str, int]] | None = None,
     ) -> None:
         cid = str(client_id or "").strip()
         if not _CLIENT_ID_RE.match(cid):
@@ -755,6 +780,9 @@ class GitHubOAuthManager:
         self._clock = clock
         self.verification_cache = verification_cache or TargetVerificationCache(clock=clock)
         self.session_not_before = int(session_not_before)
+        # Programmatic default: none. from_environ applies the configured default (the hardcoded admin).
+        self.global_admins: frozenset[tuple[str, int]] = frozenset(
+            (str(login).lower(), int(uid)) for login, uid in (global_admins or ()))
         self._session_key = derive_purpose_key(secret_bytes, "session")
         self._state_key = derive_purpose_key(secret_bytes, "oauth-state")
         self._pkce_key = derive_purpose_key(secret_bytes, "pkce")
@@ -814,6 +842,7 @@ class GitHubOAuthManager:
             "session_ttl_seconds": ttl,
             "device_flow": str(env.get(ENV_DEVICE_FLOW, "") or "").strip() == "1",
             "session_not_before": nbf,
+            "global_admins": parse_global_admins(env.get(ENV_GLOBAL_ADMINS)),
         }
         params.update(kwargs)
         return cls(client_id, client_secret, None, str(env.get(ENV_SESSION_SECRET, "") or ""), **params)
@@ -1242,6 +1271,12 @@ class GitHubOAuthManager:
                 user_login=login, user_id=uid, controlled_targets=names,
             )
         login = ALLOWED_ADMIN_LOGIN
+        if self.is_global_admin(login, uid):
+            # Configured exception: a global administrator is not required to administer every target.
+            return AuthorizationDecision(
+                True, 200, f"Authorized global administrator '{login}' (per-target admin checks not required)",
+                user_login=login, user_id=uid, controlled_targets=names, verified_targets=list(names),
+            )
         checks = [self.check_target_admin(token, login, uid, t, use_cache=use_cache) for t in targets]
         verified = [c.target for c in checks if c.is_admin]
         missing = [c.target for c in checks if not c.is_admin]
@@ -1329,6 +1364,9 @@ class GitHubOAuthManager:
             return None
         return session
 
+    def is_global_admin(self, login: Any, uid: Any) -> bool:
+        return isinstance(login, str) and _is_int(uid) and (login.lower(), uid) in self.global_admins
+
     @staticmethod
     def _session_identity_ok(session: SessionData) -> bool:
         return session.user_login == ALLOWED_ADMIN_LOGIN and session.user_id == ALLOWED_ADMIN_ID
@@ -1352,6 +1390,8 @@ class GitHubOAuthManager:
             targets = parse_controlled_targets(controlled_targets)
         except ValueError as exc:
             return SessionCheck("forbidden", session, f"Forbidden: controlled target configuration is invalid ({exc})")
+        if self.is_global_admin(session.user_login, session.user_id):
+            return SessionCheck("ok", session)
         verified = {t.lower() for t in session.verified_targets}
         missing = tuple(t.name for t in targets if t.key not in verified)
         if missing:

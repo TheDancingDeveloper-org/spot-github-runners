@@ -2233,3 +2233,45 @@ class StoreTargetPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GlobalAdminTests(unittest.TestCase):
+    """Configured global administrators skip per-target admin checks (pinned to login and uid)."""
+
+    def test_parse_and_environment_default(self):
+        self.assertEqual(dashboard_auth.parse_global_admins(None), frozenset({("swackhamer", 619624)}))
+        self.assertEqual(dashboard_auth.parse_global_admins(""), frozenset({("swackhamer", 619624)}))
+        self.assertEqual(dashboard_auth.parse_global_admins("none"), frozenset())
+        self.assertEqual(dashboard_auth.parse_global_admins("Swackhamer:619624, other:5"),
+                         frozenset({("swackhamer", 619624), ("other", 5)}))
+        for bad in ("swackhamer", "swackhamer:abc", "swackhamer:0", "bad login:1"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                dashboard_auth.parse_global_admins(bad)
+        env = {"GITHUB_OAUTH_CLIENT_ID": CLIENT_ID, "GITHUB_OAUTH_CLIENT_SECRET": "x", "DASHBOARD_SESSION_SECRET": SECRET}
+        self.assertEqual(GitHubOAuthManager.from_environ(env).global_admins, frozenset({("swackhamer", 619624)}))
+        env["DASHBOARD_GLOBAL_ADMINS"] = "none"
+        self.assertEqual(GitHubOAuthManager.from_environ(env).global_admins, frozenset())
+
+    def test_global_admin_skips_target_checks(self):
+        fake = FakeGitHub()
+        fake.add_user("tok", "swackhamer", 619624)
+        fake.set_repo("tok", "xbmc4lyfe/newznab-tmux", admin=False)
+        targets = ["xbmc4lyfe/newznab-tmux", "Appz4Fun/nzbget"]
+        plain = make_manager(fake).authorize("tok", targets)
+        self.assertFalse(plain.authorized)  # not a global admin: per-target checks apply
+        fake2 = FakeGitHub()
+        fake2.add_user("tok", "swackhamer", 619624)
+        mgr = make_manager(fake2, global_admins=[("swackhamer", 619624)])
+        decision = mgr.authorize("tok", targets)
+        self.assertTrue(decision.authorized, decision.message)
+        self.assertEqual(fake2.api_paths(), ["/user"])  # no per-target GitHub calls
+        session = mgr.issue_session(decision)
+        self.assertEqual(mgr.check_session(session, targets + ["swack-tools"]).status, "ok")
+
+    def test_uid_pinning(self):
+        fake = FakeGitHub()
+        fake.add_user("tok", "swackhamer", 619624)
+        fake.set_repo("tok", "xbmc4lyfe/newznab-tmux", admin=False)
+        mgr = make_manager(fake, global_admins=[("swackhamer", 1)])  # wrong uid: no exception
+        self.assertFalse(mgr.authorize("tok", ["xbmc4lyfe/newznab-tmux"]).authorized)
+
