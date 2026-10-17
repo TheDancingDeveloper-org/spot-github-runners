@@ -50,7 +50,7 @@ from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED,
                             RUNNER_DOCKERFILE, RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
 from .builder_assets import BUILDER_DOCKERFILE, BUILDER_ENTRYPOINT, HOST_LAUNCHER
-from .target_config import TARGET_LABEL_KEY, TargetConfig, resolve_target, target_label_value
+from .target_config import TARGET_LABEL_KEY, TargetConfig, resolve_target, target_label_value, target_owns_vm_label
 from .runner_patch import (
     RunnerPatch,
     classify_patch_diff,
@@ -524,6 +524,30 @@ def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatc
             Path(manifest_path).unlink(missing_ok=True)
 
 
+def adoption_target_label(args: argparse.Namespace, vm: dict) -> str | None:
+    """Ownership check for adopting an existing VM; returns the target label to set first, or None.
+
+    A VM labeled for another target is refused. An unlabeled VM (owned by the default org, see
+    target_owns_vm_label) is labeled only when the operator passed --target explicitly; without --target
+    it may be adopted only by the default-org target that already owns it.
+    """
+    labels = vm.get("labels") if isinstance(vm.get("labels"), dict) else {}
+    current = str(labels.get(TARGET_LABEL_KEY) or "")
+    expected = launch_target_label(args)
+    target = resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG))
+    if current:
+        if current != expected:
+            raise RuntimeError(f"VM {args.instance_name} is owned by another target ({TARGET_LABEL_KEY}={current}); "
+                               f"refusing to adopt it for {target.name}")
+        return None
+    if getattr(args, "target", None):
+        return expected
+    if target_owns_vm_label(None, target):
+        return None
+    raise RuntimeError(f"Unlabeled VM {args.instance_name} belongs to the default organization; pass "
+                       f"--target {target.name} to adopt it explicitly")
+
+
 def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     configure_storage(args)
     configure_cpu_platform(args)
@@ -542,6 +566,8 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
         actual_type = vm.get("machineType", "").rsplit("/", 1)[-1]
         if actual_type != args.instance_type:
             raise RuntimeError(f"Existing VM type {actual_type} does not match {args.instance_type}")
+        # Ownership before any change to the VM (and long before its runners register).
+        adopt_label = adoption_target_label(args, vm)
         if vm.get('status') == 'RUNNING' and args.min_cpu_platform and not cpu_platform_satisfies(
                 args.instance_type, vm.get('cpuPlatform', ''), args.min_cpu_platform, arch=arch, required_isa=required_isa):
             raise RuntimeError(f"Existing CPU platform {vm.get('cpuPlatform', 'unknown')} does not match requested {args.min_cpu_platform}")
@@ -591,6 +617,10 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     metadata_files = f"startup-script={script_path}" + (f",{PATCH_METADATA_KEY}={patch_path}" if patch_path else "")
     try:
         if vm:
+            if adopt_label:
+                # Same ownership label as a new instance gets, set before the startup script registers anything.
+                gcloud(["compute", "instances", "add-labels", args.instance_name, f"--zone={zone}",
+                        f"--labels={TARGET_LABEL_KEY}={adopt_label}"])
             for boot_disk in vm.get("disks", []):
                 if boot_disk.get("boot"):
                     gcloud(["compute", "instances", "set-disk-auto-delete", args.instance_name,

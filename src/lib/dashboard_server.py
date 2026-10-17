@@ -1654,6 +1654,12 @@ class DashboardStore:
         except KvError as exc:
             LOG.warning("Could not read %s from Cloudflare KV: %s", KV_ORIGIN_KEY, exc)
             return self.kv_writer
+        return self._apply_origin(raw)
+
+    def _apply_origin(self, raw: str | None) -> bool:
+        """Classify a successful ``origin:active`` read: missing key -> this VM may write (bootstrap); a record
+        naming this slot -> active; another slot -> inactive; an existing but malformed value -> UNKNOWN (never
+        "no owner")."""
         if raw is None:
             writer = True
             self.known_inactive = False
@@ -1668,6 +1674,21 @@ class DashboardStore:
         self.kv_writer = writer
         self._writer_checked_at = self._clock()
         return writer
+
+    def _confirm_ownership_now(self) -> None:
+        """Re-read ``origin:active`` for THIS mutation: a cutover may have moved ownership since any earlier read
+        (an unreachable old slot keeps its stale writer flags), so only a successful read naming this slot counts."""
+        if self.kv is None:
+            return
+        try:
+            raw = self.kv.get(KV_ORIGIN_KEY)
+        except KvError as exc:
+            raise DashboardFrozenError(f"Could not confirm ownership of {KV_ORIGIN_KEY}: {exc}") from exc
+        self._apply_origin(raw)
+        if self.ownership != "active":
+            raise DashboardFrozenError(
+                "This control VM is not the active slot" if self.known_inactive
+                else f"{KV_ORIGIN_KEY} is unreadable, so this control VM cannot confirm it is the active slot")
 
     def sync_with_kv_as_writer(self) -> bool:
         """When this VM is (or just became) the writer, adopt a newer KV snapshot before going further.
@@ -2014,7 +2035,9 @@ class DashboardStore:
             return status, body, False
 
     def _mutation_preflight(self) -> None:
-        """Gates every change shares (outside the lock): writer sync, active slot, confirmed ownership."""
+        """Gates every change shares (outside the lock): fresh ownership, writer sync, active slot."""
+        if self.hydrated and not self.frozen:
+            self._confirm_ownership_now()
         if self.hydrated and not self.frozen and not self.sync_with_kv_as_writer():
             raise DashboardFrozenError("Dashboard became the active slot but cannot read Cloudflare KV yet")
         if self.known_inactive:

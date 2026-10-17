@@ -102,8 +102,9 @@ Until then the dashboard fails closed:
   dashboard unhydrated with a `reason` in `/api/health`.
 - With local state and an unverifiable KV snapshot, the dashboard serves local state read-only. It
   never overwrites that KV value, because it may be newer.
-- A VM accepts changes only after it reads `origin:active` and confirms that the record names its slot,
-  or that no record exists yet. `/api/health` reports `ownership` as `active`, `inactive`, or `unknown`.
+- A VM accepts a change only after it reads `origin:active` again for that change and confirms that the
+  record names its slot, or that no record exists yet. A record that exists but can't be parsed counts as
+  unknown ownership, and so does a failed read. `/api/health` reports `ownership` as `active`, `inactive`, or `unknown`.
   Until ownership is `active`, changes get the wait response.
 
 ### Runner patches

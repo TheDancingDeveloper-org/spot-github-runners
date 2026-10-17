@@ -987,6 +987,68 @@ class OwnershipTriStateTests(unittest.TestCase):
         self.assertEqual(store.ownership, "active")
 
 
+class FreshOwnershipTests(unittest.TestCase):
+    """Codex round 10 P1-a: every mutation re-reads origin:active; stale writer flags never authorize a change."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = FakeKvRequester()
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=1).to_json()
+        self.store = DashboardStore(Path(self.tmp.name) / "state.json", control_slot="a", kv=make_kv(self.fake),
+                                    clock=FakeClock(), sleep=lambda _s: None)
+        self.store.hydrate()
+        self.assertEqual(self.change("o/first")[0], 200)
+        self.assertTrue(self.store.kv_writer and self.store._writer_synced)  # the stale state of an old slot
+
+    def change(self, target):
+        return self.store.run_request(None, "POST", "/api/targets",
+                                      lambda: (200, {"t": self.store.set_controlled_targets([target])}))
+
+    def origin_reads(self):
+        return [c for c in self.fake.calls if c == ("GET", KV_ORIGIN_KEY)]
+
+    def test_cutover_to_the_other_slot_is_seen_by_the_next_mutation(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=2).to_json()  # recovery cut over to B
+        with self.assertRaises(DashboardFrozenError):
+            self.change("o/lost")
+        self.assertEqual(self.store.get_controlled_targets(), ["o/first"])  # never acknowledged
+        self.assertTrue(self.store.known_inactive)
+        self.assertEqual(self.store.ownership, "inactive")
+
+    def test_unreachable_kv_refuses_instead_of_trusting_old_flags(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        self.fake.fail = True
+        with self.assertRaises(DashboardFrozenError):
+            self.change("o/lost")
+        with self.assertRaises(DashboardFrozenError):
+            self.store.run_external("ext-key-0001", "POST", "/api/patches/save", lambda: (200, {"ran": True}))
+        self.fake.fail = False
+        self.assertEqual(self.store.get_controlled_targets(), ["o/first"])
+
+    def test_malformed_origin_is_unknown_not_unowned(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        for raw in ("not json", json.dumps({"slot": "z"}), json.dumps(["a"])):
+            self.fake.values[KV_ORIGIN_KEY] = raw
+            with self.subTest(raw=raw), self.assertRaises(DashboardFrozenError):
+                self.change("o/lost")
+            self.assertEqual((self.store.ownership, self.store.known_inactive, self.store.kv_writer),
+                             ("unknown", False, False))
+        # A missing key is the only "no owner" case (bootstrap), and the change then goes through.
+        self.fake.values.pop(KV_ORIGIN_KEY)
+        self.assertEqual(self.change("o/bootstrap")[0], 200)
+
+    def test_each_mutation_reads_origin_again(self):
+        before = len(self.origin_reads())
+        self.change("o/second")
+        self.change("o/third")
+        self.assertGreaterEqual(len(self.origin_reads()) - before, 2)
+
+
 class StrictSnapshotClassificationTests(unittest.TestCase):
     """P1-b: an existing KV snapshot that fails verification is never treated as "no snapshot"."""
 
@@ -1152,6 +1214,23 @@ class InactiveSlotServerTests(ServerHarness):
         status, msg, payload = self.request("POST", "/api/targets", body={"targets": ["o/x"]},
                                             headers={"Idempotency-Key": "k" * 16})
         self.assert_wait_response(status, msg, payload)
+
+    def test_old_writer_slot_refuses_changes_right_after_a_cutover(self):
+        fake = FakeKvRequester()
+        fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=1).to_json()
+        store = self.start(control_slot="a", kv=make_kv(fake))
+        deadline = time.time() + 5
+        while not store.hydrated and time.time() < deadline:
+            time.sleep(0.01)
+        budget = {"target": "global", "daily_cap_usd": 7}
+        status, _, _ = self.request("POST", "/api/budget", body=budget, headers={"Idempotency-Key": "a" * 16})
+        self.assertEqual(status, 200)
+        self.assertTrue(store.kv_writer and store._writer_synced)
+        fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=2).to_json()  # origin moved to slot B
+        version = store.state_version()
+        status, msg, payload = self.request("POST", "/api/budget", body=budget, headers={"Idempotency-Key": "b" * 16})
+        self.assert_wait_response(status, msg, payload)  # never a 200 that slot B would not receive
+        self.assertEqual(store.state_version(), version)
 
 
 class IdempotencyTests(ServerHarness):

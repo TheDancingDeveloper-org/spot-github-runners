@@ -134,11 +134,76 @@ class ProvisioningMetadataTests(unittest.TestCase):
         [add] = [c for c in cloud.named("compute", "instances", "add-metadata")]
         self.assertEqual(plain_metadata(add)["spot-runner-patch-sha256"], "none")
         self.assertEqual(cloud.named("compute", "instances", "remove-metadata")[0][-1], "--keys=spot-runner-patch")
-        self.assertEqual(cloud.named("compute", "instances", "add-labels")[0][-1], "--labels=spot-runner-patch=none")
+        self.assertEqual([c[-1] for c in cloud.named("compute", "instances", "add-labels")],
+                         [f"--labels=spot-target={target_label_value(REPO)}",  # adopted explicitly (--target)
+                          "--labels=spot-runner-patch=none"])
         self.assert_no_secret(cloud)
         _, cloud = self.provision(TARGET, vm=vm)
         self.assertEqual(cloud.named("compute", "instances", "remove-metadata"), [])
         self.assertEqual(cloud.files[0]["spot-runner-patch"], canonical_json(TARGET))
+
+
+class AdoptionOwnershipTests(unittest.TestCase):
+    """Codex round 10 P1-b: --existing-instance validates and sets the target ownership label before any change."""
+
+    def adopt(self, labels, *options):
+        args = manager.args_parser().parse_args(["--max-cost", "0.3", "--instance-type", "c4d-standard-32",
+                                                 "--cpu", "32", "--ram", "128", "--instance-name", "oxidex-runners-1",
+                                                 "--existing-instance", *options])
+        manager.select_sizing(args)
+        vm = {"status": "RUNNING", "machineType": "zones/z/machineTypes/c4d-standard-32",
+              "scheduling": {"provisioningModel": "SPOT"}, "cpuPlatform": "AMD Turin", "labels": labels,
+              "disks": [{"boot": True, "deviceName": "boot"}, {"deviceName": "runner-data"}]}
+        cloud = GcloudRecorder()
+        describe = [SimpleNamespace(returncode=0, stdout=json.dumps(vm)),
+                    SimpleNamespace(returncode=0, stdout=json.dumps({"type": args.disk_type, "users": ["x"]}))]
+        with mock.patch("lib.runner_manager.subprocess.run", side_effect=describe), \
+                mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
+            try:
+                manager.apply_startup(args, "us-central1-a", "#!/bin/bash\n")
+                return None, cloud
+            except RuntimeError as exc:
+                return exc, cloud
+
+    def instance_mutations(self, cloud):
+        return [c[:3] for c in cloud.calls if c[:2] == ["compute", "instances"]]
+
+    def test_vm_labeled_for_another_target_is_refused_before_any_change(self):
+        for labels, options in (({"spot-target": target_label_value("someone/else")}, ["--target", REPO]),
+                                ({"spot-target": target_label_value("swack-tools")}, ["--target", REPO]),
+                                ({"spot-target": target_label_value(REPO)}, [])):
+            error, cloud = self.adopt(labels, *options)
+            with self.subTest(labels=labels, options=options):
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn("owned by another target", str(error))
+                self.assertEqual(self.instance_mutations(cloud), [])  # nothing touched, nothing registered
+
+    def test_unlabeled_vm_is_labeled_first_when_explicitly_targeted(self):
+        error, cloud = self.adopt({}, "--target", REPO)
+        self.assertIsNone(error)
+        mutations = self.instance_mutations(cloud)
+        self.assertEqual(mutations[0], ["compute", "instances", "add-labels"])
+        self.assertEqual(cloud.calls[[c[:2] for c in cloud.calls].index(["compute", "instances"])][-1],
+                         f"--labels=spot-target={target_label_value(REPO)}")
+        self.assertLess(mutations.index(["compute", "instances", "add-labels"]),
+                        mutations.index(["compute", "instances", "add-metadata"]))  # before the startup script
+        self.assertLess(mutations.index(["compute", "instances", "add-metadata"]),
+                        mutations.index(["compute", "instances", "reset"]))
+
+    def test_matching_label_and_legacy_default_org_hosts_are_left_alone(self):
+        for labels, options in (({"spot-target": target_label_value(REPO)}, ["--target", REPO]), ({}, [])):
+            error, cloud = self.adopt(labels, *options)
+            with self.subTest(labels=labels):
+                self.assertIsNone(error)
+                target_labels = [c for c in cloud.named("compute", "instances", "add-labels")
+                                 if c[-1].startswith("--labels=spot-target=")]
+                self.assertEqual(target_labels, [])
+
+    def test_unlabeled_vm_needs_an_explicit_target_outside_the_default_org(self):
+        error, cloud = self.adopt({}, "--org", "another-org")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("pass --target", str(error))
+        self.assertEqual(self.instance_mutations(cloud), [])
 
 
 class LivePatchMetadataTests(unittest.TestCase):
