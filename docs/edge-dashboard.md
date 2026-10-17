@@ -49,6 +49,12 @@ startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` 
   `hydrated`. A new VM with no local file waits while KV is unreachable: `/api/health` returns 503 and
   the dashboard retries with backoff. It starts from defaults only when KV reports that no snapshot
   exists.
+- A VM that starts from its local file while KV is unreachable serves pages but answers changes with
+  the wait response, and `/api/health` reports `starting` with `"reconciled": false`. When KV answers, a
+  KV snapshot whose version is equal to or higher than the starting version replaces the local copy. Otherwise the dashboard
+  publishes its local copy. Changes resume after that.
+- An import fails with HTTP 500 and `"imported": false` when the dashboard can't save it to the local
+  state file. The previous state stays in place.
 - KV writes run one at a time in version order, and a freeze waits for any write in progress. The
   active slot never writes a snapshot older than its last write. Before its first write as the active
   slot, it reads KV and refuses to replace a newer snapshot.
@@ -76,9 +82,16 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   propagate, then deletes the old VM. A failed origin write unfreezes the old VM and deletes the new one.
 - **Replacement check before deletion**: the autoscaler deletes the old VM only after a fresh check shows
   the new VM is `RUNNING`, healthy, and reporting its own slot. If the new VM disappears, or stays unready
-  for 5 minutes while the old VM still runs, the autoscaler copies any newer KV snapshot into the old VM,
-  unfreezes it, points `origin:active` back at it, and deletes the new VM if it still exists. Without a
-  running old VM, it waits and deletes nothing.
+  for 5 minutes while the old VM still runs, the autoscaler rolls back. It freezes the new VM, imports
+  the newer of its snapshot and the KV snapshot into the old VM, unfreezes the old VM, points
+  `origin:active` back at it, and deletes the new VM. Without a running old VM, it waits and deletes
+  nothing.
+- **Retained boot disks**: when the autoscaler can't confirm that a VM's state reached its successor,
+  it deletes the VM with `--keep-disks=boot`. The boot disk keeps the VM's name. The autoscaler logs an
+  error and records the disk under `retained_disks` in its controller state, and later creates for that
+  slot prefer other zones. Recover the state from the disk, then delete the disk by hand. This happens
+  when a rollback can't freeze the new VM or can't confirm the import, and when a recovery switched
+  slots without importing from the old VM.
 
 Recovery depends on the autoscaler running. If the workstation that runs it is off, the dashboard stays
 down until the autoscaler runs again.

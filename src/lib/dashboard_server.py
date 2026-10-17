@@ -980,6 +980,12 @@ class DashboardStore:
         # Durability flags: requests (other than health and control) are refused until hydrated.
         self.hydrated = False
         self.frozen = False
+        # False after starting from the local file while KV was configured but unreachable: GETs work,
+        # mutations get the wait response, and KV is retried until the two copies are reconciled.
+        self.reconciled = True
+        self._unreconciled_base_version: int | None = None
+        self._reconcile_next_at = 0.0
+        self._reconcile_delay = HYDRATE_BACKOFF_INITIAL_SECONDS
         self.kv_writer = False
         self.hydration_source = ""
         self._writer_checked_at: float | None = None
@@ -1087,7 +1093,9 @@ class DashboardStore:
                 LOG.exception("Dashboard hydration failed")
                 if self.loaded_from_file:
                     with self._lock:
-                        self.hydrated = True
+                        if not self.hydrated:
+                            self._mark_unreconciled()
+                            self.hydrated = True
             if self.hydrated:
                 break
             # No local state and KV unreachable: stay unhydrated (health 503) rather than serve defaults.
@@ -1130,6 +1138,7 @@ class DashboardStore:
         is not configured or positively reports that no snapshot exists.
         """
         snapshot: dict[str, Any] | None = None
+        reachable = True
         if self.kv is not None:
             snapshot, reachable = self._read_kv_snapshot()
             if not reachable:
@@ -1137,12 +1146,15 @@ class DashboardStore:
                     LOG.error("Cloudflare KV unreachable and no local dashboard state; staying unhydrated "
                               "and retrying instead of serving defaults")
                     return "unavailable"
-                LOG.warning("Cloudflare KV unreachable during hydration; using local dashboard state")
+                LOG.warning("Cloudflare KV unreachable during hydration; serving local dashboard state "
+                            "read-only until KV is reachable again")
             self.refresh_writer()
         with self._lock:
             if self.hydrated:
                 # A control-plane import hydrated the store meanwhile; it is authoritative.
                 return self.hydration_source
+            if not reachable:
+                self._mark_unreconciled()
             source = "local" if self.loaded_from_file else "default"
             if snapshot is not None:
                 newer = snapshot["state_version"] > self.state_version()
@@ -1157,8 +1169,12 @@ class DashboardStore:
         LOG.info("Dashboard hydrated from %s at state_version %d", source, self.state_version())
         return source
 
-    def _adopt_snapshot(self, snapshot: dict[str, Any]) -> None:
-        """Replace state with a validated snapshot envelope and keep its state_version (no bump)."""
+    def _adopt_snapshot(self, snapshot: dict[str, Any], *, require_persist: bool = False) -> None:
+        """Replace state with a validated snapshot envelope and keep its state_version (no bump).
+
+        With ``require_persist`` a failed local write restores the previous state and raises OSError.
+        """
+        previous = self.state
         loaded = dict(snapshot["state"])
         loaded["state_version"] = int(snapshot["state_version"])
         self._apply_loaded_state(loaded)
@@ -1166,7 +1182,65 @@ class DashboardStore:
         try:
             self._persist(bump=False)
         except OSError as exc:
+            if require_persist:
+                self.state = previous
+                raise
             LOG.warning("Could not write adopted dashboard snapshot to the local state file: %s", exc)
+
+    # -- reconciliation after a start from local state while KV was unreachable --
+
+    def _mark_unreconciled(self) -> None:
+        if self.kv is None:
+            return
+        self.reconciled = False
+        self._unreconciled_base_version = self.state_version()
+        self._reconcile_next_at = 0.0
+        self._reconcile_delay = HYDRATE_BACKOFF_INITIAL_SECONDS
+
+    def reconcile(self) -> bool:
+        """Compare the local start state with KV once KV answers; True when mutations may resume.
+
+        KV at or above the version the store started from wins (it is imported). Only when KV is older
+        or empty is the local state published (by the active slot). The comparison uses the starting
+        version, so local counter growth while unreconciled never authorizes overwriting KV.
+        """
+        if self.reconciled or self.kv is None:
+            return True
+        try:
+            raw = self.kv.get(KV_STATE_KEY)
+        except KvError as exc:
+            LOG.warning("Dashboard still unreconciled; KV unreachable: %s", exc)
+            return False
+        snapshot = parse_snapshot(raw) if raw is not None else None
+        base = self._unreconciled_base_version or 0
+        if snapshot is not None and snapshot["state_version"] >= base:
+            with self._lock:
+                if self.reconciled:
+                    return True
+                try:
+                    self._adopt_snapshot(snapshot)
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    LOG.error("KV snapshot is invalid; dashboard stays unreconciled: %s", exc)
+                    return False
+                self._finish_reconcile("kv")
+            return True
+        if self.refresh_writer():
+            try:
+                written = self._publish_snapshot()
+            except KvError as exc:
+                LOG.warning("Could not publish local dashboard state during reconciliation: %s", exc)
+                return False
+            if written is None:
+                return False
+        with self._lock:
+            self._finish_reconcile("local")
+        return True
+
+    def _finish_reconcile(self, source: str) -> None:
+        self.reconciled = True
+        self._unreconciled_base_version = None
+        LOG.warning("Dashboard reconciled with KV using the %s copy at state_version %d", source,
+                    self.state_version())
 
     def import_snapshot(self, envelope: Any) -> dict[str, Any]:
         """Import a snapshot envelope when its state_version >= local; always marks the store hydrated.
@@ -1180,13 +1254,17 @@ class DashboardStore:
         with self._lock:
             imported = snapshot["state_version"] >= self.state_version()
             if imported:
-                self._adopt_snapshot(snapshot)
+                # A failed local write raises OSError (state unchanged, not hydrated): the caller gets a
+                # 500 and must not treat the import as done.
+                self._adopt_snapshot(snapshot, require_persist=True)
                 self._mark_kv_dirty()
             if self.frozen or (self.freeze_marker_path is not None and os.path.lexists(self.freeze_marker_path)):
                 self._clear_freeze_marker()
                 self.frozen = False
                 LOG.info("Import cleared the dashboard freeze")
             self.hydrated = True
+            self.reconciled = True
+            self._unreconciled_base_version = None
             self.hydration_source = "import" if imported else self.hydration_source
             return {"state_version": self.state_version(), "imported": imported}
 
@@ -1283,6 +1361,11 @@ class DashboardStore:
         if self.kv is None:
             return False
         now = self._clock()
+        if self.hydrated and not self.reconciled:
+            if now >= self._reconcile_next_at and not self.reconcile():
+                self._reconcile_next_at = now + self._reconcile_delay
+                self._reconcile_delay = min(self._reconcile_delay * 2, HYDRATE_BACKOFF_MAX_SECONDS)
+            return False
         if self._writer_checked_at is None or now - self._writer_checked_at >= KV_WRITER_RECHECK_SECONDS:
             self.refresh_writer()
         if not (self.hydrated and not self.frozen and self.kv_writer and self._kv_dirty):
@@ -1385,12 +1468,13 @@ class DashboardStore:
 
     def health(self) -> dict[str, Any]:
         with self._lock:
-            hydrated, frozen = bool(self.hydrated), bool(self.frozen)
-            status = "frozen" if frozen else ("ok" if hydrated else "starting")
+            hydrated, frozen, reconciled = bool(self.hydrated), bool(self.frozen), bool(self.reconciled)
+            status = "frozen" if frozen else ("ok" if hydrated and reconciled else "starting")
             return {
                 "status": status,
                 "hydrated": hydrated,
                 "frozen": frozen,
+                "reconciled": reconciled,
                 "state_version": self.state_version(),
                 "slot": self.control_slot,
                 "kv_writer": bool(self.kv_writer),
@@ -1419,6 +1503,8 @@ class DashboardStore:
         with self._lock:
             if self.frozen:
                 raise DashboardFrozenError("Dashboard is frozen for a control VM handover")
+            if not self.reconciled:
+                raise DashboardFrozenError("Dashboard state is not yet reconciled with Cloudflare KV")
             if not key:
                 status, body = fn()
                 return status, body, False
@@ -4210,14 +4296,14 @@ def make_handler(
             if not store.hydrated:
                 self._send_unavailable()
                 return True
-            if method in MUTATING_METHODS and store.frozen:
+            if method in MUTATING_METHODS and (store.frozen or not store.reconciled):
                 self._send_unavailable()
                 return True
             return False
 
         def _send_health(self) -> None:
             info = store.health()
-            if info["hydrated"] and not info["frozen"]:
+            if info["hydrated"] and not info["frozen"] and info["reconciled"]:
                 self._send_json(info)
             else:
                 self._send_unavailable(info)
@@ -4260,9 +4346,12 @@ def make_handler(
             except (ValueError, TypeError) as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             except OSError as exc:
-                LOG.error("Control %s could not update the durable freeze marker: %s", op, exc)
-                self._send_json({"error": f"Could not update the durable freeze marker: {exc}"},
-                                status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                LOG.error("Control %s failed on a local write: %s", op, exc)
+                body: dict[str, Any] = {"error": f"Control {op} failed on a local write "
+                                                 f"(state file or freeze marker): {exc}"}
+                if op == "import":
+                    body["imported"] = False
+                self._send_json(body, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
         def _send_forbidden(self, info: dict[str, Any]) -> None:
             self._send_json(

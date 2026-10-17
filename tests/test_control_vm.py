@@ -390,8 +390,9 @@ class ExecutorTests(unittest.TestCase):
         h.kv.fail_origin_verify = True
         h.tick()
         self.assertIsNone(h.transition)
-        self.assertEqual(h.mutations()[-4:], [("import", "b"), ("origin", "b"), ("unfreeze", "a"),
+        self.assertEqual(h.mutations()[-5:], [("import", "b"), ("origin", "b"), ("freeze", "b"), ("unfreeze", "a"),
                                               ("delete", "spot-control-b")])
+        self.assertIn("--delete-disks=all", delete_call(h, "spot-control-b"))
         self.assertEqual(h.kv.origin_slot(), "a")
         self.assertIn("spot-control-a", h.gcloud.vms)
         self.assertNotIn("spot-control-b", h.gcloud.vms)
@@ -683,7 +684,8 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.assertEqual(h.gcloud.mutating(), [])
         h.clock[0] += 2
         h.tick()
-        self.assertEqual(h.mutations(), [("unfreeze", "a"), ("origin", "a"), ("delete", "spot-control-b")])
+        self.assertEqual(h.mutations(), [("freeze", "b"), ("unfreeze", "a"), ("origin", "a"),
+                                         ("delete", "spot-control-b")])
         self.assertEqual(h.kv.origin_slot(), "a")
         self.assertIn("spot-control-a", h.gcloud.vms)
         self.assertIsNone(h.transition)
@@ -697,7 +699,7 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.with_new_vm(h, healthy=False)
         h.http.unhealthy("b")
         h.tick()
-        self.assertEqual(h.mutations(), [("import", "a"), ("unfreeze", "a"), ("origin", "a"),
+        self.assertEqual(h.mutations(), [("freeze", "b"), ("import", "a"), ("unfreeze", "a"), ("origin", "a"),
                                          ("delete", "spot-control-b")])
         self.assertEqual(h.http.versions["a"], 9)
 
@@ -784,6 +786,77 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.assertEqual(h.mutations(), [("origin", "b")])
         self.assertTrue(h.transition["import_skipped"])
 
+    def rollback_setup(self, **fields):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0, freeze_requested=True,
+                                frozen_version=7, replacement_unready_since=1.0, **fields)
+        h.kv.set_origin("b")
+        return h
+
+    def test_rollback_imports_replacement_snapshot_newer_than_kv(self):
+        h = self.rollback_setup()
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 9, "b", now=1))
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        h.http.versions["b"] = 12  # write-behind had not published 10..12 yet
+        h.tick()
+        self.assertEqual(h.mutations(), [("freeze", "b"), ("import", "a"), ("unfreeze", "a"), ("origin", "a"),
+                                         ("delete", "spot-control-b")])
+        self.assertEqual(h.http.versions["a"], 12)
+        self.assertIn("--delete-disks=all", delete_call(h, "spot-control-b"))
+        self.assertEqual(h.state[cv.STATE_KEY].get("retained_disks", []), [])
+
+    def test_rollback_keeps_disk_of_unreachable_replacement(self):
+        h = self.rollback_setup()
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 9, "b", now=1))
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        h.http.freeze_status = 503  # the replacement cannot be frozen
+        h.tick()
+        self.assertEqual(h.http.versions["a"], 9)  # KV state still carried back
+        self.assertEqual(h.kv.origin_slot(), "a")
+        call = delete_call(h, "spot-control-b")
+        self.assertIn("--keep-disks=boot", call)
+        self.assertNotIn("--delete-disks=all", call)
+        retained = h.state[cv.STATE_KEY]["retained_disks"]
+        self.assertEqual([(d["disk"], d["zone"], d["slot"]) for d in retained],
+                         [("spot-control-b", "us-east1-b", "b")])
+        self.assertIsNone(h.transition)
+        manager = h.manager()
+        self.assertEqual(manager._retained_zones("b"), ["us-east1-b"])
+
+    def test_rollback_keeps_disk_of_stopped_replacement(self):
+        h = self.rollback_setup()
+        self.with_new_vm(h, status="TERMINATED", healthy=False)
+        h.clock[0] += cv.START_RETRY_SECONDS
+        h.state[cv.STATE_KEY]["last_start_at"] = {"b": h.clock[0]}  # just asked to start it
+        h.tick()
+        self.assertNotIn(("freeze", "b"), h.events)
+        self.assertIn("--keep-disks=boot", delete_call(h, "spot-control-b"))
+
+    def test_rollback_keeps_replacement_disk_when_old_vm_import_is_not_confirmed(self):
+        h = self.rollback_setup()
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        h.http.versions["b"] = 12
+        h.http.import_status = 500  # the old VM cannot persist the import
+        for _ in range(cv.STEP_RETRY_LIMIT):
+            h.tick()
+        self.assertEqual(h.http.versions["a"], 7)
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        self.assertIn("--keep-disks=boot", delete_call(h, "spot-control-b"))
+        self.assertIsNone(h.transition)
+
+    def test_recovery_without_import_keeps_old_boot_disk(self):
+        h = self.setup_rotation("delete_old", mode=cv.MODE_RECOVER, cutover_attempted=True, cutover_at=1.0,
+                                import_skipped=True)
+        h.gcloud.status("a", "TERMINATED")
+        h.kv.set_origin("b")
+        self.with_new_vm(h)
+        h.tick()
+        self.assertIn("--keep-disks=boot", delete_call(h, "spot-control-a"))
+        self.assertEqual(h.state[cv.STATE_KEY]["retained_disks"][0]["disk"], "spot-control-a")
+        self.assertIsNone(h.transition)
+
     def test_delete_old_refuses_while_origin_points_at_old(self):
         h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0)
         self.with_new_vm(h)
@@ -808,11 +881,23 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         self.assertEqual(h.transition["step"], "abort")
 
 
+def delete_call(h, name):
+    calls = [c for c in h.gcloud.calls if c[2:4] == ["instances", "delete"] and c[4] == name]
+    assert len(calls) == 1, calls
+    return calls[0]
+
+
 def h_now():
     return 100000.0
 
 
 class CreateCommandTests(unittest.TestCase):
+    def test_delete_command_disk_modes(self):
+        self.assertIn("--delete-disks=all", cv.delete_command(vm("a"), "proj"))
+        kept = cv.delete_command(vm("a"), "proj", keep_boot_disk=True)
+        self.assertIn("--keep-disks=boot", kept)
+        self.assertNotIn("--delete-disks=all", kept)
+
     def test_flags(self):
         command = cv.create_command(config(), "b", offer("t2d-standard-1", "us-east1-b"), "/tmp/s.sh")
         self.assertEqual(command[:5], ["gcloud", "compute", "instances", "create", "spot-control-b"])

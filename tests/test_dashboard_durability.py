@@ -444,14 +444,13 @@ class HydrationSafetyTests(unittest.TestCase):
         self.assertEqual(store.get_controlled_targets(), ["o/imported"])
 
     def test_writer_refuses_to_overwrite_newer_kv_snapshot(self):
-        write_state(self.path, 1, ["local/repo"])
-        self.fake.fail = True
-        store = self.store()
-        self.assertEqual(store.hydrate(), "local")  # local state exists, KV down
-        self.fake.fail = False
-        self.fake.values[KV_STATE_KEY] = kv_snapshot(9, ["kv/repo"])
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=1).to_json()
+        store = self.store()  # slot b, not the writer
+        self.assertEqual(store.hydrate(), "default")
         store.set_controlled_targets(["local/change"])
-        self.clock.now += 10
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(9, ["kv/repo"])  # slot a kept writing
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=2).to_json()  # b becomes writer
+        self.clock.now += 60
         with self.assertLogs("spot_dashboard", level="ERROR") as logs:
             self.assertFalse(store.kv_tick())
         self.assertIn("REFUSING", "\n".join(logs.output))
@@ -467,6 +466,102 @@ class HydrationSafetyTests(unittest.TestCase):
         with self.assertLogs("spot_dashboard", level="ERROR"):
             self.assertFalse(store.kv_tick())
         self.assertEqual(self.fake.count("PUT", KV_STATE_KEY), 0)
+
+
+class ReconcileAfterLocalFallbackTests(unittest.TestCase):
+    """Starting from the local file while KV is unreachable never lets local history overwrite KV."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "state.json"
+        self.fake = FakeKvRequester()
+        self.clock = FakeClock()
+        write_state(self.path, 5, ["local/repo"])
+        self.fake.fail = True
+        self.store = DashboardStore(self.path, control_slot="a", kv=make_kv(self.fake), clock=self.clock,
+                                    sleep=lambda _s: None)
+        self.store.hydrate_retry_delays = (0.0, 0.0)
+        self.assertEqual(self.store.hydrate(), "local")
+
+    def test_unreconciled_start_is_read_only_and_not_healthy(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        store = self.store
+        self.assertTrue(store.hydrated)
+        self.assertFalse(store.reconciled)
+        health = store.health()
+        self.assertEqual((health["status"], health["reconciled"]), ("starting", False))
+        with self.assertRaises(DashboardFrozenError):
+            store.run_request("k" * 16, "POST", "/api/targets", lambda: (200, {}))
+        self.clock.now += 100
+        self.assertFalse(store.kv_tick())  # KV still down: stays unreconciled, nothing written
+        self.assertFalse(store.reconciled)
+
+    def test_newer_or_equal_kv_snapshot_is_imported(self):
+        for kv_version in (9, 5):
+            with self.subTest(kv_version=kv_version):
+                self.setUp()
+                self.fake.fail = False
+                self.fake.values[KV_STATE_KEY] = kv_snapshot(kv_version, ["kv/repo"])
+                self.clock.now += 100
+                self.store.kv_tick()
+                self.assertTrue(self.store.reconciled)
+                self.assertEqual(self.store.get_controlled_targets(), ["kv/repo"])
+                self.assertEqual(self.store.state_version(), kv_version)
+                self.assertEqual(self.store.health()["status"], "ok")
+                self.assertEqual(self.fake.count("PUT", KV_STATE_KEY), 0)
+
+    def test_local_counter_growth_never_authorizes_overwrite(self):
+        # Internal persists while unreconciled (not user mutations) push the local counter past KV.
+        for _ in range(6):
+            self.store._persist()
+        self.assertEqual(self.store.state_version(), 11)
+        self.fake.fail = False
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(9, ["kv/repo"])
+        self.clock.now += 100
+        self.store.kv_tick()
+        self.assertTrue(self.store.reconciled)
+        self.assertEqual(self.store.get_controlled_targets(), ["kv/repo"])
+        self.assertEqual(parse_snapshot(self.fake.values[KV_STATE_KEY])["state_version"], 9)
+
+    def test_older_or_absent_kv_gets_local_state_published(self):
+        self.fake.fail = False
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(3, ["kv/old"])
+        self.clock.now += 100
+        self.store.kv_tick()
+        self.assertTrue(self.store.reconciled)
+        self.assertEqual(self.store.get_controlled_targets(), ["local/repo"])
+        written = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual((written["state_version"], written["state"]["controlled_targets"]), (5, ["local/repo"]))
+
+    def test_backoff_between_reconcile_attempts(self):
+        self.clock.now += 100
+        self.store.kv_tick()
+        gets = self.fake.count("GET", KV_STATE_KEY)
+        self.store.kv_tick()  # inside the backoff window: no new KV read
+        self.assertEqual(self.fake.count("GET", KV_STATE_KEY), gets)
+
+    def test_control_import_reconciles(self):
+        self.store.import_snapshot(build_snapshot({"controlled_targets": ["o/imported"]}, 7, "b"))
+        self.assertTrue(self.store.reconciled)
+        self.assertEqual(self.store.health()["status"], "ok")
+
+
+class ImportPersistFailureTests(unittest.TestCase):
+    def test_failed_local_write_fails_import_and_keeps_prior_state(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = DashboardStore(Path(tmp.name) / "state.json", control_slot="b")
+        store.set_controlled_targets(["o/prior"])
+        before = store.state_version()
+        envelope = build_snapshot({"controlled_targets": ["o/imported"]}, before + 5, "a")
+        with mock.patch.object(DashboardStore, "_persist", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                store.import_snapshot(envelope)
+        self.assertFalse(store.hydrated)
+        self.assertEqual(store.get_controlled_targets(), ["o/prior"])
+        self.assertEqual(store.state_version(), before)
 
 
 class BlockingKvRequester(FakeKvRequester):
@@ -574,7 +669,9 @@ class HealthAndGateTests(ServerHarness):
         self.start()
         status, msg, body = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
-        self.assertEqual(set(body), {"status", "hydrated", "frozen", "state_version", "slot", "kv_writer"})
+        self.assertEqual(set(body), {"status", "hydrated", "frozen", "reconciled", "state_version", "slot",
+                                     "kv_writer"})
+        self.assertTrue(body["reconciled"])
         self.assertEqual((body["status"], body["hydrated"], body["frozen"], body["slot"], body["kv_writer"]),
                          ("ok", True, False, None, False))
 
@@ -793,6 +890,17 @@ class ControlEndpointTests(ServerHarness):
         self.assertEqual(status, 500)
         self.assertIn("freeze marker", body["error"])
         self.assertTrue(store.frozen)
+
+    def test_import_returns_500_when_state_file_write_fails(self):
+        store = self.start(control_slot="b", control_secret=CONTROL_SECRET)
+        store.hydrated = False
+        env = build_snapshot({"controlled_targets": ["o/r"]}, 10, "a")
+        with mock.patch.object(DashboardStore, "_persist", side_effect=OSError("disk full")):
+            status, _, body = self.request("POST", "/api/control/import", headers=self.auth("import", slot="b"),
+                                           body=env)
+        self.assertEqual((status, body["imported"]), (500, False))
+        self.assertFalse(store.hydrated)
+        self.assertEqual(self.request("GET", "/api/health")[0], 503)
 
     def test_import_hydrates_unhydrated_store(self):
         store = self.start(control_slot="b", control_secret=CONTROL_SECRET)

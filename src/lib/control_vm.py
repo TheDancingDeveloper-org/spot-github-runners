@@ -551,9 +551,11 @@ def start_command(vm: ControlVm, project: str) -> list[str]:
             f"--project={project}", "--quiet"]
 
 
-def delete_command(vm: ControlVm, project: str) -> list[str]:
+def delete_command(vm: ControlVm, project: str, *, keep_boot_disk: bool = False) -> list[str]:
+    """Delete a control VM. ``keep_boot_disk`` retains its boot disk (named like the VM) for recovery."""
+    disks = "--keep-disks=boot" if keep_boot_disk else "--delete-disks=all"
     return ["gcloud", "compute", "instances", "delete", vm.name, f"--zone={vm.zone}",
-            f"--project={project}", "--delete-disks=all", "--quiet"]
+            f"--project={project}", disks, "--quiet"]
 
 
 def create_command(config: ControlConfig, slot: str, offer: ControlOffer, startup_script_path: str) -> list[str]:
@@ -812,7 +814,8 @@ class ControlVmManager:
                        "zone": existing.zone if existing else (offer.zone if offer else ""),
                        "machine_type": existing.machine_type if existing else (offer.machine_type if offer else "")},
             "offer": offer.to_dict() if offer else None,
-            "excluded_zones": [old_vm.zone] if (old_vm and mode == MODE_RECOVER) else [],
+            "excluded_zones": ([old_vm.zone] if (old_vm and mode == MODE_RECOVER) else [])
+                              + self._retained_zones(new_slot),
             "failed_zones": [],
             "step": "create",
             "started_at": now,
@@ -832,6 +835,30 @@ class ControlVmManager:
         self.cstate["transition"] = transition
         self.save()
         self._note("began %s transition %s -> slot %s: %s", mode, plan.slot or "-", new_slot, plan.reason)
+
+    def _retained_zones(self, slot: str) -> list[str]:
+        """Zones holding a retained boot disk for ``slot``; creating the VM there would collide on its name."""
+        return sorted({str(d.get("zone")) for d in self.cstate.get("retained_disks", [])
+                       if d.get("slot") == slot and d.get("zone")})
+
+    def _delete_vm(self, t: dict, vm: ControlVm, *, keep_boot_disk: bool, reason: str) -> bool:
+        """Delete ``vm``; with ``keep_boot_disk`` record the retained disk and log it for an operator."""
+        result = self.gcloud(delete_command(vm, self.config.project, keep_boot_disk=keep_boot_disk))
+        if result.returncode != 0:
+            t["error"] = f"delete of {vm.name} failed: {(result.stderr or '').strip()[:300]}"
+            self.save()
+            return False
+        if keep_boot_disk:
+            self.cstate.setdefault("retained_disks", []).append(
+                {"disk": vm.name, "zone": vm.zone, "slot": vm.slot, "transition": t.get("id"),
+                 "reason": reason, "at": self.clock()})
+            self.save()
+            self._note("deleted control VM %s but KEPT its boot disk %s in %s because it may hold the newest "
+                       "dashboard state (%s); recover it or delete it by hand", vm.name, vm.name, vm.zone,
+                       reason, level=logging.ERROR)
+        else:
+            self._note("deleted control VM %s", vm.name)
+        return True
 
     def _next_step(self, t: dict) -> str | None:
         order = STEPS[t["mode"]]
@@ -1143,11 +1170,12 @@ class ControlVmManager:
             if not ready:
                 return self._replacement_not_ready(t, obs, detail)
             t.pop("replacement_unready_since", None)
-            result = self.gcloud(delete_command(old, self.config.project))
-            if result.returncode != 0:
-                self._fail_attempt(t, f"delete failed: {(result.stderr or '').strip()[:300]}", limit=10**9)
+            # Recovery without an import (the old VM was down) may leave changes on the old disk that never
+            # reached KV, so its boot disk is kept.
+            if not self._delete_vm(t, old, keep_boot_disk=bool(t.get("import_skipped")),
+                                   reason="old VM went down before its state was imported"):
+                self._fail_attempt(t, t["error"], limit=10**9)
                 return "wait"
-            self._note("deleted old control VM %s", old.name)
         return self._finish(t)
 
     def _replacement_ready(self, t: dict, obs: Observation) -> tuple[bool, str]:
@@ -1193,37 +1221,65 @@ class ControlVmManager:
                        old.status if old else "missing", level=logging.ERROR)
         return "wait"
 
-    def _carry_back_newer_state(self, t: dict) -> bool:
-        """Before falling back after cutover, import into the old VM any newer snapshot the replacement
-        wrote to KV, so changes accepted after cutover are not lost. True when the fallback may proceed."""
+    def _replacement_snapshot(self, t: dict, obs: Observation) -> dict[str, Any] | None:
+        """Freeze the replacement (idempotent) and return its snapshot, or None when it is unreachable."""
+        new = obs.vm(t["new_slot"])
+        if new is None or not new.running:
+            return None
+        status, body = self._control(t["new_slot"], "freeze", "POST")
+        snapshot = parse_snapshot(body.get("snapshot")) if status == 200 and isinstance(body, dict) else None
+        if snapshot is None:
+            self._note("could not freeze replacement slot %s for rollback (HTTP %s)", t["new_slot"], status,
+                       level=logging.WARNING)
+        return snapshot
+
+    def _carry_back_newer_state(self, t: dict, obs: Observation) -> bool:
+        """Before falling back after cutover, import into the old VM the newest of the replacement's own
+        snapshot (taken after freezing it) and the KV snapshot, so changes the replacement accepted are not
+        lost even when write-behind lagged. True when the fallback may proceed.
+
+        Sets ``replacement_state_transferred`` only when the replacement's snapshot was captured and the
+        old VM confirmed holding at least that version; otherwise the replacement's boot disk is kept.
+        """
         if t.get("fallback_import_done"):
             return True
         floor = t.get("frozen_version") or 0
+        replacement = self._replacement_snapshot(t, obs)
+        candidates = [replacement] if replacement is not None else []
         try:
-            snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
+            kv_snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
         except KvError as exc:
-            return self._fail_attempt(t, f"KV snapshot unreadable before fallback: {exc}")
-        if snapshot is None or snapshot["state_version"] <= floor:
-            t["fallback_import_done"] = True
-            self.save()
-            return True
-        status, body = self._control(t["old_slot"], "import", "POST", snapshot)
-        version = body.get("state_version") if isinstance(body, dict) else None
-        if status == 200 and isinstance(version, int) and not isinstance(version, bool) \
-                and version >= snapshot["state_version"]:
-            t["fallback_import_done"] = True
-            self.save()
-            self._note("carried state_version %d back to old slot %s", version, t["old_slot"])
-            return True
-        # Give up after the retry limit: a reachable old VM with slightly older state beats no dashboard.
-        return self._fail_attempt(t, f"fallback import into slot {t['old_slot']} returned {status}")
+            if replacement is None:
+                return self._fail_attempt(t, f"KV snapshot unreadable before fallback: {exc}")
+            kv_snapshot = None
+        if kv_snapshot is not None:
+            candidates.append(kv_snapshot)
+        newest = max(candidates, key=lambda s: s["state_version"], default=None)
+        confirmed = newest is None or newest["state_version"] <= floor
+        if not confirmed:
+            status, body = self._control(t["old_slot"], "import", "POST", newest)
+            version = body.get("state_version") if isinstance(body, dict) else None
+            confirmed = (status == 200 and isinstance(version, int) and not isinstance(version, bool)
+                         and version >= newest["state_version"])
+            if confirmed:
+                self._note("carried state_version %d back to old slot %s", version, t["old_slot"])
+            elif not self._fail_attempt(t, f"fallback import into slot {t['old_slot']} returned {status}"):
+                return False  # retry next tick
+            else:
+                # A reachable old VM with older state beats no dashboard; the replacement's disk is kept.
+                self._note("could not confirm state transfer to slot %s; continuing rollback", t["old_slot"],
+                           level=logging.ERROR)
+        t["replacement_state_transferred"] = bool(confirmed and replacement is not None)
+        t["fallback_import_done"] = True
+        self.save()
+        return True
 
     def _step_abort(self, t: dict, obs: Observation) -> str:
         old = obs.vm(t.get("old_slot"))
         # After a cutover attempt the replacement may have accepted changes and published them to KV
         # (even if it has since disappeared): import them into the old VM before it serves again.
         if t.get("cutover_attempted") and t.get("old_slot") and old is not None and old.running \
-                and not self._carry_back_newer_state(t):
+                and not self._carry_back_newer_state(t, obs):
             return "wait"
         if t.get("freeze_requested") and old is not None and old.running and not t.get("unfrozen"):
             status, _ = self._control(t["old_slot"], "unfreeze", "POST")
@@ -1260,12 +1316,11 @@ class ControlVmManager:
                 t["error"] = "origin:active points at the new slot; refusing to delete it"
                 self.save()
                 return "wait"
-            result = self.gcloud(delete_command(new, self.config.project))
-            if result.returncode != 0:
-                t["error"] = f"delete of {new.name} failed: {(result.stderr or '').strip()[:300]}"
-                self.save()
+            # After a cutover attempt the replacement may hold changes that never reached the old VM.
+            keep = bool(t.get("cutover_attempted")) and not t.get("replacement_state_transferred")
+            if not self._delete_vm(t, new, keep_boot_disk=keep,
+                                   reason="rollback could not confirm its state reached the old VM"):
                 return "wait"
-            self._note("deleted new control VM %s", new.name)
         self.cstate["transition"] = None
         self.cstate["last_abort_at"] = self.clock()
         self.cstate.setdefault("history", []).append(
@@ -1287,6 +1342,7 @@ class ControlVmManager:
             "down_since": self.cstate.get("down_since", {}),
             "last_transition_end_at": self.cstate.get("last_transition_end_at"),
             "last_abort_at": self.cstate.get("last_abort_at"),
+            "retained_disks": self.cstate.get("retained_disks", []),
             "problems": obs.problems,
             "offers": [o.to_dict() for o in obs.offers[:5]] if obs.offers else None,
         }
