@@ -1353,8 +1353,6 @@ def render_login_gate_html(
     )
     script = """
 (function () {
-  // The gate only renders without a valid session; a stored bearer token would mask the new one.
-  try { sessionStorage.removeItem("dashboard_auth_token"); localStorage.removeItem("dashboard_auth_token"); } catch (_e) {}
   const msg = document.getElementById("msg");
   function show(text) { msg.textContent = text || ""; }
   async function postJson(url, body) {
@@ -1364,6 +1362,41 @@ def render_login_gate_html(
     try { data = await res.json(); } catch (_e) { data = {}; }
     return [res, data];
   }
+  const TOKEN_KEY = "dashboard_auth_token";
+  const ATTEMPT_KEY = "dashboard_gate_token_attempt";
+  function storage(fn) { try { return fn(); } catch (_e) { return null; } }
+  function takeUrlToken() {
+    // Same handling as the dashboard: accept #token=..., strip ?token= without using it.
+    return storage(function () {
+      const url = new URL(window.location.href);
+      const hash = new URLSearchParams((url.hash || "").replace(/^#/, ""));
+      const token = hash.get("token") || "";
+      const hadQuery = url.searchParams.has("token");
+      url.searchParams.delete("token");
+      hash.delete("token");
+      url.hash = hash.toString() ? "#" + hash.toString() : "";
+      if (token || hadQuery) window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
+      return token;
+    }) || "";
+  }
+  (async function tryExistingToken() {
+    // No session cookie does not mean a stored or linked dashboard token is stale: try it first,
+    // and discard it only when the server rejects it.
+    const candidate = (takeUrlToken() || storage(function () {
+      return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY);
+    }) || "").trim();
+    if (!candidate) return;
+    const last = Number(storage(function () { return sessionStorage.getItem(ATTEMPT_KEY); }) || 0);
+    if (Date.now() - last < 30000) return;  // The cookie did not stick last time; avoid a reload loop.
+    storage(function () { sessionStorage.setItem(ATTEMPT_KEY, String(Date.now())); });
+    const [res] = await postJson("/api/auth/login", {token: candidate});
+    if (res.ok) {
+      storage(function () { sessionStorage.setItem(TOKEN_KEY, candidate); });
+      window.location.replace("/");
+      return;
+    }
+    storage(function () { sessionStorage.removeItem(TOKEN_KEY); localStorage.removeItem(TOKEN_KEY); });
+  })();
   const logout = document.getElementById("logout");
   if (logout) logout.addEventListener("click", async function () {
     await postJson("/auth/logout", {}); window.location.assign("/");

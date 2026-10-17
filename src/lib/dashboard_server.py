@@ -943,9 +943,23 @@ class DashboardStore:
         self.org = org
         self.hydrated = True
         self.controlled_targets_error = ""
-        if state_path and state_path.exists():
+        # Read the file directly: Path.exists() also reports False when stat fails (for example
+        # EACCES on a parent directory), which would silently load an empty, fail-open policy.
+        # Only a genuinely absent file starts from defaults.
+        raw_state: str | None = None
+        read_error: Exception | None = None
+        if state_path:
             try:
-                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                raw_state = state_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                raw_state = None
+            except (OSError, ValueError) as exc:
+                read_error = exc
+        if raw_state is not None or read_error is not None:
+            try:
+                if read_error is not None:
+                    raise read_error
+                loaded = json.loads(raw_state)
                 if not isinstance(loaded, dict):
                     raise ValueError("state file does not contain a JSON object")
                 base = default_dashboard_state(project=project, org=org)

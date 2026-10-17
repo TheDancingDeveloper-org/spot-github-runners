@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import base64
+import os
+import shutil
+import subprocess
 import hashlib
 import http.client
 import json
@@ -133,6 +136,41 @@ class FakeGitHub:
             return 200, json.dumps({"login": login, "id": uid}).encode()
         status, payload = self.resources.get((token, parsed.path), (404, {"message": "Not Found"}))
         return status, json.dumps(payload).encode()
+
+
+_GATE_HARNESS = r"""
+const [script, cfg] = [process.argv[1], JSON.parse(process.argv[2])];
+function store(init) {
+  const m = new Map(Object.entries(init));
+  return {getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)),
+          removeItem: k => m.delete(k), dump: () => Object.fromEntries(m)};
+}
+const session = store(cfg.session), local = store(cfg.local);
+const out = {posts: [], replaced: null, url: null};
+let href = "https://spot.example/" + cfg.hash;
+global.window = {
+  get location() { return {href, replace: u => { out.replaced = u; }, assign: u => { out.replaced = u; }}; },
+  history: {replaceState: (_s, _t, u) => { out.url = u; href = "https://spot.example" + u; }},
+};
+global.document = {title: "t", getElementById: () => null};
+global.sessionStorage = session; global.localStorage = local;
+global.fetch = async (url, init) => { out.posts.push([url, JSON.parse(init.body)]);
+  return {ok: cfg.login_ok, status: cfg.login_ok ? 200 : 401, json: async () => ({})}; };
+new Function(script)();
+setTimeout(() => { out.session = session.dump(); out.local = local.dump();
+  process.stdout.write(JSON.stringify(out)); }, 50);
+"""
+
+
+def _run_gate_script(script: str, *, stored: str, hash_part: str, login_ok: bool, recent: bool) -> dict:
+    import time as _time
+    session = {"dashboard_auth_token": stored} if stored else {}
+    if recent:
+        session["dashboard_gate_token_attempt"] = str(int(_time.time() * 1000))
+    cfg = {"session": session, "local": {}, "hash": hash_part, "login_ok": login_ok}
+    proc = subprocess.run(["node", "-e", _GATE_HARNESS, script, json.dumps(cfg)],
+                          capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(proc.stdout)
 
 
 def _long_repo_targets(count: int) -> list[str]:
@@ -726,6 +764,35 @@ class StoreTargetPolicyTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "state.json"
 
+    def test_inaccessible_state_file_fails_closed(self):
+        DashboardStore(state_path=self.path).set_controlled_targets(["swack-tools/oxidex"])
+        original = self.path.read_bytes()
+        for exc in (PermissionError(13, "Permission denied"), IsADirectoryError(21, "Is a directory"),
+                    OSError(5, "Input/output error")):
+            with mock.patch.object(Path, "read_text", side_effect=exc), \
+                    mock.patch.object(Path, "exists", return_value=False):
+                with self.assertLogs("spot_runner_autoscaler.dashboard_auth", "ERROR"):
+                    store = DashboardStore(state_path=self.path)
+            self.assertIn("could not be loaded", store.controlled_targets_error, exc)
+            self.assertEqual(store.get_controlled_targets(), ["!unavailable-controlled-targets"])
+            self.assertEqual(self.path.read_bytes(), original)  # never rewritten
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
+    def test_unreadable_state_directory_fails_closed(self):
+        locked = Path(self.tmp.name) / "locked"
+        locked.mkdir()
+        path = locked / "state.json"
+        DashboardStore(state_path=path).set_controlled_targets(["swack-tools/oxidex"])
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        with self.assertLogs("spot_runner_autoscaler.dashboard_auth", "ERROR"):
+            store = DashboardStore(state_path=path)
+        self.assertEqual(store.get_controlled_targets(), ["!unavailable-controlled-targets"])
+
+    def test_missing_state_file_starts_from_defaults(self):
+        store = DashboardStore(state_path=Path(self.tmp.name) / "new" / "state.json")
+        self.assertEqual((store.controlled_targets_error, store.get_controlled_targets()), ("", []))
+
     def test_corrupt_state_file_fails_closed_and_is_preserved(self):
         DashboardStore(state_path=self.path).set_controlled_targets(["swack-tools/oxidex"])
         for corrupt in (self.path.read_bytes()[:-5], b"\xff\xfe not utf-8", b"[1, 2]", b'"text"'):
@@ -1255,9 +1322,40 @@ class OAuthServerIntegrationTests(unittest.TestCase):
         page = render_dashboard_html()
         self.assertIn('storeDashboardAuthToken("");', page)
         self.assertIn('res.status === 401 && token && !new Headers(init.headers || {}).has("Authorization")', page)
-        self.start()
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the login gate script")
+    def test_login_gate_tries_existing_token_before_discarding(self):
+        self.start(auth_token=self.LEGACY_TOKEN)
         _, _, raw = self.request("GET", "/")
-        self.assertIn('sessionStorage.removeItem("dashboard_auth_token")', raw.decode())
+        html = raw.decode()
+        script = html[html.index("<script"):]
+        script = script[script.index(">") + 1:script.index("</script>")]
+        cases = {
+            # name: (stored token, url hash, login response ok?, recent attempt?)
+            "stored_valid": (self.LEGACY_TOKEN, "", True, False),
+            "stored_rejected": ("stale-token", "", False, False),
+            "fragment_valid": ("", "#token=" + self.LEGACY_TOKEN + "&tab=fleet", True, False),
+            "none": ("", "", True, False),
+            "recent_attempt": (self.LEGACY_TOKEN, "", True, True),
+        }
+        for name, (stored, hash_part, ok, recent) in cases.items():
+            result = _run_gate_script(script, stored=stored, hash_part=hash_part, login_ok=ok, recent=recent)
+            with self.subTest(name):
+                if name in ("none", "recent_attempt"):
+                    self.assertEqual(result["posts"], [])
+                    self.assertIsNone(result["replaced"])
+                else:
+                    expected = self.LEGACY_TOKEN if name != "stored_rejected" else "stale-token"
+                    self.assertEqual(result["posts"], [["/api/auth/login", {"token": expected}]])
+                if name in ("stored_valid", "fragment_valid"):
+                    self.assertEqual(result["replaced"], "/")
+                    self.assertEqual(result["session"].get("dashboard_auth_token"), self.LEGACY_TOKEN)
+                if name == "stored_rejected":
+                    self.assertIsNone(result["replaced"])
+                    self.assertNotIn("dashboard_auth_token", result["session"])
+                    self.assertNotIn("dashboard_auth_token", result["local"])
+                if name == "fragment_valid":
+                    self.assertEqual(result["url"], "/#tab=fleet")  # token stripped from the address bar
 
     def test_unchanged_targets_need_no_reauth(self):
         self.start()
