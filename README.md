@@ -36,6 +36,9 @@ For the simplification target and remaining work, see
 | Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
 | Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
 | Run the Web UI control plane and telemetry dashboard | `src/web_dashboard.py` | Updates local dashboard state file |
+| Inspect, plan, or manage the Spot control VM that hosts the dashboard | `src/control_vm.py` | Only with `--apply` |
+
+To host the dashboard on a Spot control VM behind Cloudflare, with GitHub sign-in and state that survives preemption, see [Edge dashboard](docs/edge-dashboard.md).
 
 Keep the distinction between registered listeners and active jobs. Twenty
 registered runners do not mean that twenty jobs can each use 32 GiB at once.
