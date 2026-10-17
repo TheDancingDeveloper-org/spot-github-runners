@@ -1952,6 +1952,77 @@ class FloorQuiescenceSelectionTests(unittest.TestCase):
 
 
 
+class MinimumRunnerFloorTests(unittest.TestCase):
+    """Scale-down never drops expected listener capacity below --minimum-runners."""
+
+    def fleet(self, slots):
+        vms = [GceVm(f"oxidex-runners-vm{i}", "z", "RUNNING", "n4-standard-32", True, instance_id=f"vm-{i}")
+               for i in range(1, len(slots) + 1)]
+        runners = [GitHubRunner(100 * i + slot, f"gha-oxidex-runners-vm{i}-{slot}", "online", False, ("spot",))
+                   for i, count in enumerate(slots, 1) for slot in range(1, count + 1)]
+        state = {"host_deployments": {f"z/vm-{i}": {"expected_runner_count": count}
+                                      for i, count in enumerate(slots, 1)}}
+        return vms, runners, state
+
+    def drain_until_held(self, slots, minimum, mode="resource"):
+        """Repeatedly scale down an idle fleet, completing each drain, until no removal is allowed."""
+        from lib import spot_runner_autoscaler as controller
+        vms, runners, state = self.fleet(slots)
+        args = SimpleNamespace(scaling_mode=mode, minimum_runners=minimum, state_file=Path("/nonexistent"))
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch.object(controller, "quiesce_remote_builder", return_value=True), \
+                patch.object(controller, "reconcile_host_operation"):
+            for _ in range(len(slots) + 1):
+                controller.scale_down(vms, runners, args, state=state, state_path=Path(tmpdir) / "s.json")
+                operation = state.pop("host_operation", None)
+                if operation is None:
+                    break
+                name = operation["vm"]["name"]
+                vms = [vm for vm in vms if vm.name != name]
+                runners = [runner for runner in runners if f"-{name}-" not in runner.name]
+        return vms, state
+
+    def test_low_utilization_never_drains_below_floor_spread_across_hosts(self):
+        from lib.fleet_migration import expected_slots
+        for mode in ("resource", "legacy"):
+            vms, state = self.drain_until_held([8] * 5, 25, mode)
+            self.assertEqual(len(vms), 4)
+            self.assertGreaterEqual(sum(expected_slots(vm, state) for vm in vms), 25)
+            self.assertEqual(state["min_runner_floor"], 4)
+            self.assertEqual(state["minimum_runners"], 25)
+
+    def test_floor_of_one_drains_to_one_host_as_before(self):
+        vms, state = self.drain_until_held([8] * 4, 1)
+        self.assertEqual(len(vms), 1)
+        self.assertEqual(state["min_runner_floor"], 1)
+
+    def test_mixed_density_keeps_the_host_the_floor_depends_on(self):
+        vms, runners, state = self.fleet([16, 8, 8])
+        state.update(minimum_runners=20, min_runner_floor=2)
+        # Removing the 16-listener host would leave 16 < 20; either 8-listener host may go.
+        self.assertEqual([vm.name for vm in removable_spot_vms(vms, runners, state=state)],
+                         ["oxidex-runners-vm2", "oxidex-runners-vm3"])
+
+    def test_runner_host_floor_uses_expected_slots(self):
+        from lib.spot_runner_autoscaler import runner_host_floor
+        vms, _, state = self.fleet([16, 8, 8, 4])
+        self.assertEqual(runner_host_floor(vms, state, 1), 1)
+        self.assertEqual(runner_host_floor(vms, state, 24), 2)
+        self.assertEqual(runner_host_floor(vms, state, 33), 4)
+        # A fleet that cannot reach the floor keeps every host.
+        self.assertEqual(runner_host_floor(vms, state, 100), 4)
+        # Unrecorded hosts default to the eight listeners a resource launch provisions.
+        self.assertEqual(runner_host_floor(vms, {}, 17), 3)
+
+    def test_record_runner_floor_ignores_missing_minimum(self):
+        from lib.spot_runner_autoscaler import record_runner_floor
+        vms, _, state = self.fleet([8, 8])
+        record_runner_floor(vms, SimpleNamespace(), state)
+        self.assertNotIn("min_runner_floor", state)
+        record_runner_floor(vms, SimpleNamespace(minimum_runners=9), state)
+        self.assertEqual((state["minimum_runners"], state["min_runner_floor"]), (9, 2))
+
+
 class DeregisterIdleRecheckTests(RotationHarness, unittest.TestCase):
     """Round 8: never deregister or delete an outgoing host that picked up work after cordoning."""
 

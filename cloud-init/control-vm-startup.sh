@@ -115,6 +115,37 @@ session_not_before_ok() {
   ((10#$value <= now + 60))
 }
 
+# An optional dashboard-config-repo value: empty (the dashboard default), or owner/repo with a GitHub login
+# and repository name. Mirrors config_repo_problems() in src/lib/control_vm.py.
+config_repo_ok() {
+  local value="$1" repo
+  [[ -z "$value" ]] && return 0
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/([A-Za-z0-9._-]{1,100})$ ]] || return 1
+  repo="${BASH_REMATCH[1]}"
+  [[ "$repo" != . && "$repo" != .. ]]
+}
+
+# Print the ;-separated dashboard-controlled-targets metadata value as the comma list the dashboard reads
+# from DASHBOARD_CONTROLLED_TARGETS. Every entry must be an organization or owner/repo; an empty entry or
+# anything else fails. Mirrors controlled_target_names() in src/lib/control_vm.py.
+controlled_targets_csv() {
+  local raw="$1" entry repo joined=""
+  local -a entries=()
+  [[ -z "$raw" ]] && return 0
+  [[ "$raw" != *';' ]] || return 1
+  IFS=';' read -r -a entries <<<"$raw"
+  for entry in "${entries[@]}"; do
+    if [[ "$entry" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/([A-Za-z0-9._-]{1,100})$ ]]; then
+      repo="${BASH_REMATCH[1]}"
+      [[ "$repo" != . && "$repo" != .. ]] || return 1
+    elif [[ ! "$entry" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; then
+      return 1
+    fi
+    joined+="${joined:+,}$entry"
+  done
+  printf '%s' "$joined"
+}
+
 install_packages() {
   local missing=()
   command -v docker >/dev/null 2>&1 || missing+=(docker.io)
@@ -204,6 +235,14 @@ write_dashboard_env() {
       # Bulk sign-out: sessions issued before this Unix time are rejected (metadata, re-read every boot).
       printf 'DASHBOARD_SESSION_NOT_BEFORE=%s\n' "$SESSION_NOT_BEFORE"
     fi
+    # Target policy (metadata, re-read every boot): the config repository whose repos/<owner>/<repo>.yaml
+    # files are controlled targets, and the static controlled targets. Unset keeps the dashboard defaults.
+    if [[ -n "$CONFIG_REPO" ]]; then
+      printf 'SPOT_CONFIG_REPO=%s\n' "$CONFIG_REPO"
+    fi
+    if [[ -n "$CONTROLLED_TARGETS" ]]; then
+      printf 'DASHBOARD_CONTROLLED_TARGETS=%s\n' "$CONTROLLED_TARGETS"
+    fi
     printf 'DASHBOARD_CONTROL_SECRET=%s\n' "$control_secret"
     printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$CLOUDFLARE_ACCOUNT_ID"
     printf 'CLOUDFLARE_KV_NAMESPACE_ID=%s\n' "$CLOUDFLARE_KV_NAMESPACE_ID"
@@ -265,6 +304,8 @@ main() {
   CLOUDFLARE_KV_NAMESPACE_ID="$(metadata_required cloudflare-kv-namespace-id)"
   CLOUDFLARED_IMAGE="$(metadata_required cloudflared-image)"
   SESSION_NOT_BEFORE="$(metadata_attr dashboard-session-not-before)"
+  CONFIG_REPO="$(metadata_attr dashboard-config-repo)"
+  CONTROLLED_TARGETS_METADATA="$(metadata_attr dashboard-controlled-targets)"
 
   [[ "$SLOT" == a || "$SLOT" == b ]] || fail "spot-control-slot must be a or b"
   [[ "$PUBLIC_URL" == https://* ]] || fail "dashboard-public-url must be https"
@@ -274,6 +315,9 @@ main() {
   image_ref_pinned "$CLOUDFLARED_IMAGE" || fail "cloudflared-image must be pinned to a version tag or digest"
   session_not_before_ok "$SESSION_NOT_BEFORE" \
     || fail "dashboard-session-not-before must be Unix seconds that are not in the future"
+  config_repo_ok "$CONFIG_REPO" || fail "dashboard-config-repo must be owner/repo"
+  CONTROLLED_TARGETS="$(controlled_targets_csv "$CONTROLLED_TARGETS_METADATA")" \
+    || fail "dashboard-controlled-targets must be ;-separated organizations or owner/repo targets"
   PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url has a malformed host"
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     [[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"

@@ -940,6 +940,93 @@ class PreviewFromRecordedPatchTests(unittest.TestCase):
         self.assertIn("printf 'DASHBOARD_FLEET_INVENTORY=gce\\n'", script)
 
 
+def unrecorded_item(name, **extra):
+    """A GCE instance with neither the spot-target label nor any patch metadata (pre-recording fleet)."""
+    item = gce_item(name, label=False)
+    item.update(extra)
+    return item
+
+
+class UnrecordedRunnerHostTests(unittest.TestCase):
+    """PR #44 P2: runner VMs created before target labels and patch recording are listed, as unknown."""
+
+    def test_legacy_runner_hosts_are_listed_by_name_prefix(self):
+        items = [unrecorded_item("oxidex-runners-asiaeast2-b-1700000000"),
+                 unrecorded_item("spot-runners-old"), unrecorded_item("newznab-spot-runners-1"),
+                 unrecorded_item("oxidex-spot-runners-2"),
+                 # Foreign VMs: other names, a control VM, and a name that only resembles a prefix.
+                 unrecorded_item("my-workstation"), unrecorded_item("builder-oxidex-1"),
+                 unrecorded_item("spot-control-a", labels={"spot-role": "control"}),
+                 unrecorded_item("oxidex-runners-ctl", labels={"spot-role": "control"}),
+                 unrecorded_item("oxidex-runnersx"), unrecorded_item("prefix-oxidex-runners-1"),
+                 gce_item("labeled-host")]
+        hosts = {h["name"]: h for h in compute_api.runner_host_records(items)}
+        self.assertEqual(sorted(hosts), sorted(["oxidex-runners-asiaeast2-b-1700000000", "spot-runners-old",
+                                                "newznab-spot-runners-1", "oxidex-spot-runners-2", "labeled-host"]))
+        self.assertTrue(hosts["spot-runners-old"]["unrecorded_host"])
+        self.assertEqual(hosts["spot-runners-old"]["role"], "cicd_runner")
+        self.assertNotIn("unrecorded_host", hosts["labeled-host"])
+        self.assertNotIn("TOKEN", json.dumps(hosts))  # startup scripts are still dropped
+
+    def test_legacy_host_previews_as_unknown_for_every_repository(self):
+        items = [gce_item("old", sha=OLD.patch_sha256, manifest=canonical_json(OLD)),
+                 unrecorded_item("oxidex-runners-legacy"), unrecorded_item("foreign-vm")]
+        hosts = compute_api.runner_host_records(items)
+        for repository in (REPO, "someone/else"):
+            self.assertIn("oxidex-runners-legacy", [h["name"] for h in pc.runner_hosts(hosts, repository)])
+        console = pc.PatchConsole("swack-tools/spot-runners-config", token="t", host_source=lambda: hosts)
+        with unittest.mock.patch.object(pc.PatchConsole, "effective_patch",
+                                        return_value=(TARGET, {"draft": False, "head_sha": "a" * 40})):
+            result = console.preview(REPO, instances=[])
+        got = {h["name"]: h for h in result["hosts"]}
+        self.assertEqual(sorted(got), ["old", "oxidex-runners-legacy"])
+        self.assertEqual(got["old"]["classification"], "hot_patch")
+        legacy = got["oxidex-runners-legacy"]
+        self.assertEqual(legacy["classification"], "unknown")
+        self.assertIn("provisioned before patch recording; reprovision or run --patch-live", legacy["detail"])
+        self.assertFalse(result["hot_patch_allowed"])
+
+    def test_legacy_host_blocks_hot_patch_instead_of_partial_success(self):
+        items = [gce_item("old", sha=OLD.patch_sha256, manifest=canonical_json(OLD)),
+                 unrecorded_item("oxidex-runners-legacy")]
+        hosts = compute_api.runner_host_records(items)
+
+        class Executor:
+            available = True
+            reason = ""
+            applied = []
+            reads = []
+
+            def read_manifest(self, host):
+                self.reads.append(host["name"])
+                return OLD.to_canonical_dict()
+
+            def apply(self, host, patch):
+                self.applied.append(host["name"])
+                return {"result": "applied"}
+
+        executor = Executor()
+        console = pc.PatchConsole("swack-tools/spot-runners-config", token="t", host_source=lambda: hosts,
+                                  executor=executor)
+        with unittest.mock.patch.object(pc.PatchConsole, "effective_patch",
+                                        return_value=(TARGET, {"draft": False, "head_sha": "a" * 40})):
+            preview = console.preview(REPO, instances=[])
+            self.assertFalse(preview["hot_patch_allowed"])
+            with self.assertRaises(pc.ConflictError) as ctx:
+                console.hot_patch(REPO, TARGET.patch_sha256, instances=[])
+        self.assertEqual(ctx.exception.body["status"], "refused")
+        got = {h["name"]: h["classification"] for h in ctx.exception.body["hosts"]}
+        self.assertEqual(got, {"old": "hot_patch", "oxidex-runners-legacy": "unknown"})
+        self.assertEqual(executor.applied, [])  # nothing was patched, so there is no partial result
+        self.assertNotIn("oxidex-runners-legacy", executor.reads)  # an unknown-target host is never read live
+
+    def test_runner_host_prefixes_are_shared_with_price_guard(self):
+        import inspect
+        from lib import price_guard
+        self.assertIn("oxidex-runners-", runner_fleet.RUNNER_HOST_NAME_PREFIXES)
+        self.assertNotIn('"oxidex-runners-", "newznab-spot-runners-"', inspect.getsource(price_guard))
+
+
 BIG = validate_patch_dict({**BASE, "hardware": {"min_vcpu": 64, "min_ram_gib": 256},
                            "container": {"apt_packages": ["ripgrep"]}})
 VBMI = validate_patch_dict({**BASE, "hardware": {"isa": ["avx512-vbmi2"]}})

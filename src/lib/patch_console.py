@@ -409,6 +409,14 @@ UNRECORDED_REASON = (
 )
 
 
+UNRECORDED_HOST_REASON = (
+    "provisioned before patch recording; reprovision or run --patch-live. The host has no spot-target label and no "
+    "spot-runner-patch metadata, so neither its repository nor its patch is known and it is listed for every "
+    "repository. It stays unknown, and blocks hot-patching, until it is reprovisioned or hot-patched once from a "
+    "workstation (src/spot_runner_manager.py --patch-live records it)"
+)
+
+
 def pending_patch_reason(pending: str) -> str:
     """Why a host whose provisioning patch is still pending classifies as ``unknown``."""
     requested = ("no patch" if pending == "none" else "an unreadable patch record" if len(pending) != 64
@@ -420,7 +428,11 @@ def pending_patch_reason(pending: str) -> str:
 
 
 def runner_hosts(instances: Iterable[Mapping[str, Any]], repository: str) -> list[dict[str, Any]]:
-    """Running CI runner hosts of ``repository``: recorded ``patch_target``, or the host's ``spot-target`` label."""
+    """Running CI runner hosts of ``repository``: recorded ``patch_target``, or the host's ``spot-target`` label.
+
+    A host marked ``unrecorded_host`` (found by name, provisioned before target labels and patch recording) could
+    belong to any repository, so it is included for every repository; ``classify_hosts`` reports it ``unknown``.
+    """
     from .target_config import target_label_value
 
     wanted = repository.lower()
@@ -431,7 +443,8 @@ def runner_hosts(instances: Iterable[Mapping[str, Any]], repository: str) -> lis
             continue
         if inst.get("role") != "cicd_runner" or inst.get("status") != "RUNNING":
             continue
-        if str(inst.get("patch_target") or "").lower() != wanted and inst.get("target_label") != label:
+        if (inst.get("unrecorded_host") is not True and str(inst.get("patch_target") or "").lower() != wanted
+                and inst.get("target_label") != label):
             continue
         hosts.append(dict(inst))
     return hosts
@@ -662,6 +675,11 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
     out = []
     for host in hosts:
         host = dict(host)
+        if host.get("unrecorded_host") is True:
+            # Never read or patched live: the host's repository is unknown, and the executor would refuse it anyway
+            # for its missing deployment record, which would report a partial success instead of a refusal.
+            out.append(HostClassification(host, "unknown", None, UNRECORDED_HOST_REASON))
+            continue
         violations, unknowns = _capacity(host, target)
         if violations:
             # The host can never satisfy the patch's hardware constraints: it needs a different VM.

@@ -366,3 +366,65 @@ class ManagerDeadlineTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LaunchNameTests(unittest.TestCase):
+    """PR #44 P2: launched host and disk names carry a target tag and a random part."""
+
+    setUp = LaunchFailoverTests.setUp
+
+    def launch(self, target=None, seconds=1_790_000_000):
+        args = controller.args_parser().parse_args(['--state-file', str(self.path)]
+                                                   + (['--target', target] if target else []))
+        state = {}
+        with patch.object(controller.time, 'time', return_value=float(seconds)):
+            vm = controller.launch_offer(candidate('us-west4-a'), args, state, self.path)
+        command = self.cloud.commands[-1]
+        self.assertEqual(command[command.index('--instance-name') + 1], vm.name)
+        return vm, command[command.index('--disk-device-name') + 1], state
+
+    def test_target_controllers_in_one_project_never_share_a_name(self):
+        first, first_disk, _ = self.launch('swack-tools')
+        second, second_disk, _ = self.launch('xbmc4lyfe/newznab-tmux')
+        self.assertNotEqual(first.name, second.name)
+        self.assertNotEqual(first_disk, second_disk)
+        self.assertIn(f"-{controller.target_name_tag('swack-tools')}-", first.name)
+        self.assertIn(f"-{controller.target_name_tag('xbmc4lyfe/newznab-tmux')}-", second.name)
+        self.assertNotEqual(controller.target_name_tag('swack-tools'),
+                            controller.target_name_tag('xbmc4lyfe/newznab-tmux'))
+        # Stable per target, case-insensitive like GitHub; the default target is the organization.
+        self.assertEqual(controller.target_name_tag('Swack-Tools'), controller.target_name_tag('swack-tools'))
+        default, _, _ = self.launch()
+        self.assertIn(f"-{controller.target_name_tag('swack-tools')}-", default.name)
+
+    def test_two_launches_in_the_same_second_differ(self):
+        first, first_disk, _ = self.launch('swack-tools')
+        second, second_disk, _ = self.launch('swack-tools')
+        self.assertNotEqual(first.name, second.name)
+        self.assertNotEqual(first_disk, second_disk)
+        suffixes = {controller.launch_name_suffix('us-west4', 'us-west4-a', 'swack-tools', 1_790_000_000)
+                    for _ in range(200)}
+        self.assertEqual(len(suffixes), 200)
+
+    def test_names_keep_the_prefix_and_fleet_recognition(self):
+        vm, disk, state = self.launch('swack-tools')
+        self.assertTrue(vm.name.startswith('oxidex-runners-uswest4-a-'))
+        self.assertRegex(vm.name, r'^[a-z]([-a-z0-9]*[a-z0-9])?$')
+        # fleet_migration.data_storage_status and launch cleanup derive the data disk name this way.
+        self.assertEqual(disk, 'runner-data-' + vm.name.removeprefix('oxidex-runners-'))
+        self.assertEqual(state['host_operation']['data_disk_name'], disk)
+        from lib.runner_fleet import RUNNER_HOST_NAME_PREFIXES
+        self.assertTrue(vm.name.startswith(RUNNER_HOST_NAME_PREFIXES))
+        self.assertEqual(controller.spot_instances(self.cloud.vms), self.cloud.vms)
+        self.assertEqual(len(controller.host_runners(vm, self.cloud.runners, self.cloud.vms)), 8)
+
+    def test_length_limits_hold_for_the_longest_region_and_slot_count(self):
+        from lib.runner_tiers import TIERS
+        slots = max(tier.maximum_slots for tier in TIERS.values())
+        for seconds in (1_790_000_000, 4_102_444_800):  # now, and 2100 when base36 seconds need 7 digits
+            suffix = controller.launch_name_suffix('northamerica-northeast2', 'northamerica-northeast2-c',
+                                                   'some-very-long-organization-name/and-a-long-repository', seconds)
+            name = 'oxidex-runners-' + suffix
+            self.assertLessEqual(len(name), controller.GCE_NAME_MAX_LENGTH)
+            self.assertLessEqual(len('runner-data-' + suffix), controller.GCE_NAME_MAX_LENGTH)
+            self.assertLessEqual(controller.maximum_runner_name_length('gha', name, slots), 64)

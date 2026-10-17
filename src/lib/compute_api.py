@@ -348,11 +348,16 @@ async def list_instances(api: AsyncGoogleApi, project: str) -> tuple[list[dict],
 def runner_host_records(items: list[dict]) -> list[dict]:
     """Dashboard host records for runner hosts in a GCE instance listing.
 
-    A runner host carries the ``spot-target`` label or recorded patch metadata. Only the recorded patch and
-    deployment keys are kept (see runner_fleet); every other metadata value, including startup scripts, is
-    dropped.
+    A runner host carries the ``spot-target`` label or recorded patch metadata. A host provisioned before either
+    existed is recognized by its runner-host name prefix (``RUNNER_HOST_NAME_PREFIXES``) and marked
+    ``unrecorded_host``: its target and patch are unknown, so the patch console lists it for every repository as
+    ``unknown`` and refuses to hot-patch until it is reprovisioned or patched with ``--patch-live``. VMs with
+    another ``spot-role`` (control VMs) and VMs outside those prefixes are never runner hosts. Only the recorded
+    patch and deployment keys are kept (see runner_fleet); every other metadata value, including startup
+    scripts, is dropped.
     """
-    from .runner_fleet import gce_timestamp, patch_record_from_gce_item, runner_deployment_from_gce_item
+    from .runner_fleet import (RUNNER_HOST_NAME_PREFIXES, gce_timestamp, patch_record_from_gce_item,
+                               runner_deployment_from_gce_item)
     from .target_config import TARGET_LABEL_KEY
 
     hosts = []
@@ -362,9 +367,10 @@ def runner_host_records(items: list[dict]) -> list[dict]:
         labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
         record = patch_record_from_gce_item(item)
         target_label = str(labels.get(TARGET_LABEL_KEY, "") or "")
-        if not target_label and not record["patch_sha256"] and not record["patch_pending_sha256"]:
+        unrecorded = not target_label and not record["patch_sha256"] and not record["patch_pending_sha256"]
+        if unrecorded and (not item["name"].startswith(RUNNER_HOST_NAME_PREFIXES) or labels.get("spot-role")):
             continue
-        hosts.append({
+        host = {
             "name": item["name"],
             "zone": str(item.get("zone", "")).rsplit("/", 1)[-1],
             "status": str(item.get("status", "UNKNOWN")),
@@ -375,7 +381,10 @@ def runner_host_records(items: list[dict]) -> list[dict]:
             "target_label": target_label,
             **runner_deployment_from_gce_item(item),
             **record,
-        })
+        }
+        if unrecorded:
+            host["unrecorded_host"] = True
+        hosts.append(host)
     return hosts
 
 

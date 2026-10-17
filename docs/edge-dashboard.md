@@ -179,9 +179,13 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   classifies a host whose unproven receipt names the target as `hot_patch`, so the live script runs
   again and writes a completion receipt. Receipts written before this change don't count as proof.
 - On the control VM, `DASHBOARD_FLEET_INVENTORY=gce` makes the preview list runner hosts from Compute
-  Engine. A runner host carries the `spot-target` label or the patch metadata. The control VM's
-  service account needs `compute.instances.list`. Elsewhere the preview uses the host records in the
-  dashboard state.
+  Engine. A runner host carries the `spot-target` label or the patch metadata. The preview also lists
+  a VM that has neither, when its name starts with a runner host prefix such as `oxidex-runners-`. Such a
+  host was provisioned before patch recording, so its repository and patch are unknown. It shows as
+  `unknown` in the preview of every repository and blocks hot-patching until it's reprovisioned or
+  patched once with `--patch-live`. VMs with other names, and control VMs, aren't listed. The control
+  VM's service account needs `compute.instances.list`. Elsewhere the preview uses the host records in
+  the dashboard state.
 - The preview checks each host's observed capacity against every hardware constraint of the patch first:
   `hardware.min_vcpu`, `hardware.min_ram_gib`, the architecture, and the CPU platform for `hardware.isa`. A
   host that can't meet them is `replace_vm` with the reason, and a host whose capacity is unknown is
@@ -358,6 +362,18 @@ list.
 | `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` | Access service token for the tunnel hostnames. |
 | `DASHBOARD_CONTROL_SECRET` | Signs control calls (`freeze`, `unfreeze`, `snapshot`, `import`). |
 | `SPOT_DASHBOARD_IMAGE` or `SPOT_DASHBOARD_SOURCE_REF` | A digest-pinned image, or a 40-character commit to build on the VM. |
+| `SPOT_CONFIG_REPO` | Optional config repository, as `owner/repo`, whose `repos/<owner>/<repo>.yaml` files are controlled targets. The autoscaler's `--config-repo` takes precedence. Default: `<org>/spot-runners-config`. |
+| `DASHBOARD_CONTROLLED_TARGETS` | Optional comma-separated organizations and `owner/repo` targets that the signed-in user must administer. Default: none. |
+
+The autoscaler passes `SPOT_CONFIG_REPO` and `DASHBOARD_CONTROLLED_TARGETS` to new control VMs as the
+`dashboard-config-repo` and `dashboard-controlled-targets` instance metadata values. Neither is a secret.
+The targets travel separated by semicolons, because a `gcloud --metadata` list can't hold commas. At every
+boot, the startup script writes both to the dashboard environment file, with the targets separated by
+commas. The autoscaler and `src/control_vm.py` refuse to create a control VM when either value is malformed.
+The config repository must be `owner/repo`, and every target must be an organization or `owner/repo`, as the
+dashboard parses them. The startup script applies the same checks and stops with an error on a malformed
+value. A running control VM keeps its creation-time values. To change them on that VM, update its metadata
+and then reboot it. Rotating to the other slot also applies the new values.
 
 The control VM reads its secrets from Secret Manager at boot: `spot-dashboard-session-secret`,
 `spot-dashboard-oauth-client-id`, `spot-dashboard-oauth-client-secret`, `spot-dashboard-control-secret`,

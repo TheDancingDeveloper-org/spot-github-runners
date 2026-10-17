@@ -26,6 +26,10 @@ from .target_config import TARGET_LABEL_KEY
 
 LOG = logging.getLogger("spot_runner_autoscaler")
 
+# Name prefixes of the runner hosts this project provisions, current and earlier fleets. A host created before
+# the ``spot-target`` label and patch recording existed is recognizable only by its name.
+RUNNER_HOST_NAME_PREFIXES = ("oxidex-runners-", "newznab-spot-runners-", "spot-runners-", "oxidex-spot-runners-")
+
 # Which spot-runner-patch-v1 patch a runner host runs, recorded by runner_manager as instance metadata at
 # provisioning and after a confirmed live patch. ``spot-runner-patch`` holds the canonical manifest JSON (omitted
 # when larger than MAX_PATCH_METADATA_BYTES), ``spot-runner-patch-sha256`` its sha256 or ``none`` (no patch), and

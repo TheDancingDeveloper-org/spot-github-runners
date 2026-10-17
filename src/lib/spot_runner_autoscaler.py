@@ -339,24 +339,59 @@ def log_hourly_spend(vms, args: argparse.Namespace, state: dict, state_path: Pat
     write_scale_state(state_path, state)
 
 
+def runner_host_floor(fleet: list[GceVm], state: dict, minimum_runners: int) -> int:
+    """Return the fewest hosts whose expected listener slots can still reach ``minimum_runners``.
+
+    Each host contributes its recorded deployment slot count (``expected_slots``), so the floor
+    follows the actual per-host listener density instead of assuming one runner per host. A
+    fleet that cannot reach the runner floor at all keeps every host.
+    """
+    from .fleet_migration import expected_slots
+    total = 0
+    slots = sorted((expected_slots(vm, state) for vm in fleet), reverse=True)
+    for hosts, count in enumerate(slots, 1):
+        total += count
+        if total >= minimum_runners:
+            return hosts
+    return max(1, len(slots))
+
+
+def record_runner_floor(vms: list[GceVm], args: argparse.Namespace, state: dict) -> None:
+    """Persist the runner floor derived from ``--minimum-runners`` for resource and legacy scale-down."""
+    minimum = getattr(args, "minimum_runners", None)
+    if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 1:
+        return
+    state["minimum_runners"] = minimum
+    state["min_runner_floor"] = runner_host_floor(spot_instances(vms), state, minimum)
+
+
 def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner], state=None) -> list[GceVm]:
-    """Choose complete, idle Spot VMs for scale-down."""
+    """Choose complete, idle Spot VMs for scale-down.
+
+    Removal must keep at least ``state['min_runner_floor']`` hosts and, when
+    ``state['minimum_runners']`` is recorded, the remaining hosts' expected listener slots must
+    still reach that runner count.
+    """
+    from .fleet_migration import expected_slots
     candidates = []
     fleet = spot_instances(vms)
-    min_floor = 1
-    if state and isinstance(state, dict):
-        min_floor = int(state.get("min_runner_floor", 1))
+    state = state if isinstance(state, dict) else {}
+    min_floor = max(1, int(state.get("min_runner_floor", 1)))
+    minimum_runners = int(state.get("minimum_runners", 0) or 0)
+    total_slots = sum(expected_slots(vm, state) for vm in fleet)
     for vm in fleet:
         assigned = host_runners(vm, runners, fleet)
         names = {runner.name for runner in assigned}
         marker = f"-{vm.name}-"
         prefixes = {name.rsplit(marker, 1)[0] for name in names if marker in name}
-        from .fleet_migration import expected_slots
-        complete = any(prefix and {f"{prefix}-{vm.name}-{slot}" for slot in range(1, expected_slots(vm,state or {})+1)}.issubset(names)
+        slots = expected_slots(vm, state)
+        complete = any(prefix and {f"{prefix}-{vm.name}-{slot}" for slot in range(1, slots + 1)}.issubset(names)
                        for prefix in prefixes)
         if (not vm.instance_id or not complete
                 or any(not runner.online or runner.busy for runner in assigned)):
             continue
+        if total_slots - slots < minimum_runners:
+            continue  # Removing this host would leave fewer listeners than --minimum-runners.
         candidates.append(vm)
     # Scale-down removes one host at a time, so the floor limits whether any removal is allowed,
     # not which candidate: keep them all so builder quiescence can pick a quiet host.
@@ -1053,9 +1088,11 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     state_path = state_path or args.state_file.expanduser()
     if state.get("host_operation") or len(spot_instances(vms)) <= 1:
         return 0
+    record_runner_floor(vms, args, state)
     candidates = removable_spot_vms(vms, runners, state)
     if not candidates:
-        LOG.info("Scale-down waits: no complete idle host is available")
+        LOG.info("Scale-down waits: no complete idle host can be removed without dropping below "
+                 "%s runners (%s-host floor)", state.get("minimum_runners", 1), state.get("min_runner_floor", 1))
         return 0
     # Existing builder presence is independent of future installation settings.
     vm = next((vm for vm in candidates if quiesce_remote_builder(vm, args)), None)
@@ -2479,6 +2516,48 @@ def launch_slot_count(offer, args) -> int:
     return 8
 
 
+RUNNER_HOST_PREFIX = "oxidex-runners-"
+GCE_NAME_MAX_LENGTH = 63  # GCE instance and disk names
+# Lowercase RFC 4648 base32: valid in GCE resource names and runner names.
+_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
+TARGET_TAG_LENGTH = 4
+LAUNCH_RANDOM_LENGTH = 5
+
+
+def target_name_tag(target: str) -> str:
+    """Stable short tag of a GitHub target for launched host names (case-insensitive, like GitHub)."""
+    import hashlib
+    digest = int.from_bytes(hashlib.sha256(str(target).strip().lower().encode("utf-8")).digest()[:4], "big")
+    return "".join(_NAME_ALPHABET[(digest >> (5 * index)) & 31] for index in range(TARGET_TAG_LENGTH))
+
+
+def _base36(value: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while True:
+        value, remainder = divmod(value, 36)
+        out = digits[remainder] + out
+        if not value:
+            return out
+
+
+def launch_name_suffix(region: str, zone: str, target: str, timestamp: float | None = None,
+                       random_part: str | None = None) -> str:
+    """Suffix shared by a launched host (``oxidex-runners-<suffix>``) and its data disk (``runner-data-<suffix>``).
+
+    ``<region>-<zone letter>-<target tag>-<base36 seconds><random>``. The target tag keeps controllers of
+    different GitHub targets in one project from choosing the same name, and the random part keeps two launches
+    in the same second apart. The worst-case region keeps the VM name within GCE's 63 characters and its
+    runner names within GitHub's 64.
+    """
+    import secrets
+    random_part = random_part if random_part is not None else "".join(
+        secrets.choice(_NAME_ALPHABET) for _ in range(LAUNCH_RANDOM_LENGTH))
+    seconds = int(time.time() if timestamp is None else timestamp)
+    return (f"{region.replace('-', '')}-{zone.rsplit('-', 1)[-1]}-{target_name_tag(target)}-"
+            f"{_base36(seconds)}{random_part}")
+
+
 def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -> GceVm:
     """Try each zone until the manager confirms a complete runner deployment; return the launched VM."""
     state_path = state_path or args.state_file.expanduser()
@@ -2534,10 +2613,11 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             LOG.info('Skipping %s in %s: requested CPU platform %s is unsupported for this shape/zone',
                      offer.machine_type, zone, cpu_platform)
             continue
-        letter = zone.rsplit("-", 1)[-1]
-        suffix = f"{offer.region.replace('-', '')}-{letter}-{int(time.time())}"
-        instance_name = f"oxidex-runners-{suffix}"
+        suffix = launch_name_suffix(offer.region, zone, _active_target(args))
+        instance_name = f"{RUNNER_HOST_PREFIX}{suffix}"
         runner_prefix = "gha"
+        # Runner names are the VM name plus at least six characters, so this check also keeps the VM name
+        # and its shorter runner-data-<suffix> disk name within GCE_NAME_MAX_LENGTH.
         longest_name = maximum_runner_name_length(runner_prefix, instance_name, slots)
         if longest_name > 64:
             raise RuntimeError(f"Generated GitHub runner name would be {longest_name} characters (maximum 64)")
@@ -3007,6 +3087,8 @@ def _run_controller(args: argparse.Namespace) -> int:
             time.sleep(args.interval_seconds)
             continue
         fleet_vms = spot_instances(vms)
+        if args.scaling_mode != 'tiered':
+            record_runner_floor(vms, args, state)
         current, busy = utilization_counts(runners)
         LOG.info("Managed GCP runners: %d online, %d busy; %d Spot VMs",
                  current, busy, len(fleet_vms))
@@ -3032,7 +3114,9 @@ def _run_controller(args: argparse.Namespace) -> int:
             LOG.info('Resource check: CPU/memory fractions=%s; decision=%s; threshold=75%%, two 5-minute checks', observed, action)
             if action == 'up' and len(fleet_vms) >= args.maximum_hosts:
                 action = 'wait'
-            if action == 'down' and len(fleet_vms) <= 1:
+            if action == 'down' and len(fleet_vms) <= state.get('min_runner_floor', 1):
+                LOG.info('Resource scale-down holds at the %d-host floor for %d runners',
+                         state.get('min_runner_floor', 1), args.minimum_runners)
                 action = 'wait'
             host_count, idle_loops, scale_up_active = (1 if action in ('up', 'down') else 0), 0, False
         else:

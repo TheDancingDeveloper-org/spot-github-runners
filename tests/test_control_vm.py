@@ -1900,6 +1900,74 @@ class CreateCommandTests(unittest.TestCase):
         self.assertNotIn("control_secret='s'", repr(cfg))
 
 
+class DashboardTargetPolicyTests(unittest.TestCase):
+    """SPOT_CONFIG_REPO and DASHBOARD_CONTROLLED_TARGETS reach the control VM's dashboard."""
+
+    ENV = {"SPOT_CONFIG_REPO": " swack-tools/runner-config ",
+           "DASHBOARD_CONTROLLED_TARGETS": "swack-tools, xbmc4lyfe/newznab-tmux,Swack-Tools"}
+
+    def test_from_env_carries_both_settings(self):
+        cfg = cv.ControlConfig.from_env("proj", self.ENV, dashboard_image=IMAGE)
+        self.assertEqual(cfg.config_repo, "swack-tools/runner-config")
+        self.assertEqual(cfg.controlled_targets, "swack-tools, xbmc4lyfe/newznab-tmux,Swack-Tools")
+        unset = cv.ControlConfig.from_env("proj", {}, dashboard_image=IMAGE)
+        self.assertEqual((unset.config_repo, unset.controlled_targets), ("", ""))
+        override = cv.ControlConfig.from_env("proj", self.ENV, dashboard_image=IMAGE, config_repo="a/b")
+        self.assertEqual(override.config_repo, "a/b")
+
+    def test_metadata_and_create_command_include_both(self):
+        cfg = config(config_repo="swack-tools/runner-config",
+                     controlled_targets="swack-tools, xbmc4lyfe/newznab-tmux,Swack-Tools")
+        items = cv.metadata_items(cfg, "a")
+        self.assertEqual(items["dashboard-config-repo"], "swack-tools/runner-config")
+        # Normalized as the dashboard parses it (case-insensitive de-duplication), ;-separated for gcloud.
+        self.assertEqual(items["dashboard-controlled-targets"], "swack-tools;xbmc4lyfe/newznab-tmux")
+        metadata = next(a for a in cv.create_command(cfg, "a", offer(), "/s") if a.startswith("--metadata="))
+        self.assertIn("dashboard-config-repo=swack-tools/runner-config", metadata.split(","))
+        self.assertIn("dashboard-controlled-targets=swack-tools;xbmc4lyfe/newznab-tmux", metadata.split(","))
+        for key in ("dashboard-config-repo", "dashboard-controlled-targets"):
+            self.assertIn(key, cv.METADATA_KEYS)
+            self.assertNotIn(key, cv.metadata_items(config(), "a"))
+
+    def test_invalid_values_are_refused(self):
+        for bad in ("swack-tools", "a/b/c", "-bad/repo", "owner/..", "owner/.", "owner/re po", "owner/a,b",
+                    "o" * 40 + "/repo", "owner/" + "r" * 101):
+            self.assertTrue(cv.config_repo_problems(bad), bad)
+            with self.assertRaises(ValueError, msg=bad):
+                cv.create_command(config(config_repo=bad), "a", offer(), "/s")
+            with self.assertRaises(ValueError, msg=bad):
+                cv.metadata_items(config(config_repo=bad), "a")
+        for bad in ("swack-tools;other", "a/b/c", "-org", "owner/..", "owner/re=po", "https://github.com/a/b"):
+            self.assertTrue(cv.dashboard_target_problems("", bad), bad)
+            with self.assertRaises(ValueError, msg=bad):
+                cv.create_command(config(controlled_targets=bad), "a", offer(), "/s")
+        self.assertEqual(cv.dashboard_target_problems("swack-tools/x", "swack-tools owner/repo"), [])
+        # The planner reports both before it plans a create, not only when the command is built.
+        problems = config(config_repo="nope", controlled_targets="a/b/c").create_problems()
+        self.assertTrue(any(p.startswith("SPOT_CONFIG_REPO") for p in problems), problems)
+        self.assertTrue(any(p.startswith("DASHBOARD_CONTROLLED_TARGETS") for p in problems), problems)
+        self.assertEqual(config(config_repo="a/b", controlled_targets="org,a/c").create_problems(), [])
+
+    def test_autoscaler_config_repo_reaches_the_control_vm(self):
+        captured = {}
+
+        def factory(project, state, save, **overrides):
+            captured.update(overrides)
+            raise RuntimeError("stop")
+        with patch.object(cv, "build_manager", side_effect=factory):
+            cv.autoscaler_tick(SimpleNamespace(dry_run=True, project="p", config_repo="swack-tools/cfg"), {},
+                               lambda: None)
+            self.assertEqual(captured["config_repo"], "swack-tools/cfg")
+            captured.clear()
+            cv.autoscaler_tick(SimpleNamespace(dry_run=True, project="p"), {}, lambda: None)
+            self.assertIsNone(captured["config_repo"])
+
+    def test_cli_overrides_include_both(self):
+        args = cv.args_parser().parse_args(["plan", "--config-repo", "a/b", "--controlled-targets", "org,a/c"])
+        overrides = cv._overrides(args)
+        self.assertEqual((overrides["config_repo"], overrides["controlled_targets"]), ("a/b", "org,a/c"))
+
+
 class PricingTests(unittest.TestCase):
     def test_shapes_ranked_with_fractional_e2_cores_and_boot_disk(self):
         rates = {("us-central1", "e2"): (Decimal("0.01"), Decimal("0.001")),
@@ -2093,6 +2161,51 @@ class StartupScriptTests(unittest.TestCase):
         for value in ("", str(now - 100), str(now), "0", "0099", "soon", "-1", "1.5", str(now + 3600), "1" * 16, "1 2"):
             expected = not cv.session_not_before_problems(value)
             self.assertEqual(self._run_function("session_not_before_ok", value).returncode == 0, expected, value)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_config_repo_check_matches_create_problems(self):
+        self.assertIn('CONFIG_REPO="$(metadata_attr dashboard-config-repo)"', self.text)
+        self.assertIn('config_repo_ok "$CONFIG_REPO" || fail', self.text)
+        for value in ("", "swack-tools/spot-runners-config", "a/b", "a-1/x.y_z", "swack-tools", "a/b/c",
+                      "-a/b", "a/..", "a/.", "a/b c", "a/b,c", "a/b;c", "o" * 39 + "/r", "o" * 40 + "/r",
+                      "a/" + "r" * 100, "a/" + "r" * 101, "a/b\nc"):
+            expected = not cv.config_repo_problems(value)
+            self.assertEqual(self._run_function("config_repo_ok", value).returncode == 0, expected, value)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_controlled_targets_round_trip_through_metadata(self):
+        from lib.dashboard_auth import parse_controlled_targets_env
+        self.assertIn('CONTROLLED_TARGETS_METADATA="$(metadata_attr dashboard-controlled-targets)"', self.text)
+        self.assertIn('CONTROLLED_TARGETS="$(controlled_targets_csv "$CONTROLLED_TARGETS_METADATA")" \\\n'
+                      '    || fail', self.text)
+        for raw in ("", "swack-tools", "swack-tools, xbmc4lyfe/newznab-tmux", "a/b c/d Org"):
+            metadata = cv.metadata_items(config(controlled_targets=raw), "a").get("dashboard-controlled-targets", "")
+            result = self._run_function("controlled_targets_csv", metadata)
+            self.assertEqual(result.returncode, 0, raw)
+            self.assertEqual([t.name for t in parse_controlled_targets_env(result.stdout)],
+                             cv.controlled_target_names(raw), raw)
+            self.assertNotIn(";", result.stdout)
+        # Hand-edited metadata is held to the same rules: every entry must be an org or owner/repo.
+        for bad in ("a;;b", ";a", "a;", "a b", "a,b", "a/b/c", "-a", "a/..", "a/.", "a/b=c", "o" * 40):
+            self.assertNotEqual(self._run_function("controlled_targets_csv", bad).returncode, 0, bad)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_env_file_gets_target_policy(self):
+        stubs = "fetch_secret() { printf 'secret-%s' \"$1\"; }\nwrite_private_file() { cat; }\n"
+        body = self._bash_function("write_dashboard_env")
+
+        def env_file(config_repo, targets):
+            script = (stubs + body + '\nPUBLIC_URL=https://spot.example SLOT=a PUBLIC_ORIGIN=https://spot.example '
+                      'SESSION_NOT_BEFORE= CLOUDFLARE_ACCOUNT_ID=a CLOUDFLARE_KV_NAMESPACE_ID=n GITHUB_TOKEN=t '
+                      'CONFIG_REPO="$1" CONTROLLED_TARGETS="$2"\nwrite_dashboard_env\n')
+            result = subprocess.run(["bash", "-c", script, "check", config_repo, targets],
+                                    capture_output=True, text=True, timeout=30, check=True)
+            return result.stdout.splitlines()
+        lines = env_file("swack-tools/runner-config", "swack-tools,a/b")
+        self.assertIn("SPOT_CONFIG_REPO=swack-tools/runner-config", lines)
+        self.assertIn("DASHBOARD_CONTROLLED_TARGETS=swack-tools,a/b", lines)
+        lines = env_file("", "")
+        self.assertFalse(any(line.startswith(("SPOT_CONFIG_REPO=", "DASHBOARD_CONTROLLED_TARGETS=")) for line in lines))
 
     @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
     def test_cloudflared_pin_check_accepts_what_create_problems_accepts(self):

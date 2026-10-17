@@ -105,7 +105,14 @@ METADATA_KEYS = (
     "cloudflare-kv-namespace-id",
     "cloudflared-image",
     "dashboard-session-not-before",
+    "dashboard-config-repo",
+    "dashboard-controlled-targets",
 )
+# Dashboard target policy. Neither is a secret, so both travel as instance metadata and the startup script
+# writes them to the dashboard env file on every boot. GCE metadata values can't hold commas in a
+# ``--metadata`` list, so the controlled targets travel ``;``-separated and become a comma list on the VM.
+ENV_CONFIG_REPO = "SPOT_CONFIG_REPO"
+ENV_CONTROLLED_TARGETS = "DASHBOARD_CONTROLLED_TARGETS"
 # Optional bulk sign-out cut-off (Unix seconds). Not a secret, so it travels as instance metadata; the
 # startup script writes it to the dashboard env file as DASHBOARD_SESSION_NOT_BEFORE on every boot.
 ENV_SESSION_NOT_BEFORE = "DASHBOARD_SESSION_NOT_BEFORE"
@@ -176,6 +183,8 @@ class ControlConfig:
     access_client_secret: str = field(default="", repr=False)
     control_secret: str = field(default="", repr=False)
     session_not_before: str = ""
+    config_repo: str = ""
+    controlled_targets: str = ""
 
     @classmethod
     def from_env(cls, project: str, env: Mapping[str, str] | None = None, **overrides: Any) -> ControlConfig:
@@ -200,6 +209,8 @@ class ControlConfig:
             access_client_secret=env.get("CF_ACCESS_CLIENT_SECRET", ""),
             control_secret=env.get(edge_state.ENV_CONTROL_SECRET, ""),
             session_not_before=str(env.get(ENV_SESSION_NOT_BEFORE, "") or "").strip(),
+            config_repo=str(env.get(ENV_CONFIG_REPO, "") or "").strip(),
+            controlled_targets=str(env.get(ENV_CONTROLLED_TARGETS, "") or "").strip(),
         )
         values.update({key: value for key, value in overrides.items() if value is not None})
         if isinstance(values["regions"], str):
@@ -239,6 +250,7 @@ class ControlConfig:
         if self.service_account and not re.match(r"^[^\s,@]+@[^\s,@]+$", self.service_account):
             problems.append("control VM service account must be an e-mail address")
         problems.extend(session_not_before_problems(self.session_not_before))
+        problems.extend(dashboard_target_problems(self.config_repo, self.controlled_targets))
         return problems
 
 
@@ -258,6 +270,42 @@ def session_not_before_problems(value: str, now: float | None = None) -> list[st
     return []
 
 
+def config_repo_problems(value: str) -> list[str]:
+    """Problems with an optional SPOT_CONFIG_REPO value (empty means the dashboard default).
+
+    Accepts exactly what the dashboard's ``resolve_config_repo`` accepts: ``owner/repo`` with a GitHub
+    login and repository name. Mirrors ``config_repo_ok`` in cloud-init/control-vm-startup.sh.
+    """
+    if not value:
+        return []
+    from .dashboard_auth import parse_controlled_target
+    try:
+        if parse_controlled_target(value).kind == "repo":
+            return []
+    except ValueError:
+        pass
+    return [f"{ENV_CONFIG_REPO} must be owner/repo"]
+
+
+def controlled_target_names(value: str) -> list[str]:
+    """Normalized DASHBOARD_CONTROLLED_TARGETS entries, parsed exactly as the dashboard parses them.
+
+    Raises ValueError on any entry that is not an organization or ``owner/repo``.
+    """
+    from .dashboard_auth import parse_controlled_targets_env
+    return [target.name for target in parse_controlled_targets_env(value)]
+
+
+def dashboard_target_problems(config_repo: str, controlled_targets: str) -> list[str]:
+    """Problems with the dashboard target policy forwarded to the control VM."""
+    problems = config_repo_problems(config_repo)
+    try:
+        controlled_target_names(controlled_targets)
+    except ValueError as exc:
+        problems.append(f"{ENV_CONTROLLED_TARGETS} must list organizations or owner/repo targets: {exc}")
+    return problems
+
+
 def metadata_items(config: ControlConfig, slot: str) -> dict[str, str]:
     """Non-secret instance metadata; secrets are fetched from Secret Manager at boot."""
     edge_state.validate_slot(slot)
@@ -271,7 +319,12 @@ def metadata_items(config: ControlConfig, slot: str) -> dict[str, str]:
         "cloudflare-kv-namespace-id": config.cloudflare_kv_namespace_id,
         "cloudflared-image": config.cloudflared_image,
         "dashboard-session-not-before": config.session_not_before,
+        "dashboard-config-repo": config.config_repo,
+        "dashboard-controlled-targets": ";".join(controlled_target_names(config.controlled_targets)),
     }
+    problems = config_repo_problems(config.config_repo)
+    if problems:
+        raise ValueError("; ".join(problems))
     items = {key: value for key, value in items.items() if value}
     for key, value in items.items():
         if any(c in value for c in ",\n\r\t ") or "=" in key:
@@ -1927,7 +1980,10 @@ def autoscaler_tick(args: Any, state: dict, save: Callable[[], None], *,
     """Run one control VM step from the runner autoscaler loop; never raises."""
     dry_run = bool(getattr(args, "dry_run", False))
     try:
-        manager = manager or build_manager(args.project, state, save)
+        # The autoscaler's --config-repo is the same central runner configuration repository the
+        # dashboard reads its controlled targets from; when it is unset SPOT_CONFIG_REPO applies.
+        manager = manager or build_manager(args.project, state, save,
+                                           config_repo=getattr(args, "config_repo", None) or None)
         plan = manager.tick(apply=not dry_run)
         if dry_run:
             print(f"Control VM plan (dry run): {plan.describe()}")
@@ -1964,6 +2020,11 @@ def args_parser() -> "argparse.ArgumentParser":
     common.add_argument("--public-url", help="Public dashboard URL (or SPOT_DASHBOARD_PUBLIC_URL)")
     common.add_argument("--cloudflared-image", help="Pinned cloudflared image (or SPOT_CLOUDFLARED_IMAGE)")
     common.add_argument("--origin-domain", help="Domain of the per-slot tunnel hostnames")
+    common.add_argument("--config-repo",
+                        help=f"Dashboard runner configuration repository, owner/repo (or {ENV_CONFIG_REPO})")
+    common.add_argument("--controlled-targets",
+                        help=f"Comma-separated orgs and owner/repo targets the dashboard requires admin on "
+                             f"(or {ENV_CONTROLLED_TARGETS})")
 
     parser = argparse.ArgumentParser(
         description="Inspect and manage the Spot control VM that hosts the web dashboard. "
@@ -1982,7 +2043,8 @@ def args_parser() -> "argparse.ArgumentParser":
 
 def _overrides(args: Any) -> dict[str, Any]:
     keys = ("regions", "max_daily_usd", "external_ip", "service_account", "dashboard_image", "dashboard_repo",
-            "dashboard_source_ref", "public_url", "cloudflared_image", "origin_domain")
+            "dashboard_source_ref", "public_url", "cloudflared_image", "origin_domain", "config_repo",
+            "controlled_targets")
     return {key: getattr(args, key, None) for key in keys}
 
 
