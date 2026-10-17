@@ -3796,5 +3796,49 @@ class PublicOriginBehindWorkerTests(unittest.TestCase):
         self.assertEqual(query["redirect_uri"], [self.PUBLIC + "/auth/github/callback"])
 
 
+class ConfigRepoSelectionTests(unittest.TestCase):
+    def test_resolution_order_and_validation(self):
+        from lib.dashboard_server import args_parser, resolve_config_repo
+
+        self.assertEqual(resolve_config_repo(org="swack-tools", environ={}), "swack-tools/spot-runners-config")
+        self.assertEqual(resolve_config_repo(org="acme", environ={}), "acme/spot-runners-config")
+        self.assertEqual(resolve_config_repo(org="acme", environ={"SPOT_CONFIG_REPO": "ops/runner-config"}),
+                         "ops/runner-config")
+        self.assertEqual(resolve_config_repo("x/y", org="acme", environ={"SPOT_CONFIG_REPO": "ops/runner-config"}),
+                         "x/y")
+        for bad in ("noslash", "a/b/c", "a/..", "-bad/repo", "a/ b"):
+            with self.assertRaises(ValueError, msg=bad):
+                resolve_config_repo(org="acme", environ={"SPOT_CONFIG_REPO": bad})
+        self.assertEqual(args_parser().parse_args(["--config-repo", "o/r"]).config_repo, "o/r")
+
+    def test_authorization_provider_uses_the_resolved_repo(self):
+        from lib.dashboard_auth import GitHubOAuthManager
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        manager = GitHubOAuthManager("Iv1.testclientid", "client-secret", None,
+                                     "test-session-secret-0123456789-abcdefghijklmnopqrstuvwxyz")
+        seen = []
+
+        class Recorder:
+            def __init__(self, repo):
+                seen.append(repo)
+
+        cases = ((dict(org="acme"), {}, "acme/spot-runners-config"),
+                 (dict(org="acme"), {"SPOT_CONFIG_REPO": "ops/runner-config"}, "ops/runner-config"),
+                 (dict(org="acme", config_repo="x/y"), {"SPOT_CONFIG_REPO": "ops/runner-config"}, "x/y"))
+        for kwargs, env, expected in cases:
+            with unittest.mock.patch("lib.dashboard_server.ConfigRepoTargets", Recorder), \
+                    unittest.mock.patch.dict("os.environ", env, clear=False):
+                if "SPOT_CONFIG_REPO" not in env:
+                    os.environ.pop("SPOT_CONFIG_REPO", None)
+                server, store = create_dashboard_server(host="127.0.0.1", port=0,
+                                                        state_path=Path(tmp.name) / "s.json",
+                                                        oauth_manager=manager, **kwargs)
+                server.server_close()
+                store.close()
+            self.assertEqual(seen[-1], expected)
+
+
 if __name__ == "__main__":
     unittest.main()

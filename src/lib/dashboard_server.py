@@ -131,6 +131,10 @@ FORWARDED_CLIENT_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "X-Forwarded-For")
 # Worker reaches this server under a different Host (the tunnel hostname). Defaults to the origin of
 # GITHUB_OAUTH_REDIRECT_URI.
 ENV_PUBLIC_ORIGIN = "DASHBOARD_PUBLIC_ORIGIN"
+# Central runner configuration repository whose repos/<owner>/<repo>.yaml files are controlled targets.
+ENV_CONFIG_REPO = "SPOT_CONFIG_REPO"
+CONFIG_REPO_NAME = "spot-runners-config"
+_CONFIG_REPO_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}")
 FREEZE_MARKER_SUFFIX = ".frozen"
 
 LOG = logging.getLogger("spot_dashboard")
@@ -996,8 +1000,6 @@ class DashboardStore:
         self.kv_last_written_version: int | None = None
         # Every KV snapshot write (background write-behind and freeze) runs under this lock, in version order.
         self._kv_write_lock = threading.Lock()
-        # False until this writer has confirmed KV does not already hold a newer snapshot.
-        self._kv_floor_checked = False
         self._defer: dict[str, Any] | None = None
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -1164,6 +1166,10 @@ class DashboardStore:
                         source = "kv"
                     except (ValueError, TypeError, KeyError, AttributeError) as exc:
                         LOG.warning("Ignoring invalid dashboard KV snapshot: %s", exc)
+            if source == "local" and reachable and (snapshot is None or snapshot["state_version"] < self.state_version()):
+                # The local file is ahead of KV (for example a preemption interrupted write-behind after a
+                # successful local save): publish it once this VM is the writer.
+                self._mark_kv_dirty()
             self.hydration_source = source
             self.hydrated = True
         LOG.info("Dashboard hydrated from %s at state_version %d", source, self.state_version())
@@ -1290,8 +1296,6 @@ class DashboardStore:
         else:
             record = OriginRecord.from_json(raw)
             writer = record is not None and record.slot == self.control_slot
-        if writer and not self.kv_writer:
-            self._kv_floor_checked = False  # Re-check KV's version before the first write as writer.
         self.kv_writer = writer
         self._writer_checked_at = self._clock()
         return writer
@@ -1323,6 +1327,9 @@ class DashboardStore:
             captured = envelope is None
             if captured:
                 with self._lock:
+                    if self.frozen:
+                        # A freeze (and maybe a handover) happened while this write waited for the lock.
+                        return None
                     envelope = self.snapshot_envelope()
                     self._kv_dirty = False
             version = int(envelope["state_version"])
@@ -1334,16 +1341,28 @@ class DashboardStore:
                     return None
                 return version  # Already published.
             try:
-                if not self._kv_floor_checked:
-                    current = parse_snapshot(self.kv.get(KV_STATE_KEY))
-                    if current is not None and current["state_version"] > version:
-                        LOG.error("REFUSING to overwrite the KV dashboard snapshot at state_version %d with "
-                                  "older local state_version %d; this VM's state is stale",
-                                  current["state_version"], version)
+                # Under the write lock, immediately before the put: this VM must still own origin:active and
+                # KV must not already hold a newer snapshot. (Equal versions share one history: a handover
+                # target imports the frozen version before changing anything.)
+                raw_origin = self.kv.get(KV_ORIGIN_KEY)
+                if raw_origin is not None:
+                    record = OriginRecord.from_json(raw_origin)
+                    if record is None or record.slot != self.control_slot:
+                        self.kv_writer = False
+                        self._writer_checked_at = self._clock()
+                        LOG.warning("Skipping dashboard KV write: origin:active names slot %s, not %s",
+                                    record.slot if record else None, self.control_slot)
                         if captured:
                             self._restore_kv_dirty()
                         return None
-                    self._kv_floor_checked = True
+                current = parse_snapshot(self.kv.get(KV_STATE_KEY))
+                if current is not None and current["state_version"] > version:
+                    LOG.error("REFUSING to overwrite the KV dashboard snapshot at state_version %d (slot %s) with "
+                              "local state_version %d; this VM's state is stale",
+                              current["state_version"], current.get("writer_slot"), version)
+                    if captured:
+                        self._restore_kv_dirty()
+                    return None
                 self.kv.put(KV_STATE_KEY, json.dumps(envelope, separators=(",", ":"), allow_nan=False))
             except KvError:
                 if captured:
@@ -4059,6 +4078,15 @@ def resolve_public_origin(explicit: str | None = None, *, redirect_uri: str | No
     return None
 
 
+def resolve_config_repo(explicit: str | None = None, *, org: str, environ: Any = None) -> str:
+    """Config repo: the explicit value, else SPOT_CONFIG_REPO, else ``<org>/spot-runners-config``."""
+    env = os.environ if environ is None else environ
+    value = str(explicit or env.get(ENV_CONFIG_REPO) or f"{org}/{CONFIG_REPO_NAME}").strip()
+    if not _CONFIG_REPO_RE.fullmatch(value) or value.split("/", 1)[1] in (".", ".."):
+        raise ValueError(f"{ENV_CONFIG_REPO} must be owner/repo, got {value!r}")
+    return value
+
+
 _HOST_HEADER_RE = re.compile(r"[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?|\[[0-9A-Fa-f:.]{2,45}\](?::[0-9]{1,5})?")
 
 
@@ -5000,13 +5028,15 @@ def create_dashboard_server(
     control_secret: str | None = None,
     kv: CloudflareKv | None = None,
     public_origin: str | None = None,
+    config_repo: str | None = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
     """Instantiate the ThreadingHTTPServer and DashboardStore, then start hydration.
 
     ``oauth_manager`` enables GitHub OAuth login (additive to ``auth_token``); ``controlled_targets`` are
     static organization or ``owner/repo`` targets on which OAuth users must be administrators, in
     addition to the dynamic list stored in dashboard state and every repository in the private config
-    repo (``config_targets_provider``; defaults to :class:`ConfigRepoTargets` when OAuth is enabled).
+    repo (``config_targets_provider``; defaults to :class:`ConfigRepoTargets` for ``config_repo``, else
+    ``SPOT_CONFIG_REPO``, else ``<org>/spot-runners-config``, when OAuth is enabled).
     ``control_slot``/``kv`` enable Cloudflare KV hydration and write-behind; ``control_secret`` enables
     ``/api/control/*``. Nothing is read from Cloudflare unless ``kv`` is passed. ``public_origin``
     (else ``DASHBOARD_PUBLIC_ORIGIN``, else the OAuth redirect URI's origin) is the browser-facing origin
@@ -5064,7 +5094,7 @@ def create_dashboard_server(
         public_origin, redirect_uri=oauth_manager.redirect_uri if oauth_manager is not None else None
     )
     if oauth_manager is not None and config_targets_provider is None:
-        config_targets_provider = ConfigRepoTargets()
+        config_targets_provider = ConfigRepoTargets(resolve_config_repo(config_repo, org=org))
     store = DashboardStore(state_path=state_path, project=project, org=org, control_slot=control_slot, kv=kv)
     handler = make_handler(
         store,
@@ -5161,12 +5191,20 @@ def args_parser():
     parser.add_argument(
         "--controlled-targets",
         default=None,
-        help=f"Comma-separated orgs and owner/repo targets on which OAuth users must be admins, in addition to every repo in swack-tools/spot-runners-config (overrides {ENV_CONTROLLED_TARGETS}; default: none)",
+        help=f"Comma-separated orgs and owner/repo targets on which OAuth users must be admins, in addition to every repo in the --config-repo repository (overrides {ENV_CONTROLLED_TARGETS}; default: none)",
     )
     parser.add_argument(
         "--oauth-redirect-uri",
         default=None,
         help="Absolute GitHub OAuth callback URL, for example https://spot.example.com/auth/github/callback (or set GITHUB_OAUTH_REDIRECT_URI; default: derived from the Host header)",
+    )
+    parser.add_argument(
+        "--config-repo",
+        default=None,
+        help=(
+            f"Runner configuration repository whose repos/<owner>/<repo>.yaml files are controlled targets "
+            f"(or set {ENV_CONFIG_REPO}; default: <org>/{CONFIG_REPO_NAME})"
+        ),
     )
     parser.add_argument(
         "--public-origin",
@@ -5225,6 +5263,7 @@ def main(argv: list[str] | None = None) -> int:
         control_secret=os.environ.get(ENV_CONTROL_SECRET) or None,
         kv=kv,
         public_origin=args.public_origin,
+        config_repo=args.config_repo,
     )
     actual_host, actual_port = server.server_address[:2]
     scheme = "https" if isinstance(server.socket, ssl.SSLSocket) else "http"

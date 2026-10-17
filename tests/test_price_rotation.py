@@ -695,6 +695,7 @@ class PriceRotationStateMachineTests(unittest.TestCase):
             with patch("lib.runner_drain.jobs_finished", return_value=True), \
                     patch("lib.spot_runner_autoscaler.now", return_value=2000000010.0), \
                     patch("lib.runner_drain.api") as mock_api, \
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=True) as quiesce, \
                     patch("lib.runner_drain.subprocess.run") as mock_delete_cmd:
                 # Step 1: Drain finishes -> advances to deregister
                 live = [self.outgoing_vm, self.replacement_vm]
@@ -714,6 +715,8 @@ class PriceRotationStateMachineTests(unittest.TestCase):
                 ], check=True, text=True, capture_output=True, timeout=180)
                 # Transaction completed and cleared
                 self.assertNotIn("price_rotation", read_scale_state(path))
+                # Builder quiescence was confirmed before deregistration and again before deletion.
+                self.assertEqual(quiesce.call_count, 2)
 
     def test_launch_offer_propagates_target_argument(self):
         from lib.spot_runner_autoscaler import launch_offer
@@ -1116,6 +1119,7 @@ class RotationHarness:
         self.new_runner = GitHubRunner(500, "gha-oxidex-runners-new-1", "online", False, ("spot",))
         self.args = SimpleNamespace(project="homelab-424523", org="swack-tools", target="xbmc4lyfe/newznab-tmux",
                                     max_daily_usd=Decimal("4.00"), maximum_hosts=5)
+        self.now = 1010.0
 
     def state(self, phase, target="xbmc4lyfe/newznab-tmux", target_type="repo", **extra):
         rotation = {
@@ -1129,7 +1133,7 @@ class RotationHarness:
         rotation.update(extra)
         return {"price_rotation": rotation}
 
-    def step(self, state, vms, runners, api=None):
+    def step(self, state, vms, runners, api=None, builders_quiet=True):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
             api_kwargs = {"side_effect": api} if api is not None else {"return_value": {}}
@@ -1137,7 +1141,8 @@ class RotationHarness:
                     patch("lib.runner_drain.jobs_finished", return_value=True), \
                     patch("lib.spot_runner_autoscaler.delete_overpriced_vm") as delete_old, \
                     patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete_new, \
-                    patch("lib.spot_runner_autoscaler.now", return_value=1010.0):
+                    patch("lib.spot_runner_autoscaler.quiesce_remote_builder", return_value=builders_quiet), \
+                    patch("lib.spot_runner_autoscaler.now", return_value=self.now):
                 step_price_rotation(vms, runners, self.args, state, path)
             saved = read_scale_state(path) if path.exists() else {}
         return mock_api, delete_old, delete_new, saved
@@ -1348,6 +1353,88 @@ class RecreatedOutgoingHostTests(RotationHarness, unittest.TestCase):
         mock_api.assert_not_called()
         delete_old.assert_not_called()
         self.assertNotIn("price_rotation", saved)
+
+
+class RotationBuilderQuiescenceTests(RotationHarness, unittest.TestCase):
+    """Round 4: rotation never retires a host while a remote build may be running."""
+
+    def test_active_build_holds_deregistration_even_past_drain_deadline(self):
+        from lib.spot_runner_autoscaler import DRAIN_DEADLINE_SECONDS
+        self.now = 1000.0 + DRAIN_DEADLINE_SECONDS + 60
+        state = self.state("cordon_drain")
+        for _ in range(2):
+            mock_api, delete_old, _, state = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                                       [self.old_runner, self.new_runner], builders_quiet=False)
+            mock_api.assert_not_called()
+            delete_old.assert_not_called()
+            self.assertEqual(state["price_rotation"]["phase"], "cordon_drain")
+        _, _, _, state = self.step(state, [self.outgoing_vm, self.replacement_vm],
+                                   [self.old_runner, self.new_runner])
+        self.assertEqual(state["price_rotation"]["phase"], "deregister")
+
+    def test_delete_requires_builder_quiescence(self):
+        state = self.state("delete")
+        _, delete_old, _, saved = self.step(state, [self.outgoing_vm, self.replacement_vm], [self.new_runner],
+                                            builders_quiet=False)
+        delete_old.assert_not_called()
+        self.assertEqual(saved["price_rotation"]["phase"], "delete")
+        self.assertNotIn("asia-east2-a/oxidex-runners-old", saved.get("intentional_deletions", []))
+        _, delete_old, _, saved = self.step(saved, [self.outgoing_vm, self.replacement_vm], [self.new_runner])
+        delete_old.assert_called_once()
+        self.assertNotIn("price_rotation", saved)
+
+
+class TrackedJobRepositoryTests(unittest.TestCase):
+    """Round 4: job recovery and tier evidence follow a repository target by default."""
+
+    def test_default_follows_target(self):
+        from lib.spot_runner_autoscaler import args_parser, tracked_job_repositories
+        cases = [([], ["swack-tools/oxidex"]),
+                 (["--org", "acme"], ["acme/oxidex"]),
+                 (["--target", "xbmc4lyfe/newznab-tmux"], ["xbmc4lyfe/newznab-tmux"]),
+                 (["--target", "xbmc4lyfe/newznab-tmux", "--job-repository", "a/b", "--job-repository", "c/d"],
+                  ["a/b", "c/d"])]
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(tracked_job_repositories(args_parser().parse_args(argv)), expected)
+
+    def test_controller_and_tier_evidence_use_the_same_resolution(self):
+        import inspect
+        from lib import fleet_migration, spot_runner_autoscaler, tier_controller
+        for module in (spot_runner_autoscaler, tier_controller, fleet_migration):
+            source = inspect.getsource(module)
+            self.assertNotRegex(source, r"job_repository or \[[^\]]")  # No independent org-only fallback.
+        self.assertIn("controller.tracked_job_repositories(args)", inspect.getsource(tier_controller.evidence_for))
+        self.assertIn("controller.tracked_job_repositories(args)", inspect.getsource(tier_controller.dry_run))
+
+    def test_controller_loop_tracks_repository_target_jobs(self):
+        from contextlib import ExitStack
+        from lib import spot_runner_autoscaler as controller
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            args = controller.args_parser().parse_args(
+                ["--once", "--target", "xbmc4lyfe/newznab-tmux", "--state-file", str(Path(directory) / "s.json")])
+            for name, value in [("clear_catalog_cache", None), ("load_cpu_platform_map", {}),
+                                ("list_github_runners", []), ("list_gcloud_vms", ()),
+                                ("log_hourly_spend", None), ("read_utilization", None),
+                                ("check_running_prices", [])]:
+                stack.enter_context(patch.object(controller, name, return_value=value))
+            recovery = stack.enter_context(patch.object(controller, "JobRecovery"))
+            controller._run_controller(args)
+        self.assertEqual(recovery.call_args.args[2], ["xbmc4lyfe/newznab-tmux"])
+
+    def test_launch_agent_restart_resolves_the_same_repositories(self):
+        import plistlib
+        from lib import spot_runner_autoscaler as controller
+        for argv in (["--target", "xbmc4lyfe/newznab-tmux"], ["--target", "o/r", "--job-repository", "x/y"]):
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as directory:
+                args = controller.args_parser().parse_args(argv)
+                with patch.object(Path, "home", return_value=Path(directory)), \
+                        patch.object(controller.subprocess, "run"):
+                    path = controller.install_launch_agent(args)
+                program = plistlib.loads(path.read_bytes())["ProgramArguments"]
+                restarted = controller.args_parser().parse_args(program[2:])
+                self.assertEqual(controller.tracked_job_repositories(restarted),
+                                 controller.tracked_job_repositories(args))
 
 
 class LaunchAgentArgumentTests(unittest.TestCase):

@@ -60,6 +60,16 @@ def _active_target(args: Any) -> str:
     return getattr(args, "target", None) or getattr(args, "org", "swack-tools")
 
 
+def tracked_job_repositories(args: Any) -> list[str]:
+    """Return repositories whose jobs are tracked: explicit ``--job-repository`` values, else the
+    repository target itself, else ``<org>/oxidex`` for an organization target."""
+    explicit = getattr(args, "job_repository", None)
+    if explicit:
+        return list(explicit)
+    target = _active_target(args)
+    return [target] if is_repo_target(target) else [f"{target}/oxidex"]
+
+
 def owns_vm(vm: GceVm, args: Any) -> bool:
     """Return whether this controller's GitHub target owns a runner host (via its GCE label)."""
     return target_owns_vm_label(getattr(vm, "target_label", ""), _active_target(args),
@@ -1700,6 +1710,13 @@ def _step_rotation_cordon_drain(vms, runners, args, state, state_path, rotation)
             write_scale_state(state_path, state)
             return True
 
+    if out_vm is not None and not quiesce_remote_builder(out_vm, args):
+        # Idle runners do not prove the host is idle: a remote build may still be running. The
+        # drain deadline never overrides this; keep the host until builds finish and new ones stop.
+        LOG.info("Rotation waits for remote builds to finish on %s before deregistration", out_dict["name"])
+        write_scale_state(state_path, state)
+        return True
+
     LOG.info("All CI jobs finished on %s; advancing to runner deregistration", out_dict["name"])
     _advance_rotation(rotation, "deregister", state, state_path)
     return True
@@ -1753,6 +1770,12 @@ def _step_rotation_delete(vms, runners, args, state, state_path, rotation):
         protected[repl_dict["instance_id"]] = {"name": repl_dict["name"], "zone": repl_dict["zone"]}
         protected.pop(out_dict["instance_id"], None)
         LOG.info("Transferred protected heavy route from %s to replacement %s", out_dict["name"], repl_dict["name"])
+
+    if out_vm is not None and not quiesce_remote_builder(out_vm, args):
+        # Re-confirm under the builder lock right before deletion; never delete under a build.
+        LOG.info("Rotation deletion waits for remote builds to finish on %s", out_dict["name"])
+        write_scale_state(state_path, state)
+        return True
 
     key = f"{out_dict['zone']}/{out_dict['name']}"
     if key not in state.setdefault("intentional_deletions", []):
@@ -2402,7 +2425,7 @@ def _run_controller(args: argparse.Namespace) -> int:
         from .tier_controller import dry_run
         return dry_run(args,state)
     jobs = JobRecovery(state, lambda: write_scale_state(state_path, state),
-                       args.job_repository or [f"{args.org}/oxidex"])
+                       tracked_job_repositories(args))
     args.cpu_platforms_by_zone = None
     while True:
         clear_catalog_cache()

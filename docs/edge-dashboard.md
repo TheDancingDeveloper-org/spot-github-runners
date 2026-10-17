@@ -25,7 +25,8 @@ when all of these are true:
 - The GitHub login is `swackhamer` and the numeric user ID is `619624`.
 - The user has administrator permission on every controlled target. Targets are the union of
   `DASHBOARD_CONTROLLED_TARGETS`, targets saved in the dashboard, and every `repos/<owner>/<repo>.yaml`
-  file in `swack-tools/spot-runners-config`.
+  file in the config repository. The config repository is `--config-repo`, then `SPOT_CONFIG_REPO`,
+  then `<org>/spot-runners-config` with the organization from `--org` (default `swack-tools`).
 - The dashboard can list the config repository. If the listing fails, sign-in fails closed with a 403.
 
 The session cookie is HMAC-signed with `DASHBOARD_SESSION_SECRET`. The Worker and every control VM share
@@ -56,8 +57,11 @@ startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` 
 - An import fails with HTTP 500 and `"imported": false` when the dashboard can't save it to the local
   state file. The previous state stays in place.
 - KV writes run one at a time in version order, and a freeze waits for any write in progress. The
-  active slot never writes a snapshot older than its last write. Before its first write as the active
-  slot, it reads KV and refuses to replace a newer snapshot.
+  active slot never writes a snapshot older than its last write. Right before each write it checks that
+  it isn't frozen, that `origin:active` still names its slot, and that KV doesn't hold a newer
+  snapshot. If any check fails, it skips the write.
+- When the local file is newer than the KV copy at startup, for example because a preemption cut off a
+  write after a local save, the active slot publishes the local copy.
 - The browser sends an `Idempotency-Key` header with every change. The dashboard stores the response in
   the same atomic save as the change, so a retried request never applies twice.
 - A freeze writes the marker file `state.json.frozen` next to the state file. If the container restarts

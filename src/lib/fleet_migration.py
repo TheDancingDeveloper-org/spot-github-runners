@@ -234,7 +234,7 @@ def defer_unused_low_plan(entry,vms,runners,args,state,state_path,discovery):
         if (state.get('latest_workload',{}).get('complete') is not True or len(resources)!=len(managed)
                 or {(row['zone'],row['instance_id']) for row in resources}!={(vm.zone,vm.instance_id) for vm in managed}
                 or io_status(resources)=='incomplete'):return False
-        if not current_job_coverage(state.get('job_tracking',{}),args.job_repository or [args.org+'/oxidex'],timestamp):return False
+        if not current_job_coverage(state.get('job_tracking',{}),controller.tracked_job_repositories(args),timestamp):return False
         for vm in managed:
             key=f'{vm.zone}/{vm.instance_id}';record=next(row for row in records if row['instance_id']==vm.instance_id)
             if (not same_source_inventory(record,asdict(vm))

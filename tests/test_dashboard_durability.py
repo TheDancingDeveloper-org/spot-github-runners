@@ -564,6 +564,101 @@ class ImportPersistFailureTests(unittest.TestCase):
         self.assertEqual(store.state_version(), before)
 
 
+class SerializedWriteRecheckTests(unittest.TestCase):
+    """A background write that waited for the write lock re-checks everything before its put."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = FakeKvRequester()
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=1).to_json()
+        self.clock = FakeClock()
+        self.store = DashboardStore(Path(self.tmp.name) / "state.json", control_slot="a", kv=make_kv(self.fake),
+                                    clock=self.clock, sleep=lambda _s: None)
+        self.store.hydrate()
+        self.store.set_controlled_targets(["o/a"])
+        self.clock.now += 10
+        self.assertTrue(self.store.kv_tick())  # an earlier successful write as the writer
+        self.puts = self.fake.count("PUT", KV_STATE_KEY)
+        self.published = self.fake.values[KV_STATE_KEY]
+        self.store.set_controlled_targets(["o/a2"])
+        self.clock.now += 10
+
+    def run_paused_tick(self, while_paused):
+        """Start kv_tick while the write lock is held, change the world, then let the tick continue."""
+        self.store._kv_write_lock.acquire()
+        result: list[bool] = []
+        worker = threading.Thread(target=lambda: result.append(self.store.kv_tick()))
+        worker.start()
+        time.sleep(0.1)  # the tick passed its unlocked checks and now waits for the lock
+        while_paused()
+        self.store._kv_write_lock.release()
+        worker.join(5)
+        return result[0]
+
+    def assert_no_new_put(self):
+        self.assertEqual(self.fake.count("PUT", KV_STATE_KEY), self.puts)
+
+    def test_freeze_while_waiting_aborts_the_write(self):
+        self.assertFalse(self.run_paused_tick(lambda: setattr(self.store, "frozen", True)))
+        self.assert_no_new_put()
+        self.assertEqual(self.fake.values[KV_STATE_KEY], self.published)
+
+    def test_lost_writer_ownership_aborts_the_write(self):
+        def hand_origin_to_b():
+            self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=2).to_json()
+
+        self.assertFalse(self.run_paused_tick(hand_origin_to_b))
+        self.assert_no_new_put()
+        self.assertFalse(self.store.kv_writer)
+
+    def test_newer_kv_snapshot_aborts_the_write_even_after_earlier_writes(self):
+        # Repro shape: the replacement published a newer version; the old slot must not move KV back.
+        def replacement_published():
+            self.fake.values[KV_STATE_KEY] = kv_snapshot(self.store.state_version() + 1, ["o/b"], slot="b")
+
+        with self.assertLogs("spot_dashboard", level="ERROR"):
+            self.assertFalse(self.run_paused_tick(replacement_published))
+        self.assert_no_new_put()
+        kept = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual((kept["writer_slot"], kept["state"]["controlled_targets"]), ("b", ["o/b"]))
+
+
+class LocalAheadOfKvTests(unittest.TestCase):
+    def test_newer_local_file_is_published_after_hydration(self):
+        for kv_value in (kv_snapshot(3, ["kv/old"]), None):
+            with self.subTest(kv=bool(kv_value)):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                path = Path(tmp.name) / "state.json"
+                write_state(path, 5, ["local/saved"])
+                fake = FakeKvRequester()
+                if kv_value:
+                    fake.values[KV_STATE_KEY] = kv_value
+                clock = FakeClock()
+                store = DashboardStore(path, control_slot="a", kv=make_kv(fake), clock=clock, sleep=lambda _s: None)
+                self.assertEqual(store.hydrate(), "local")
+                clock.now += 10
+                self.assertTrue(store.kv_tick())
+                written = parse_snapshot(fake.values[KV_STATE_KEY])
+                self.assertEqual((written["state_version"], written["state"]["controlled_targets"]),
+                                 (5, ["local/saved"]))
+
+    def test_equal_versions_do_not_republish(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "state.json"
+        write_state(path, 5, ["local/saved"])
+        fake = FakeKvRequester()
+        fake.values[KV_STATE_KEY] = kv_snapshot(5, ["local/saved"])
+        clock = FakeClock()
+        store = DashboardStore(path, control_slot="a", kv=make_kv(fake), clock=clock, sleep=lambda _s: None)
+        store.hydrate()
+        clock.now += 10
+        self.assertFalse(store.kv_tick())
+        self.assertEqual(fake.count("PUT", KV_STATE_KEY), 0)
+
+
 class BlockingKvRequester(FakeKvRequester):
     """Blocks the first snapshot PUT until released, to model a slow in-flight background write."""
 
