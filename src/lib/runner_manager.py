@@ -582,23 +582,29 @@ def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatc
             Path(manifest_path).unlink(missing_ok=True)
 
 
+def boot_change_problem(args: argparse.Namespace, before: GceVm, now: GceVm) -> str | None:
+    """Why ``now`` is not the same instance and boot (GCE lastStartTimestamp) as ``before``; None when it is."""
+    first, then = gce_timestamp(before.last_start_timestamp), gce_timestamp(now.last_start_timestamp)
+    if not first or not then:
+        return (f"Cannot bind the confirmed patch of {args.instance_name} to a boot: lastStartTimestamp is "
+                "unknown; the applied patch is not recorded")
+    if first != then or (before.instance_id and now.instance_id != before.instance_id):
+        return (f"{args.instance_name} restarted while its patch was being confirmed (boot {first}, now "
+                f"{then}); the applied patch is not recorded")
+    return None
+
+
 def confirmed_boot(args: argparse.Namespace, zone: str, observed: GceVm) -> str:
     """The boot (GCE lastStartTimestamp) a patch confirmation belongs to.
 
-    ``observed`` is the VM as seen before the confirmation (bootstrap marker or LIVE_PATCH_APPLIED). A fresh
-    observation must show the same instance and boot; otherwise it restarted mid-confirmation and nothing is
-    recorded.
+    ``observed`` is the VM as seen BEFORE the confirmation was read (bootstrap marker or LIVE_PATCH_APPLIED);
+    never pass an observation taken after it, which may already show a later boot. A fresh observation must
+    show the same instance and boot; otherwise it restarted mid-confirmation and nothing is recorded.
     """
-    before = gce_timestamp(observed.last_start_timestamp)
-    now = observed_deployment_vm(args, zone)
-    after = gce_timestamp(now.last_start_timestamp)
-    if not before or not after:
-        raise RuntimeError(f"Cannot bind the confirmed patch of {args.instance_name} to a boot: lastStartTimestamp is "
-                           "unknown; the applied patch is not recorded")
-    if before != after or (observed.instance_id and now.instance_id != observed.instance_id):
-        raise RuntimeError(f"{args.instance_name} restarted while its patch was being confirmed (boot {before}, now "
-                           f"{after}); the applied patch is not recorded")
-    return before
+    problem = boot_change_problem(args, observed, observed_deployment_vm(args, zone))
+    if problem:
+        raise RuntimeError(problem)
+    return gce_timestamp(observed.last_start_timestamp)
 
 
 def registered_runner_rows(target: TargetConfig) -> list[dict]:
@@ -1170,11 +1176,19 @@ def main() -> int:
         log_project_costs(args.project, args.billing_export_table)
         apply_startup(args, zone, script)
         args.deployment_vm = observed_deployment_vm(args, zone)
+        # The boot that runs this deployment's startup script, captured BEFORE the bootstrap marker is read. The
+        # marker persists on disk across reboots, so it proves completion only for a boot that is still current:
+        # every later observation through publication must show this same boot, or nothing is confirmed (a reboot
+        # after the marker read would otherwise lend the previous boot's completion to the new boot).
+        bootstrap_vm = args.deployment_vm
         write_deployment_receipt(args, args.deployment_vm)
         wait_for_bootstrap(args, zone, deployment_id)
         args.deployment_vm = observed_deployment_vm(args, zone)
         if not args.deployment_vm.running:
             raise RuntimeError(f'Deployed VM is not running: {deployment_details(args)}')
+        boot_problem = boot_change_problem(args, bootstrap_vm, args.deployment_vm)
+        if boot_problem:
+            raise RuntimeError(boot_problem)
         online = online_runners(args)
         if len(online) != args.runner_count:
             raise RuntimeError(f"Only {len(online)}/{args.runner_count} expected runners are online")
@@ -1187,7 +1201,7 @@ def main() -> int:
             if not hasattr(args, "startup_patch"):
                 raise RuntimeError("apply_startup did not record which patch the startup script applies")
             record_patch_metadata(args, zone, args.startup_patch, clear_pending=True,
-                                  boot=confirmed_boot(args, zone, args.deployment_vm))
+                                  boot=confirmed_boot(args, zone, bootstrap_vm))
     except BaseException as exc:
         failure = exc
     finally:

@@ -9,7 +9,7 @@ from pathlib import Path
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
-from unittest import mock
+import unittest.mock
 
 from lib import compute_api, patch_console as pc, runner_fleet
 from lib import runner_manager as manager
@@ -132,9 +132,9 @@ class ProvisioningMetadataTests(unittest.TestCase):
         cloud = GcloudRecorder()
         describe = [SimpleNamespace(returncode=0 if vm else 1, stdout=json.dumps(vm) if vm else ""),
                     SimpleNamespace(returncode=0, stdout=json.dumps({"type": args.disk_type, "users": ["x"]}) if vm else "")]
-        with mock.patch("lib.runner_manager.subprocess.run", side_effect=describe), \
-                mock.patch("lib.runner_manager.registered_runner_rows", return_value=[]), \
-                mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
+        with unittest.mock.patch("lib.runner_manager.subprocess.run", side_effect=describe), \
+                unittest.mock.patch("lib.runner_manager.registered_runner_rows", return_value=[]), \
+                unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
             manager.apply_startup(args, "us-central1-a", script)
         return args, cloud
 
@@ -214,7 +214,8 @@ class ProvisioningMetadataTests(unittest.TestCase):
 class BootstrapConfirmationTests(unittest.TestCase):
     """Codex round 13 P2: the applied patch keys are published only after main() confirms the bootstrap."""
 
-    def deploy(self, *, bootstrap_error=None, short_on_check=None, later_boot=BOOT_TS):
+    def deploy(self, *, bootstrap_error=None, short_on_check=None, later_boot=BOOT_TS, marker_boot=BOOT_TS,
+               start_boot=BOOT_TS):
         cloud = GcloudRecorder()
         running = runner_fleet.GceVm("oxidex-runners-1", "us-central1-a", "RUNNING", "c4d-standard-32", True,
                                      instance_id="1", cpu_platform="AMD Turin", last_start_timestamp=BOOT_TS)
@@ -236,21 +237,24 @@ class BootstrapConfirmationTests(unittest.TestCase):
                 "--instance-name", "oxidex-runners-1", "--zone", "us-central1-a", "--apply"]
         missing = SimpleNamespace(returncode=1, stdout="")
         saved = (manager.PROJECT, manager.ORG)
-        with mock.patch("sys.argv", argv), mock.patch.object(manager, "configure_logging"), \
-                mock.patch.object(manager, "load_env"), \
-                mock.patch.object(manager, "verify_price_and_capacity", return_value=manager.Decimal("0.2")), \
-                mock.patch.object(manager, "generate_registration_token", return_value=TOKEN), \
-                mock.patch.object(manager, "log_project_costs"), \
-                mock.patch.object(manager, "resolve_runner_patch", return_value=TARGET), \
-                mock.patch.object(manager, "observed_deployment_vm",
-                                  side_effect=[running, running, replace(running, last_start_timestamp=later_boot)]), \
-                mock.patch.object(manager, "write_deployment_receipt"), \
-                mock.patch.object(manager, "wait_for_bootstrap", side_effect=bootstrap), \
-                mock.patch.object(manager, "online_runners", side_effect=online), \
-                mock.patch.object(manager, "sync_runner_labels"), mock.patch.object(manager, "verify_runner_storage"), \
-                mock.patch.object(manager, "remove_startup_metadata_if_vm_exists"), \
-                mock.patch("lib.runner_manager.subprocess.run", side_effect=[missing, missing]), \
-                mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
+        with unittest.mock.patch("sys.argv", argv), unittest.mock.patch.object(manager, "configure_logging"), \
+                unittest.mock.patch.object(manager, "load_env"), \
+                unittest.mock.patch.object(manager, "verify_price_and_capacity", return_value=manager.Decimal("0.2")), \
+                unittest.mock.patch.object(manager, "generate_registration_token", return_value=TOKEN), \
+                unittest.mock.patch.object(manager, "log_project_costs"), \
+                unittest.mock.patch.object(manager, "resolve_runner_patch", return_value=TARGET), \
+                unittest.mock.patch.object(manager, "observed_deployment_vm",
+                                  side_effect=[replace(running, last_start_timestamp=start_boot),
+                                               replace(running, last_start_timestamp=marker_boot),
+                                               replace(running, last_start_timestamp=later_boot)]), \
+                unittest.mock.patch.object(manager, "write_deployment_receipt"), \
+                unittest.mock.patch.object(manager, "wait_for_bootstrap", side_effect=bootstrap), \
+                unittest.mock.patch.object(manager, "online_runners", side_effect=online), \
+                unittest.mock.patch.object(manager, "sync_runner_labels"), \
+                unittest.mock.patch.object(manager, "verify_runner_storage"), \
+                unittest.mock.patch.object(manager, "remove_startup_metadata_if_vm_exists"), \
+                unittest.mock.patch("lib.runner_manager.subprocess.run", side_effect=[missing, missing]), \
+                unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
             try:
                 result = manager.main()
             except BaseException as exc:  # noqa: BLE001 - the test inspects the failure
@@ -305,6 +309,32 @@ class BootstrapConfirmationTests(unittest.TestCase):
                 self.assertEqual(self.applied_writes(cloud), ([], [], []))
 
 
+    def test_reboot_after_the_marker_read_never_confirms_the_new_boot(self):
+        """Codex round 22 P2: the boot is captured before the marker wait and must hold through publication."""
+        reboot = "2026-10-02T00:00:00.000-07:00"
+        # The VM rebooted after the marker was read but before the next observation: that observation (and any
+        # later one) shows the new boot, which never confirmed anything, so nothing applied is written.
+        result, cloud = self.deploy(marker_boot=reboot, later_boot=reboot)
+        self.assertIsInstance(result, RuntimeError)
+        self.assertIn(f"boot {BOOT_TS}, now {reboot}", str(result))
+        self.assertEqual(self.applied_writes(cloud), ([], [], []))  # pending stays
+        steps = [c[0] if len(c) == 1 else " ".join(c[:3]) for c in cloud.calls]
+        self.assertIn("BOOTSTRAP_MARKER_CHECKED", steps)
+        self.assertNotIn("RUNNERS_ONLINE_CHECKED", steps)  # aborted as soon as the change was observed
+
+    def test_unknown_boot_before_the_marker_wait_never_confirms(self):
+        result, cloud = self.deploy(start_boot="")
+        self.assertIsInstance(result, RuntimeError)
+        self.assertIn("lastStartTimestamp is unknown", str(result))
+        self.assertEqual(self.applied_writes(cloud), ([], [], []))
+
+    def test_unchanged_boot_through_publication_is_confirmed(self):
+        result, cloud = self.deploy()
+        self.assertEqual(result, 0)
+        [applied], [_label], [_pending] = self.applied_writes(cloud)
+        self.assertEqual(plain_metadata(applied)["spot-runner-patch-boot"], BOOT_TS)
+
+
 class AdoptionOwnershipTests(unittest.TestCase):
     """Codex round 10 P1-b: --existing-instance validates and sets the target ownership label before any change."""
 
@@ -329,9 +359,9 @@ class AdoptionOwnershipTests(unittest.TestCase):
 
         describe = [SimpleNamespace(returncode=0, stdout=json.dumps(vm)),
                     SimpleNamespace(returncode=0, stdout=json.dumps({"type": args.disk_type, "users": ["x"]}))]
-        with mock.patch("lib.runner_manager.subprocess.run", side_effect=describe), \
-                mock.patch("lib.runner_manager.registered_runner_rows", side_effect=rows), \
-                mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
+        with unittest.mock.patch("lib.runner_manager.subprocess.run", side_effect=describe), \
+                unittest.mock.patch("lib.runner_manager.registered_runner_rows", side_effect=rows), \
+                unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
             try:
                 manager.apply_startup(args, "us-central1-a", "#!/bin/bash\n")
                 return None, cloud
@@ -418,18 +448,19 @@ class AdoptionOwnershipTests(unittest.TestCase):
                                       instance_id="1")
         saved = (manager.PROJECT, manager.ORG)
         try:
-            with mock.patch("sys.argv", argv), mock.patch.object(manager, "configure_logging"), \
-                    mock.patch.object(manager, "load_env"), \
-                    mock.patch.object(manager, "observed_deployment_vm", return_value=observed), \
-                    mock.patch.object(manager, "verify_price_and_capacity", return_value=manager.Decimal("0.2")), \
-                    mock.patch("lib.runner_manager.subprocess.run",
+            with unittest.mock.patch("sys.argv", argv), unittest.mock.patch.object(manager, "configure_logging"), \
+                    unittest.mock.patch.object(manager, "load_env"), \
+                    unittest.mock.patch.object(manager, "observed_deployment_vm", return_value=observed), \
+                    unittest.mock.patch.object(manager, "verify_price_and_capacity",
+                                               return_value=manager.Decimal("0.2")), \
+                    unittest.mock.patch("lib.runner_manager.subprocess.run",
                                return_value=SimpleNamespace(returncode=0, stdout=json.dumps(vm))), \
-                    mock.patch.object(manager, "registered_runner_rows",
+                    unittest.mock.patch.object(manager, "registered_runner_rows",
                                       side_effect=lambda scope: [{"id": 1, "name": "oxidex-oxidex-runners-1-1"}]
                                       if scope.name == "swack-tools" else []), \
-                    mock.patch.object(manager, "start_retained_strict_host") as start, \
-                    mock.patch.object(manager, "generate_registration_token") as token, \
-                    mock.patch("lib.runner_manager.gcloud") as cloud:
+                    unittest.mock.patch.object(manager, "start_retained_strict_host") as start, \
+                    unittest.mock.patch.object(manager, "generate_registration_token") as token, \
+                    unittest.mock.patch("lib.runner_manager.gcloud") as cloud:
                 with self.assertRaisesRegex(RuntimeError, "registered to another target"):
                     manager.main()
         finally:
@@ -461,10 +492,10 @@ class LivePatchMetadataTests(unittest.TestCase):
 
         cloud = GcloudRecorder(respond)
         listing = [[vm]] + [[later] for later in (observed or [vm] * 3)]
-        with mock.patch("lib.runner_manager.list_gcloud_vms", side_effect=listing), \
-                mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
-                mock.patch("lib.runner_manager.sync_runner_labels"), \
-                    mock.patch("lib.runner_manager.runner_label_sync_plan"):
+        with unittest.mock.patch("lib.runner_manager.list_gcloud_vms", side_effect=listing), \
+                unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
+                unittest.mock.patch("lib.runner_manager.sync_runner_labels"), \
+                    unittest.mock.patch("lib.runner_manager.runner_label_sync_plan"):
             try:
                 result = manager.apply_live_patch(args, "us-central1-a")
             except RuntimeError as exc:
@@ -521,7 +552,7 @@ class LivePatchMetadataTests(unittest.TestCase):
         big = validate_patch_dict({**BASE, "host": {"files": [{"path": "/etc/big", "content": "x" * 70_000}]}})
         args = args_for(big)
         cloud = GcloudRecorder()
-        with mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
+        with unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
             manager.record_pending_patch_metadata(args, "us-central1-a", big)
         [write] = cloud.calls
         self.assertEqual(plain_metadata(write), {"spot-runner-patch-pending-sha256": big.patch_sha256})
@@ -532,11 +563,11 @@ class LivePatchMetadataTests(unittest.TestCase):
         vm = runner_fleet.GceVm(args.instance_name, "us-central1-a", "RUNNING", "c4d-standard-32", True,
                                 instance_id="1", cpu_platform="AMD Turin")
         cloud = GcloudRecorder(lambda c: receipt_output(OLD) if c[:2] == ["compute", "ssh"] else "")
-        with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
-                mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
-                mock.patch("lib.runner_manager.runner_label_sync_plan",
+        with unittest.mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
+                unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
+                unittest.mock.patch("lib.runner_manager.runner_label_sync_plan",
                            side_effect=RuntimeError("Runner group 10 is not enabled for swack-tools/oxidex")), \
-                mock.patch("lib.runner_manager.sync_runner_labels") as sync:
+                unittest.mock.patch("lib.runner_manager.sync_runner_labels") as sync:
             with self.assertRaisesRegex(RuntimeError, "Runner group"):
                 manager.apply_live_patch(args, "us-central1-a")
         self.assertEqual(live_sequence(cloud), ["read-receipt"])  # no pending write, no script
@@ -552,7 +583,7 @@ class LivePatchMetadataTests(unittest.TestCase):
             commands.append(cmd)
             return "\n".join(json.dumps(r) for r in rows)
 
-        with mock.patch("lib.runner_manager.run", side_effect=run):
+        with unittest.mock.patch("lib.runner_manager.run", side_effect=run):
             manager.runner_label_sync_plan(args)
             self.assertTrue(all("PUT" not in c for c in commands))
             rows.pop()
@@ -630,10 +661,10 @@ class LivePatchMetadataTests(unittest.TestCase):
                 return _output if command[:2] == ["compute", "ssh"] else ""
 
             cloud = GcloudRecorder(respond)
-            with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
-                    mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
-                    mock.patch("lib.runner_manager.sync_runner_labels"), \
-                    mock.patch("lib.runner_manager.runner_label_sync_plan"):
+            with unittest.mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
+                    unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
+                    unittest.mock.patch("lib.runner_manager.sync_runner_labels"), \
+                    unittest.mock.patch("lib.runner_manager.runner_label_sync_plan"):
                 if expect_metadata:
                     self.assertEqual(ex.apply(host, TARGET), {"result": "applied"})
                 else:
@@ -704,7 +735,7 @@ class InventoryTests(unittest.TestCase):
                 return [{**item, "scheduling": {"provisioningModel": "SPOT"}}]
             return [] if args[1:4] == ["compute", "disks", "list"] else {}
 
-        with mock.patch("lib.runner_fleet._command_json", side_effect=command_json):
+        with unittest.mock.patch("lib.runner_fleet._command_json", side_effect=command_json):
             [vm] = runner_fleet.list_gcloud_vms("p")
         self.assertEqual((vm.patch_boot, vm.last_start_timestamp), (BOOT_TS, BOOT_TS))
 
@@ -735,7 +766,7 @@ class InventoryTests(unittest.TestCase):
                 return rows
             return [] if args[1:4] == ["compute", "disks", "list"] else {}
 
-        with mock.patch("lib.runner_fleet._command_json", side_effect=command_json):
+        with unittest.mock.patch("lib.runner_fleet._command_json", side_effect=command_json):
             vms = runner_fleet.list_gcloud_vms("p")
         self.assertEqual((vms[0].patch_sha256, vms[0].patch_target), (TARGET.patch_sha256, REPO))
         self.assertEqual(json.loads(vms[0].patch_manifest_json), json.loads(canonical_json(TARGET)))
@@ -800,7 +831,7 @@ class PreviewFromRecordedPatchTests(unittest.TestCase):
         ]
         hosts = compute_api.runner_host_records(items)
         console = pc.PatchConsole("swack-tools/spot-runners-config", token="t", host_source=lambda: hosts)
-        with mock.patch.object(pc.PatchConsole, "effective_patch",
+        with unittest.mock.patch.object(pc.PatchConsole, "effective_patch",
                                return_value=(TARGET, {"draft": False, "head_sha": "a" * 40})):
             result = console.preview(REPO, instances=[{"name": "ignored-state-record"}])
         got = {h["name"]: (h["classification"], h["detail"]) for h in result["hosts"]}
@@ -898,7 +929,7 @@ class PreviewFromRecordedPatchTests(unittest.TestCase):
             raise RuntimeError("compute.instances.list denied")
 
         console = pc.PatchConsole("swack-tools/spot-runners-config", token="t", host_source=broken)
-        with mock.patch.object(pc.PatchConsole, "effective_patch", return_value=(TARGET, {"draft": False})):
+        with unittest.mock.patch.object(pc.PatchConsole, "effective_patch", return_value=(TARGET, {"draft": False})):
             with self.assertRaisesRegex(pc.GitHubRestError, "Could not list runner hosts"):
                 console.preview(REPO, [])
         self.assertIsNone(pc.host_source_from_env("p", {}))
@@ -943,10 +974,10 @@ class HostCapacityTests(unittest.TestCase):
         cloud = GcloudRecorder(lambda c: receipt_output(OLD)
                                if c[:2] == ["compute", "ssh"] and "state.json" in c[-1]
                                else f"LIVE_PATCH_APPLIED:{patch.patch_sha256}")
-        with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
-                mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
-                mock.patch("lib.runner_manager.runner_label_sync_plan"), \
-                mock.patch("lib.runner_manager.sync_runner_labels"):
+        with unittest.mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
+                unittest.mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
+                unittest.mock.patch("lib.runner_manager.runner_label_sync_plan"), \
+                unittest.mock.patch("lib.runner_manager.sync_runner_labels"):
             try:
                 return manager.apply_live_patch(args, "us-central1-a"), cloud
             except RuntimeError as exc:
@@ -978,7 +1009,7 @@ class HostCapacityTests(unittest.TestCase):
                                                       manifest=canonical_json(OLD))])[0],
         ]
         console = pc.PatchConsole("swack-tools/spot-runners-config", token="t", host_source=lambda: hosts)
-        with mock.patch.object(pc.PatchConsole, "effective_patch", return_value=(BIG, {"draft": False})):
+        with unittest.mock.patch.object(pc.PatchConsole, "effective_patch", return_value=(BIG, {"draft": False})):
             result = console.preview(REPO, [])
         got = {h["name"]: (h["classification"], h["detail"]) for h in result["hosts"]}
         self.assertEqual({n: c for n, (c, _) in got.items()},
@@ -993,7 +1024,7 @@ class HostCapacityTests(unittest.TestCase):
         record = {"name": "h", "zone": "us-central1-a", "machine_type": "n2-standard-32", "runner_prefix": "oxidex",
                   "runners_count": 3, "runner_label": "l", "runner_region": "us-central1", "patch_target": REPO,
                   "registration_target": "swack-tools", "runner_group_id": 10, "vcpu": 32, "ram_gib": 128.0}
-        with mock.patch.object(manager, "apply_live_patch") as apply:
+        with unittest.mock.patch.object(manager, "apply_live_patch") as apply:
             for bad in (record, {k: v for k, v in record.items() if k not in ("vcpu", "ram_gib")}):
                 with self.assertRaisesRegex(pc.HostRefusedError, "refused"):
                     ex.apply(bad, BIG)
@@ -1024,14 +1055,14 @@ class HostCapacityTests(unittest.TestCase):
         async def measured(_api, _project, zone, machine_type):
             return {"vcpu": 32, "ram_gib": 128.0}
 
-        with mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("tok", "proj")), \
-                mock.patch.object(compute_api, "list_instances", side_effect=listing), \
-                mock.patch.object(compute_api, "machine_type_capacity", side_effect=measured):
+        with unittest.mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("tok", "proj")), \
+                unittest.mock.patch.object(compute_api, "list_instances", side_effect=listing), \
+                unittest.mock.patch.object(compute_api, "machine_type_capacity", side_effect=measured):
             hosts = pc.gce_host_source("proj")()
         self.assertEqual([(h["vcpu"], h["ram_gib"]) for h in hosts], [(32, 128.0), (32, 128.0)])
-        with mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("tok", "proj")), \
-                mock.patch.object(compute_api, "list_instances", side_effect=listing), \
-                mock.patch.object(compute_api, "machine_type_capacity", side_effect=capacity):
+        with unittest.mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("tok", "proj")), \
+                unittest.mock.patch.object(compute_api, "list_instances", side_effect=listing), \
+                unittest.mock.patch.object(compute_api, "machine_type_capacity", side_effect=capacity):
             hosts = pc.gce_host_source("proj")()
         self.assertTrue(all("vcpu" not in h for h in hosts))  # unknown, never guessed
 

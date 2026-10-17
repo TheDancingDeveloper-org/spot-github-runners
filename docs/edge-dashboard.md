@@ -147,7 +147,8 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   for this deployment, every runner is online, and the storage check passes. A live patch confirms it
   when the host reports `LIVE_PATCH_APPLIED:<sha256>`. The keys are:
   - `spot-runner-patch-boot`: the GCE `lastStartTimestamp` of the boot that the confirmation belongs to.
-    If the VM restarts during the confirmation, nothing is recorded.
+    The manager observes the boot before it waits for the bootstrap marker. If the VM restarts at any
+    point after that, including after the marker was read, nothing is recorded and the host stays pending.
   - `spot-runner-patch`: the canonical manifest JSON. It's left out when larger than 64 KiB, and then
     only the sha256 is recorded.
   - `spot-runner-patch-sha256`: the sha256, or `none` when the host has no patch.
@@ -325,6 +326,11 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
 - **Uncertain creates**: if `gcloud` reports a failed create without a capacity or quota error, the
   autoscaler checks that zone for the instance before it tries another zone, and adopts the instance if
   it exists. If it can't tell, it waits.
+- **Capacity failures**: the autoscaler records a failed create for that machine type in that zone only,
+  so a stockout of the cheapest machine type never hides another affordable machine type in the same
+  zone. It retries a failed pair after 30 minutes, and starts the search over only after every affordable
+  pair failed. Zone-only records from older autoscaler versions still exclude the whole zone until they
+  expire.
 - **Duplicate slots**: if two VMs carry the same slot, the autoscaler logs an error and changes nothing,
   including `origin:active`, until an operator deletes the extra VM.
 - **Retained boot disks**: when the autoscaler can't confirm that a VM's state reached its successor,

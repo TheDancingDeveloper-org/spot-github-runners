@@ -128,7 +128,7 @@ MIN_SAVINGS_DAILY_USD = Decimal("0.05")
 CREATE_ATTEMPTS_PER_TICK = 3
 PRICE_CREATE_MAX_FAILURES = 3
 STEP_RETRY_LIMIT = 5
-FAILED_ZONE_TTL_SECONDS = 1800     # A zone that failed a create is retried after this long.
+FAILED_ZONE_TTL_SECONDS = 1800     # A (machine type, zone) that failed a create is retried after this long.
 MAX_STEPS_PER_TICK = 12
 
 STOPPED_STATES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED"})
@@ -571,6 +571,11 @@ _DEFINITIVE_CREATE_ERROR_RE = re.compile(
 _NOT_FOUND_RE = re.compile(r"was not found|notFound|HTTP 404|code: 404|\b404\b", re.IGNORECASE)
 
 
+def _offer_key(machine_type: str, zone: str) -> str:
+    """Persisted identity of one placement in create-failure records (JSON object keys must be strings)."""
+    return f"{machine_type}@{zone}"
+
+
 def describe_command(name: str, zone: str, project: str) -> list[str]:
     return ["gcloud", "compute", "instances", "describe", name, f"--zone={zone}", f"--project={project}",
             "--format=json(name,zone,status,labels,id,machineType)"]
@@ -586,6 +591,39 @@ def duplicate_slot_problems(vms: Sequence[ControlVm]) -> list[str]:
             problems.append(f"more than one control VM for slot {slot}: {where}; they share the slot's tunnel "
                             f"and KV writer identity, so nothing changes until an operator deletes the extra")
     return problems
+
+
+# stderr lines gcloud prints on a COMPLETE instance listing. Anything else (for example "Some requests did not
+# succeed") means the inventory may be partial. The filter-keys warning appears when no instance carries the
+# role label at all, which is exactly the empty inventory that bootstrap starts from.
+_BENIGN_INVENTORY_LINE_RES = (
+    re.compile(r"WARNING: The following filter keys were not present in any resource : labels\.%s"
+               % re.escape(ROLE_LABEL)),
+)
+# gcloud's update notice and the lines that follow it (accepted only after the notice itself).
+_UPDATE_NOTICE_RE = re.compile(r"Updates are available for some (?:Google Cloud CLI|Cloud SDK) components\."
+                               r"(?:\s+To install them,)?")
+_UPDATE_NOTICE_FOLLOW_RES = (re.compile(r"(?:To install them, )?please run:"),
+                             re.compile(r"\$ gcloud components update"))
+
+
+def inventory_stderr_problem(stderr: str) -> str | None:
+    """The first stderr line that is not a known-benign gcloud message, or None when every line is."""
+    in_update_notice = False
+    for raw in (stderr or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if any(r.fullmatch(line) for r in _BENIGN_INVENTORY_LINE_RES):
+            in_update_notice = False
+            continue
+        if _UPDATE_NOTICE_RE.fullmatch(line):
+            in_update_notice = True
+            continue
+        if in_update_notice and any(r.fullmatch(line) for r in _UPDATE_NOTICE_FOLLOW_RES):
+            continue
+        return line
+    return None
 
 
 def list_command(project: str) -> list[str]:
@@ -770,8 +808,9 @@ class ControlVmManager:
         result = self.gcloud(list_command(self.config.project))
         if result.returncode != 0:
             raise RuntimeError(f"control VM inventory failed: {(result.stderr or '').strip()[:300]}")
-        if (result.stderr or "").strip():
+        if inventory_stderr_problem(result.stderr or ""):
             # gcloud can exit 0 with partial results and diagnostics on stderr; completeness is unknown.
+            # Only lines on the known-benign allowlist (see inventory_stderr_problem) are tolerated.
             raise RuntimeError("control VM inventory returned diagnostics; completeness unknown: "
                                f"{result.stderr.strip()[:300]}")
         vms = parse_control_vms(json.loads(result.stdout or "[]"))
@@ -905,8 +944,10 @@ class ControlVmManager:
             "offer": offer.to_dict() if offer else None,
             "excluded_zones": ([old_vm.zone] if (old_vm and mode == MODE_RECOVER) else [])
                               + self._retained_zones(new_slot),
-            "failed_zones": [],
-            "failed_zones_at": {},
+            # Create failures are tracked per placement ("machine_type@zone", see _offer_key): a stockout of one
+            # shape in a zone says nothing about another shape there.
+            "failed_offers": [],
+            "failed_offers_at": {},
             "step": "create",
             "started_at": now,
             "step_started_at": now,
@@ -1130,7 +1171,7 @@ class ControlVmManager:
             return "exists"
         if _NOT_FOUND_RE.search(result.stderr or ""):
             t.pop("pending_create", None)
-            self._mark_zone_failed(t, pending["zone"])
+            self._mark_offer_failed(t, pending.get("machine_type") or "", pending["zone"])
             self.save()
             return "absent"
         t["error"] = (f"cannot confirm whether {pending['name']} exists in {pending['zone']}: "
@@ -1161,9 +1202,14 @@ class ControlVmManager:
             except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
                 self._note("control VM price scan failed: %s", exc, level=logging.WARNING)
                 offers = []
-        failed = self._failed_zones(t)
+        failed_offers, failed_zones = self._failed_offers(t)
+        failed = failed_offers or failed_zones
         affordable = [o for o in offers if o.daily_usd <= self.config.max_daily_usd]
-        candidates = [o for o in affordable if o.zone not in failed]
+        # Filter by (machine type, zone), so an exhausted cheapest shape never hides an affordable alternative
+        # shape in the same zone. Zone-only records from before per-shape tracking still exclude the whole zone
+        # (conservatively) until they expire.
+        candidates = [o for o in affordable
+                      if _offer_key(o.machine_type, o.zone) not in failed_offers and o.zone not in failed_zones]
         preferred = [o for o in candidates if o.zone not in t.get("excluded_zones", [])]
         candidates = preferred or candidates
         if t.get("offer") and not failed:
@@ -1179,10 +1225,12 @@ class ControlVmManager:
                            planned.machine_type, planned.zone, level=logging.WARNING)
         if not candidates:
             if affordable:
-                # Every available zone failed recently: start over with the full list next tick
-                # (stockouts are transient), however few zones there are.
-                t["failed_zones"], t["failed_zones_at"] = [], {}
-                return self._create_failed(t, "every affordable zone failed; retrying all zones next tick")
+                # Every affordable (machine type, zone) failed recently: start over with the full list next
+                # tick (stockouts are transient), however few placements there are.
+                t["failed_offers"], t["failed_offers_at"] = [], {}
+                t.pop("failed_zones", None)
+                t.pop("failed_zones_at", None)
+                return self._create_failed(t, "every affordable machine type and zone failed; retrying all next tick")
             return self._create_failed(t, "no priced offer under the cap")
         script = render_control_startup()
         with tempfile.TemporaryDirectory(prefix="spot-control-") as tmp:
@@ -1209,10 +1257,11 @@ class ControlVmManager:
                                offer.machine_type, offer.zone, offer.daily_usd)
                     return self._advance_step(t)
                 stderr = (result.stderr or "").strip()
-                self._note("create in %s failed: %s", offer.zone, stderr[:300], level=logging.WARNING)
+                self._note("create of %s in %s failed: %s", offer.machine_type, offer.zone, stderr[:300],
+                           level=logging.WARNING)
                 if _DEFINITIVE_CREATE_ERROR_RE.search(stderr):
                     t.pop("pending_create", None)
-                    self._mark_zone_failed(t, offer.zone)
+                    self._mark_offer_failed(t, offer.machine_type, offer.zone)
                     self.save()
                     continue
                 outcome = self._reconcile_pending_create(t)
@@ -1221,22 +1270,47 @@ class ControlVmManager:
                     return "wait"
         return self._create_failed(t, "every create attempt this tick failed")
 
+    def _mark_offer_failed(self, t: dict, machine_type: str, zone: str) -> None:
+        if not machine_type:
+            # No shape recorded (a pending create persisted by an older controller): fail the whole zone.
+            self._mark_zone_failed(t, zone)
+            return
+        key = _offer_key(machine_type, zone)
+        keys = t.setdefault("failed_offers", [])
+        if key not in keys:
+            keys.append(key)
+        t.setdefault("failed_offers_at", {})[key] = self.clock()
+
     def _mark_zone_failed(self, t: dict, zone: str) -> None:
+        """Legacy zone-wide record: excludes every machine type in ``zone`` until it expires."""
         zones = t.setdefault("failed_zones", [])
         if zone not in zones:
             zones.append(zone)
         t.setdefault("failed_zones_at", {})[zone] = self.clock()
 
-    def _failed_zones(self, t: dict) -> list[str]:
-        """Zones that failed within FAILED_ZONE_TTL_SECONDS; older failures expire so capacity is retried."""
+    def _failed_offers(self, t: dict) -> tuple[list[str], list[str]]:
+        """Fresh failures: ("machine_type@zone" keys, legacy zone-wide records).
+
+        Records older than FAILED_ZONE_TTL_SECONDS expire so capacity is retried. Zone-only records persisted
+        before per-shape tracking cannot say which shape failed, so they keep excluding the whole zone (the
+        conservative reading) for the rest of their TTL; nothing new is written in that form except for a
+        pending create that names no machine type.
+        """
+        return (self._fresh(t, "failed_offers", "failed_offers_at"),
+                self._fresh(t, "failed_zones", "failed_zones_at"))
+
+    def _fresh(self, t: dict, list_key: str, stamps_key: str) -> list[str]:
         now = self.clock()
-        stamps = t.setdefault("failed_zones_at", {})
-        for zone in t.get("failed_zones", []):
-            stamps.setdefault(zone, now)  # Records from before timestamps existed start their TTL now.
-        fresh = [z for z in t.get("failed_zones", []) if now - stamps[z] < FAILED_ZONE_TTL_SECONDS]
-        if fresh != t.get("failed_zones", []):
-            t["failed_zones"] = fresh
-            t["failed_zones_at"] = {z: stamps[z] for z in fresh}
+        if list_key not in t and stamps_key not in t:
+            return []
+        entries = list(t.get(list_key) or [])
+        stamps = t.setdefault(stamps_key, {})
+        for entry in entries:
+            stamps.setdefault(entry, now)  # Records from before timestamps existed start their TTL now.
+        fresh = [e for e in entries if now - stamps[e] < FAILED_ZONE_TTL_SECONDS]
+        if fresh != t.get(list_key):
+            t[list_key] = fresh
+            t[stamps_key] = {e: stamps[e] for e in fresh}
         return list(fresh)
 
     def _create_failed(self, t: dict, error: str) -> str:

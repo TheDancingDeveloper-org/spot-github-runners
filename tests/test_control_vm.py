@@ -59,6 +59,8 @@ class FakeGcloud:
         self.vms: dict[str, dict] = {}
         self.calls: list[list[str]] = []
         self.fail_create_zones: set[str] = set()
+        self.fail_create_offers: set[tuple[str, str]] = set()  # (machine type, zone) stockouts
+        self.create_attempts: list[tuple[str, str]] = []  # (machine type, zone) of every create call
         self.start_rc = 0
         self.stop_rc = 0
         self.delete_rc = 0
@@ -96,11 +98,12 @@ class FakeGcloud:
         if verb == ["instances", "create"]:
             script = next(a.split("=", 2)[2] for a in argv if a.startswith("--metadata-from-file="))
             self.scripts.append(Path(script).read_text(encoding="utf-8"))
-            if zone in self.fail_create_zones:
+            machine = next(a.split("=", 1)[1] for a in argv if a.startswith("--machine-type="))
+            self.create_attempts.append((machine, zone))
+            if zone in self.fail_create_zones or (machine, zone) in self.fail_create_offers:
                 self.events.append(("create_failed", name, zone))
                 return SimpleNamespace(returncode=1, stdout="", stderr="ZONE_RESOURCE_POOL_EXHAUSTED")
             slot = name.rsplit("-", 1)[1]
-            machine = next(a.split("=", 1)[1] for a in argv if a.startswith("--machine-type="))
             self.add(slot, status="PROVISIONING", zone=zone, machine=machine,
                      instance_id=self.create_ids.pop(0) if self.create_ids else None)
             self.events.append(("create", name, zone))
@@ -628,28 +631,102 @@ class ExecutorTests(unittest.TestCase):
 
     def test_failed_zones_reset_when_every_available_zone_failed(self):
         h = Harness()
-        self.healthy_active(h)
         h.gcloud.fail_create_zones = {"us-central1-a", "us-east1-b"}  # only two zones exist
-        h.tick()
-        self.assertEqual(sorted(h.transition["failed_zones"]), ["us-central1-a", "us-east1-b"])
-        h.tick()  # candidates exhausted: the list resets instead of filtering every zone forever
-        self.assertEqual(h.transition["failed_zones"], [])
+        h.tick()  # bootstrap: all three placements fail
+        self.assertEqual(sorted(h.transition["failed_offers"]),
+                         ["e2-medium@us-central1-a", "e2-small@us-central1-a", "e2-small@us-east1-b"])
+        h.tick()  # candidates exhausted: the list resets instead of filtering every placement forever
+        self.assertEqual(h.transition["failed_offers"], [])
         h.gcloud.fail_create_zones = set()
         h.tick()
         self.assertEqual(h.transition["step"], "wait_health")
 
-    def test_failed_zone_records_expire(self):
+    # Codex round 22 P1: the cheapest shape exhausted in 3+ zones must not hide other shapes in those zones.
+    WIDE_OFFERS = [offer("e2-small", "us-central1-a", "0.10"), offer("e2-small", "us-central1-b", "0.10"),
+                   offer("e2-small", "us-central1-c", "0.10"), offer("e2-small", "us-east1-b", "0.12"),
+                   offer("e2-medium", "us-central1-a", "0.40")]
+
+    def test_exhausted_cheapest_shape_tries_another_shape_in_the_same_zone(self):
+        h = Harness(offers=self.WIDE_OFFERS)
+        h.gcloud.fail_create_offers = {("e2-small", o.zone) for o in self.WIDE_OFFERS}
+        h.tick()  # bootstrap: the per-tick limit spends every attempt on the cheapest shape
+        self.assertEqual(h.gcloud.create_attempts, [("e2-small", "us-central1-a"), ("e2-small", "us-central1-b"),
+                                                    ("e2-small", "us-central1-c")])
+        self.assertEqual(h.transition["step"], "create")
+        h.tick()  # next tick: the remaining cheap zone, then the other shape in a zone that already failed
+        self.assertEqual(h.gcloud.create_attempts[3:], [("e2-small", "us-east1-b"), ("e2-medium", "us-central1-a")])
+        self.assertEqual(h.transition["step"], "wait_health")
+        self.assertEqual(h.transition["new_vm"]["machine_type"], "e2-medium")
+        self.assertEqual(h.transition["new_vm"]["zone"], "us-central1-a")
+
+    def test_search_restarts_only_after_every_shape_and_zone_failed(self):
+        h = Harness(offers=self.WIDE_OFFERS)
+        every = {(o.machine_type, o.zone) for o in self.WIDE_OFFERS}
+        h.gcloud.fail_create_offers = set(every)
+        h.tick()
+        h.tick()
+        # Each placement was attempted exactly once before anything was retried.
+        self.assertEqual(sorted(h.gcloud.create_attempts), sorted(every))
+        self.assertEqual(sorted(h.transition["failed_offers"]), sorted(cv._offer_key(m, z) for m, z in every))
+        self.assertEqual(set(h.transition["failed_offers_at"]), set(h.transition["failed_offers"]))
+        h.tick()  # nothing left: reset, without another create this tick
+        self.assertEqual(len(h.gcloud.create_attempts), len(every))
+        self.assertEqual((h.transition["failed_offers"], h.transition["failed_offers_at"]), ([], {}))
+        self.assertIn("every affordable machine type and zone failed", h.transition["error"])
+        h.tick()  # the search starts over from the cheapest placement
+        self.assertEqual(h.gcloud.create_attempts[len(every)], ("e2-small", "us-central1-a"))
+
+    def test_definitive_failure_marks_only_that_shape_and_zone(self):
+        h = Harness()
+        h.gcloud.fail_create_offers = {("e2-small", "us-central1-a")}
+        h.tick()
+        self.assertEqual(h.transition["failed_offers"], ["e2-small@us-central1-a"])
+        self.assertNotIn("failed_zones", h.transition)
+        self.assertEqual(h.gcloud.create_attempts, [("e2-small", "us-central1-a"), ("e2-small", "us-east1-b")])
+
+    def test_legacy_zone_only_failures_still_exclude_the_whole_zone_until_they_expire(self):
+        h = Harness(offers=self.WIDE_OFFERS)
+        h.gcloud.fail_create_offers = {(o.machine_type, o.zone) for o in self.WIDE_OFFERS}
+        h.tick()  # leaves a bootstrap transition at the create step
+        t = h.transition
+        # A record persisted before per-shape tracking: zone-only, one with and one without a timestamp.
+        t["failed_offers"], t["failed_offers_at"] = [], {}
+        t["failed_zones"] = ["us-central1-a", "us-central1-b"]
+        t["failed_zones_at"] = {"us-central1-a": h.clock[0]}
+        h.gcloud.fail_create_offers = set()
+        h.gcloud.create_attempts.clear()
+        h.tick()
+        # Neither shape is tried in a legacy-failed zone: the first create lands in the next zone.
+        self.assertEqual(h.gcloud.create_attempts, [("e2-small", "us-central1-c")])
+        self.assertEqual(h.transition["step"], "wait_health")
+
+    def test_legacy_zone_records_expire_and_reset_with_the_search(self):
         h = Harness()
         manager = h.manager()
-        t = {"failed_zones": []}
-        manager._mark_zone_failed(t, "us-central1-a")
-        self.assertEqual(manager._failed_zones(t), ["us-central1-a"])
+        t = {"failed_zones": ["us-east1-b"]}  # recorded before timestamps existed
+        self.assertEqual(manager._failed_offers(t), ([], ["us-east1-b"]))
         h.clock[0] += cv.FAILED_ZONE_TTL_SECONDS
-        self.assertEqual(manager._failed_zones(t), [])
-        legacy = {"failed_zones": ["us-east1-b"]}  # recorded before timestamps existed
-        self.assertEqual(manager._failed_zones(legacy), ["us-east1-b"])
+        self.assertEqual(manager._failed_offers(t), ([], []))
+        # A pending create persisted without its machine type fails the whole zone (conservative).
+        manager._mark_offer_failed(t, "", "us-central1-a")
+        self.assertEqual(manager._failed_offers(t), ([], ["us-central1-a"]))
+        manager._mark_offer_failed(t, "e2-small", "us-east1-b")
+        self.assertEqual(manager._failed_offers(t), (["e2-small@us-east1-b"], ["us-central1-a"]))
         h.clock[0] += cv.FAILED_ZONE_TTL_SECONDS
-        self.assertEqual(manager._failed_zones(legacy), [])
+        self.assertEqual(manager._failed_offers(t), ([], []))
+
+    def test_failed_offer_records_expire(self):
+        h = Harness()
+        manager = h.manager()
+        t = {"failed_offers": []}
+        manager._mark_offer_failed(t, "e2-small", "us-central1-a")
+        self.assertEqual(manager._failed_offers(t), (["e2-small@us-central1-a"], []))
+        h.clock[0] += cv.FAILED_ZONE_TTL_SECONDS
+        self.assertEqual(manager._failed_offers(t), ([], []))
+        untimed = {"failed_offers": ["e2-small@us-east1-b"]}
+        self.assertEqual(manager._failed_offers(untimed), (["e2-small@us-east1-b"], []))
+        h.clock[0] += cv.FAILED_ZONE_TTL_SECONDS
+        self.assertEqual(manager._failed_offers(untimed), ([], []))
 
     def test_price_create_failures_abort_without_touching_old(self):
         h = Harness()
@@ -1983,6 +2060,40 @@ class PartialInventoryTests(unittest.TestCase):
             h.tick()
         self.assertEqual(h.mutations(), [])
         self.assertNotIn("spot-control-b", h.gcloud.vms)
+
+    FILTER_KEYS_WARNING = "WARNING: The following filter keys were not present in any resource : labels.spot-role\n"
+    UPDATE_NOTICE = ("\n\nUpdates are available for some Google Cloud CLI components.  To install them,\n"
+                     "please run:\n  $ gcloud components update\n\n")
+
+    def test_empty_inventory_filter_keys_warning_still_bootstraps(self):
+        """Live bootstrap: with zero control VMs gcloud exits 0 and warns that the label key matched nothing."""
+        h = Harness()
+        h.gcloud.list_stderr = self.FILTER_KEYS_WARNING
+        obs = h.manager().observe(want_offers=False)
+        self.assertEqual(obs.vms, [])
+        plan = h.tick()
+        self.assertEqual(plan.action, "bootstrap")
+        self.assertEqual(h.events[0], ("create", "spot-control-a", "us-central1-a"))
+
+    def test_update_notice_is_tolerated(self):
+        for stderr in (self.UPDATE_NOTICE, self.FILTER_KEYS_WARNING + self.UPDATE_NOTICE):
+            with self.subTest(stderr=stderr):
+                h = Harness()
+                h.gcloud.list_stderr = stderr
+                self.assertEqual(h.tick().action, "bootstrap")
+
+    def test_unknown_lines_mixed_with_benign_ones_still_block(self):
+        for stderr in (self.FILTER_KEYS_WARNING + "WARNING: Some requests did not succeed:\n - zone unavailable\n",
+                       "WARNING: Some requests did not succeed:\n" + self.UPDATE_NOTICE,
+                       "please run:\n",  # a follow-up line without the update notice it belongs to
+                       "WARNING: The following filter keys were not present in any resource : labels.other\n"):
+            with self.subTest(stderr=stderr):
+                h = Harness()
+                h.gcloud.list_stderr = stderr
+                with self.assertRaisesRegex(RuntimeError, "completeness unknown"):
+                    h.tick()
+                self.assertEqual(h.mutations(), [])
+                self.assertEqual(h.gcloud.mutating(), [])
 
     def test_default_gcloud_disables_partial_compute_results(self):
         with mock.patch.object(cv.subprocess, "run") as run:
