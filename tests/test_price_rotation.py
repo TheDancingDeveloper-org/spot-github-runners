@@ -2340,3 +2340,26 @@ class ReplacementListenerMatchingTests(unittest.TestCase):
                     patch("lib.spot_runner_autoscaler.delete_vm_and_disks"):
                 reconcile_replacement_cleanups([repl], [extended], SimpleNamespace(project="p"), state, path)
             self.assertNotIn("DELETE", [c.args[1] for c in api.call_args_list])
+
+
+class RecreatedReplacementCleanupTests(unittest.TestCase):
+    """Codex M4 round 17: a recreated same-name VM's runners are never claimed by name."""
+
+    def test_recreated_instance_runners_are_not_deregistered(self):
+        from lib.spot_runner_autoscaler import reconcile_replacement_cleanups, write_scale_state
+        recreated = GceVm("oxidex-runners-new", "z", "RUNNING", "n4-highcpu-16", True, instance_id="other")
+        theirs = GitHubRunner(222, "gha-oxidex-runners-new-1", "offline", False, ("spot",))
+        ours = GitHubRunner(111, "gha-oxidex-runners-new-2", "offline", False, ("spot",))
+        state = {"runner_inventory_observed_at": __import__("time").time(),
+                 "replacement_cleanups": {"z/oxidex-runners-new": {
+                     "name": "oxidex-runners-new", "zone": "z", "instance_id": "new", "target": "swack-tools",
+                     "runners": {"111": "gha-oxidex-runners-new-2"}}}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            write_scale_state(path, state)
+            with patch("lib.runner_drain.api", return_value={}) as api, \
+                    patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete:
+                reconcile_replacement_cleanups([recreated], [theirs, ours], SimpleNamespace(project="p"), state, path)
+            delete.assert_not_called()
+            deletes = [c.args[2] for c in api.call_args_list if c.args[1] == "DELETE"]
+            self.assertEqual(deletes, ["orgs/swack-tools/actions/runners/111"])  # recorded only, never 222

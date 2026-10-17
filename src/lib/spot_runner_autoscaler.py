@@ -1489,11 +1489,13 @@ def _delete_replacement(repl_vm, args, state, state_path, *, target=None, runner
                   repl_vm.name, error_detail(exc))
 
 
-def _deregister_replacement_runners(record, runners, state, state_path) -> bool:
+def _deregister_replacement_runners(record, runners, state, state_path, *, discover=True) -> bool:
     """Remove a deleted replacement's runner registrations; True once none remain.
 
-    Uses this check's fresh runner inventory: recorded runners (and any other ``gha-<vm>-`` runner
-    that appeared later) are deregistered only while offline and idle, matched by id and name.
+    Uses this check's fresh runner inventory: recorded runners (and, with ``discover``, any other
+    ``gha-<vm>-<n>`` runner that appeared later) are deregistered only while offline and idle,
+    matched by id and name. ``discover`` is off when another instance now uses the name, whose
+    listeners must never be claimed by name.
     """
     target = record.get("target")
     if not target:
@@ -1503,8 +1505,9 @@ def _deregister_replacement_runners(record, runners, state, state_path) -> bool:
         return False
     from .runner_drain import api
     pending = dict(record.get("runners") or {})
-    for runner in _replacement_runners(runners, record.get("name")):
-        pending.setdefault(str(runner.runner_id), runner.name)
+    if discover:
+        for runner in _replacement_runners(runners, record.get("name")):
+            pending.setdefault(str(runner.runner_id), runner.name)
     present = {str(r.runner_id): r for r in runners}
     for rid, name in list(pending.items()):
         runner = present.get(rid)
@@ -1589,7 +1592,14 @@ def reconcile_replacement_cleanups(vms, runners, args, state, state_path) -> Non
         current = next((vm for vm in vms if vm.name == record.get("name") and vm.zone == record.get("zone")
                         and (not record.get("instance_id") or vm.instance_id == record["instance_id"])), None)
         if current is None:
-            if not _deregister_replacement_runners(record, runners, state, state_path):
+            # A VM with the recorded name and zone but another instance ID is a recreation, not this
+            # replacement: only the registrations recorded for the original instance may be removed.
+            recreated = any(vm.name == record.get("name") and vm.zone == record.get("zone")
+                            for vm in vms) and bool(record.get("instance_id"))
+            if recreated:
+                LOG.warning("Aborted replacement %s was recreated under the same name; cleaning up only its "
+                            "recorded registrations", record.get("name"))
+            if not _deregister_replacement_runners(record, runners, state, state_path, discover=not recreated):
                 continue  # keep the obligation until every registration is confirmed gone
             cleanups.pop(key)
             LOG.info("Confirmed aborted replacement %s is deleted", record.get("name"))
