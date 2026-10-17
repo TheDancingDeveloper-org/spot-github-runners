@@ -1356,8 +1356,14 @@ def render_login_gate_html(
   const msg = document.getElementById("msg");
   function show(text) { msg.textContent = text || ""; }
   async function postJson(url, body) {
-    const res = await fetch(url, {method: "POST", credentials: "same-origin",
-      headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+    let res;
+    try {
+      res = await fetch(url, {method: "POST", credentials: "same-origin",
+        headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+    } catch (_e) {
+      // Transport failure (offline, reset): report status 0 so callers can recover instead of hanging.
+      return [{ok: false, status: 0, headers: new Headers()}, {error: "Network error; check your connection and try again"}];
+    }
     let data = {};
     try { data = await res.json(); } catch (_e) { data = {}; }
     return [res, data];
@@ -1417,6 +1423,10 @@ def render_login_gate_html(
       if (Date.now() > deadline) { status.textContent = "Code expired. Request a new one."; start.disabled = false; return; }
       const [pr, pd] = await postJson("/auth/device/token", {device_handle: d.device_handle});
       if (pr.ok && pd.status === "authorized") { window.location.assign("/"); return; }
+      if (pr.status === 0) {  // Transient network failure: keep polling until the code expires.
+        status.textContent = "Connection lost; retrying...";
+        setTimeout(poll, interval * 1000); return;
+      }
       if (pr.status === 429) {
         setTimeout(poll, Math.max(interval, Number(pr.headers.get("Retry-After")) || interval) * 1000); return;
       }

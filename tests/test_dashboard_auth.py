@@ -162,6 +162,74 @@ setTimeout(() => { out.session = session.dump(); out.local = local.dump();
 """
 
 
+_DEVICE_HARNESS = r"""
+const [script, cfg] = [process.argv[1], JSON.parse(process.argv[2])];
+const els = {};
+function el(id) {
+  if (!els[id]) els[id] = {id, hidden: true, disabled: false, textContent: "", href: "", listeners: {},
+    addEventListener(type, fn) { this.listeners[type] = fn; }};
+  return els[id];
+}
+["msg", "device-start", "device-box", "device-code", "device-link", "device-status"].forEach(el);
+const queue = [];
+global.setTimeout = fn => { queue.push(fn); return queue.length; };
+global.window = {location: {href: "https://spot.example/", assign: u => { out.assigned = u; },
+  replace: u => { out.assigned = u; }}, history: {replaceState() {}}};
+global.document = {title: "t", getElementById: id => els[id] || null};
+const mem = {getItem: () => null, setItem() {}, removeItem() {}};
+global.sessionStorage = mem; global.localStorage = mem;
+const out = {calls: [], assigned: null};
+let polls = 0;
+global.fetch = async (url) => {
+  out.calls.push(url);
+  if (url === "/auth/device/code") {
+    if (cfg.code_fails) throw new TypeError("Failed to fetch");
+    return {ok: true, status: 200, headers: new Headers(), json: async () => ({
+      user_code: "ABCD-1234", verification_uri: "https://github.com/login/device", interval: 5,
+      expires_in: 900, device_handle: "h"})};
+  }
+  polls += 1;
+  if (polls <= cfg.poll_failures) throw new TypeError("network reset");
+  return {ok: true, status: 200, headers: new Headers(), json: async () => ({status: "authorized"})};
+};
+new Function(script)();
+(async () => {
+  await els["device-start"].listeners.click();
+  for (let i = 0; i < 10 && queue.length; i++) { await queue.shift()(); }
+  out.msg = els.msg.textContent; out.disabled = els["device-start"].disabled;
+  out.status = els["device-status"].textContent;
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+_FETCH_WRAPPER_HARNESS = r"""
+const [source, cfg] = [process.argv[1], JSON.parse(process.argv[2])];
+const out = {calls: [], assigned: null, prompted: false, resolved: null};
+const NATIVE_FETCH = async (url, init) => {
+  out.calls.push(url);
+  if (url === "/api/auth/status") {
+    return {ok: true, status: 200, json: async () => ({oauth: {enabled: cfg.oauth}})};
+  }
+  return {ok: false, status: 401, json: async () => ({error: "Unauthorized"})};
+};
+function getDashboardAuthToken() { return ""; }
+function storeDashboardAuthToken() { return ""; }
+async function authenticateDashboardToken() { return false; }
+global.window = {location: {assign: u => { out.assigned = u; }}, prompt: () => { out.prompted = true; return null; }};
+new Function("NATIVE_FETCH", "getDashboardAuthToken", "storeDashboardAuthToken",
+  "authenticateDashboardToken", source)(NATIVE_FETCH, getDashboardAuthToken, storeDashboardAuthToken,
+  authenticateDashboardToken);
+window.fetch("/api/overview").then(r => { out.resolved = r.status; });
+setTimeout(() => process.stdout.write(JSON.stringify(out)), 50);
+"""
+
+
+def _run_node(harness: str, source: str, cfg: dict) -> dict:
+    proc = subprocess.run(["node", "-e", harness, source, json.dumps(cfg)],
+                          capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(proc.stdout)
+
+
 def _run_gate_script(script: str, *, stored: str, hash_part: str, login_ok: bool, recent: bool) -> dict:
     import time as _time
     session = {"dashboard_auth_token": stored} if stored else {}
@@ -1356,6 +1424,34 @@ class OAuthServerIntegrationTests(unittest.TestCase):
                     self.assertNotIn("dashboard_auth_token", result["local"])
                 if name == "fragment_valid":
                     self.assertEqual(result["url"], "/#tab=fleet")  # token stripped from the address bar
+
+    def _gate_script(self):
+        _, _, raw = self.request("GET", "/")
+        html = raw.decode()
+        script = html[html.index("<script"):]
+        return script[script.index(">") + 1:script.index("</script>")]
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the login gate script")
+    def test_device_login_recovers_from_network_failures(self):
+        self.start(client_secret="")
+        script = self._gate_script()
+        failed = _run_node(_DEVICE_HARNESS, script, {"code_fails": True, "poll_failures": 0})
+        self.assertIn("Network error", failed["msg"])
+        self.assertFalse(failed["disabled"])  # the user can retry without reloading
+        recovered = _run_node(_DEVICE_HARNESS, script, {"code_fails": False, "poll_failures": 2})
+        self.assertEqual(recovered["calls"].count("/auth/device/token"), 3)
+        self.assertEqual(recovered["assigned"], "/")
+
+    @unittest.skipUnless(shutil.which("node"), "node is required to execute the dashboard fetch wrapper")
+    def test_expired_oauth_session_returns_to_login_gate(self):
+        from lib.dashboard_ui_assets import render_dashboard_html
+        page = render_dashboard_html()
+        start = page.index("window.fetch = async function dashboardAuthorizedFetch")
+        source = page[start:page.index("\n    };", start) + len("\n    };")]
+        oauth = _run_node(_FETCH_WRAPPER_HARNESS, source, {"oauth": True})
+        self.assertEqual((oauth["assigned"], oauth["prompted"], oauth["resolved"]), ("/", False, None))
+        legacy = _run_node(_FETCH_WRAPPER_HARNESS, source, {"oauth": False})
+        self.assertEqual((legacy["assigned"], legacy["prompted"], legacy["resolved"]), (None, True, 401))
 
     def test_unchanged_targets_need_no_reauth(self):
         self.start()
