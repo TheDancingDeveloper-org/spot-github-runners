@@ -806,55 +806,6 @@ def deployment_details(args: argparse.Namespace) -> str:
     return "planned " + vm_details(vm)
 
 
-def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
-    patch = resolve_runner_patch(args)
-    if patch is None:
-        raise RuntimeError("Live patching requires --patch-repo or --patch-file")
-    vm = observed_deployment_vm(args, zone)
-    if not vm.running:
-        raise RuntimeError(f"Cannot hot-patch non-running VM: {vm_details(vm)}")
-    if vm.machine_type and vm.machine_type != args.instance_type:
-        raise RuntimeError(f"Existing VM type {vm.machine_type} does not match {args.instance_type}")
-    state_raw = gcloud(
-        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet",
-         "--command=sudo -n cat /var/lib/gha-runner-patch/state.json 2>/dev/null || true"],
-        quiet=True,
-    )
-    current_manifest = json.loads(state_raw).get("manifest") if state_raw.strip() else None
-    action = classify_patch_diff(current_manifest, patch)
-    if action == "noop":
-        LOG.info("VM %s is already at patch %s", args.instance_name, patch.patch_sha256[:12])
-        return "noop"
-    if action == "replace_vm":
-        raise RuntimeError(
-            f"Patch {patch.patch_sha256[:12]} changes hardware architecture or CPU ISA requirements; "
-            "a rolling VM replacement is required instead of --patch-live"
-        )
-    if action == "recreate_containers":
-        raise RuntimeError(
-            f"Patch {patch.patch_sha256[:12]} modifies container bind mounts; "
-            "containers must be drained and recreated instead of --patch-live"
-        )
-    prefix = f"{args.runner_prefix}-"
-    live_script = render_live_hot_patch_script(
-        patch,
-        base_dockerfile=RUNNER_DOCKERFILE,
-        runner_version=RUNNER_VERSION,
-        runner_prefix=prefix,
-    )
-    script_b64 = base64.b64encode(live_script.encode("utf-8")).decode("ascii")
-    remote_cmd = f"printf '%s' '{script_b64}' | base64 -d | sudo -n bash -euo pipefail"
-    output = gcloud(
-        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={remote_cmd}"],
-        quiet=True,
-    )
-    if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
-        raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
-    sync_runner_labels(args)
-    LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
-    return "hot_patch"
-
-
 def observed_deployment_vm(args: argparse.Namespace, zone: str) -> GceVm:
     arch, required_isa = _requested_arch_and_isa(args)
     for vm in list_gcloud_vms(PROJECT, name_prefix=args.instance_name):
