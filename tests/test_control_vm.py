@@ -1227,6 +1227,86 @@ class RollbackFenceTests(unittest.TestCase):
         self.assertEqual(h.mutations(), [("unfreeze", "a"), ("delete", "spot-control-b")])
 
 
+class ProvisionalOldStateTests(unittest.TestCase):
+    """Codex P1 round 13: state taken from an old VM that never confirmed a freeze is provisional."""
+
+    setup_rotation = ResumeFromPersistedStepTests.setup_rotation
+    with_new_vm = ResumeFromPersistedStepTests.with_new_vm
+
+    def old_delete(self, h):
+        return delete_call(h, "spot-control-a")
+
+    def finish_recovery(self, h):
+        h.clock[0] += cv.PROPAGATION_SECONDS + 1
+        h.tick()
+
+    def test_unfrozen_snapshot_import_keeps_old_disk_with_its_later_changes(self):
+        h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER)
+        self.with_new_vm(h)
+        h.http.freeze_status = 500  # reachable, healthy, but never freezes
+        with self.assertLogs(cv.LOG, level="ERROR") as marked:
+            for _ in range(cv.STEP_RETRY_LIMIT):
+                h.tick()
+        self.assertTrue(any("will be KEPT" in line for line in marked.output))
+        self.assertEqual(h.http.versions["b"], 7)  # the unfrozen snapshot (v7) was imported
+        self.assertTrue(h.transition["old_state_unconfirmed"])
+        self.assertIn("did not freeze", h.transition["old_state_unconfirmed_reason"])
+        manager = h.manager()
+        self.assertIn("did not freeze", manager.status(manager.observe(want_offers=False))["old_state_unconfirmed"])
+        h.http.versions["a"] = 8  # the still-unfrozen old dashboard accepts v8 before it is stopped
+        self.assertIn(("stop", "spot-control-a"), h.events)
+        h.gcloud.status("a", "TERMINATED")
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "b")
+        with self.assertLogs(cv.LOG, level="ERROR") as kept:
+            self.finish_recovery(h)
+        self.assertTrue(any("KEPT its boot disk" in line for line in kept.output))
+        self.assertIsNone(h.transition)
+        call = self.old_delete(h)
+        self.assertIn("--keep-disks=boot", call)  # v8 survives on the retained disk
+        self.assertNotIn("--delete-disks=all", call)
+        retained = h.state[cv.STATE_KEY]["retained_disks"]
+        self.assertEqual([(d["disk"], d["slot"]) for d in retained], [("spot-control-a", "a")])
+        self.assertIn("did not freeze", retained[0]["reason"])
+
+    def test_confirmed_freeze_deletes_old_disk(self):
+        h = self.setup_rotation("freeze", mode=cv.MODE_RECOVER)
+        self.with_new_vm(h)
+        h.tick()
+        self.assertTrue(h.transition["old_frozen"])
+        self.assertNotIn("old_state_unconfirmed", h.transition)
+        self.finish_recovery(h)
+        self.assertIsNone(h.transition)
+        self.assertIn("--delete-disks=all", self.old_delete(h))
+        self.assertEqual(h.state[cv.STATE_KEY].get("retained_disks", []), [])
+        self.assertNotIn(("stop", "spot-control-a"), h.events)
+
+    def test_old_vm_fenced_by_stop_keeps_its_disk(self):
+        # import_skipped was cleared by hand to isolate the stop fence as the only reason to keep the disk.
+        h = self.setup_rotation("cutover", mode=cv.MODE_RECOVER, kv_caught_up=True, freeze_requested=True,
+                                frozen_version=7)
+        h.http.unhealthy("a")
+        self.with_new_vm(h)
+        h.tick()
+        self.assertIn(("stop", "spot-control-a"), h.events)
+        self.assertIn("fenced by stopping", h.transition["old_state_unconfirmed_reason"])
+        h.gcloud.status("a", "TERMINATED")
+        h.tick()
+        self.finish_recovery(h)
+        self.assertIn("--keep-disks=boot", self.old_delete(h))
+        self.assertIn("fenced by stopping", h.state[cv.STATE_KEY]["retained_disks"][0]["reason"])
+
+    def test_recovery_without_a_recorded_freeze_keeps_old_disk(self):
+        # A recovery transition saved before freeze confirmation was recorded: no proof, so keep the disk.
+        h = self.setup_rotation("delete_old", mode=cv.MODE_RECOVER, cutover_attempted=True, cutover_at=1.0,
+                                freeze_requested=True, frozen_version=7)
+        h.kv.set_origin("b")
+        self.with_new_vm(h)
+        h.tick()
+        self.assertIn("--keep-disks=boot", self.old_delete(h))
+        self.assertIn("never confirmed frozen", h.state[cv.STATE_KEY]["retained_disks"][0]["reason"])
+
+
 class InstanceIdentityTests(unittest.TestCase):
     """Codex P1: a VM recreated under a transition's slot name is never stopped, deleted, or reactivated."""
 

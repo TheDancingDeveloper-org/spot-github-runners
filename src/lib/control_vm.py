@@ -1346,8 +1346,11 @@ class ControlVmManager:
                 if snapshot is not None:
                     self._snapshot = snapshot
                     t["frozen_version"] = snapshot["state_version"]
-                    self._note("old slot %s did not freeze; importing its snapshot at state_version %d",
-                               t["old_slot"], snapshot["state_version"], level=logging.WARNING)
+                    # The old dashboard was never frozen, so it may accept changes after this snapshot
+                    # until it is fenced by stop: the imported state is provisional.
+                    self._mark_old_state_unconfirmed(
+                        t, f"old slot {t['old_slot']} did not freeze; its unfrozen snapshot at state_version "
+                           f"{snapshot['state_version']} was imported, and it may have accepted later changes")
                     return self._advance_step(t)
                 t["import_skipped"] = True
                 self._goto(t, "cutover")
@@ -1414,6 +1417,24 @@ class ControlVmManager:
         self.save()
         return True
 
+    def _mark_old_state_unconfirmed(self, t: dict, reason: str) -> None:
+        """Record that the replacement's state may be older than the old VM's (no confirmed freeze).
+
+        delete_old then keeps the old boot disk (``retained_disks``) so an operator can reconcile it.
+        """
+        if t.get("old_state_unconfirmed"):
+            return
+        t["old_state_unconfirmed"] = True
+        t["old_state_unconfirmed_reason"] = reason
+        self.save()
+        self._note("%s; the old boot disk will be KEPT when the old VM is deleted so those changes can be "
+                   "reconciled by an operator", reason, level=logging.ERROR)
+
+    @staticmethod
+    def _old_state_confirmed(t: dict) -> bool:
+        """True only when the old VM confirmed a freeze, so the imported snapshot is its final state."""
+        return bool(t.get("old_frozen")) and not t.get("old_state_unconfirmed")
+
     def _fence_old_writer(self, t: dict, obs: Observation) -> bool:
         """True once the old slot can no longer accept writes: confirmed frozen, or confirmed stopped.
 
@@ -1425,7 +1446,13 @@ class ControlVmManager:
         if t["mode"] != MODE_RECOVER or not t.get("old_slot") or t.get("old_frozen"):
             return True
         old = obs.vm(t["old_slot"])
-        if old is None or old.status in STOPPED_STATES:
+        if old is None:
+            return True  # nothing left that could write (its boot disk went with it)
+        # Fenced by stop rather than freeze: whatever it accepted before it stopped may be only on its disk.
+        self._mark_old_state_unconfirmed(
+            t, f"old slot {t['old_slot']} was fenced by stopping it, not by a confirmed freeze; changes it "
+               f"accepted before it stopped may exist only on its boot disk")
+        if old.status in STOPPED_STATES:
             return True
         if self._request_stop(t, "old", old, "old_stop_requested_at", "(unreachable old slot) before cutover"):
             t["error"] = f"waiting for old slot {t['old_slot']} ({old.status}) to stop before cutover"
@@ -1491,10 +1518,14 @@ class ControlVmManager:
             if not ready:
                 return self._replacement_not_ready(t, obs, detail)
             t.pop("replacement_unready_since", None)
-            # Recovery without an import (the old VM was down) may leave changes on the old disk that never
-            # reached KV, so its boot disk is kept.
-            if not self._delete_vm(t, old, role="old", keep_boot_disk=bool(t.get("import_skipped")),
-                                   reason="old VM went down before its state was imported"):
+            # Without a confirmed freeze (recovery without an import, an unfrozen snapshot, or an old VM
+            # fenced by stop) the old disk may hold changes that never reached the replacement: keep it.
+            keep = t.get("import_skipped") or not self._old_state_confirmed(t)
+            if t.get("import_skipped"):
+                reason = "old VM went down before its state was imported"
+            else:
+                reason = t.get("old_state_unconfirmed_reason") or "old VM was never confirmed frozen"
+            if not self._delete_vm(t, old, role="old", keep_boot_disk=bool(keep), reason=reason):
                 self._fail_attempt(t, t["error"], limit=10**9)
                 return "wait"
         return self._finish(t)
@@ -1703,6 +1734,9 @@ class ControlVmManager:
             "last_transition_end_at": self.cstate.get("last_transition_end_at"),
             "last_abort_at": self.cstate.get("last_abort_at"),
             "retained_disks": self.cstate.get("retained_disks", []),
+            "old_state_unconfirmed": ((self.cstate.get("transition") or {}).get("old_state_unconfirmed_reason")
+                                      if (self.cstate.get("transition") or {}).get("old_state_unconfirmed")
+                                      else None),
             "problems": obs.problems,
             "offers": [o.to_dict() for o in obs.offers[:5]] if obs.offers else None,
         }
