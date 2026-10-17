@@ -1379,6 +1379,23 @@ class ReplacementEvidenceTests(RotationHarness, unittest.TestCase):
         self.assertNotIn("99", saved["price_rotation"].get("cordoned_runners", {}))
         self.assertNotIn("DELETE", [c.args[1] for c in mock_api.call_args_list])  # labels untouched
 
+    def test_preempted_outgoing_vm_is_deleted_without_ssh_quiesce(self):
+        """Codex M4 round 19: a TERMINATED outgoing VM must not stall the rotation on SSH."""
+        stopped = replace_vm(self.outgoing_vm, status="TERMINATED")
+        state = self.state("delete")
+        with patch("lib.spot_runner_autoscaler.quiesce_remote_builder", side_effect=AssertionError("no ssh")), \
+                patch("lib.spot_runner_autoscaler.delete_vm_and_disks") as delete_stopped, \
+                patch("lib.spot_runner_autoscaler.delete_overpriced_vm") as delete_running, \
+                patch("lib.runner_drain.jobs_finished", return_value=True), \
+                patch("lib.spot_runner_autoscaler.now", return_value=self.now), \
+                tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            step_price_rotation([stopped, self.replacement_vm], [self.new_runner], self.args, state, path)
+            saved = read_scale_state(path)
+        delete_running.assert_not_called()
+        delete_stopped.assert_called_once_with(stopped, "homelab-424523")
+        self.assertNotIn("price_rotation", saved)
+
     def test_delete_never_targets_a_same_named_vm_with_another_identity(self):
         reused = replace_vm(self.outgoing_vm, instance_id="reused-999")
         state = self.state("delete")

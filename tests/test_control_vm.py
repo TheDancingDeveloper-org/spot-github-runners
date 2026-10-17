@@ -2014,3 +2014,27 @@ class MalformedOriginTests(unittest.TestCase):
         h.tick()
         self.assertEqual(h.kv.store[edge_state.KV_ORIGIN_KEY], "{corrupt")  # never rewritten
         self.assertEqual(h.mutations(), [])
+
+
+class SavedOfferRevalidationTests(unittest.TestCase):
+    """Codex M4 round 19: a resumed create never provisions above the cap on a stale saved quote."""
+
+    def resume_create(self, offers):
+        h = ResumeFromPersistedStepTests().setup_rotation("create")
+        h.offers = offers
+        h.tick()
+        return [e for e in h.events if e[0] == "create"]
+
+    def test_saved_offer_now_over_cap_is_not_used(self):
+        # Saved plan: e2-small in us-east1-b at 0.10/day. Today that placement costs 0.80 (> cap).
+        creates = self.resume_create([offer("e2-small", "us-east1-b", "0.80"),
+                                      offer("e2-small", "us-central1-a", "0.20")])
+        self.assertEqual(creates, [("create", "spot-control-b", "us-central1-a")])
+
+    def test_saved_offer_still_affordable_is_preferred(self):
+        creates = self.resume_create([offer("e2-small", "us-central1-a", "0.05"),
+                                      offer("e2-small", "us-east1-b", "0.30")])
+        self.assertEqual(creates, [("create", "spot-control-b", "us-east1-b")])
+
+    def test_failed_price_scan_creates_nothing(self):
+        self.assertEqual(self.resume_create([]), [])

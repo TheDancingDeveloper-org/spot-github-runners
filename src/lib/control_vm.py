@@ -1167,8 +1167,16 @@ class ControlVmManager:
         preferred = [o for o in candidates if o.zone not in t.get("excluded_zones", [])]
         candidates = preferred or candidates
         if t.get("offer") and not failed:
+            # Prefer the planned placement only if a fresh scan still quotes it under the cap, and use
+            # that current quote: a saved offer's price is not evidence of today's price.
             planned = ControlOffer.from_dict(t["offer"])
-            candidates = [planned] + [o for o in candidates if o != planned]
+            current = next((o for o in candidates
+                            if (o.machine_type, o.zone) == (planned.machine_type, planned.zone)), None)
+            if current is not None:
+                candidates = [current] + [o for o in candidates if o is not current]
+            else:
+                self._note("planned offer %s in %s is no longer priced under the cap; choosing from the fresh scan",
+                           planned.machine_type, planned.zone, level=logging.WARNING)
         if not candidates:
             if affordable:
                 # Every available zone failed recently: start over with the full list next tick

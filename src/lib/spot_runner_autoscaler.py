@@ -2196,7 +2196,10 @@ def _step_rotation_delete(vms, runners, args, state, state_path, rotation):
             write_scale_state(state_path, state)
             return True
 
-    if out_vm is not None and not quiesce_remote_builder(out_vm, args):
+    # A stopped outgoing VM (for example preempted after deletion was first attempted) runs no builds and
+    # cannot be reached over SSH; quiescing it would wait forever.
+    stopped = out_vm is not None and not out_vm.running
+    if out_vm is not None and not stopped and not quiesce_remote_builder(out_vm, args):
         # Re-confirm under the builder lock right before deletion; never delete under a build.
         LOG.info("Rotation deletion waits for remote builds to finish on %s", out_dict["name"])
         write_scale_state(state_path, state)
@@ -2215,7 +2218,11 @@ def _step_rotation_delete(vms, runners, args, state, state_path, rotation):
     else:
         try:
             guard_fleet_mutation(state, out_vm, is_rotation=True)
-            delete_overpriced_vm(out_vm, args.project)
+            if stopped:
+                # Identity already verified above; delete_overpriced_vm only accepts running VMs.
+                delete_vm_and_disks(out_vm, args.project)
+            else:
+                delete_overpriced_vm(out_vm, args.project)
             LOG.info("Deleted old Spot VM %s and its attached disks", out_dict["name"])
         except Exception as exc:
             LOG.error("Failed to delete old VM %s: %s; retrying next loop", out_dict["name"], error_detail(exc))
