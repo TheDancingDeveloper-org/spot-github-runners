@@ -175,6 +175,11 @@ def strict_pool_settings(args):
     if type(count)is not int or count not in (2,3):raise RuntimeError('Strict pool must contain two or three runners')
     if getattr(args,'remote_builder',False):raise RuntimeError('Strict CI pool cannot host remote builders')
     if getattr(args,'tier',None):raise RuntimeError('Strict pool is an explicit fixed mode, not a tier override')
+    # Strict pools are verified through an organization runner group; reject a repository target
+    # here, before any VM is provisioned or listener registered, instead of failing afterwards.
+    target=resolve_target(getattr(args,'target',None) or getattr(args,'org',ORG))
+    if target.is_repo:raise RuntimeError(f'Strict pools need an organization runner group; repository target {target.name} is not supported')
+    if not getattr(args,'runner_group_id',None):raise RuntimeError('Strict pool requires --runner-group-id')
     if args.cpu < count*8+2 or args.ram < count*32+16:raise RuntimeError('Strict pool needs 2 CPU and 16 GiB host headroom')
     return count
 
