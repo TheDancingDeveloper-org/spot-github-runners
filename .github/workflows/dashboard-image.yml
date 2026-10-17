@@ -29,9 +29,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      # TODO(review): pin actions/checkout to a full commit SHA once verified.
       - name: Check out
-        uses: actions/checkout@v4
+        # actions/checkout v4, pinned to the commit the v4 tag resolved to on 2026-10-17.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
