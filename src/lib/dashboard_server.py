@@ -190,6 +190,13 @@ class ControlledTargetsConflictError(RuntimeError):
 
 
 
+def snapshot_state_digest(state: Any) -> str:
+    """SHA-256 of a snapshot's state, ignoring ``updated_at`` (a re-save of the same content changes only that)."""
+    content = {k: v for k, v in state.items() if k != "updated_at"} if isinstance(state, dict) else state
+    return hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                                     default=str).encode("utf-8")).hexdigest()
+
+
 def _iso_hours_ago(hours_ago: float, base_epoch: float | None = None) -> str:
     now_ts = base_epoch if base_epoch is not None else time.time()
     dt = datetime.fromtimestamp(now_ts - hours_ago * 3600.0, tz=timezone.utc)
@@ -1057,6 +1064,9 @@ class DashboardStore:
         self._kv_dirty_last_at = 0.0
         self._kv_next_attempt_at = 0.0
         self.kv_last_written_version: int | None = None
+        # Set when a published snapshot did not read back as ours: this store is fenced (changes wait).
+        self.publish_conflict = ""
+        self._conflict_expect: tuple[int, str] = (0, "")
         # Every KV snapshot write (background write-behind and freeze) runs under this lock, in version order.
         self._kv_write_lock = threading.Lock()
         # True once this VM, as the KV writer, has compared its state with the KV snapshot (and adopted a
@@ -1765,24 +1775,21 @@ class DashboardStore:
                               "writing state_version %d", version, last)
                     return None
                 return version  # Already published.
+            if envelope.get("writer_slot") != self.control_slot:
+                LOG.error("REFUSING to publish a dashboard snapshot that names writer slot %r from slot %s",
+                          envelope.get("writer_slot"), self.control_slot)
+                return None
+            digest = snapshot_state_digest(envelope.get("state") or {})
             try:
-                # Under the write lock, immediately before the put: this VM must still own origin:active and
-                # KV must not already hold a newer snapshot. (Equal versions share one history: a handover
-                # target imports the frozen version before changing anything.)
-                raw_origin = self.kv.get(KV_ORIGIN_KEY)
-                if raw_origin is not None:
-                    record = OriginRecord.from_json(raw_origin)
-                    if record is None or record.slot != self.control_slot:
-                        self.kv_writer = False
-                        self._writer_synced = False
-                        self.known_inactive = record is not None
-                        self.ownership = "inactive" if record is not None else "unknown"
-                        self._writer_checked_at = self._clock()
-                        LOG.warning("Skipping dashboard KV write: origin:active names slot %s, not %s",
-                                    record.slot if record else None, self.control_slot)
-                        if captured:
-                            self._restore_kv_dirty()
-                        return None
+                # Under the write lock, immediately before the put: a fresh read must show this VM owns
+                # origin:active (a malformed record is unknown ownership), and KV must not hold a newer snapshot
+                # or a different one at the same version.
+                if not self._apply_origin(self.kv.get(KV_ORIGIN_KEY)):
+                    LOG.warning("Skipping dashboard KV write: slot %s does not own origin:active (%s)",
+                                self.control_slot, self.ownership)
+                    if captured:
+                        self._restore_kv_dirty()
+                    return None
                 raw_current = self.kv.get(KV_STATE_KEY)
                 current, outcome = self._classify_kv_snapshot(raw_current)
                 if outcome == "invalid":
@@ -1798,13 +1805,65 @@ class DashboardStore:
                     if captured:
                         self._restore_kv_dirty()
                     return None
+                if current is not None and current["state_version"] == version:
+                    if snapshot_state_digest(current["state"]) == digest:
+                        self.kv_last_written_version = version  # Idempotent republish: KV already has it.
+                        return version
+                    # Same version, different content: never overwrite it. From the other slot this is expected right
+                    # after a handover import (local normalization differs); KV already holds that history, and
+                    # this VM's next change publishes version + 1.
+                    log = LOG.error if current.get("writer_slot") == self.control_slot else LOG.warning
+                    log("Not overwriting the KV dashboard snapshot at state_version %d (slot %s): this VM holds "
+                        "different content at the same version", version, current.get("writer_slot"))
+                    return None
                 self.kv.put(KV_STATE_KEY, json.dumps(envelope, separators=(",", ":"), allow_nan=False))
+                verified = self._verify_published(version, digest)
             except KvError:
                 if captured:
                     self._restore_kv_dirty()
                 raise
+            if not verified:
+                return None
             self.kv_last_written_version = version
             return version
+
+    def _verify_published(self, version: int, digest: str) -> bool:
+        """Read the snapshot back after a PUT; anything but our slot, version, and content fences this store."""
+        try:
+            stored, _outcome = self._classify_kv_snapshot(self.kv.get(KV_STATE_KEY))
+        except KvError as exc:
+            stored = None
+            LOG.warning("Could not read back the published dashboard snapshot: %s", exc)
+        if (stored is not None and stored.get("writer_slot") == self.control_slot
+                and stored["state_version"] == version and snapshot_state_digest(stored["state"]) == digest):
+            self.publish_conflict = ""
+            return True
+        found = (f"slot {stored.get('writer_slot')} state_version {stored['state_version']}" if stored is not None
+                 else "an unreadable value")
+        self.publish_conflict = (f"after writing state_version {version} from slot {self.control_slot}, KV holds "
+                                 f"{found}; changes wait until KV shows this slot's snapshot")
+        self._conflict_expect = (version, digest)
+        self.kv_writer = False
+        self._writer_synced = False
+        LOG.error("DASHBOARD KV PUBLISH CONFLICT: %s", self.publish_conflict)
+        return False
+
+    def _resolve_publish_conflict(self) -> bool:
+        """True once KV shows the snapshot this store wrote (for example after eventual consistency caught up)."""
+        if not self.publish_conflict or self.kv is None:
+            return True
+        version, digest = self._conflict_expect
+        try:
+            stored, _outcome = self._classify_kv_snapshot(self.kv.get(KV_STATE_KEY))
+        except KvError:
+            return False
+        if (stored is not None and stored.get("writer_slot") == self.control_slot
+                and stored["state_version"] == version and snapshot_state_digest(stored["state"]) == digest):
+            LOG.warning("Dashboard KV publish conflict resolved: KV shows this slot's state_version %d", version)
+            self.publish_conflict = ""
+            self.kv_last_written_version = version
+            return True
+        return False
 
     def _kv_put_snapshot(self) -> int | None:
         """Background write of the current state. Returns the written state_version (None when refused)."""
@@ -1815,6 +1874,11 @@ class DashboardStore:
         if self.kv is None:
             return False
         now = self._clock()
+        if self.publish_conflict:
+            # Fenced after a publish that did not read back as ours: only re-check; never write again until resolved.
+            if now >= self._kv_next_attempt_at and not self._resolve_publish_conflict():
+                self._kv_next_attempt_at = now + KV_RETRY_BACKOFF_SECONDS
+            return False
         if self.hydrated and not self.reconciled:
             if now >= self._reconcile_next_at and not self.reconcile():
                 self._reconcile_next_at = now + self._reconcile_delay
@@ -1961,6 +2025,10 @@ class DashboardStore:
             if self.hydrate_problem and not hydrated:
                 status = "state_unavailable"
             extra = {"reason": self.hydrate_problem} if self.hydrate_problem else {}
+            if self.publish_conflict and not frozen:
+                # Not "ok", so the control-VM controller sees it; changes wait until KV shows this slot's write.
+                status = "state_conflict"
+                extra = {"reason": self.publish_conflict}
             return {
                 **extra,
                 "status": status,
@@ -2036,6 +2104,8 @@ class DashboardStore:
 
     def _mutation_preflight(self) -> None:
         """Gates every change shares (outside the lock): fresh ownership, writer sync, active slot."""
+        if self.publish_conflict and not self._resolve_publish_conflict():
+            raise DashboardFrozenError(f"Dashboard KV publish conflict: {self.publish_conflict}")
         if self.hydrated and not self.frozen:
             self._confirm_ownership_now()
         if self.hydrated and not self.frozen and not self.sync_with_kv_as_writer():

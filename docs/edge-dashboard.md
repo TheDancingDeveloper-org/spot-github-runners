@@ -102,6 +102,15 @@ Until then the dashboard fails closed:
   dashboard unhydrated with a `reason` in `/api/health`.
 - With local state and an unverifiable KV snapshot, the dashboard serves local state read-only. It
   never overwrites that KV value, because it may be newer.
+- Before each KV write, the dashboard reads `origin:active` again and requires the snapshot to name this
+  slot. It never overwrites a newer snapshot, or one at the same version with different content. After the
+  write it reads the snapshot back. If the snapshot isn't this slot's, the dashboard stops accepting
+  changes and `/api/health` reports `"status": "state_conflict"` with a reason until KV shows this slot's
+  write.
+- Workers KV is eventually consistent and has no compare-and-swap, so these checks narrow the race between
+  two writers but can't rule it out. The real exclusivity guarantee is the autoscaler's fence: it stops the
+  old control VM and confirms that it stopped before any recovery cutover. A Durable Object holding the
+  active-slot pointer and the snapshot version is the planned upgrade.
 - A VM accepts a change only after it reads `origin:active` again for that change and confirms that the
   record names its slot, or that no record exists yet. A record that exists but can't be parsed counts as
   unknown ownership, and so does a failed read. `/api/health` reports `ownership` as `active`, `inactive`, or `unknown`.

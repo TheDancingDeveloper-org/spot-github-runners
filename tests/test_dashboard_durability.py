@@ -1049,6 +1049,141 @@ class FreshOwnershipTests(unittest.TestCase):
         self.assertGreaterEqual(len(self.origin_reads()) - before, 2)
 
 
+class PublishSafetyTests(unittest.TestCase):
+    """Codex round 11: publish requires fresh ownership, never overwrites a different snapshot at the same or a
+    newer version, and verifies the write by reading it back."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = FakeKvRequester()
+
+    def store(self, slot="a", name="a.json"):
+        store = DashboardStore(Path(self.tmp.name) / name, control_slot=slot, kv=make_kv(self.fake),
+                               clock=FakeClock(), sleep=lambda _s: None)
+        store.hydrate()
+        return store
+
+    def puts(self):
+        return [c for c in self.fake.calls if c == ("PUT", KV_STATE_KEY)]
+
+    def test_publish_needs_fresh_ownership_and_its_own_writer_slot(self):
+        store = self.store()
+        store.set_controlled_targets(["o/a"])
+        for raw in (OriginRecord.for_slot("b", now=2).to_json(), "malformed"):
+            self.fake.values[KV_ORIGIN_KEY] = raw
+            with self.subTest(origin=raw):
+                self.assertIsNone(store._publish_snapshot())
+                self.assertEqual(self.puts(), [])
+                self.assertNotEqual(store.ownership, "active")
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=3).to_json()
+        envelope = store.snapshot_envelope()
+        envelope["writer_slot"] = "b"  # a snapshot claiming another writer is never published
+        with self.assertLogs("spot_dashboard", "ERROR"):
+            self.assertIsNone(store._publish_snapshot(envelope))
+        self.assertEqual(self.puts(), [])
+        self.assertEqual(store._publish_snapshot(), store.state_version())
+        self.assertEqual(len(self.puts()), 1)
+
+    def test_two_stores_at_the_same_version_never_overwrite_each_other(self):
+        self.fake.values[KV_STATE_KEY] = kv_snapshot(7, ["base/repo"])
+        a, b = self.store("a", "a.json"), self.store("b", "b.json")
+        self.assertEqual((a.state_version(), b.state_version()), (7, 7))
+        b.set_controlled_targets(["b/policy"])  # both now hold different content at version 8
+        a.set_controlled_targets(["a/policy"])
+        # Ownership briefly looks unset to both (the window the VM fence closes): b publishes first.
+        self.assertEqual(b._publish_snapshot(), 8)
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.assertIsNone(a._publish_snapshot())
+        stored = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual((stored["writer_slot"], stored["state"]["controlled_targets"]), ("b", ["b/policy"]))
+        self.assertEqual(len(self.puts()), 1)
+
+    def test_identical_content_at_the_same_version_is_an_idempotent_republish(self):
+        store = self.store()
+        store.set_controlled_targets(["o/same"])
+        envelope = store.snapshot_envelope()
+        self.assertEqual(store._publish_snapshot(envelope), store.state_version())
+        store.kv_last_written_version = None  # for example a restarted process republishing what it wrote
+        envelope = {**envelope, "written_at": envelope["written_at"] + 60,
+                    "state": {**envelope["state"], "updated_at": "2099-01-01T00:00:00Z"}}
+        puts = len(self.puts())
+        self.assertEqual(store._publish_snapshot(envelope), store.state_version())
+        self.assertEqual(len(self.puts()), puts)  # nothing rewritten
+
+    def test_handover_target_never_overwrites_the_snapshot_it_imported(self):
+        old = self.store("a", "a.json")
+        old.set_controlled_targets(["o/handover"])
+        self.assertEqual(old._publish_snapshot(), old.state_version())
+        new = DashboardStore(Path(self.tmp.name) / "b.json", control_slot="b", kv=make_kv(self.fake),
+                             clock=FakeClock(), sleep=lambda _s: None)
+        new.import_snapshot(old.snapshot_envelope())
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=5).to_json()
+        puts = len(self.puts())
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            new._publish_snapshot()  # equal version: KV already holds that history, so nothing is rewritten
+        self.assertEqual(len(self.puts()), puts)
+        self.assertEqual(parse_snapshot(self.fake.values[KV_STATE_KEY])["writer_slot"], "a")
+        new.set_controlled_targets(["o/handover", "o/next"])  # the first new change publishes normally
+        self.assertEqual(new._publish_snapshot(), old.state_version() + 1)
+        self.assertEqual(parse_snapshot(self.fake.values[KV_STATE_KEY])["writer_slot"], "b")
+
+    def test_read_back_mismatch_fences_the_store_until_kv_shows_our_write(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        store = self.store()
+        store.set_controlled_targets(["o/ours"])
+        real = self.fake.__call__
+        intruder = kv_snapshot(store.state_version(), ["o/theirs"], slot="b")
+
+        def overwritten(method, url, headers, body, timeout):
+            result = real(method, url, headers, body, timeout)
+            if method == "PUT":
+                self.fake.values[KV_STATE_KEY] = intruder  # another writer landed right after ours
+            return result
+
+        store.kv.requester = overwritten
+        with self.assertLogs("spot_dashboard", "ERROR") as logs:
+            self.assertIsNone(store._publish_snapshot())
+        self.assertTrue(any("PUBLISH CONFLICT" in line for line in logs.output))
+        self.assertFalse(store.kv_writer)
+        health = store.health()
+        self.assertEqual(health["status"], "state_conflict")
+        self.assertIn("slot b", health["reason"])
+        with self.assertRaises(DashboardFrozenError):  # changes wait while fenced
+            store.run_request(None, "POST", "/api/targets",
+                              lambda: (200, {"t": store.set_controlled_targets(["o/next"])}))
+        store.kv.requester = real
+        self.assertFalse(store.kv_tick())  # still fenced: KV does not show our write
+        self.assertTrue(store.publish_conflict)
+        ours = store.snapshot_envelope()
+        self.fake.values[KV_STATE_KEY] = json.dumps(ours)  # e.g. eventual consistency caught up
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.assertEqual(store.run_request(None, "POST", "/api/targets",
+                                               lambda: (200, {"t": store.set_controlled_targets(["o/next"])}))[0], 200)
+        self.assertEqual(store.publish_conflict, "")
+        self.assertEqual(store.health()["status"], "ok")
+
+    def test_unreadable_read_back_also_fences(self):
+        store = self.store()
+        store.set_controlled_targets(["o/ours"])
+        real = self.fake.__call__
+        state = {"after_put": False}
+
+        def flaky(method, url, headers, body, timeout):
+            if method == "GET" and state["after_put"] and url.endswith("/values/" + urllib.parse.quote(KV_STATE_KEY, safe="")):
+                raise KvError("read-back failed")
+            result = real(method, url, headers, body, timeout)
+            if method == "PUT":
+                state["after_put"] = True
+            return result
+
+        store.kv.requester = flaky
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.assertIsNone(store._publish_snapshot())
+        self.assertIn("unreadable", store.publish_conflict)
+
+
 class StrictSnapshotClassificationTests(unittest.TestCase):
     """P1-b: an existing KV snapshot that fails verification is never treated as "no snapshot"."""
 
