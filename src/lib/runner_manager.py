@@ -29,6 +29,7 @@ from .fleet_logging import vm_details
 from .runner_fleet import (
     MAX_PATCH_METADATA_BYTES,
     NO_PATCH,
+    PATCH_BOOT_METADATA_KEY,
     PATCH_LABEL_KEY,
     PATCH_LABEL_SHA_CHARS,
     PATCH_METADATA_KEY,
@@ -45,21 +46,26 @@ from .runner_fleet import (
     RUNNER_REGISTRATION_TARGET_METADATA_KEY,
     GceVm,
     gce_metadata_items,
+    gce_timestamp,
     list_gcloud_vms,
+    runner_deployment_from_gce_item,
 )
 from .log_format import configure_logging, error_detail, single_line
 from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED,
                             RUNNER_DOCKERFILE, RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
 from .builder_assets import BUILDER_DOCKERFILE, BUILDER_ENTRYPOINT, HOST_LAUNCHER
-from .target_config import TARGET_LABEL_KEY, TargetConfig, resolve_target, target_label_value, target_owns_vm_label
+from .target_config import (DEFAULT_ORG, TARGET_LABEL_KEY, TargetConfig, resolve_target, target_label_value,
+                            target_owns_vm_label)
 from .runner_patch import (
     RunnerPatch,
     classify_patch_diff,
     fetch_patch_from_config_repo,
     host_capacity_problems,
+    PATCH_RECEIPT_READ_COMMAND,
     inject_startup_patch,
     load_patch_from_file,
+    parse_patch_receipt,
     render_dockerfile,
     render_live_hot_patch_script,
 )
@@ -514,15 +520,19 @@ def _plain_metadata_flag(plain: dict[str, str]) -> str:
     return "--metadata=" + ",".join(f"{k}={v}" for k, v in plain.items())
 
 
-def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatch | None, *,
+def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatch | None, *, boot: str,
                           existing_keys: set[str] | None = None, clear_pending: bool = False) -> None:
     """Record the patch a running host now runs (instance metadata plus a sha-prefix label).
 
-    Call it only after the host confirmed ``patch`` (a completed bootstrap or LIVE_PATCH_APPLIED).
-    ``clear_pending`` then removes the PENDING keys, last, so the host never looks confirmed before the
-    applied record is complete.
+    Call it only after the host confirmed ``patch`` (a completed bootstrap or LIVE_PATCH_APPLIED). ``boot`` is
+    the GCE lastStartTimestamp of the boot that confirmation belongs to (see confirmed_boot); a later boot makes
+    the record stale. ``clear_pending`` then removes the PENDING keys, last, so the host never looks
+    confirmed before the applied record is complete.
     """
+    if not gce_timestamp(boot):
+        raise RuntimeError(f"Refusing to record a patch for {args.instance_name} without the boot it was confirmed in")
     plain, manifest, label = runner_patch_record(args, patch)
+    plain[PATCH_BOOT_METADATA_KEY] = gce_timestamp(boot)
     manifest_path = None
     try:
         command = ["compute", "instances", "add-metadata", args.instance_name, f"--zone={zone}",
@@ -546,6 +556,82 @@ def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatc
             Path(manifest_path).unlink(missing_ok=True)
 
 
+def confirmed_boot(args: argparse.Namespace, zone: str, observed: GceVm) -> str:
+    """The boot (GCE lastStartTimestamp) a patch confirmation belongs to.
+
+    ``observed`` is the VM as seen before the confirmation (bootstrap marker or LIVE_PATCH_APPLIED). A fresh
+    observation must show the same instance and boot; otherwise it restarted mid-confirmation and nothing is
+    recorded.
+    """
+    before = gce_timestamp(observed.last_start_timestamp)
+    now = observed_deployment_vm(args, zone)
+    after = gce_timestamp(now.last_start_timestamp)
+    if not before or not after:
+        raise RuntimeError(f"Cannot bind the confirmed patch of {args.instance_name} to a boot: lastStartTimestamp is "
+                           "unknown; the applied patch is not recorded")
+    if before != after or (observed.instance_id and now.instance_id != observed.instance_id):
+        raise RuntimeError(f"{args.instance_name} restarted while its patch was being confirmed (boot {before}, now "
+                           f"{after}); the applied patch is not recorded")
+    return before
+
+
+def registered_runner_rows(target: TargetConfig) -> list[dict]:
+    """Every runner registered to ``target`` on GitHub (raises when the scope can't be listed)."""
+    output = run(["gh", "api", "--paginate", target.runners_url, "--jq", ".runners[] | @json"], quiet=True)
+    return [json.loads(row) for row in output.splitlines() if row.strip()]
+
+
+def runners_named_for_vm(rows: list[dict], vm_name: str) -> list[str]:
+    """Names of the runners startup.sh registers for ``vm_name`` (``<prefix>-<vm>-<n>``), with any prefix."""
+    pattern = re.compile(rf"[A-Za-z0-9._-]+-{re.escape(vm_name)}-[0-9]+")
+    return sorted(str(row.get("name")) for row in rows
+                  if isinstance(row, dict) and pattern.fullmatch(str(row.get("name") or "")))
+
+
+def verify_adoption_registrations(args: argparse.Namespace, vm: dict) -> None:
+    """Refuse to relabel an unlabeled VM whose runners are registered to another GitHub scope.
+
+    The runner data disk keeps each runner's ``.runner`` registration and entrypoint.sh skips configuration when
+    it exists, so relabeling would scope the VM to the new target while its listeners stay registered elsewhere.
+    The new target, the default organization (which owns unlabeled hosts), and any registration scope recorded on
+    the VM are listed; a scope that can't be listed refuses the adoption rather than guessing.
+    """
+    new = resolve_target(args.target)
+    recorded = gce_metadata_items(vm).get(RUNNER_REGISTRATION_TARGET_METADATA_KEY, "").strip()
+    if recorded and runner_deployment_from_gce_item(vm).get("registration_target") != recorded:
+        raise RuntimeError(f"Cannot verify which GitHub scope the runners of {args.instance_name} are registered to "
+                           f"(recorded scope {recorded!r} is malformed); refusing to adopt it for {new.name}")
+    candidates = [args.target, DEFAULT_ORG, ORG, recorded]
+    elsewhere: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or str(candidate).lower() in seen:
+            continue
+        seen.add(str(candidate).lower())
+        try:
+            scope = resolve_target(candidate)
+            names = runners_named_for_vm(registered_runner_rows(scope), args.instance_name)
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(f"Cannot verify which GitHub scope the runners of {args.instance_name} are registered "
+                               f"to ({candidate}: {exc}); refusing to adopt it for {new.name}") from exc
+        if names and scope.name.lower() != new.name.lower():
+            elsewhere[scope.name] = names
+    if elsewhere:
+        found = "; ".join(f"{scope}: {', '.join(names)}" for scope, names in sorted(elsewhere.items()))
+        raise RuntimeError(f"VM {args.instance_name} has runners registered to another target ({found}). Their "
+                           f"persisted registrations would keep serving that target after it is labeled for "
+                           f"{new.name}; drain the host and remove those registrations (or reprovision it) first")
+
+
+def adoption_preflight(args: argparse.Namespace, zone: str) -> None:
+    """Ownership and registration checks for --existing-instance, before anything (even a start) changes the VM."""
+    describe = subprocess.run(["gcloud", "compute", "instances", "describe", args.instance_name,
+                               "--zone", zone, "--project", PROJECT, "--format=json"], text=True, capture_output=True)
+    if describe.returncode:
+        raise RuntimeError(f"Existing VM {args.instance_name} was not found")
+    adoption_target_label(args, json.loads(describe.stdout))
+
+
 def adoption_target_label(args: argparse.Namespace, vm: dict) -> str | None:
     """Ownership check for adopting an existing VM; returns the target label to set first, or None.
 
@@ -563,6 +649,7 @@ def adoption_target_label(args: argparse.Namespace, vm: dict) -> str | None:
                                f"refusing to adopt it for {target.name}")
         return None
     if getattr(args, "target", None):
+        verify_adoption_registrations(args, vm)  # Never relabel a host whose registrations belong elsewhere.
         return expected
     if target_owns_vm_label(None, target):
         return None
@@ -881,23 +968,21 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     if violations or unknowns:
         raise RuntimeError(f"Patch {patch.patch_sha256[:12]} cannot be live-applied to {args.instance_name}: "
                            + "; ".join(violations + unknowns))
-    state_raw = gcloud(
-        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet",
-         "--command=sudo -n cat /var/lib/gha-runner-patch/state.json 2>/dev/null || true"],
+    receipt = parse_patch_receipt(gcloud(
+        ["compute", "ssh", args.instance_name, f"--zone={zone}", "--quiet", f"--command={PATCH_RECEIPT_READ_COMMAND}"],
         quiet=True,
-    )
-    current_manifest = json.loads(state_raw).get("manifest") if state_raw.strip() else None
-    action = classify_patch_diff(current_manifest, patch)
+    ))
+    action = classify_patch_diff(receipt.manifest, patch)
     pending = bool(vm.patch_pending_sha256)
-    if action == "noop" and pending:
-        # The receipt matches, but this host's bootstrap never confirmed its patch: re-apply it live so
-        # LIVE_PATCH_APPLIED, not the receipt alone, confirms it before the pending record is cleared.
-        LOG.info("VM %s reports patch %s, but its bootstrap never confirmed it; re-applying it live",
-                 args.instance_name, patch.patch_sha256[:12])
+    if action == "noop" and (pending or not receipt.proof):
+        # The host names this patch, but only a completion receipt from this boot (and a confirmed bootstrap)
+        # proves it: re-apply it live so LIVE_PATCH_APPLIED confirms it before anything is recorded.
+        LOG.info("VM %s reports patch %s, but %s; re-applying it live", args.instance_name, patch.patch_sha256[:12],
+                 "its bootstrap never confirmed it" if pending else receipt.detail)
     elif action == "noop":
         LOG.info("VM %s is already at patch %s", args.instance_name, patch.patch_sha256[:12])
-        # The host's own receipt confirms the patch: record it (backfills hosts provisioned before recording).
-        record_patch_metadata(args, zone, patch)
+        # The host's completion receipt confirms the patch: record it (backfills hosts provisioned before recording).
+        record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm))
         return "noop"
     if action == "replace_vm":
         raise RuntimeError(
@@ -926,8 +1011,8 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     )
     if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
         raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
-    # Only now, after the host confirmed this exact patch, does the recorded patch change.
-    record_patch_metadata(args, zone, patch, clear_pending=pending)
+    # Only now, after the host confirmed this exact patch in this boot, does the recorded patch change.
+    record_patch_metadata(args, zone, patch, boot=confirmed_boot(args, zone, vm), clear_pending=pending)
     sync_runner_labels(args)
     LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
     return "hot_patch"
@@ -1041,6 +1126,7 @@ def main() -> int:
         group = verify_runner_group(args)
         group_name = group["name"]
     if args.existing_instance:
+        adoption_preflight(args, zone)  # Before the retained-host start, the first change to the VM.
         start_retained_strict_host(args, zone)
         verify_strict_identities(args)
     token = generate_registration_token(target)
@@ -1071,7 +1157,8 @@ def main() -> int:
             # host advertise the patch its startup script applied (and the pending record go away).
             if not hasattr(args, "startup_patch"):
                 raise RuntimeError("apply_startup did not record which patch the startup script applies")
-            record_patch_metadata(args, zone, args.startup_patch, clear_pending=True)
+            record_patch_metadata(args, zone, args.startup_patch, clear_pending=True,
+                                  boot=confirmed_boot(args, zone, args.deployment_vm))
     except BaseException as exc:
         failure = exc
     finally:

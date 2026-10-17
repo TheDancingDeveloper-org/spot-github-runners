@@ -330,7 +330,7 @@ async def list_instances(api: AsyncGoogleApi, project: str) -> tuple[list[dict],
         "maxResults": "500",
         "returnPartialSuccess": "true",
         "fields": ("nextPageToken,unreachables,"
-                   "items/*/instances(name,zone,status,machineType,cpuPlatform,labels,metadata/items)"),
+                   "items/*/instances(name,zone,status,machineType,cpuPlatform,lastStartTimestamp,labels,metadata/items)"),
     }
     rows: list[dict] = []
     unreachables: list[str] = []
@@ -352,7 +352,7 @@ def runner_host_records(items: list[dict]) -> list[dict]:
     deployment keys are kept (see runner_fleet); every other metadata value, including startup scripts, is
     dropped.
     """
-    from .runner_fleet import patch_record_from_gce_item, runner_deployment_from_gce_item
+    from .runner_fleet import gce_timestamp, patch_record_from_gce_item, runner_deployment_from_gce_item
     from .target_config import TARGET_LABEL_KEY
 
     hosts = []
@@ -370,6 +370,7 @@ def runner_host_records(items: list[dict]) -> list[dict]:
             "status": str(item.get("status", "UNKNOWN")),
             "machine_type": str(item.get("machineType", "")).rsplit("/", 1)[-1],
             "cpu_platform": str(item.get("cpuPlatform", "") or ""),
+            "last_start_timestamp": gce_timestamp(item.get("lastStartTimestamp")),
             "role": "cicd_runner",
             "target_label": target_label,
             **runner_deployment_from_gce_item(item),

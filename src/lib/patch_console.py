@@ -27,12 +27,15 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 import urllib.parse
 
 from .runner_patch import (
+    PATCH_RECEIPT_READ_COMMAND,
     SCHEMA_VERSION,
+    HostPatchReceipt,
     RunnerPatch,
     classify_patch_diff,
     host_capacity_problems,
     merge_patch_dicts,
     parse_manifest_text,
+    parse_patch_receipt,
     validate_patch_dict,
 )
 
@@ -434,11 +437,29 @@ def runner_hosts(instances: Iterable[Mapping[str, Any]], repository: str) -> lis
     return hosts
 
 
+def _boot_problem(host: Mapping[str, Any]) -> str:
+    """Why the applied record may not describe the current boot ('' when it was confirmed in this boot)."""
+    recorded = str(host.get("patch_boot") or "")
+    current = str(host.get("last_start_timestamp") or "")
+    if not recorded:
+        return ("the applied patch record has no boot binding (spot-runner-patch-boot), so a reboot since it was "
+                "confirmed can't be ruled out; reprovision or re-run --patch-live")
+    if not current:
+        return "the host's lastStartTimestamp is unknown, so the applied patch record can't be tied to this boot"
+    if recorded != current:
+        return (f"rebooted since the patch was confirmed (confirmed in the boot started {recorded}, now {current}), "
+                "and a reboot can bring the runners back without it; reprovision or re-run --patch-live")
+    return ""
+
+
 def _recorded_manifest(host: Mapping[str, Any], target: RunnerPatch) -> tuple[bool, dict[str, Any] | None, str]:
     """(known, current manifest or None, detail) from the ``spot-runner-patch`` metadata recorded on a host."""
     sha = str(host.get("patch_sha256") or "")
     if not sha:
         return False, None, UNRECORDED_REASON
+    stale = _boot_problem(host)
+    if stale:
+        return False, None, stale
     if sha == "none":
         return True, None, "no patch recorded at provisioning (instance metadata)"
     raw = host.get("patch_manifest_json") or ""
@@ -461,7 +482,7 @@ class HotPatchExecutor(Protocol):
     available: bool
     reason: str
 
-    def read_manifest(self, host: Mapping[str, Any]) -> dict[str, Any] | None: ...
+    def read_manifest(self, host: Mapping[str, Any]) -> HostPatchReceipt | dict[str, Any] | None: ...
 
     def apply(self, host: Mapping[str, Any], patch: RunnerPatch) -> dict[str, Any]: ...
 
@@ -500,25 +521,22 @@ class GcloudHotPatchExecutor:
         self.available = (which or shutil.which)("gcloud") is not None
         self.reason = "" if self.available else "gcloud is not installed where the dashboard runs"
 
-    def read_manifest(self, host: Mapping[str, Any]) -> dict[str, Any] | None:
+    def read_manifest(self, host: Mapping[str, Any]) -> HostPatchReceipt:
+        """The host's patch state: its last completed manifest and whether that receipt proves the current state."""
         name, zone = str(host.get("name") or ""), str(host.get("zone") or "")
         if not name or not zone:
             raise PatchConsoleError("host record has no name or zone")
         result = self._run(
             ["gcloud", "compute", "ssh", name, f"--zone={zone}", f"--project={self.project}", "--quiet",
-             "--command=sudo -n cat /var/lib/gha-runner-patch/state.json 2>/dev/null || true"],
+             f"--command={PATCH_RECEIPT_READ_COMMAND}"],
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:
             raise PatchConsoleError(f"could not read the patch state of {name} (exit {result.returncode})")
-        raw = (result.stdout or "").strip()
-        if not raw:
-            return None
         try:
-            manifest = json.loads(raw).get("manifest")
-        except (ValueError, AttributeError) as exc:
-            raise PatchConsoleError(f"{name} has an unreadable patch state file") from exc
-        return manifest if isinstance(manifest, dict) else None
+            return parse_patch_receipt(result.stdout or "")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise PatchConsoleError(f"{name} has an unreadable patch state: {exc}") from exc
 
     def apply(self, host: Mapping[str, Any], patch: RunnerPatch) -> dict[str, Any]:
         from . import runner_manager
@@ -657,10 +675,13 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
             # Never noop: neither the applied record nor a host receipt proves that a pending bootstrap finished.
             out.append(HostClassification(host, "unknown", None, pending_patch_reason(pending)))
             continue
+        proof, receipt_detail = True, ""
         try:
             if executor.available:
                 current = executor.read_manifest(host)
                 source = "read from the host"
+                if isinstance(current, HostPatchReceipt):
+                    proof, receipt_detail, current = current.proof, current.detail, current.manifest
             elif "patch_manifest" in host:
                 current = host.get("patch_manifest")
                 source = "recorded by the fleet controller"
@@ -674,6 +695,13 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
             current_sha = validate_patch_dict(current).patch_sha256 if current is not None else None
             classification = classify_patch_diff(current, target)
             detail = source if source.startswith(("recorded", "no patch", "sha256")) else f"current patch {source}"
+            if not proof and classification == "noop":
+                # Only a completion receipt from this boot proves the patch; a live re-apply writes one.
+                classification = "hot_patch"
+                detail = (f"the host names this patch, but {receipt_detail}; a hot patch re-applies it and writes a "
+                          "completion receipt")
+            elif not proof:
+                detail = f"{detail} ({receipt_detail})"
             out.append(HostClassification(host, classification, current_sha, detail))
         except Exception as exc:  # noqa: BLE001 - an unreadable host is "unknown", never a guess
             out.append(HostClassification(host, "unknown", None, f"could not determine the current patch: {exc}"))

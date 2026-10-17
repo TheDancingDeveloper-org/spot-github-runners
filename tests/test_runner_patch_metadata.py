@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -26,6 +27,27 @@ ARM = validate_patch_dict({**BASE, "hardware": {"arch": "arm64"}})
 
 def canonical_json(patch) -> str:
     return json.dumps(patch.to_canonical_dict(), sort_keys=True, separators=(",", ":"))
+
+
+BOOT_ID = "0f6c3a52-8d1e-4b7a-9c2d-5e8f1a2b3c4d"
+BOOT_TS = "2026-10-01T09:00:00.123-07:00"
+
+
+def receipt_output(patch=None, *, pending=None, receipt_boot=BOOT_ID, boot=BOOT_ID, legacy=False):
+    """What PATCH_RECEIPT_READ_COMMAND prints for a host (base64 state and pending marker, then the boot id)."""
+    import base64
+
+    def b64(obj):
+        return base64.b64encode(json.dumps(obj).encode()).decode() if obj is not None else ""
+
+    state = None
+    if patch is not None:
+        state = ({"manifest": patch.to_canonical_dict()} if legacy else
+                 {"boot_id": receipt_boot, "receipt": {"receipt_schema": "gha-runner-patch-receipt-v2",
+                                                       "patch_sha256": patch.patch_sha256,
+                                                       "manifest": patch.to_canonical_dict()}})
+    marker = {"pending_patch_sha256": pending.patch_sha256} if pending is not None else None
+    return f"state:{b64(state)}\npending:{b64(marker)}\nboot:{boot}\n"
 
 
 def args_for(patch, *extra):
@@ -72,6 +94,7 @@ class ProvisioningMetadataTests(unittest.TestCase):
         describe = [SimpleNamespace(returncode=0 if vm else 1, stdout=json.dumps(vm) if vm else ""),
                     SimpleNamespace(returncode=0, stdout=json.dumps({"type": args.disk_type, "users": ["x"]}) if vm else "")]
         with mock.patch("lib.runner_manager.subprocess.run", side_effect=describe), \
+                mock.patch("lib.runner_manager.registered_runner_rows", return_value=[]), \
                 mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
             manager.apply_startup(args, "us-central1-a", script)
         return args, cloud
@@ -152,10 +175,10 @@ class ProvisioningMetadataTests(unittest.TestCase):
 class BootstrapConfirmationTests(unittest.TestCase):
     """Codex round 13 P2: the applied patch keys are published only after main() confirms the bootstrap."""
 
-    def deploy(self, *, bootstrap_error=None, short_on_check=None):
+    def deploy(self, *, bootstrap_error=None, short_on_check=None, later_boot=BOOT_TS):
         cloud = GcloudRecorder()
         running = runner_fleet.GceVm("oxidex-runners-1", "us-central1-a", "RUNNING", "c4d-standard-32", True,
-                                     instance_id="1", cpu_platform="AMD Turin")
+                                     instance_id="1", cpu_platform="AMD Turin", last_start_timestamp=BOOT_TS)
 
         def bootstrap(*_args):
             cloud.calls.append(["BOOTSTRAP_MARKER_CHECKED"])
@@ -180,7 +203,8 @@ class BootstrapConfirmationTests(unittest.TestCase):
                 mock.patch.object(manager, "generate_registration_token", return_value=TOKEN), \
                 mock.patch.object(manager, "log_project_costs"), \
                 mock.patch.object(manager, "resolve_runner_patch", return_value=TARGET), \
-                mock.patch.object(manager, "observed_deployment_vm", return_value=running), \
+                mock.patch.object(manager, "observed_deployment_vm",
+                                  side_effect=[running, running, replace(running, last_start_timestamp=later_boot)]), \
                 mock.patch.object(manager, "write_deployment_receipt"), \
                 mock.patch.object(manager, "wait_for_bootstrap", side_effect=bootstrap), \
                 mock.patch.object(manager, "online_runners", side_effect=online), \
@@ -216,6 +240,7 @@ class BootstrapConfirmationTests(unittest.TestCase):
                                                    "compute instances remove-metadata"])
         applied = cloud.calls[last_online + 1]
         self.assertEqual(plain_metadata(applied)["spot-runner-patch-sha256"], TARGET.patch_sha256)
+        self.assertEqual(plain_metadata(applied)["spot-runner-patch-boot"], BOOT_TS)  # bound to the confirmed boot
         self.assertEqual(cloud.files[-1], {"spot-runner-patch": canonical_json(TARGET)})
         self.assertEqual(cloud.calls[-2][-1], f"--labels=spot-runner-patch={TARGET.patch_sha256[:16]}")
         self.assertEqual(cloud.calls[-1][-1], "--keys=spot-runner-patch-pending-sha256,spot-runner-patch-pending")
@@ -231,22 +256,42 @@ class BootstrapConfirmationTests(unittest.TestCase):
                 [create] = cloud.named("compute", "instances", "create")
                 self.assertEqual(plain_metadata(create)["spot-runner-patch-pending-sha256"], TARGET.patch_sha256)
 
+    def test_restart_during_confirmation_records_nothing(self):
+        """Codex round 14 P2: the applied record names the boot it was confirmed in, or nothing is recorded."""
+        for later in ("2026-10-02T00:00:00.000-07:00", ""):
+            with self.subTest(later=later):
+                result, cloud = self.deploy(later_boot=later)
+                self.assertIsInstance(result, RuntimeError)
+                self.assertIn("lastStartTimestamp is unknown" if not later else "restarted while", str(result))
+                self.assertEqual(self.applied_writes(cloud), ([], [], []))
+
 
 class AdoptionOwnershipTests(unittest.TestCase):
     """Codex round 10 P1-b: --existing-instance validates and sets the target ownership label before any change."""
 
-    def adopt(self, labels, *options):
+    def adopt(self, labels, *options, registrations=None, metadata=()):
         args = manager.args_parser().parse_args(["--max-cost", "0.3", "--instance-type", "c4d-standard-32",
                                                  "--cpu", "32", "--ram", "128", "--instance-name", "oxidex-runners-1",
                                                  "--existing-instance", *options])
         manager.select_sizing(args)
         vm = {"status": "RUNNING", "machineType": "zones/z/machineTypes/c4d-standard-32",
               "scheduling": {"provisioningModel": "SPOT"}, "cpuPlatform": "AMD Turin", "labels": labels,
-              "disks": [{"boot": True, "deviceName": "boot"}, {"deviceName": "runner-data"}]}
+              "disks": [{"boot": True, "deviceName": "boot"}, {"deviceName": "runner-data"}],
+              "metadata": {"items": [{"key": k, "value": v} for k, v in metadata]}}
         cloud = GcloudRecorder()
+        self.listed = []
+
+        def rows(scope):
+            self.listed.append(scope.name)
+            found = (registrations or {}).get(scope.name, [])
+            if isinstance(found, Exception):
+                raise found
+            return [{"id": i, "name": name} for i, name in enumerate(found, 1)]
+
         describe = [SimpleNamespace(returncode=0, stdout=json.dumps(vm)),
                     SimpleNamespace(returncode=0, stdout=json.dumps({"type": args.disk_type, "users": ["x"]}))]
         with mock.patch("lib.runner_manager.subprocess.run", side_effect=describe), \
+                mock.patch("lib.runner_manager.registered_runner_rows", side_effect=rows), \
                 mock.patch("lib.runner_manager.gcloud", side_effect=cloud):
             try:
                 manager.apply_startup(args, "us-central1-a", "#!/bin/bash\n")
@@ -288,6 +333,72 @@ class AdoptionOwnershipTests(unittest.TestCase):
                                  if c[-1].startswith("--labels=spot-target=")]
                 self.assertEqual(target_labels, [])
 
+    def test_unlabeled_vm_with_runners_registered_elsewhere_is_never_relabeled(self):
+        """Codex round 14 P1: persisted registrations to another scope refuse adoption before any change."""
+        mine = ["oxidex-oxidex-runners-1-1", "oxidex-oxidex-runners-1-2"]
+        for registrations, metadata, scope in (
+                ({"swack-tools": mine}, (), "swack-tools"),  # the default org owns unlabeled hosts
+                ({"someone/else": ["gha-oxidex-runners-1-1"]},
+                 (("spot-runner-registration-target", "someone/else"),), "someone/else")):  # recorded scope
+            error, cloud = self.adopt({}, "--target", REPO, registrations=registrations, metadata=metadata)
+            with self.subTest(scope=scope):
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn(f"registered to another target ({scope}:", str(error))
+                self.assertIn("drain the host", str(error))
+                self.assertEqual(self.instance_mutations(cloud), [])  # no label, no metadata, no reset
+                self.assertIn(REPO, self.listed)
+                self.assertIn("swack-tools", self.listed)
+
+    def test_registrations_under_the_new_target_or_for_other_vms_do_not_block_adoption(self):
+        error, cloud = self.adopt({}, "--target", REPO, registrations={
+            REPO: ["oxidex-oxidex-runners-1-1"],  # already this target's
+            "swack-tools": ["oxidex-oxidex-runners-10-1", "oxidex-runners-1", "oxidex-oxidex-runners-1-x"]})
+        self.assertIsNone(error)
+        self.assertEqual(self.instance_mutations(cloud)[0], ["compute", "instances", "add-labels"])
+
+    def test_unverifiable_registration_scope_refuses_adoption(self):
+        for failing in (REPO, "swack-tools"):
+            error, cloud = self.adopt({}, "--target", REPO,
+                                      registrations={failing: RuntimeError("command failed (1): gh api ... 403")})
+            with self.subTest(failing=failing):
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn("Cannot verify which GitHub scope", str(error))
+                self.assertEqual(self.instance_mutations(cloud), [])
+        error, cloud = self.adopt({}, "--target", REPO, metadata=(("spot-runner-registration-target", "bad scope!"),))
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("Cannot verify which GitHub scope", str(error))
+        self.assertEqual(self.instance_mutations(cloud), [])
+
+    def test_main_checks_registrations_before_starting_a_retained_host(self):
+        vm = {"status": "TERMINATED", "machineType": "zones/z/machineTypes/c4d-standard-32",
+              "scheduling": {"provisioningModel": "SPOT"}, "labels": {}, "metadata": {"items": []}, "disks": []}
+        argv = ["manager", "--max-cost", "0.3", "--instance-type", "c4d-standard-32", "--cpu", "32", "--ram", "128",
+                "--target", REPO, "--instance-name", "oxidex-runners-1", "--zone", "us-central1-a",
+                "--existing-instance", "--apply"]
+        observed = runner_fleet.GceVm("oxidex-runners-1", "us-central1-a", "TERMINATED", "c4d-standard-32", True,
+                                      instance_id="1")
+        saved = (manager.PROJECT, manager.ORG)
+        try:
+            with mock.patch("sys.argv", argv), mock.patch.object(manager, "configure_logging"), \
+                    mock.patch.object(manager, "load_env"), \
+                    mock.patch.object(manager, "observed_deployment_vm", return_value=observed), \
+                    mock.patch.object(manager, "verify_price_and_capacity", return_value=manager.Decimal("0.2")), \
+                    mock.patch("lib.runner_manager.subprocess.run",
+                               return_value=SimpleNamespace(returncode=0, stdout=json.dumps(vm))), \
+                    mock.patch.object(manager, "registered_runner_rows",
+                                      side_effect=lambda scope: [{"id": 1, "name": "oxidex-oxidex-runners-1-1"}]
+                                      if scope.name == "swack-tools" else []), \
+                    mock.patch.object(manager, "start_retained_strict_host") as start, \
+                    mock.patch.object(manager, "generate_registration_token") as token, \
+                    mock.patch("lib.runner_manager.gcloud") as cloud:
+                with self.assertRaisesRegex(RuntimeError, "registered to another target"):
+                    manager.main()
+        finally:
+            manager.PROJECT, manager.ORG = saved
+        start.assert_not_called()
+        token.assert_not_called()
+        cloud.assert_not_called()
+
     def test_unlabeled_vm_needs_an_explicit_target_outside_the_default_org(self):
         error, cloud = self.adopt({}, "--org", "another-org")
         self.assertIsInstance(error, RuntimeError)
@@ -296,20 +407,22 @@ class AdoptionOwnershipTests(unittest.TestCase):
 
 
 class LivePatchMetadataTests(unittest.TestCase):
-    def run_live(self, receipt, script_output, pending=""):
+    def run_live(self, receipt, script_output, pending="", receipt_text=None, observed=None):
         args = args_for(TARGET, "--patch-live")
         vm = runner_fleet.GceVm(args.instance_name, "us-central1-a", "RUNNING", "c4d-standard-32", True,
-                                instance_id="1", cpu_platform="AMD Turin", patch_pending_sha256=pending)
+                                instance_id="1", cpu_platform="AMD Turin", patch_pending_sha256=pending,
+                                last_start_timestamp=BOOT_TS)
 
         def respond(command):
             if command[:2] == ["compute", "ssh"] and "state.json" in command[-1]:
-                return json.dumps({"manifest": receipt.to_canonical_dict()}) if receipt else ""
+                return receipt_output(receipt) if receipt_text is None else receipt_text
             if command[:2] == ["compute", "ssh"]:
                 return script_output
             return ""
 
         cloud = GcloudRecorder(respond)
-        with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
+        listing = [[vm]] + [[later] for later in (observed or [vm] * 3)]
+        with mock.patch("lib.runner_manager.list_gcloud_vms", side_effect=listing), \
                 mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
                 mock.patch("lib.runner_manager.sync_runner_labels"), \
                     mock.patch("lib.runner_manager.runner_label_sync_plan"):
@@ -340,8 +453,7 @@ class LivePatchMetadataTests(unittest.TestCase):
         args = args_for(TARGET, "--patch-live")
         vm = runner_fleet.GceVm(args.instance_name, "us-central1-a", "RUNNING", "c4d-standard-32", True,
                                 instance_id="1", cpu_platform="AMD Turin")
-        cloud = GcloudRecorder(lambda c: json.dumps({"manifest": OLD.to_canonical_dict()})
-                               if c[:2] == ["compute", "ssh"] else "")
+        cloud = GcloudRecorder(lambda c: receipt_output(OLD) if c[:2] == ["compute", "ssh"] else "")
         with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
                 mock.patch("lib.runner_manager.gcloud", side_effect=cloud), \
                 mock.patch("lib.runner_manager.runner_label_sync_plan",
@@ -392,6 +504,39 @@ class LivePatchMetadataTests(unittest.TestCase):
                           ["compute", "instances", "remove-metadata"]])  # pending cleared last
         self.assertEqual(cloud.calls[-1][-1], "--keys=spot-runner-patch-pending-sha256,spot-runner-patch-pending")
 
+    def test_only_a_completion_receipt_from_this_boot_skips_the_live_apply(self):
+        """Codex round 14 P2: failed-then-noop. A pending marker, a legacy receipt, or a receipt from an earlier
+        boot never counts as proof; the CLI re-applies live instead of recording from it."""
+        for name, text in (("pending attempt", receipt_output(TARGET, pending=TARGET)),
+                           ("failed attempt after an older patch", receipt_output(OLD, pending=TARGET)),
+                           ("legacy receipt", receipt_output(TARGET, legacy=True)),
+                           ("rebooted", receipt_output(TARGET, receipt_boot="1" * 8 + BOOT_ID[8:]))):
+            with self.subTest(name):
+                result, cloud = self.run_live(None, "build failed\n", receipt_text=text)
+                self.assertIsInstance(result, RuntimeError)  # the live script ran and did not confirm
+                self.assertEqual(len([c for c in cloud.calls if c[:2] == ["compute", "ssh"]]), 2)
+                self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
+        result, cloud = self.run_live(TARGET, "")  # a completion receipt from this boot
+        self.assertEqual(result, "noop")
+        self.assertEqual(plain_metadata(cloud.named("compute", "instances", "add-metadata")[0])["spot-runner-patch-boot"],
+                         BOOT_TS)
+
+    def test_live_patch_binds_the_record_to_the_boot_and_refuses_a_restart(self):
+        result, cloud = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n")
+        self.assertEqual(result, "hot_patch")
+        self.assertEqual(plain_metadata(cloud.named("compute", "instances", "add-metadata")[0])["spot-runner-patch-boot"],
+                         BOOT_TS)
+        args = args_for(TARGET)
+        rebooted = runner_fleet.GceVm(args.instance_name, "us-central1-a", "RUNNING", "c4d-standard-32", True,
+                                      instance_id="1", cpu_platform="AMD Turin",
+                                      last_start_timestamp="2026-10-02T00:00:00.000-07:00")
+        result, cloud = self.run_live(OLD, f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}\n", observed=[rebooted])
+        self.assertIsInstance(result, RuntimeError)
+        self.assertIn("restarted while", str(result))
+        self.assertEqual(cloud.named("compute", "instances", "add-metadata"), [])
+        with self.assertRaisesRegex(RuntimeError, "without the boot"):
+            manager.record_patch_metadata(args, "us-central1-a", TARGET, boot="")
+
     def test_refused_classifications_record_nothing(self):
         for receipt in (ARM, MOUNTS):
             # The target has no mounts and x86_64, so an arm host needs a new VM and a mounts host recreated containers.
@@ -405,11 +550,12 @@ class LivePatchMetadataTests(unittest.TestCase):
                 "runner_prefix": "oxidex", "runners_count": 3, "runner_label": "oxidex-spot-ci",
                 "runner_region": "us-central1", "patch_target": REPO,
                 "registration_target": "swack-tools", "runner_group_id": 10}
-        vm = runner_fleet.GceVm("oxidex-runners-1", "us-central1-a", "RUNNING", "c4d-standard-32", True)
+        vm = runner_fleet.GceVm("oxidex-runners-1", "us-central1-a", "RUNNING", "c4d-standard-32", True,
+                                last_start_timestamp=BOOT_TS)
         for output, expect_metadata in (("no marker", False), (f"LIVE_PATCH_APPLIED:{TARGET.patch_sha256}", True)):
             def respond(command, _output=output):
                 if command[:2] == ["compute", "ssh"] and "state.json" in command[-1]:
-                    return json.dumps({"manifest": OLD.to_canonical_dict()})
+                    return receipt_output(OLD)
                 return _output if command[:2] == ["compute", "ssh"] else ""
 
             cloud = GcloudRecorder(respond)
@@ -426,7 +572,7 @@ class LivePatchMetadataTests(unittest.TestCase):
 
 
 def gce_item(name, *, sha=None, manifest=None, target=REPO, label=True, status="RUNNING", extra=(), pending=None,
-             pending_manifest=None):
+             pending_manifest=None, boot=BOOT_TS, last_start=BOOT_TS):
     items = [{"key": "startup-script", "value": f"#!/bin/bash\nTOKEN={TOKEN}"}, *extra]
     if pending is not None:
         items.append({"key": "spot-runner-patch-pending-sha256", "value": pending})
@@ -436,6 +582,8 @@ def gce_item(name, *, sha=None, manifest=None, target=REPO, label=True, status="
         items.append({"key": "spot-runner-patch-pending", "value": pending_manifest})
     if sha is not None:
         items.append({"key": "spot-runner-patch-sha256", "value": sha})
+        if boot is not None:
+            items.append({"key": "spot-runner-patch-boot", "value": boot})
         items.append({"key": "spot-runner-patch-target", "value": target})
         items.append({"key": "spot-runner-prefix", "value": "oxidex"})
         items.append({"key": "spot-runner-count", "value": "3"})
@@ -447,9 +595,12 @@ def gce_item(name, *, sha=None, manifest=None, target=REPO, label=True, status="
     if manifest is not None:
         items.append({"key": "spot-runner-patch", "value": manifest})
     labels = {"spot-target": target_label_value(target)} if label else {}
-    return {"name": name, "zone": "projects/p/zones/us-central1-a", "status": status,
+    item = {"name": name, "zone": "projects/p/zones/us-central1-a", "status": status,
             "machineType": "projects/p/zones/us-central1-a/machineTypes/c4d-standard-32",
             "labels": labels, "metadata": {"items": items}}
+    if last_start is not None:
+        item["lastStartTimestamp"] = last_start
+    return item
 
 
 class InventoryTests(unittest.TestCase):
@@ -457,21 +608,39 @@ class InventoryTests(unittest.TestCase):
         full = runner_fleet.patch_record_from_gce_item(gce_item("a", sha=TARGET.patch_sha256,
                                                                 manifest=canonical_json(TARGET)))
         self.assertEqual(full, {"patch_sha256": TARGET.patch_sha256, "patch_manifest_json": canonical_json(TARGET),
-                                "patch_target": REPO, "patch_pending_sha256": ""})
+                                "patch_target": REPO, "patch_pending_sha256": "", "patch_boot": BOOT_TS})
         self.assertEqual(runner_fleet.patch_record_from_gce_item(gce_item("b", sha="none", manifest="{}"))["patch_manifest_json"], "")
         for bad_sha in ("abc", "Z" * 64, "", " "):
             self.assertEqual(runner_fleet.patch_record_from_gce_item(gce_item("c", sha=bad_sha))["patch_sha256"], "", bad_sha)
         oversized = runner_fleet.patch_record_from_gce_item(gce_item("d", sha=TARGET.patch_sha256, manifest="x" * 70_000))
         self.assertEqual(oversized["patch_manifest_json"], "")
         self.assertEqual(runner_fleet.patch_record_from_gce_item(gce_item("e")),
-                         {"patch_sha256": "", "patch_manifest_json": "", "patch_target": "", "patch_pending_sha256": ""})
+                         {"patch_sha256": "", "patch_manifest_json": "", "patch_target": "", "patch_pending_sha256": "",
+                          "patch_boot": ""})
+
+    def test_inventory_carries_the_recorded_boot_and_last_start(self):
+        item = gce_item("a", sha=TARGET.patch_sha256, manifest=canonical_json(TARGET))
+        [host] = compute_api.runner_host_records([item])
+        self.assertEqual((host["patch_boot"], host["last_start_timestamp"]), (BOOT_TS, BOOT_TS))
+        bad = gce_item("b", sha=TARGET.patch_sha256, boot="not a timestamp,=", last_start="x" * 50)
+        [host] = compute_api.runner_host_records([bad])
+        self.assertEqual((host["patch_boot"], host["last_start_timestamp"]), ("", ""))
+
+        def command_json(args):
+            if args[1:4] == ["compute", "instances", "list"]:
+                return [{**item, "scheduling": {"provisioningModel": "SPOT"}}]
+            return [] if args[1:4] == ["compute", "disks", "list"] else {}
+
+        with mock.patch("lib.runner_fleet._command_json", side_effect=command_json):
+            [vm] = runner_fleet.list_gcloud_vms("p")
+        self.assertEqual((vm.patch_boot, vm.last_start_timestamp), (BOOT_TS, BOOT_TS))
 
     def test_pending_record_parse(self):
         """Codex round 13 P2: the pending keys survive inventory parsing; a damaged one still reads as pending."""
         fresh = runner_fleet.patch_record_from_gce_item(gce_item("f", pending=TARGET.patch_sha256,
                                                                  pending_manifest=canonical_json(TARGET)))
         self.assertEqual(fresh, {"patch_sha256": "", "patch_manifest_json": "", "patch_target": REPO,
-                                 "patch_pending_sha256": TARGET.patch_sha256})
+                                 "patch_pending_sha256": TARGET.patch_sha256, "patch_boot": ""})
         self.assertEqual(runner_fleet.patch_record_from_gce_item(gce_item("g", pending="NONE"))["patch_pending_sha256"],
                          "none")
         for bad in ("abc", "", "Z" * 64):
@@ -604,6 +773,53 @@ class PreviewFromRecordedPatchTests(unittest.TestCase):
                 self.assertIn("unreadable patch record", got["pending-damaged"].detail)
                 self.assertEqual(got["confirmed"].classification, "noop")
 
+    def test_applied_record_from_another_boot_previews_as_unknown(self):
+        """Codex round 14 P2: a reboot since confirmation, or no recorded boot, makes the applied record stale."""
+        items = [
+            gce_item("same-boot", sha=TARGET.patch_sha256, manifest=canonical_json(TARGET)),
+            gce_item("rebooted", sha=TARGET.patch_sha256, manifest=canonical_json(TARGET),
+                     last_start="2026-10-02T00:00:00.000-07:00"),
+            gce_item("unbound", sha=TARGET.patch_sha256, manifest=canonical_json(TARGET), boot=None),
+            gce_item("no-last-start", sha=TARGET.patch_sha256, manifest=canonical_json(TARGET), last_start=None),
+            gce_item("unpatched-rebooted", sha="none", last_start="2026-10-02T00:00:00.000-07:00"),
+        ]
+        got = {h.host["name"]: h for h in pc.classify_hosts(compute_api.runner_host_records(items), TARGET,
+                                                             pc.UnavailableHotPatchExecutor())}
+        self.assertEqual(got["same-boot"].classification, "noop")
+        for name in ("rebooted", "unbound", "no-last-start", "unpatched-rebooted"):
+            self.assertEqual(got[name].classification, "unknown", name)
+        self.assertIn("rebooted since the patch was confirmed", got["rebooted"].detail)
+        self.assertIn("reprovision or re-run --patch-live", got["rebooted"].detail)
+        self.assertIn("no boot binding", got["unbound"].detail)
+        self.assertIn("lastStartTimestamp is unknown", got["no-last-start"].detail)
+
+    def test_executor_receipts_count_as_proof_only_when_complete(self):
+        """Codex round 14 P2: with an executor, a non-proof receipt naming the target is hot_patch, never noop."""
+        from lib.runner_patch import parse_patch_receipt
+
+        receipts = {"complete": receipt_output(TARGET), "pending": receipt_output(TARGET, pending=TARGET),
+                    "legacy": receipt_output(TARGET, legacy=True),
+                    "rebooted": receipt_output(TARGET, receipt_boot="1" * 8 + BOOT_ID[8:]),
+                    "older-with-pending": receipt_output(OLD, pending=TARGET), "none": receipt_output()}
+
+        class Receipts:
+            available = True
+            reason = ""
+
+            def read_manifest(self, host):
+                return parse_patch_receipt(receipts[host["name"]])
+
+        hosts = compute_api.runner_host_records([gce_item(n, sha=OLD.patch_sha256) for n in receipts])
+        got = {h.host["name"]: h for h in pc.classify_hosts(hosts, TARGET, Receipts())}
+        self.assertEqual({n: h.classification for n, h in got.items()},
+                         {"complete": "noop", "pending": "hot_patch", "legacy": "hot_patch", "rebooted": "hot_patch",
+                          "older-with-pending": "hot_patch", "none": "hot_patch"})
+        self.assertIn("has not completed", got["pending"].detail)
+        self.assertIn("predates completion receipts", got["legacy"].detail)
+        self.assertIn("rebooted since the completion receipt", got["rebooted"].detail)
+        self.assertIn("re-applies it", got["rebooted"].detail)
+        self.assertIn("has not completed", got["older-with-pending"].detail)
+
     def test_host_source_failure_is_a_clear_error(self):
         def broken():
             raise RuntimeError("compute.instances.list denied")
@@ -651,7 +867,7 @@ class HostCapacityTests(unittest.TestCase):
         # The operator's arguments claim a 64 vCPU / 256 GiB host (so select_sizing passes); only the observed VM
         # tells the truth, which is exactly the bypass this check closes.
         args = args_for(patch, "--patch-live", "--cpu", "64", "--ram", "256")
-        cloud = GcloudRecorder(lambda c: json.dumps({"manifest": OLD.to_canonical_dict()})
+        cloud = GcloudRecorder(lambda c: receipt_output(OLD)
                                if c[:2] == ["compute", "ssh"] and "state.json" in c[-1]
                                else f"LIVE_PATCH_APPLIED:{patch.patch_sha256}")
         with mock.patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
@@ -665,7 +881,7 @@ class HostCapacityTests(unittest.TestCase):
 
     def test_cli_live_patch_refuses_undersized_or_unmeasured_hosts_before_changing_anything(self):
         base = dict(zone="us-central1-a", status="RUNNING", machine_type="c4d-standard-32", spot=True,
-                    instance_id="1", cpu_platform="AMD Turin")
+                    instance_id="1", cpu_platform="AMD Turin", last_start_timestamp=BOOT_TS)
         for vcpu, ram in ((32, 128.0), (None, None)):
             vm = runner_fleet.GceVm("oxidex-runners-1", vcpu=vcpu, ram_gib=ram, **base)
             result, cloud = self.run_live(vm, BIG)

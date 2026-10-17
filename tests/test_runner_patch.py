@@ -29,6 +29,7 @@ from lib.runner_patch import (
     render_dockerfile,
     render_host_patch_script,
     render_live_hot_patch_script,
+    PATCH_RECEIPT_READ_COMMAND,
     resolve_repo_default_branch,
     validate_patch_dict,
     SCHEMA_VERSION,
@@ -288,7 +289,16 @@ container:
         host_patch = render_host_patch_script(patch_obj)
         self.assertIn("grep -Eiwq avx512_vbmi2 /proc/cpuinfo", host_patch)
         self.assertIn("/etc/sysctl.d/99-spot-runner-patch.conf", host_patch)
-        self.assertIn("/var/lib/gha-runner-patch/state.json", host_patch)
+        # The host steps carry no receipt: startup writes the pending marker before them and the completion
+        # receipt only after every runner container started, right before the bootstrap completion marker.
+        self.assertNotIn("state.json", host_patch)
+        pending_at = startup.index("/var/lib/gha-runner-patch/pending.json.tmp")
+        self.assertLess(pending_at, startup.index("/opt/gha-runners/repo-host-patch.sh"))
+        receipt_at = startup.index("mv -f /var/lib/gha-runner-patch/state.json.tmp /var/lib/gha-runner-patch/state.json")
+        self.assertLess(startup.index('docker run "${docker_args[@]}"'), receipt_at)
+        self.assertLess(receipt_at, startup.index("rm -f /var/lib/gha-runner-patch/pending.json"))
+        self.assertLess(startup.index("rm -f /var/lib/gha-runner-patch/pending.json"),
+                        startup.index("/var/lib/gha-runner-bootstrap.complete"))
 
         for script_text in (startup, host_patch):
             with tempfile.NamedTemporaryFile("w", suffix=".sh") as f:
@@ -338,14 +348,18 @@ container:
         args.runner_patch = updated
         manager.select_sizing(args)
         vm = GceVm(args.instance_name, "asia-south2-a", "RUNNING", "c4d-standard-32", True,
-                   instance_id="123", cpu_platform="AMD Turin")
+                   instance_id="123", cpu_platform="AMD Turin", last_start_timestamp="2026-10-01T09:00:00.000-07:00")
 
         ssh_commands = []
+        boot_id = "0f6c3a52-8d1e-4b7a-9c2d-5e8f1a2b3c4d"
+        state = {"boot_id": boot_id, "receipt": {"receipt_schema": "gha-runner-patch-receipt-v2",
+                                                 "patch_sha256": initial.patch_sha256,
+                                                 "manifest": initial.to_canonical_dict()}}
 
         def fake_gcloud(cmd, **kwargs):
             ssh_commands.append(cmd)
-            if "cat /var/lib/gha-runner-patch/state.json" in cmd[-1]:
-                return json.dumps({"manifest": initial.to_canonical_dict()})
+            if cmd[-1] == f"--command={PATCH_RECEIPT_READ_COMMAND}":
+                return f"state:{base64.b64encode(json.dumps(state).encode()).decode()}\npending:\nboot:{boot_id}\n"
             return f"LIVE_PATCH_APPLIED:{updated.patch_sha256}\n"
 
         with patch("lib.runner_manager.list_gcloud_vms", return_value=[vm]), \
@@ -366,6 +380,76 @@ container:
         self.assertIn('docker exec -i -u root "$cid" bash -euo pipefail', live_script)
         self.assertIn('nsenter -t "$pid" -n sysctl -w', live_script)
         self.assertIn("docker build --pull -t oxidex-self-hosted-runner:2.337.0 /opt/gha-runners/build", live_script)
+
+    def test_live_script_writes_the_completion_receipt_only_after_every_step(self):
+        """Codex round 14 P2: pending marker first; receipt (atomic rename) and LIVE_PATCH_APPLIED last."""
+        target = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["jq"]},
+                                      "container": {"apt_packages": ["ripgrep"]}})
+        lines = render_live_hot_patch_script(target, base_dockerfile=RUNNER_DOCKERFILE,
+                                             runner_prefix="oxidex-").splitlines()
+
+        def at(fragment, last=False):
+            hits = [i for i, line in enumerate(lines) if fragment in line]
+            self.assertTrue(hits, fragment)
+            return hits[-1] if last else hits[0]
+
+        order = [at("pending.json.tmp"), at("Repo runner patch:"), at("apt-get install"), at("docker build"),
+                 at("docker exec", last=True), at("done", last=True), at("state.json.tmp /var/lib/gha-runner-patch/state.json"),
+                 at("rm -f /var/lib/gha-runner-patch/pending.json"), at("LIVE_PATCH_APPLIED")]
+        self.assertEqual(order, sorted(order))
+        empty = validate_patch_dict({"schema": "spot-runner-patch-v1"})
+        self.assertIn("state.json.tmp", render_live_hot_patch_script(empty, base_dockerfile=RUNNER_DOCKERFILE))
+
+    def test_receipt_commands_on_a_real_shell(self):
+        from lib.runner_patch import (PATCH_STATE_DIR, parse_patch_receipt, render_patch_pending_commands,
+                                      render_patch_receipt_commands)
+
+        first = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["jq"]}})
+        second = validate_patch_dict({"schema": "spot-runner-patch-v1", "host": {"apt_packages": ["ripgrep"]}})
+        boot = "0f6c3a52-8d1e-4b7a-9c2d-5e8f1a2b3c4d"
+
+        def canonical(patch):
+            return json.loads(json.dumps(patch.to_canonical_dict()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir, boot_file = Path(tmp) / "state", Path(tmp) / "boot_id"
+            boot_file.write_text(boot + "\n")
+
+            def attempt(patch, step):
+                body = "\n".join([*render_patch_pending_commands(patch), step, *render_patch_receipt_commands(patch)])
+                body = body.replace(PATCH_STATE_DIR, str(state_dir)).replace("/proc/sys/kernel/random/boot_id",
+                                                                             str(boot_file))
+                return self.real_subprocess_run(["bash", "-c", "set -Eeuo pipefail\n" + body],
+                                                capture_output=True, text=True).returncode
+
+            def read(current_boot=boot):  # what PATCH_RECEIPT_READ_COMMAND prints (base64 -w0 of each file)
+                def b64(name):
+                    f = state_dir / name
+                    return base64.b64encode(f.read_bytes()).decode() if f.exists() else ""
+                return parse_patch_receipt(f"state:{b64('state.json')}\npending:{b64('pending.json')}\n"
+                                           f"boot:{current_boot}\n")
+
+            self.assertNotEqual(attempt(first, "false"), 0)  # e.g. the image build failed
+            receipt = read()
+            self.assertEqual((receipt.manifest, receipt.proof), (None, False))
+            self.assertIn("has not completed", receipt.detail)
+            self.assertEqual(attempt(first, "true"), 0)
+            receipt = read()
+            self.assertEqual((receipt.manifest, receipt.proof), (canonical(first), True))
+            self.assertFalse((state_dir / "pending.json").exists())
+            self.assertFalse(read("1" * 8 + boot[8:]).proof)  # another boot
+            self.assertNotEqual(attempt(second, "false"), 0)
+            receipt = read()  # the last completed patch stays the receipt; the failed attempt stays pending
+            self.assertEqual((receipt.manifest, receipt.proof), (canonical(first), False))
+            tampered = json.loads((state_dir / "state.json").read_text())
+            tampered["receipt"]["patch_sha256"] = second.patch_sha256
+            (state_dir / "state.json").write_text(json.dumps(tampered))
+            with self.assertRaises(ValueError):
+                read()
+        with self.assertRaises(ValueError):
+            parse_patch_receipt("state:\npending:\nboot:\n")
+        self.assertIn("base64 -w0", PATCH_RECEIPT_READ_COMMAND)
+        self.assertIn("/proc/sys/kernel/random/boot_id", PATCH_RECEIPT_READ_COMMAND)
 
     def test_path_normalization_and_arm64_storage_and_yaml_chomping(self) -> None:
         from decimal import Decimal

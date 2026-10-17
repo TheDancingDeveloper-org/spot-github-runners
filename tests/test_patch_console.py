@@ -727,16 +727,29 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(body["status"], "partial")
 
     def test_gcloud_executor_reads_host_receipt(self):
-        receipts = {"h1": json.dumps({"manifest": OLD}), "h2": ""}
+        from lib.runner_patch import PATCH_RECEIPT_READ_COMMAND, validate_patch_dict
+
+        boot = "0f6c3a52-8d1e-4b7a-9c2d-5e8f1a2b3c4d"
+        sha = validate_patch_dict(OLD).patch_sha256
+        state = {"boot_id": boot, "receipt": {"receipt_schema": "gha-runner-patch-receipt-v2", "patch_sha256": sha,
+                                              "manifest": OLD}}
+        encoded = base64.b64encode(json.dumps(state).encode()).decode()
+        receipts = {"h1": f"state:{encoded}\npending:\nboot:{boot}\n", "h2": f"state:\npending:\nboot:{boot}\n",
+                    "h3": f"state:{encoded}\npending:\nboot:", "h4": "state:!!!\npending:\nboot:" + boot}
 
         def run(cmd, **_kw):
             self.assertEqual(cmd[:4], ["gcloud", "compute", "ssh", cmd[3]])
             self.assertIn("--project=proj", cmd)
+            self.assertEqual(cmd[-1], f"--command={PATCH_RECEIPT_READ_COMMAND}")
             return subprocess.CompletedProcess(cmd, 0, receipts[cmd[3]], "")
 
         ex = pc.GcloudHotPatchExecutor("proj", which=lambda _n: "/usr/bin/gcloud", run=run)
-        self.assertEqual(ex.read_manifest(host("h1")), json.loads(json.dumps(OLD)))
-        self.assertIsNone(ex.read_manifest(host("h2")))
+        receipt = ex.read_manifest(host("h1"))
+        self.assertEqual((receipt.manifest, receipt.proof), (json.loads(json.dumps(OLD)), True))
+        self.assertIsNone(ex.read_manifest(host("h2")).manifest)
+        for unreadable in ("h3", "h4"):  # no boot id, or a damaged state file
+            with self.assertRaises(pc.PatchConsoleError):
+                ex.read_manifest(host(unreadable))
         bad = pc.GcloudHotPatchExecutor("proj", which=lambda _n: "/x",
                                         run=lambda cmd, **_k: subprocess.CompletedProcess(cmd, 255, "", "denied"))
         with self.assertRaises(pc.PatchConsoleError):

@@ -977,7 +977,40 @@ def render_host_patch_script(patch: RunnerPatch | None) -> str:
         qual_b64 = base64.b64encode(patch.hardware.qualify_command.encode("utf-8")).decode("ascii")
         lines.append(f"printf '%s' '{qual_b64}' | base64 -d | bash -euo pipefail")
 
+    # No receipt here: the caller writes the pending marker before these steps and the completion receipt only
+    # after every later step (image build, containers) succeeded. See render_patch_receipt_commands.
+    return "\n".join(lines) + "\n"
+
+
+# Host-side patch state. ``pending.json`` names a patch whose application started and has not completed;
+# ``state.json`` is the completion receipt of the last patch that fully applied, bound to the boot it applied in
+# (``/proc/sys/kernel/random/boot_id``). Both are replaced by atomic rename. Only a completion receipt from the
+# current boot, with no pending marker, proves which patch a host runs.
+PATCH_STATE_DIR = "/var/lib/gha-runner-patch"
+RECEIPT_SCHEMA = "gha-runner-patch-receipt-v2"
+# Prints the state, the pending marker (base64, empty when absent), and the current boot id, one per line.
+PATCH_RECEIPT_READ_COMMAND = (
+    "sudo -n sh -c 'd=" + PATCH_STATE_DIR + "; printf \"state:\"; base64 -w0 \"$d/state.json\" 2>/dev/null; echo; "
+    "printf \"pending:\"; base64 -w0 \"$d/pending.json\" 2>/dev/null; echo; "
+    "printf \"boot:\"; cat /proc/sys/kernel/random/boot_id'"
+)
+
+
+def render_patch_pending_commands(patch: RunnerPatch) -> list[str]:
+    """Shell lines that mark ``patch`` as being applied, before any patch step changes the host."""
+    marker = {"receipt_schema": RECEIPT_SCHEMA, "pending_patch_sha256": patch.patch_sha256}
+    marker_b64 = base64.b64encode(json.dumps(marker, sort_keys=True).encode("utf-8")).decode("ascii")
+    return [
+        f"install -d -m 0755 {PATCH_STATE_DIR}",
+        f"printf '%s' '{marker_b64}' | base64 -d >{PATCH_STATE_DIR}/pending.json.tmp",
+        f"mv -f {PATCH_STATE_DIR}/pending.json.tmp {PATCH_STATE_DIR}/pending.json",
+    ]
+
+
+def render_patch_receipt_commands(patch: RunnerPatch) -> list[str]:
+    """Shell lines that write the completion receipt for ``patch``; they must run after every patch step."""
     receipt = {
+        "receipt_schema": RECEIPT_SCHEMA,
         "schema": patch.schema,
         "repository": patch.repository,
         "source_commit": patch.source_commit,
@@ -985,10 +1018,68 @@ def render_host_patch_script(patch: RunnerPatch | None) -> str:
         "manifest": patch.to_canonical_dict(),
     }
     receipt_b64 = base64.b64encode(json.dumps(receipt, sort_keys=True).encode("utf-8")).decode("ascii")
-    lines.append("install -d -m 0755 /var/lib/gha-runner-patch")
-    lines.append(f"printf '%s' '{receipt_b64}' | base64 -d >/var/lib/gha-runner-patch/state.json")
-    lines.append("chmod 0644 /var/lib/gha-runner-patch/state.json")
-    return "\n".join(lines) + "\n"
+    return [
+        f"install -d -m 0755 {PATCH_STATE_DIR}",
+        'patch_boot_id="$(cat /proc/sys/kernel/random/boot_id)"',
+        '[[ "$patch_boot_id" =~ ^[0-9a-f-]{36}$ ]] || { echo "Cannot read the boot id for the patch receipt" >&2; exit 1; }',
+        f"{{ printf '{{\"boot_id\":\"%s\",\"receipt\":' \"$patch_boot_id\"; printf '%s' '{receipt_b64}' | base64 -d; "
+        f"printf '}}'; }} >{PATCH_STATE_DIR}/state.json.tmp",
+        f"chmod 0644 {PATCH_STATE_DIR}/state.json.tmp",
+        f"mv -f {PATCH_STATE_DIR}/state.json.tmp {PATCH_STATE_DIR}/state.json",
+        f"rm -f {PATCH_STATE_DIR}/pending.json",
+    ]
+
+
+@dataclass(frozen=True)
+class HostPatchReceipt:
+    """What a host's patch state proves. ``manifest`` is the last completed (or legacy) patch, None for none;
+    ``proof`` is True only for a completion receipt from the current boot with no pending attempt."""
+
+    manifest: dict[str, Any] | None
+    proof: bool
+    detail: str
+
+
+def parse_patch_receipt(output: str) -> HostPatchReceipt:
+    """Parse PATCH_RECEIPT_READ_COMMAND output; raises ValueError when the state can't be read or trusted."""
+    fields: dict[str, str] = {}
+    for line in str(output or "").splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key in ("state", "pending", "boot"):
+            fields[key] = value.strip()
+    boot = fields.get("boot", "")
+    if not re.fullmatch(r"[0-9a-f-]{36}", boot):
+        raise ValueError("the host's boot id is unreadable")
+
+    def decode(name: str) -> Any:
+        raw = fields.get(name, "")
+        return json.loads(base64.b64decode(raw, validate=True).decode("utf-8")) if raw else None
+
+    state, pending = decode("state"), decode("pending")
+    problems: list[str] = []
+    if pending is not None:
+        sha = pending.get("pending_patch_sha256") if isinstance(pending, dict) else None
+        problems.append(f"an attempt to apply patch {str(sha or 'unknown')[:12]} has not completed")
+    manifest: dict[str, Any] | None = None
+    detail = "no patch receipt on the host"
+    if state is None:
+        pass
+    elif isinstance(state, dict) and isinstance(state.get("receipt"), dict):
+        receipt = state["receipt"]
+        manifest = receipt.get("manifest")
+        if (not isinstance(manifest, dict) or receipt.get("receipt_schema") != RECEIPT_SCHEMA
+                or validate_patch_dict(manifest).patch_sha256 != receipt.get("patch_sha256")):
+            raise ValueError("the host's patch receipt does not match its manifest")
+        if state.get("boot_id") != boot:
+            problems.append("the host rebooted since the completion receipt was written")
+        detail = "completion receipt"
+    elif isinstance(state, dict) and isinstance(state.get("manifest"), dict):
+        manifest = state["manifest"]
+        validate_patch_dict(manifest)
+        problems.append("the receipt predates completion receipts, so it may name a patch that failed part way")
+    else:
+        raise ValueError("the host's patch state is not a receipt")
+    return HostPatchReceipt(manifest, not problems, "; ".join(problems) or detail)
 
 
 def render_docker_run_args(patch: RunnerPatch | None) -> list[str]:
@@ -1015,6 +1106,7 @@ def inject_startup_patch(startup_script: str, patch: RunnerPatch | None) -> str:
     if host_script:
         host_b64 = base64.b64encode(host_script.encode("utf-8")).decode("ascii")
         host_hook = (
+            "\n".join(render_patch_pending_commands(patch)) + "\n"
             f"printf '%s' '{host_b64}' | base64 -d >/opt/gha-runners/repo-host-patch.sh\n"
             "chmod 0755 /opt/gha-runners/repo-host-patch.sh\n"
             "/opt/gha-runners/repo-host-patch.sh\n"
@@ -1023,6 +1115,13 @@ def inject_startup_patch(startup_script: str, patch: RunnerPatch | None) -> str:
         if build_anchor not in startup_script:
             raise RuntimeError("Startup script is missing build entrypoint anchor for host patch injection")
         startup_script = startup_script.replace(build_anchor, host_hook + build_anchor, 1)
+
+    receipt_anchor = "unset REGISTRATION_TOKEN\n"
+    if startup_script.count(receipt_anchor) != 1:
+        raise RuntimeError("Startup script is missing the registration-token anchor for the patch receipt")
+    # After every runner container started and right before the bootstrap completion marker.
+    startup_script = startup_script.replace(
+        receipt_anchor, receipt_anchor + "\n".join(render_patch_receipt_commands(patch)) + "\n", 1)
 
     extra_docker_flags = render_docker_run_args(patch)
     if extra_docker_flags:
@@ -1140,6 +1239,7 @@ def render_live_hot_patch_script(
     lines = [
         "#!/usr/bin/env bash",
         "set -Eeuo pipefail",
+        *render_patch_pending_commands(patch),
         host_script.strip(),
         f"if [[ -d /opt/gha-runners/build ]]; then",
         f"  printf '%s' '{dockerfile_b64}' | base64 -d >/opt/gha-runners/build/Dockerfile",
@@ -1158,6 +1258,8 @@ def render_live_hot_patch_script(
         lines.append(f'  nsenter -t "$pid" -n sysctl -w {shlex.quote(f"{k}={v}")} >/dev/null')
     lines.extend([
         "done",
+        # Only after the host steps, the image build, and every container succeeded (set -e stops earlier).
+        *render_patch_receipt_commands(patch),
         f"echo 'LIVE_PATCH_APPLIED:{patch.patch_sha256}'",
     ])
     return "\n".join(lines) + "\n"

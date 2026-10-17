@@ -245,6 +245,13 @@ It can restart an existing host. Drain active work and verify the adoption scope
 before using it. Do not use the fresh dedicated builder bootstrap on an occupied
 runner or benchmark host.
 
+Adopting an unlabeled host with `--target` first lists the GitHub runners named
+for that VM under the new target, the default organization, and any registration
+scope recorded on the VM. The runner data disk keeps each runner's registration,
+so the command refuses the adoption when any of those runners belongs to another
+scope, or when a scope can't be listed. Drain the host and remove those
+registrations, or reprovision it, before you adopt it for the new target.
+
 ### Understand runner limits
 
 For manual deployments without `--tier`, automatic sizing uses:

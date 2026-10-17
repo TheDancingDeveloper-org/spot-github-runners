@@ -139,6 +139,8 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   the host confirms it. A provisioned host confirms it when its bootstrap writes the completion marker
   for this deployment, every runner is online, and the storage check passes. A live patch confirms it
   when the host reports `LIVE_PATCH_APPLIED:<sha256>`. The keys are:
+  - `spot-runner-patch-boot`: the GCE `lastStartTimestamp` of the boot that the confirmation belongs to.
+    If the VM restarts during the confirmation, nothing is recorded.
   - `spot-runner-patch`: the canonical manifest JSON. It's left out when larger than 64 KiB, and then
     only the sha256 is recorded.
   - `spot-runner-patch-sha256`: the sha256, or `none` when the host has no patch.
@@ -155,6 +157,15 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   fails, the pending keys stay, and the applied keys stay unset or keep their earlier value. Confirmation
   writes the applied keys and the label, then removes the pending keys. `--patch-live` on a pending host
   applies the patch again, even when its receipt already matches, so `LIVE_PATCH_APPLIED` confirms it.
+- On the host, the patch steps first write the pending marker `/var/lib/gha-runner-patch/pending.json`.
+  Only after every step succeeds do they write the completion receipt `state.json`, with an atomic
+  rename, and then remove the marker. For a live patch, the steps include the image build and every
+  runner container. At startup, the receipt waits until every runner container has started. The
+  receipt records the boot ID it was written in. A failed attempt leaves the earlier receipt and the
+  marker in place. Only a completion receipt from the current boot, with no pending marker, proves the
+  patch. `--patch-live` skips the live script only on such proof. The console's hot-patch executor
+  classifies a host whose unproven receipt names the target as `hot_patch`, so the live script runs
+  again and writes a completion receipt. Receipts written before this change don't count as proof.
 - On the control VM, `DASHBOARD_FLEET_INVENTORY=gce` makes the preview list runner hosts from Compute
   Engine. A runner host carries the `spot-target` label or the patch metadata. The control VM's
   service account needs `compute.instances.list`. Elsewhere the preview uses the host records in the
@@ -168,6 +179,10 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   until they're reprovisioned or hot-patched once with `--patch-live`. A host with a pending patch is
   also `unknown`, never `noop`. That holds even when the applied keys match, and even when the receipt
   matches. The reason names the pending patch.
+- A reboot can bring the runners back without a live patch's changes. When a host's current
+  `lastStartTimestamp` differs from the recorded `spot-runner-patch-boot`, the preview shows it as
+  `unknown`, with a reason that says to reprovision it or run `--patch-live` again. A host with no
+  recorded boot is `unknown` too, and that includes every host confirmed before boot recording.
 - Hot-patching applies the saved effective patch, never a draft. It runs only when every host is
   `hot_patch` or `noop` and the `patch_sha256` from the preview is still current. It reports a result per
   host. A repeated request with the same `Idempotency-Key` returns the stored result without touching

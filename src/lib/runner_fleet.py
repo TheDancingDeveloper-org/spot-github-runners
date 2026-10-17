@@ -40,6 +40,10 @@ PATCH_METADATA_KEY = "spot-runner-patch"
 PATCH_SHA_METADATA_KEY = "spot-runner-patch-sha256"
 PATCH_PENDING_METADATA_KEY = "spot-runner-patch-pending"
 PATCH_PENDING_SHA_METADATA_KEY = "spot-runner-patch-pending-sha256"
+# The GCE ``lastStartTimestamp`` of the boot in which the applied patch was confirmed. A reboot can bring the
+# runners back without a live patch's changes, so an applied record whose boot differs from the instance's current
+# lastStartTimestamp (or that has no boot) is stale.
+PATCH_BOOT_METADATA_KEY = "spot-runner-patch-boot"
 PATCH_TARGET_METADATA_KEY = "spot-runner-patch-target"
 PATCH_LABEL_KEY = "spot-runner-patch"
 # Deployment details apply_live_patch needs to hot-patch a host found by inventory (not secrets).
@@ -80,6 +84,12 @@ def _pending_patch_sha(metadata: dict[str, str]) -> str:
     return "invalid"  # Still pending: a damaged pending record never reads as confirmed.
 
 
+def gce_timestamp(value: Any) -> str:
+    """A GCE RFC 3339 timestamp such as ``lastStartTimestamp``, or an empty string when absent or malformed."""
+    text = str(value or "").strip()
+    return text if 0 < len(text) <= 40 and all(c.isdigit() or c in "TZ:.+-" for c in text) else ""
+
+
 def patch_record_from_gce_item(item: dict) -> dict[str, str]:
     """The recorded runner patch of a GCE instance resource: ``patch_sha256``, ``patch_manifest_json``,
     ``patch_target`` (empty strings when not recorded), and ``patch_pending_sha256`` (non-empty while a
@@ -94,8 +104,9 @@ def patch_record_from_gce_item(item: dict) -> dict[str, str]:
     if len(manifest.encode("utf-8")) > MAX_PATCH_METADATA_BYTES:
         manifest = ""
     target = metadata.get(PATCH_TARGET_METADATA_KEY, "").strip() if sha or pending else ""
+    boot = gce_timestamp(metadata.get(PATCH_BOOT_METADATA_KEY)) if sha else ""
     return {"patch_sha256": sha, "patch_manifest_json": manifest, "patch_target": target,
-            "patch_pending_sha256": pending}
+            "patch_pending_sha256": pending, "patch_boot": boot}
 
 
 def runner_deployment_from_gce_item(item: dict) -> dict[str, Any]:
@@ -163,6 +174,9 @@ class GceVm:
     patch_target: str = ""
     # Requested at provisioning but not yet confirmed by a completed bootstrap; the patch is unknown while set.
     patch_pending_sha256: str = ""
+    # The boot the applied record was confirmed in, and the instance's current GCE lastStartTimestamp.
+    patch_boot: str = ""
+    last_start_timestamp: str = ""
 
     @property
     def running(self) -> bool:
@@ -366,6 +380,7 @@ def list_gcloud_vms(
                 target_label=str((item.get("labels") or {}).get(TARGET_LABEL_KEY, "")
                                  if isinstance(item.get("labels"), dict) else ""),
                 **patch_record_from_gce_item(item),
+                last_start_timestamp=gce_timestamp(item.get("lastStartTimestamp")),
             )
         )
     return tuple(vms)
