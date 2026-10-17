@@ -1,7 +1,8 @@
 # Edge dashboard on a spot control VM
 
-The web dashboard runs on one small Spot VM, the control VM, behind a Cloudflare Worker at
-`https://spot.swacktech.com`. The owner, GitHub user `swackhamer`, can sign in, and so can the
+The web dashboard runs on one small VM, the control VM, behind a Cloudflare Worker at
+`https://spot.swacktech.com`. The control VM is a Spot VM by default, or the always-on free-tier e2-micro
+described in [Use the free-tier control VM](#use-the-free-tier-control-vm). The owner, GitHub user `swackhamer`, can sign in, and so can the
 administrators that the owner adds on the **Admins** page. Each of them must administer every
 controlled repository unless global administrators are enabled, which they are by default.
 
@@ -11,7 +12,7 @@ controlled repository unless global administrators are enabled, which they are b
 | --- | --- | --- |
 | Cloudflare Worker | `cloudflare/worker.js` | Verifies the session cookie's signature and expiry, proxies to the active control VM, and returns a wait response while the control VM is down. |
 | Workers KV | Binding `SPOT_KV` | `origin:active` names the active slot. `dashboard:state` holds the latest dashboard state snapshot. |
-| Control VM | `spot-control-a` or `spot-control-b` | Runs the dashboard container and a `cloudflared` tunnel. Created by `src/control_vm.py`. |
+| Control VM | `spot-control-a` or `spot-control-b` | Runs the dashboard container and a `cloudflared` tunnel. Created by `src/control_vm.py` as a Spot VM or a free-tier e2-micro. |
 | Tunnel hostnames | `spot-origin-a.swacktech.com`, `spot-origin-b.swacktech.com` | One Cloudflare Tunnel per slot, protected by a Cloudflare Access service token. |
 | Startup script | `cloud-init/control-vm-startup.sh` | Fetches secrets, pulls or builds the image, and starts both containers on every boot. |
 | Dashboard image | `dashboard/Dockerfile` | Built on the VM from a pinned commit, or pulled from `ghcr.io/swack-tools/spot-dashboard`. |
@@ -327,7 +328,8 @@ startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` 
 ## State durability
 
 - The dashboard writes state atomically to `/var/lib/spot-dashboard/state.json` on the boot disk.
-  Control VMs use the `STOP` termination action, so a preemption keeps the boot disk.
+  Spot control VMs use the `STOP` termination action, so a preemption keeps the boot disk. A standard
+  control VM is never preempted, and a stop keeps its boot disk too.
 - Every save increments `state_version`. The active slot copies each save to KV about one second later.
 - At startup the dashboard loads the newer of the local file and the KV snapshot, then reports
   `hydrated`. A new VM with no local file waits while KV is unreachable: `/api/health` returns 503 and
@@ -382,6 +384,9 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   moves to the project file on that controller's first check. An idle copy is dropped. When both files
   hold different transitions or retained disks, that controller refuses to manage the control VM and
   logs an error until an operator decides which state is current.
+- **Stopped standard VM**: the autoscaler starts a stopped free-tier VM again and never treats it as lost
+  Spot capacity. It replaces the VM with the other slot only after a start fails and the VM has stayed
+  down for 10 minutes. A start that succeeds restarts that grace period.
 - **Preempted VM**: the autoscaler starts it again. If the start keeps failing, it creates the other slot,
   which loads state from KV, then points `origin:active` at it. If the old VM still answers but reports
   `frozen`, the autoscaler freezes it again, or reads its snapshot, and imports that state before the
@@ -392,7 +397,8 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   changes until it stops, so the autoscaler treats that state as provisional. It logs an error, reports
   the reason as `old_state_unconfirmed` in the `status` output, and keeps the old boot disk when it
   deletes the old VM. An old VM that the autoscaler stopped, rather than froze, gets the same treatment.
-- **Price rotation**: the autoscaler creates the other slot, waits for health, freezes the old VM, copies
+- **Price rotation**: price never rotates away from a standard control VM. For a Spot control VM, the
+  autoscaler creates the other slot, waits for health, freezes the old VM, copies
   its snapshot into the new VM, writes `origin:active` with read-back verification, waits for KV to
   propagate, then deletes the old VM. A failed origin write unfreezes the old VM and deletes the new one.
 - **Instance identity**: each transition records the provider instance IDs of the old and new VMs and
@@ -434,6 +440,136 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
 Recovery depends on the autoscaler running. If the workstation that runs it is off, the dashboard stays
 down until the autoscaler runs again.
 
+## Use the free-tier control VM
+
+`SPOT_CONTROL_PROVISIONING=standard`, or `--provisioning standard` on `src/control_vm.py`, runs the
+control VM as a free, always-on, non-preemptible e2-micro inside the Compute Engine free tier. The default,
+`spot`, keeps the Spot behavior that the preceding sections describe.
+
+### Free-tier constraints
+
+Google's free tier covers, per billing account and month:
+
+- One non-preemptible e2-micro VM in `us-west1`, `us-central1`, or `us-east1`.
+- 30 GB-months of standard persistent disk (`pd-standard`).
+- 1 GB of outbound data transfer from North America to every destination except China and Australia.
+
+The standard mode enforces what it can:
+
+- The only shape is `e2-micro`, created with `--provisioning-model=STANDARD`,
+  `--maintenance-policy=MIGRATE`, and `--no-restart-on-failure`, and with no Spot flags or termination
+  action. Host maintenance live-migrates the VM. After a host failure, the autoscaler restarts it, rather than
+  Compute Engine, so a fenced control VM stays stopped until the autoscaler starts it.
+- The boot disk is a 15 GB `pd-standard` disk. It holds Debian 12, Docker, the 2 GiB swap file, both
+  images, and the capped container logs. Two such disks, during a cutover or with a retained boot disk,
+  still fit in 30 GB-months.
+- Every region in `SPOT_CONTROL_REGIONS` must be a free-tier region. Any other region is a configuration
+  error that pauses every control VM change until you fix it. Without `SPOT_CONTROL_REGIONS`, the standard
+  mode uses `us-central1` only.
+- No price lookup runs. The offer is fixed at $0 a day, and a capacity failure moves on to the next
+  free-tier zone of the same region, then to the next listed region.
+- Price never rotates away from a standard VM. The autoscaler also never switches a standard VM back to
+  Spot by itself. To move back, set `SPOT_CONTROL_PROVISIONING=spot` and run `src/control_vm.py rotate --apply`.
+
+The free tier doesn't cover these costs:
+
+- The external IPv4 address, at about $0.005 an hour, or about $3.65 a month. The VM keeps it, because
+  GitHub has no IPv6 endpoints and a NAT gateway costs more. The $0 offer doesn't include it.
+- A second e2-micro or a second boot disk beyond the free amounts. During a cutover or a recovery, both
+  slots run for a few minutes up to about an hour, and those extra hours are billed at the e2-micro rate.
+- Outbound data transfer over 1 GB a month. The tunnel, health checks, and KV snapshots normally stay well
+  below that.
+- Any other e2-micro in the same billing account, which uses up the same free allowance.
+
+### Dashboard image
+
+The e2-micro never builds the dashboard image. It pulls the image that
+`.github/workflows/dashboard-image.yml` publishes to `ghcr.io/swack-tools/spot-dashboard` for every push to
+`main` that changes the image's inputs. The workflow tags each image `:<commit>` and `:main`, and its run
+summary prints the digest.
+
+- Preferred: set `SPOT_DASHBOARD_IMAGE` to the digest, such as
+  `ghcr.io/swack-tools/spot-dashboard@sha256:<64 hex>`. A digest can't move.
+- Also accepted: an image tagged with a 40-character commit, such as
+  `ghcr.io/swack-tools/spot-dashboard:<commit>`. When only `SPOT_DASHBOARD_SOURCE_REF` is set and
+  `SPOT_DASHBOARD_REPO` is the default, the standard mode pulls that commit's tag. The tag exists only for a
+  commit that the workflow published.
+- Without either, the autoscaler and `src/control_vm.py` refuse to create the VM, and they don't begin the
+  switch from Spot. The startup script also stops with an error on an e2-micro without a pinned image, and
+  it never installs `git` there.
+
+A Spot control VM is unchanged: it accepts a digest or builds `SPOT_DASHBOARD_SOURCE_REF` on the VM. The
+published image is the recommended path there too, because it boots faster than a build.
+
+### Memory on the e2-micro
+
+The e2-micro has 1 GB of RAM. On that shape, the startup script reads the machine type from the metadata
+server and sets up two swap areas before it installs packages or pulls images:
+
+- Compressed swap in RAM: the `zram` kernel module's `/dev/zram0`, half of `MemTotal`, with `zstd`
+  compression, or `lz4` when the kernel lacks `zstd`, or else the kernel default. It has swap priority
+  100, so the kernel uses it first. When the module or the device is missing, or any `zram` step fails, the
+  script logs why and continues with the swap file alone.
+- The swap file `/swapfile`: 2 GiB, owned by root, mode 0600, at swap priority 10.
+
+Both steps run at every boot and are idempotent. Active swap areas stay as they are, and the script creates the
+swap file only once and turns it on again on later boots. The script also limits the dashboard container to
+320 MB of RAM (640 MB with swap) and `cloudflared` to 160 MB (320 MB with swap). Every shape caps container
+logs at three 10 MB files.
+
+### Switch to the free-tier VM
+
+When the mode is `standard` and the active control VM is a healthy Spot VM, the next check replaces it. It
+uses the same make-before-break rotation as a price rotation: create the e2-micro in the other slot, wait for
+health, freeze the Spot VM, import its snapshot, check the version floor, write `origin:active`, wait for KV
+to propagate, and delete the Spot VM. Every fence and version check applies. A failed step aborts the
+switch, the Spot VM keeps serving, and the switch is retried after the 6-hour rotation cooldown. Every
+controller that runs `--manage-control-vm` in the project must use the same mode. A controller configured for
+the other mode never creates the replacement of a switch in progress, and the switch aborts instead.
+
+Prerequisites:
+
+- No other non-preemptible e2-micro runs in the billing account.
+- The control VM service account, secrets, and Cloudflare settings that the Spot VM uses.
+- A published dashboard image. Copy its digest from the summary of the latest **Dashboard image**
+  workflow run, or read it with
+  `docker buildx imagetools inspect ghcr.io/swack-tools/spot-dashboard:<commit>`.
+
+To switch:
+
+1. Add these settings to the autoscaler's environment file:
+
+   ```bash
+   SPOT_CONTROL_PROVISIONING=standard
+   SPOT_CONTROL_REGIONS=us-central1
+   SPOT_DASHBOARD_IMAGE=ghcr.io/swack-tools/spot-dashboard@sha256:DIGEST
+   ```
+
+1. Preview the switch. These commands change nothing:
+
+   ```bash
+   PYTHONPATH=src python3 src/control_vm.py status
+   PYTHONPATH=src python3 src/control_vm.py plan
+   ```
+
+   The plan reads `rotate slot=a target=b offer=e2-micro@us-central1-a $0.0000/day` and names the switch to
+   the free-tier VM. A `wait` plan whose reason starts with `rotate refused` names the setting to fix, such
+   as a missing image.
+
+1. Restart the autoscaler, which runs with `--manage-control-vm`, so that it reads the new settings. It then
+   runs the switch, one step a check:
+
+   ```bash
+   launchctl kickstart -k "gui/$(id -u)/com.swacktools.spot-runner-autoscaler"
+   ```
+
+   To drive the steps yourself, run `PYTHONPATH=src python3 src/control_vm.py ensure --apply` until
+   `status` shows no `transition`. While the autoscaler holds the project lock, the command stops with an
+   error, and you can run it again.
+
+1. Confirm that `status` lists only the new slot with `"provisioning_model": "STANDARD"` and that
+   `origin:active` names it.
+
 ## Configuration
 
 Set these in the autoscaler's environment file outside the Git checkout. See `.env.example` for the full
@@ -445,6 +581,7 @@ list.
 | `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` | Access service token for the tunnel hostnames. |
 | `DASHBOARD_CONTROL_SECRET` | Signs control calls (`freeze`, `unfreeze`, `snapshot`, `import`). |
 | `SPOT_DASHBOARD_IMAGE` or `SPOT_DASHBOARD_SOURCE_REF` | A digest-pinned image, or a 40-character commit to build on the VM. |
+| `SPOT_CONTROL_PROVISIONING` | `spot` (default) or `standard`, the free-tier e2-micro, which needs a published image. See [Use the free-tier control VM](#use-the-free-tier-control-vm). |
 | `SPOT_CONFIG_REPO` | Optional config repository, as `owner/repo`, whose `repos/<owner>/<repo>.yaml` files are controlled targets. The autoscaler's `--config-repo` takes precedence. Default: `<org>/spot-runners-config`. |
 | `DASHBOARD_CONTROLLED_TARGETS` | Optional comma-separated organizations and `owner/repo` targets that the signed-in user must administer. Default: none. |
 
@@ -476,6 +613,8 @@ Write the startup script for review:
 ```bash
 PYTHONPATH=src python3 src/control_vm.py render-startup --output "$HOME/oxidex-ops/control-vm-startup.sh"
 ```
+
+Pass `--provisioning standard` to any command to try the free-tier mode without changing the environment file.
 
 Run one lifecycle step. This command creates, starts, or deletes VMs:
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Boot script for the Spot dashboard control VM (spot-control-a / spot-control-b).
+# Boot script for the dashboard control VM (spot-control-a / spot-control-b), a Spot VM or the always-on
+# free-tier e2-micro.
 #
-# GCE runs this on every boot, including each start after a Spot preemption stopped the VM, so every
+# GCE runs this on every boot, including each start after a Spot preemption or an operator stop, so every
 # step is idempotent. Per-VM settings come from instance metadata; secrets come from Secret Manager
 # through the VM service account and are written only to root-owned 0600 files. This script never
 # echoes a secret and never enables shell tracing.
@@ -17,6 +18,19 @@ readonly STATE_DIR=/var/lib/spot-dashboard
 readonly CONTAINER_UID=10001
 readonly DASHBOARD_CONTAINER=spot-dashboard
 readonly TUNNEL_CONTAINER=spot-cloudflared
+# The free-tier e2-micro has 1 GB of RAM. It never builds the dashboard image (it pulls the published one), and
+# before any package install it gets compressed zram swap in RAM (used first) backed by a swap file on disk,
+# plus memory limits on both containers. Other shapes have at least 2 GB and get none of this.
+readonly MICRO_MACHINE_TYPE=e2-micro
+readonly SWAP_FILE=/swapfile
+readonly SWAP_SIZE_MIB=2048
+readonly SWAP_FILE_PRIORITY=10
+readonly ZRAM_DEV=/dev/zram0
+readonly ZRAM_SYS=/sys/block/zram0
+readonly ZRAM_PRIORITY=100
+readonly MEMINFO=/proc/meminfo
+# Container logs are capped on every shape so they can't fill the small boot disk.
+readonly LOG_ARGS=(--log-driver json-file --log-opt max-size=10m --log-opt max-file=3)
 
 log() {
   printf 'spot-control-startup: %s\n' "$*" >&2
@@ -97,6 +111,15 @@ image_ref_pinned() {
   [[ "$ref" != *:latest ]] || return 1
 }
 
+# The dashboard image the e2-micro pulls: pinned by digest (name[:tag]@sha256:<64 hex>), or by the 40-hex commit tag
+# that .github/workflows/dashboard-image.yml publishes (name:<sha>). Mirrors ControlConfig.create_problems() in
+# src/lib/control_vm.py for the standard mode; other shapes keep the digest-only check.
+dashboard_image_ok() {
+  local ref="$1"
+  [[ "$ref" =~ ^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]] && return 0
+  [[ "$ref" =~ ^[a-z0-9][a-z0-9._/-]*:[0-9a-f]{40}$ ]]
+}
+
 # Origin (https://host[:port]) of the public dashboard URL. The URL must be https:// plus a DNS host name, an
 # optional port 1-65535 without leading zeros and at most a trailing slash: no path, query, fragment or user info. Mirrors
 # public_origin() in src/lib/control_vm.py, which refuses the same values before a VM is created.
@@ -172,6 +195,90 @@ global_admins_csv() {
     joined+="${joined:+,}$entry"
   done
   printf '%s' "$joined"
+}
+
+# Create (once) and enable (every boot) a root-owned 0600 swap file of size_mib MiB. Idempotent: an active swap
+# file is left alone, and a complete file of the right size is reused. The file is built under a temporary
+# name and renamed only after mkswap, so a crash never leaves a half-made file at $SWAP_FILE.
+ensure_swap() {
+  local size_mib="$1" bytes temp active
+  bytes=$((size_mib * 1024 * 1024))
+  if [[ -f "$SWAP_FILE" && "$(stat -c %s "$SWAP_FILE")" == "$bytes" ]]; then
+    chown root:root "$SWAP_FILE"
+    chmod 0600 "$SWAP_FILE"
+  else
+    log "creating ${size_mib} MiB swap file $SWAP_FILE"
+    temp="$SWAP_FILE.partial"
+    swapoff "$SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$temp" "$SWAP_FILE"
+    (umask 077 && fallocate -l "$bytes" "$temp") || fail "could not allocate $SWAP_FILE"
+    chown root:root "$temp"
+    chmod 0600 "$temp"
+    mkswap "$temp" >/dev/null || fail "mkswap failed for $SWAP_FILE"
+    mv -f "$temp" "$SWAP_FILE"
+  fi
+  active="$(swapon --show=NAME --noheadings)" || fail "could not list the active swap areas"
+  if ! grep -Fxq -- "$SWAP_FILE" <<<"$active"; then
+    swapon --priority "$SWAP_FILE_PRIORITY" "$SWAP_FILE" || fail "could not enable swap file $SWAP_FILE"
+    log "enabled swap file $SWAP_FILE"
+  fi
+}
+
+# Compressed swap in RAM (zram, zstd or else lz4, half of MemTotal) at a higher priority than the swap file, so
+# the kernel swaps there first. Idempotent, and never fatal: without the zram module, or on any zram error, it
+# logs why and the VM keeps only the swap file.
+ensure_zram_swap() {
+  local active algorithms algorithm="" candidate mem_kib size=""
+  active="$(swapon --show=NAME --noheadings 2>/dev/null)" || active=""
+  if grep -Fxq -- "$ZRAM_DEV" <<<"$active"; then
+    return 0
+  fi
+  if ! modprobe zram num_devices=1 >/dev/null 2>&1 || [[ ! -d "$ZRAM_SYS" ]]; then
+    log "zram is unavailable on this kernel; continuing with only the swap file"
+    return 0
+  fi
+  # A device sized by an earlier, interrupted boot keeps its size and algorithm (both are fixed once set).
+  if [[ "$(cat "$ZRAM_SYS/disksize" 2>/dev/null || echo 0)" == 0 ]]; then
+    algorithms="$(cat "$ZRAM_SYS/comp_algorithm" 2>/dev/null || true)"
+    for candidate in zstd lz4; do
+      if [[ " ${algorithms//[\[\]]/ } " == *" $candidate "* ]]; then
+        algorithm="$candidate"
+        break
+      fi
+    done
+    if [[ -z "$algorithm" ]]; then
+      log "zram offers neither zstd nor lz4 (${algorithms:-none listed}); keeping the kernel default"
+    elif ! { printf '%s\n' "$algorithm" >"$ZRAM_SYS/comp_algorithm"; } 2>/dev/null; then
+      log "could not select $algorithm for zram; keeping the kernel default"
+      algorithm=""
+    fi
+    mem_kib="$(awk '/^MemTotal:/ {print $2}' "$MEMINFO" 2>/dev/null || true)"
+    if [[ ! "$mem_kib" =~ ^[0-9]+$ ]]; then
+      log "could not read MemTotal; continuing with only the swap file"
+      return 0
+    fi
+    size=$((mem_kib * 1024 / 2))
+    if ! { printf '%s\n' "$size" >"$ZRAM_SYS/disksize"; } 2>/dev/null; then
+      log "could not size $ZRAM_DEV; continuing with only the swap file"
+      return 0
+    fi
+  fi
+  if ! mkswap "$ZRAM_DEV" >/dev/null 2>&1 || ! swapon --priority "$ZRAM_PRIORITY" "$ZRAM_DEV" >/dev/null 2>&1; then
+    log "could not enable zram swap on $ZRAM_DEV; continuing with only the swap file"
+    return 0
+  fi
+  log "enabled zram swap on $ZRAM_DEV (${size:-existing size} bytes, ${algorithm:-default} compression)"
+}
+
+# Per-shape docker run arguments: capped logs everywhere, plus memory limits on the 1 GB e2-micro so the
+# dashboard and cloudflared fit next to the guest agents and dockerd (the swap file absorbs short peaks).
+set_container_limits() {
+  DASHBOARD_RUN_ARGS=("${LOG_ARGS[@]}")
+  TUNNEL_RUN_ARGS=("${LOG_ARGS[@]}")
+  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then
+    DASHBOARD_RUN_ARGS+=(--memory=320m --memory-swap=640m)
+    TUNNEL_RUN_ARGS+=(--memory=160m --memory-swap=320m)
+  fi
 }
 
 install_packages() {
@@ -295,6 +402,7 @@ run_containers() {
   # Recreate on every boot so changed metadata, secrets, or images always take effect.
   docker rm -f "$DASHBOARD_CONTAINER" >/dev/null 2>&1 || true
   docker run -d --name "$DASHBOARD_CONTAINER" --restart unless-stopped --network host \
+    "${DASHBOARD_RUN_ARGS[@]}" \
     --user "$CONTAINER_UID:$CONTAINER_UID" --cap-drop ALL --security-opt no-new-privileges \
     --env-file "$ENV_FILE" -v "$STATE_DIR:/state" "$DASHBOARD_IMAGE_REF" \
     --host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \
@@ -304,6 +412,7 @@ run_containers() {
   docker rm -f "$TUNNEL_CONTAINER" >/dev/null 2>&1 || true
   # cloudflared reads the slot's tunnel token from TUNNEL_TOKEN, keeping it out of argv.
   docker run -d --name "$TUNNEL_CONTAINER" --restart unless-stopped --network host \
+    "${TUNNEL_RUN_ARGS[@]}" \
     --cap-drop ALL --security-opt no-new-privileges \
     --env-file "$TUNNEL_ENV_FILE" "$CLOUDFLARED_IMAGE" tunnel --no-autoupdate run >/dev/null
 }
@@ -325,6 +434,11 @@ main() {
   [[ "$(id -u)" -eq 0 ]] || fail "must run as root"
   wait_for_metadata
   PROJECT="$(curl -fsS -H 'Metadata-Flavor: Google' "$METADATA/project/project-id")"
+  # projects/<number>/machineTypes/<type>; the shape decides the swap file and the container memory limits.
+  MACHINE_TYPE="$(curl -fsS --retry 5 --retry-connrefused --max-time 10 -H 'Metadata-Flavor: Google' \
+    "$METADATA/instance/machine-type")" || fail "could not read the machine type"
+  MACHINE_TYPE="${MACHINE_TYPE##*/}"
+  [[ "$MACHINE_TYPE" =~ ^[a-z0-9-]+$ ]] || fail "machine type is malformed"
   SLOT="$(metadata_required spot-control-slot)"
   DASHBOARD_IMAGE="$(metadata_attr dashboard-image)"
   DASHBOARD_REPO="$(metadata_attr dashboard-repo)"
@@ -353,11 +467,22 @@ main() {
   GLOBAL_ADMINS="$(global_admins_csv "$GLOBAL_ADMINS_METADATA")" \
     || fail "dashboard-global-admins must be none or ;-separated login:numeric_id entries"
   PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url must be https://host[:port] without a path, query, or user info"
-  if [[ -n "$DASHBOARD_IMAGE" ]]; then
+  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then
+    # 1 GB of RAM: never build on the box, always pull the published image.
+    dashboard_image_ok "$DASHBOARD_IMAGE" \
+      || fail "the e2-micro control VM needs dashboard-image pinned by digest or a 40-hex commit tag; it never builds the image"
+  elif [[ -n "$DASHBOARD_IMAGE" ]]; then
     [[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"
   else
     [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || fail "dashboard-source-ref must be a 40-hex commit"
   fi
+
+  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then
+    # Before apt, docker, and the image pull, which would otherwise risk the OOM killer on 1 GB.
+    ensure_zram_swap
+    ensure_swap "$SWAP_SIZE_MIB"
+  fi
+  set_container_limits
 
   install -d -m 0700 -o root -g root "$CONFIG_DIR"
   TOKEN="$(access_token)"

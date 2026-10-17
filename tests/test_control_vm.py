@@ -84,11 +84,15 @@ class FakeGcloud:
         self.create_ids: list[str] = []  # instance ids for the next creates (default id-<slot>)
         self.create_returns_row = True  # create prints the new instance (with its id) as JSON
 
-    def add(self, slot, status="RUNNING", zone="us-central1-a", machine="e2-small", instance_id=None):
+    def add(self, slot, status="RUNNING", zone="us-central1-a", machine="e2-small", instance_id=None,
+            provisioning=None):
         name = f"spot-control-{slot}"
         self.vms[name] = {"name": name, "zone": f"projects/proj/zones/{zone}", "status": status,
                           "labels": {"spot-role": "control", "spot-control-slot": slot},
                           "id": instance_id or f"id-{slot}", "machineType": f"zones/{zone}/machineTypes/{machine}"}
+        if provisioning:  # None: an inventory row without scheduling (model unknown)
+            self.vms[name]["scheduling"] = {"provisioningModel": provisioning,
+                                            "preemptible": False}
 
     def recreate(self, slot, instance_id):
         """Simulate an operator deleting and recreating a slot VM under the same name."""
@@ -116,8 +120,9 @@ class FakeGcloud:
                 self.events.append(("create_failed", name, zone))
                 return SimpleNamespace(returncode=1, stdout="", stderr="ZONE_RESOURCE_POOL_EXHAUSTED")
             slot = name.rsplit("-", 1)[1]
+            model = next((a.split("=", 1)[1] for a in argv if a.startswith("--provisioning-model=")), None)
             self.add(slot, status="PROVISIONING", zone=zone, machine=machine,
-                     instance_id=self.create_ids.pop(0) if self.create_ids else None)
+                     instance_id=self.create_ids.pop(0) if self.create_ids else None, provisioning=model)
             self.events.append(("create", name, zone))
             if zone in self.land_but_fail_zones:
                 return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: operation polling failed")
@@ -2591,3 +2596,651 @@ class SavedOfferRevalidationTests(unittest.TestCase):
 
     def test_failed_price_scan_creates_nothing(self):
         self.assertEqual(self.resume_create([]), [])
+
+
+# --------------------------------------------------------------------------------------------
+# Free-tier standard (always-on e2-micro) provisioning mode
+# --------------------------------------------------------------------------------------------
+
+def micro(zone="us-central1-a"):
+    return offer("e2-micro", zone, "0")
+
+
+STANDARD_OFFERS = [micro("us-central1-a"), micro("us-central1-b"), micro("us-central1-c"), micro("us-central1-f")]
+
+
+def std_vm(slot, status="RUNNING", zone="us-central1-a"):
+    return cv.ControlVm(f"spot-control-{slot}", zone, status, slot, "e2-micro", f"id-{slot}", cv.MODEL_STANDARD)
+
+
+def spot_vm(slot, status="RUNNING", zone="us-central1-a", machine="e2-small"):
+    return cv.ControlVm(f"spot-control-{slot}", zone, status, slot, machine, f"id-{slot}", cv.MODEL_SPOT)
+
+
+class ProvisioningConfigTests(unittest.TestCase):
+    def test_default_is_spot_and_env_or_override_selects_standard(self):
+        spot = cv.ControlConfig.from_env("proj", {}, dashboard_image=IMAGE)
+        self.assertEqual((spot.provisioning, spot.regions, spot.standard), ("spot", cv.DEFAULT_REGIONS, False))
+        std = cv.ControlConfig.from_env("proj", {"SPOT_CONTROL_PROVISIONING": " Standard "}, dashboard_image=IMAGE)
+        self.assertEqual((std.provisioning, std.regions, std.standard), ("standard", ("us-central1",), True))
+        listed = cv.ControlConfig.from_env("proj", {"SPOT_CONTROL_PROVISIONING": "standard",
+                                                    "SPOT_CONTROL_REGIONS": "us-west1,us-east1"})
+        self.assertEqual(listed.regions, ("us-west1", "us-east1"))
+        self.assertEqual(listed.provisioning_problems(), [])
+        override = cv.ControlConfig.from_env("proj", {"SPOT_CONTROL_PROVISIONING": "spot"}, provisioning="standard")
+        self.assertEqual((override.provisioning, override.regions), ("standard", ("us-central1",)))
+        cli = cv.ControlConfig.from_env("proj", {"SPOT_CONTROL_PROVISIONING": "standard"}, provisioning=None)
+        self.assertEqual(cli.provisioning, "standard")  # an unset CLI flag keeps the environment's mode
+
+    def test_cli_flag_reaches_the_overrides(self):
+        args = cv.args_parser().parse_args(["plan", "--provisioning", "standard"])
+        self.assertEqual(cv._overrides(args)["provisioning"], "standard")
+        self.assertIsNone(cv._overrides(cv.args_parser().parse_args(["plan"]))["provisioning"])
+        with redirect_stdout(io.StringIO()), patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            cv.args_parser().parse_args(["plan", "--provisioning", "preemptible"])
+
+    def test_standard_regions_must_be_free_tier(self):
+        for regions in (("us-east4",), ("us-central1", "europe-west1"), ("us-west2",)):
+            cfg = config(provisioning="standard", regions=regions)
+            self.assertTrue(cfg.provisioning_problems(), regions)
+            self.assertTrue(any("free-tier" in p for p in cfg.runtime_problems()), regions)
+            self.assertTrue(cfg.create_problems(), regions)
+            with self.assertRaises(ValueError, msg=regions):
+                cv.create_command(cfg, "b", micro(f"{regions[0]}-a"), "/s")
+        for regions in (("us-central1",), ("us-east1",), ("us-west1",), cv.FREE_TIER_REGIONS):
+            self.assertEqual(config(provisioning="standard", regions=regions).runtime_problems(), [], regions)
+        # Spot keeps its region freedom.
+        self.assertEqual(config(regions=("us-east4",)).runtime_problems(), [])
+
+    def test_misspelt_mode_fails_closed(self):
+        cfg = cv.ControlConfig.from_env("proj", {"SPOT_CONTROL_PROVISIONING": "standrd"})
+        self.assertEqual(cfg.provisioning, "standrd")
+        self.assertTrue(any("must be spot or standard" in p for p in cfg.runtime_problems()))
+        h = Harness(provisioning="standrd")
+        h.gcloud.add("a", status="TERMINATED")
+        h.kv.set_origin("a")
+        self.assertEqual(h.tick().action, "wait")
+        self.assertEqual(h.gcloud.mutating(), [])
+
+    def test_free_tier_disk_size(self):
+        self.assertLessEqual(cv.STANDARD_BOOT_DISK_GB * 2, cv.FREE_TIER_DISK_GB)
+        self.assertGreaterEqual(cv.STANDARD_BOOT_DISK_GB, 10)  # the debian-12 image needs 10 GB
+        self.assertEqual(config(provisioning="standard").boot_disk, (cv.STANDARD_BOOT_DISK_GB, "pd-standard"))
+        self.assertEqual(config().boot_disk, (cv.BOOT_DISK_GB, "pd-balanced"))
+
+
+class ProvisioningCreateCommandTests(unittest.TestCase):
+    def test_standard_flags(self):
+        command = cv.create_command(config(provisioning="standard"), "b", micro("us-central1-b"), "/tmp/s.sh")
+        for flag in ("--zone=us-central1-b", "--machine-type=e2-micro", "--provisioning-model=STANDARD",
+                     "--maintenance-policy=MIGRATE", "--no-restart-on-failure", "--boot-disk-type=pd-standard",
+                     f"--boot-disk-size={cv.STANDARD_BOOT_DISK_GB}GB", "--boot-disk-auto-delete",
+                     "--labels=spot-role=control,spot-control-slot=b", "--shielded-secure-boot"):
+            self.assertIn(flag, command)
+        joined = " ".join(command)
+        for spot_only in ("SPOT", "--instance-termination-action", "pd-balanced", "--preemptible"):
+            self.assertNotIn(spot_only, joined)
+        self.assertNotIn("--no-address", command)  # GitHub has no IPv6, so the free-tier VM keeps its IPv4
+
+    def test_spot_flags_unchanged(self):
+        command = cv.create_command(config(), "b", offer("e2-small", "us-east1-b"), "/tmp/s.sh")
+        for flag in ("--provisioning-model=SPOT", "--instance-termination-action=STOP", "--boot-disk-type=pd-balanced",
+                     "--boot-disk-size=20GB"):
+            self.assertIn(flag, command)
+        for standard_only in ("STANDARD", "--maintenance-policy", "--no-restart-on-failure", "pd-standard"):
+            self.assertNotIn(standard_only, " ".join(command))
+
+    def test_shapes_and_zones_follow_the_mode(self):
+        for shape in ("e2-small", "e2-medium", "t2d-standard-1", "e2-standard-2"):
+            with self.assertRaises(ValueError, msg=shape):
+                cv.create_command(config(provisioning="standard"), "a", offer(shape, "us-central1-a", "0"), "/s")
+        with self.assertRaises(ValueError):
+            cv.create_command(config(), "a", micro(), "/s")  # Spot never creates the free-tier shape
+        with self.assertRaises(ValueError):  # a zone outside the configured free-tier region
+            cv.create_command(config(provisioning="standard", regions=("us-central1",)), "a", micro("us-east1-b"), "/s")
+        with self.assertRaises(ValueError):  # a zone outside every free-tier region
+            cv.create_command(config(provisioning="standard"), "a", micro("us-east4-a"), "/s")
+
+
+class StandardOfferTests(unittest.TestCase):
+    def test_fixed_offers_in_region_order_without_prices(self):
+        zones = {"e2-micro": ["us-west1-b", "us-central1-c", "us-central1-a", "us-east4-a", "us-east1-b",
+                              "us-west1-a"],
+                 "e2-small": ["us-central1-a"]}
+        offers = cv.standard_control_offers(["us-central1", "us-west1", "us-east4"], zones)
+        self.assertEqual([o.zone for o in offers], ["us-central1-a", "us-central1-c", "us-west1-a", "us-west1-b"])
+        self.assertEqual({(o.machine_type, o.daily_usd) for o in offers}, {("e2-micro", Decimal("0"))})
+
+    def test_offer_source_lists_e2_micro_zones_and_never_reads_prices(self):
+        calls = []
+
+        def gcloud(argv):
+            calls.append(argv)
+            rows = [{"name": "e2-micro", "zone": f"zones/{z}"} for z in ("us-central1-b", "us-central1-a", "us-east1-b")]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+        boom = mock.Mock(side_effect=AssertionError("no price lookup in standard mode"))
+        with patch("lib.runner_manager.spot_rates", boom), patch("lib.storage_selection.storage_rates", boom):
+            offers = cv.default_offer_source(config(provisioning="standard", regions=("us-central1",)), gcloud)
+        self.assertEqual([o.zone for o in offers], ["us-central1-a", "us-central1-b"])
+        self.assertIn("--filter=name=(e2-micro)", calls[0])
+        boom.assert_not_called()
+        self.assertIn("--filter=name=(e2-small e2-medium t2d-standard-1)", cv.zones_command("proj"))
+
+    def test_inventory_reports_the_provisioning_model(self):
+        base = {"name": "spot-control-a", "zone": "zones/us-central1-a", "status": "TERMINATED",
+                "labels": {"spot-role": "control", "spot-control-slot": "a"}, "id": "1"}
+        cases = [({"provisioningModel": "STANDARD", "preemptible": False}, cv.MODEL_STANDARD),
+                 ({"preemptible": False}, cv.MODEL_STANDARD),
+                 ({"provisioningModel": "SPOT"}, cv.MODEL_SPOT),
+                 ({"provisioningModel": "STANDARD", "preemptible": True}, cv.MODEL_SPOT),
+                 ({}, ""), (None, "")]
+        for scheduling, model in cases:
+            row = dict(base) if scheduling is None else dict(base, scheduling=scheduling)
+            [parsed] = cv.parse_control_vms([row])
+            self.assertEqual(parsed.provisioning_model, model, scheduling)
+        self.assertIn("scheduling.provisioningModel", " ".join(cv.list_command("proj")))
+
+
+class StandardPlannerTests(unittest.TestCase):
+    def plan(self, vms, *, provisioning="standard", offers=STANDARD_OFFERS, cstate=None, now=100000.0, **kw):
+        return cv.plan_next(vms=list(vms), origin=OriginRecord.for_slot("a", now=1), origin_known=True,
+                            health=kw.pop("health", {"a": ok()}), offers=offers, control_state=cstate or {},
+                            now=now, max_daily_usd=Decimal("0.50"), provisioning=provisioning, **kw)
+
+    def test_no_price_rotation_away_from_a_standard_vm(self):
+        cheaper = [offer("e2-small", "us-east1-b", "0.01")]
+        for provisioning, offers in (("standard", STANDARD_OFFERS), ("spot", cheaper), ("spot", OFFERS)):
+            plan = self.plan([std_vm("a")], provisioning=provisioning, offers=offers)
+            self.assertEqual(plan.action, "noop", (provisioning, plan.reason))
+            self.assertIn("never rotated for price", plan.reason)
+        self.assertIn("run rotate", self.plan([std_vm("a")], provisioning="spot", offers=cheaper).reason)
+        # An explicit operator rotation still works (for example to move back to Spot).
+        self.assertEqual(self.plan([std_vm("a")], provisioning="spot", offers=cheaper, force_rotate=True).action,
+                         "rotate")
+
+    def test_stopped_standard_vm_is_restarted_not_replaced(self):
+        long_down = {"down_since": {"a": 1.0}}
+        plan = self.plan([std_vm("a", "TERMINATED")], cstate=long_down, health={})
+        self.assertEqual((plan.action, plan.slot), ("start", "a"))
+        self.assertIn("not preempted", plan.reason)
+        plan = self.plan([std_vm("a", "TERMINATED")], cstate=dict(long_down, start_failed_at={"a": 50.0}), health={})
+        self.assertEqual((plan.action, plan.target_slot), ("recreate_other_slot", "b"))
+        self.assertEqual(plan.offer.zone, "us-central1-b")  # another free-tier zone of the same region
+        recent = {"down_since": {"a": 100000.0 - 60}, "start_failed_at": {"a": 50.0}}
+        self.assertEqual(self.plan([std_vm("a", "TERMINATED")], cstate=recent, health={}).action, "start")
+        # A stopped Spot VM is still treated as preempted capacity and replaced after the grace period.
+        self.assertEqual(self.plan([spot_vm("a", "TERMINATED")], cstate=long_down, health={}).action,
+                         "recreate_other_slot")
+
+    def test_switch_replaces_a_known_spot_vm_with_the_free_tier_vm(self):
+        plan = self.plan([spot_vm("a")])
+        self.assertEqual((plan.action, plan.slot, plan.target_slot), ("rotate", "a", "b"))
+        self.assertEqual((plan.offer.machine_type, plan.offer.daily_usd), ("e2-micro", Decimal("0")))
+        # Unknown provisioning model: never rotated for the mode, so a VM can't rotate in a loop.
+        unknown = cv.ControlVm("spot-control-a", "us-central1-a", "RUNNING", "a", "e2-small", "id-a")
+        self.assertEqual(self.plan([unknown]).action, "noop")
+        # Cooldown after an earlier transition or abort spaces out retries.
+        cooling = self.plan([spot_vm("a")], cstate={"last_abort_at": 100000.0 - 60})
+        self.assertEqual(cooling.action, "noop")
+        self.assertIn("cooldown", cooling.reason)
+        # Spot mode never switches a Spot VM; no free-tier offer means nothing to switch to.
+        self.assertEqual(self.plan([spot_vm("a")], provisioning="spot", offers=OFFERS[:1]).action, "noop")
+        self.assertEqual(self.plan([spot_vm("a")], offers=[]).action, "noop")
+        # A stray VM in the other slot still blocks every automatic rotation.
+        self.assertEqual(self.plan([spot_vm("a"), std_vm("b")]).action, "noop")
+
+
+class StandardExecutorTests(unittest.TestCase):
+    def harness(self):
+        return Harness(offers=STANDARD_OFFERS, provisioning="standard")
+
+    def test_stopped_standard_vm_restart_then_replacement_only_after_failed_starts(self):
+        h = self.harness()
+        h.gcloud.add("a", status="TERMINATED", machine="e2-micro", provisioning="STANDARD")
+        h.kv.set_origin("a")
+        h.state[cv.STATE_KEY] = {"down_since": {"a": 1.0}}  # long past every grace period
+        self.assertEqual(h.tick().action, "start")
+        self.assertEqual(h.mutations(), [("start", "spot-control-a")])
+        h.gcloud.status("a", "TERMINATED")  # stopped again, but the start itself succeeded
+        h.clock[0] += cv.START_RETRY_SECONDS
+        self.assertEqual(h.tick().action, "start")
+        h.gcloud.status("a", "TERMINATED")
+        h.gcloud.start_rc = 1
+        h.clock[0] += cv.START_RETRY_SECONDS
+        self.assertEqual(h.tick().action, "start")
+        self.assertIn("a", h.state[cv.STATE_KEY]["start_failed_at"])
+        h.clock[0] += cv.START_RETRY_SECONDS
+        self.assertEqual(h.tick().action, "start")  # failing, but still inside the grace from the last start
+        h.clock[0] += cv.START_GRACE_SECONDS
+        self.assertEqual(h.tick().action, "recreate_other_slot")
+        self.assertEqual(h.events[-1], ("create", "spot-control-b", "us-central1-b"))
+        create = next(c for c in h.gcloud.calls if c[2:4] == ["instances", "create"])
+        self.assertIn("--provisioning-model=STANDARD", create)
+
+    def test_successful_start_clears_the_failure_and_restarts_the_grace(self):
+        h = self.harness()
+        h.gcloud.add("a", status="TERMINATED", machine="e2-micro", provisioning="STANDARD")
+        h.kv.set_origin("a")
+        h.state[cv.STATE_KEY] = {"down_since": {"a": h.clock[0] - 60}}
+        h.gcloud.start_rc = 1
+        h.tick()
+        h.gcloud.start_rc = 0
+        h.clock[0] += cv.START_RETRY_SECONDS
+        self.assertEqual(h.tick().action, "start")
+        self.assertNotIn("a", h.state[cv.STATE_KEY]["start_failed_at"])
+        self.assertEqual(h.state[cv.STATE_KEY]["down_since"]["a"], h.clock[0])
+        # Booting (and unhealthy) for longer than the original outage plus the start grace: not replaced.
+        h.gcloud.status("a", "RUNNING")
+        h.http.unhealthy("a")
+        h.clock[0] += cv.START_GRACE_SECONDS
+        self.assertEqual(h.tick().action, "wait")
+        h.gcloud.status("a", "TERMINATED")
+        h.clock[0] += cv.START_RETRY_SECONDS
+        self.assertEqual(h.tick().action, "start")
+        self.assertNotIn("spot-control-b", h.gcloud.vms)
+
+    def test_spot_start_keeps_the_original_outage_time(self):
+        h = Harness()
+        h.gcloud.add("a", status="TERMINATED", provisioning="SPOT")
+        h.kv.set_origin("a")
+        h.state[cv.STATE_KEY] = {"down_since": {"a": h.clock[0] - 60}}
+        self.assertEqual(h.tick().action, "start")
+        self.assertEqual(h.state[cv.STATE_KEY]["down_since"]["a"], h.clock[0] - 60)
+
+    def spot_active(self, h, version=7):
+        h.gcloud.add("a", machine="e2-small", provisioning="SPOT")
+        h.kv.set_origin("a")
+        h.http.healthy("a", version=version)
+        # A recent price check must not delay the switch.
+        h.state[cv.STATE_KEY] = {"last_price_check_at": h.clock[0]}
+
+    def test_spot_to_standard_cutover_end_to_end(self):
+        h = self.harness()
+        self.spot_active(h)
+        plan = h.tick()
+        self.assertEqual((plan.action, plan.slot, plan.target_slot), ("rotate", "a", "b"))
+        self.assertEqual((h.transition["mode"], h.transition["provisioning"]), (cv.MODE_PRICE, "standard"))
+        create = next(c for c in h.gcloud.calls if c[2:4] == ["instances", "create"])
+        for flag in ("--machine-type=e2-micro", "--provisioning-model=STANDARD", "--maintenance-policy=MIGRATE",
+                     "--boot-disk-type=pd-standard"):
+            self.assertIn(flag, create)
+        self.assertNotIn("--instance-termination-action=STOP", create)
+        h.gcloud.status("b", "RUNNING")
+        h.http.healthy("b")
+        h.tick()
+        self.assertEqual(h.transition["step"], "propagate")
+        self.assertTrue(h.transition["old_frozen"])
+        self.assertEqual(h.transition["required_version"], 7)
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        h.clock[0] += cv.PROPAGATION_SECONDS + 1
+        h.tick()
+        self.assertEqual(h.mutations(), [("create", "spot-control-b", "us-central1-a"), ("freeze", "a"),
+                                         ("import", "b"), ("origin", "b"), ("delete", "spot-control-a")])
+        self.assertIn("--delete-disks=all", delete_call(h, "spot-control-a"))  # confirmed freeze: no retained disk
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.kv.origin_slot(), "b")
+        self.assertEqual(h.http.versions["b"], 7)
+        self.assertEqual(list(h.gcloud.vms), ["spot-control-b"])
+        self.assertEqual(h.gcloud.vms["spot-control-b"]["scheduling"]["provisioningModel"], "STANDARD")
+        # Settled on the free-tier VM: later checks never rotate it for price.
+        before = len(h.mutations())
+        for _ in range(3):
+            h.clock[0] += cv.ROTATION_COOLDOWN_SECONDS + cv.PRICE_CHECK_INTERVAL_SECONDS
+            self.assertEqual(h.tick().action, "noop")
+        self.assertEqual(len(h.mutations()), before)
+
+    def test_switch_never_skips_the_freeze(self):
+        h = self.harness()
+        self.spot_active(h)
+        h.tick()
+        h.gcloud.status("b", "RUNNING")
+        h.http.healthy("b")
+        h.http.freeze_status = 503
+        for _ in range(cv.STEP_RETRY_LIMIT):
+            h.tick()
+            h.clock[0] += 60
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertNotIn(("origin", "b"), h.events)
+        self.assertNotIn(("import", "b"), h.events)
+        self.assertNotIn("spot-control-b", h.gcloud.vms)
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        self.assertEqual(h.state[cv.STATE_KEY]["history"][-1]["result"], "aborted")
+
+    def test_switch_keeps_the_version_floor_before_deleting_spot(self):
+        h = self.harness()
+        self.spot_active(h)
+        h.tick()
+        h.gcloud.status("b", "RUNNING")
+        h.http.healthy("b")
+        h.tick()
+        self.assertEqual(h.transition["step"], "propagate")
+        h.http.versions["b"] = 3  # the replacement restarted and recovered an older KV snapshot
+        h.http.import_status = 500
+        h.clock[0] += cv.PROPAGATION_SECONDS + 1
+        h.tick()
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        self.assertNotIn(("delete", "spot-control-a"), h.events)
+        self.assertEqual(h.transition["step"], "delete_old")
+
+    def test_switch_with_unreachable_old_slot_stops_and_keeps_its_disk(self):
+        # The Spot VM was preempted right after the switch began: it finishes as a recovery, fenced by stop.
+        h = self.harness()
+        self.spot_active(h)
+        h.tick()
+        h.gcloud.status("b", "RUNNING")
+        h.http.healthy("b")
+        h.gcloud.status("a", "TERMINATED")
+        h.tick()
+        self.assertEqual(h.transition["mode"], cv.MODE_RECOVER)
+        self.assertTrue(h.transition["import_skipped"])
+        h.clock[0] += cv.PROPAGATION_SECONDS + 1
+        h.tick()
+        self.assertIn("--keep-disks=boot", delete_call(h, "spot-control-a"))
+
+    def test_controller_in_the_other_mode_never_creates_the_planned_replacement(self):
+        h = self.harness()
+        self.spot_active(h)
+        h.gcloud.fail_create_zones = {o.zone for o in STANDARD_OFFERS}
+        h.tick()
+        self.assertEqual((h.transition["step"], h.transition["provisioning"]), ("create", "standard"))
+        attempts = len(h.gcloud.create_attempts)
+        h.config = config()  # a second controller still configured for Spot resumes the shared transition
+        h.offers = list(OFFERS)
+        h.gcloud.fail_create_zones = set()
+        for _ in range(cv.PRICE_CREATE_MAX_FAILURES):
+            h.clock[0] += 60
+            h.tick()
+        self.assertEqual(len(h.gcloud.create_attempts), attempts)
+        self.assertNotIn("spot-control-b", h.gcloud.vms)
+        self.assertIsNone(h.transition)  # the switch aborts; the Spot VM keeps serving
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertIn("configured for SPOT_CONTROL_PROVISIONING=spot",
+                      h.state[cv.STATE_KEY]["history"][-1]["reason"])
+
+    def test_autoscaler_path_reads_the_mode_from_the_environment(self):
+        seen = []
+
+        def tick(self, apply):
+            seen.append((self.config.provisioning, self.config.regions, apply))
+            return cv.Plan("noop", "test")
+        with patch.dict("os.environ", {"SPOT_CONTROL_PROVISIONING": "standard"}), \
+                patch.dict("os.environ", {"SPOT_CONTROL_REGIONS": ""}), \
+                patch.object(cv.ControlVmManager, "tick", tick):
+            cv.autoscaler_tick(SimpleNamespace(dry_run=False, project="proj"), {}, lambda: None)
+        self.assertEqual(seen, [("standard", ("us-central1",), True)])
+
+
+class StartupScriptSwapTests(unittest.TestCase):
+    def setUp(self):
+        self.text = SCRIPT.read_text(encoding="utf-8")
+        self.main = re.search(r"^main\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+
+    def _function(self, name):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", self.text, re.S | re.M)
+        self.assertIsNotNone(match, name)
+        return match.group(0)
+
+    def test_swap_only_on_e2_micro_and_before_packages_and_build(self):
+        self.assertIn('"$METADATA/instance/machine-type"', self.main)
+        self.assertIn('MACHINE_TYPE="${MACHINE_TYPE##*/}"', self.main)
+        guard = self.main.index('if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then\n    '
+                                '# Before apt, docker, and the image pull')
+        swap = self.main.index('ensure_swap "$SWAP_SIZE_MIB"')
+        self.assertLess(guard, swap)
+        for later in ("install_packages\n", "build_from_source\n", "pull_published_image\n", "run_containers\n"):
+            self.assertLess(swap, self.main.index(later), later)
+        self.assertIn("readonly MICRO_MACHINE_TYPE=e2-micro", self.text)
+        self.assertIn("readonly SWAP_SIZE_MIB=2048", self.text)
+        zram = self.main.index("ensure_zram_swap\n")
+        self.assertLess(guard, zram)
+        self.assertLess(zram, self.main.index("install_packages\n"))
+        priorities = dict(re.findall(r"^readonly (ZRAM_PRIORITY|SWAP_FILE_PRIORITY)=(\d+)$", self.text, re.M))
+        self.assertGreater(int(priorities["ZRAM_PRIORITY"]), int(priorities["SWAP_FILE_PRIORITY"]))
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_swap_file_is_idempotent_and_private(self):
+        stubs = r'''
+log() { :; }
+fail() { echo "FAIL: $*" >&2; exit 1; }
+stat() { wc -c <"$3" | tr -d ' '; }
+chown() { :; }
+fallocate() { head -c "$2" /dev/zero >"$3"; echo fallocate >>"$CALLS"; }
+mkswap() { echo mkswap >>"$CALLS"; }
+swapoff() { echo swapoff >>"$CALLS"; }
+swapon() {
+  if [[ "$1" == --show=NAME ]]; then cat "$ACTIVE" 2>/dev/null || true; return 0; fi
+  [[ "$1" == --priority ]] || { echo "swapon without --priority" >&2; return 1; }
+  echo "$3" >>"$ACTIVE"; echo "swapon:$2:${3##*/}" >>"$CALLS"
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"PATH": "/usr/bin:/bin", "SWAP_FILE": f"{tmp}/swapfile", "CALLS": f"{tmp}/calls",
+                   "ACTIVE": f"{tmp}/active", "SWAP_FILE_PRIORITY": "10"}
+            program = stubs + self._function("ensure_swap") + 'umask 022\nensure_swap 1\n'
+
+            def run():
+                result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + program], env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = Path(env["CALLS"]).read_text().split() if Path(env["CALLS"]).exists() else []
+                Path(env["CALLS"]).unlink(missing_ok=True)
+                return calls
+
+            self.assertEqual(run(), ["swapoff", "fallocate", "mkswap", "swapon:10:swapfile"])
+            swapfile = Path(env["SWAP_FILE"])
+            self.assertEqual(swapfile.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(swapfile.stat().st_size, 1024 * 1024)
+            self.assertFalse(Path(f"{tmp}/swapfile.partial").exists())
+            self.assertEqual(run(), [])  # active and complete: nothing to do
+            Path(env["ACTIVE"]).unlink()  # reboot: the file stays, swap is off
+            swapfile.chmod(0o644)
+            self.assertEqual(run(), ["swapon:10:swapfile"])
+            self.assertEqual(swapfile.stat().st_mode & 0o777, 0o600)
+            Path(env["ACTIVE"]).unlink()
+            swapfile.write_bytes(b"\0" * 10)  # wrong size (a different SWAP_SIZE_MIB): rebuilt
+            self.assertEqual(run(), ["swapoff", "fallocate", "mkswap", "swapon:10:swapfile"])
+            self.assertEqual(swapfile.stat().st_size, 1024 * 1024)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_container_memory_limits_only_on_e2_micro(self):
+        log_args = re.search(r"^readonly LOG_ARGS=.*$", self.text, re.M).group(0)
+        program = (log_args + "\nreadonly MICRO_MACHINE_TYPE=e2-micro\n" + self._function("set_container_limits")
+                   + 'set_container_limits\necho "D ${DASHBOARD_RUN_ARGS[*]}"\necho "T ${TUNNEL_RUN_ARGS[*]}"\n')
+        outputs = {}
+        for shape in ("e2-micro", "e2-small"):
+            result = subprocess.run(["bash", "-c", "set -euo pipefail\nMACHINE_TYPE=$1\n" + program, "x", shape],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs[shape] = dict(line.split(" ", 1) for line in result.stdout.splitlines())
+        logs = "--log-driver json-file --log-opt max-size=10m --log-opt max-file=3"
+        self.assertEqual(outputs["e2-micro"], {"D": logs + " --memory=320m --memory-swap=640m",
+                                               "T": logs + " --memory=160m --memory-swap=320m"})
+        self.assertEqual(outputs["e2-small"], {"D": logs, "T": logs})
+        run = self._function("run_containers")
+        self.assertIn('--network host \\\n    "${DASHBOARD_RUN_ARGS[@]}" \\\n    --user', run)
+        self.assertIn('--network host \\\n    "${TUNNEL_RUN_ARGS[@]}" \\\n    --cap-drop', run)
+        self.assertLess(self.main.index("set_container_limits"), self.main.index("run_containers"))
+
+
+class StandardDashboardImageTests(unittest.TestCase):
+    """The free-tier e2-micro never builds the dashboard image: it pulls a pinned, published one."""
+
+    SHA = "c" * 40
+    DIGEST = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "d" * 64
+
+    def std(self, **overrides):
+        values = dict(provisioning="standard", dashboard_image="")
+        values.update(overrides)
+        return config(**values)
+
+    def test_source_ref_resolves_to_the_published_commit_tag(self):
+        cfg = self.std(dashboard_source_ref=self.SHA)
+        self.assertEqual(cfg.effective_dashboard_image, f"ghcr.io/swack-tools/spot-dashboard:{self.SHA}")
+        self.assertEqual(cfg.create_problems(), [])
+        items = cv.metadata_items(cfg, "b")
+        self.assertEqual(items["dashboard-image"], f"ghcr.io/swack-tools/spot-dashboard:{self.SHA}")
+        self.assertNotIn("dashboard-source-ref", items)  # nothing on the box can build
+        cv.create_command(cfg, "b", micro(), "/s")
+        # An explicit digest wins over the derived tag.
+        both = self.std(dashboard_image=self.DIGEST, dashboard_source_ref=self.SHA)
+        self.assertEqual(cv.metadata_items(both, "b")["dashboard-image"], self.DIGEST)
+        self.assertNotIn("dashboard-source-ref", cv.metadata_items(both, "b"))
+
+    def test_missing_or_unpinned_image_refuses_creation(self):
+        for bad in (dict(), dict(dashboard_source_ref="main"),
+                    dict(dashboard_source_ref=self.SHA, dashboard_repo="someone/fork"),
+                    dict(dashboard_image="ghcr.io/swack-tools/spot-dashboard:main"),
+                    dict(dashboard_image="ghcr.io/swack-tools/spot-dashboard:latest"),
+                    dict(dashboard_image="ghcr.io/swack-tools/spot-dashboard"),
+                    dict(dashboard_image="ghcr.io/swack-tools/spot-dashboard:" + "c" * 39)):
+            cfg = self.std(**bad)
+            self.assertTrue(cfg.create_problems(), bad)
+            with self.assertRaises(ValueError, msg=bad):
+                cv.create_command(cfg, "b", micro(), "/s")
+        for good in (dict(dashboard_image=self.DIGEST),
+                     dict(dashboard_image="ghcr.io/swack-tools/spot-dashboard:v1@sha256:" + "d" * 64),
+                     dict(dashboard_image=f"ghcr.io/swack-tools/spot-dashboard:{self.SHA}")):
+            self.assertEqual(self.std(**good).create_problems(), [], good)
+
+    def test_spot_mode_is_unchanged(self):
+        source = config(dashboard_image="", dashboard_source_ref=self.SHA)
+        self.assertEqual(source.effective_dashboard_image, "")
+        items = cv.metadata_items(source, "a")
+        self.assertEqual(items["dashboard-source-ref"], self.SHA)
+        self.assertNotIn("dashboard-image", items)
+        # Spot still accepts only a digest for SPOT_DASHBOARD_IMAGE.
+        self.assertTrue(config(dashboard_image=f"ghcr.io/swack-tools/spot-dashboard:{self.SHA}").create_problems())
+
+    def test_switch_without_an_image_never_begins(self):
+        h = Harness(offers=STANDARD_OFFERS, provisioning="standard", dashboard_image="")
+        h.gcloud.add("a", machine="e2-small", provisioning="SPOT")
+        h.kv.set_origin("a")
+        h.http.healthy("a", version=7)
+        plan = h.tick()
+        self.assertEqual(plan.action, "wait")
+        self.assertIn("rotate refused", plan.reason)
+        self.assertIn("never builds the dashboard image", plan.reason)
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertEqual(h.mutations(), [])
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_startup_image_check_matches_create_problems(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        function = re.search(r"^dashboard_image_ok\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        values = [self.DIGEST, f"ghcr.io/swack-tools/spot-dashboard:{self.SHA}",
+                  "ghcr.io/swack-tools/spot-dashboard:v1@sha256:" + "d" * 64, "",
+                  "ghcr.io/swack-tools/spot-dashboard:main", "ghcr.io/swack-tools/spot-dashboard",
+                  "ghcr.io/swack-tools/spot-dashboard:" + "C" * 40, "Ghcr.io/x:" + self.SHA,
+                  "ghcr.io/x:" + self.SHA + "0", "ghcr.io/x@sha256:" + "d" * 63]
+        for value in values:
+            result = subprocess.run(["bash", "-c", function + 'dashboard_image_ok "$1"', "check", value],
+                                    capture_output=True, text=True, timeout=30)
+            expected = not self.std(dashboard_image=value).create_problems() if value else False
+            self.assertEqual(result.returncode == 0, expected, value)
+        main = re.search(r"^main\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        micro_check = main.index('dashboard_image_ok "$DASHBOARD_IMAGE"')
+        self.assertLess(main.index('if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then\n    # 1 GB'), micro_check)
+        self.assertLess(micro_check, main.index("build_from_source\n"))
+        # Other shapes keep the digest-only check and the source build.
+        self.assertIn('[[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"',
+                      main)
+
+
+class StartupScriptZramTests(unittest.TestCase):
+    STUBS = r"""
+log() { echo "LOG: $*" >&2; }
+fail() { echo "FAIL: $*" >&2; exit 1; }
+modprobe() { echo "modprobe:$*" >>"$CALLS"; return "${MODPROBE_RC:-0}"; }
+mkswap() { echo "mkswap:${1##*/}" >>"$CALLS"; return "${MKSWAP_RC:-0}"; }
+swapon() {
+  if [[ "$1" == --show=NAME ]]; then cat "$ACTIVE" 2>/dev/null || true; return 0; fi
+  [[ "$1" == --priority ]] || { echo "swapon without --priority" >&2; return 1; }
+  echo "$3" >>"$ACTIVE"; echo "swapon:$2:${3##*/}" >>"$CALLS"
+}
+"""
+
+    def setUp(self):
+        self.text = SCRIPT.read_text(encoding="utf-8")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.tmp = Path(directory.name)
+        self.sys = self.tmp / "sys-zram0"
+        self.sys.mkdir()
+        (self.sys / "disksize").write_text("0\n")
+        (self.tmp / "meminfo").write_text("MemTotal:        1004300 kB\nMemFree:          500000 kB\n")
+        self.env = {"PATH": "/usr/bin:/bin", "CALLS": str(self.tmp / "calls"), "ACTIVE": str(self.tmp / "active"),
+                    "ZRAM_DEV": str(self.tmp / "zram0"), "ZRAM_SYS": str(self.sys), "ZRAM_PRIORITY": "100",
+                    "MEMINFO": str(self.tmp / "meminfo")}
+
+    def function(self, name):
+        return re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", self.text, re.S | re.M).group(0)
+
+    def run_zram(self, algorithms="lzo lzo-rle lz4 [zstd]", extra="", **env):
+        (self.sys / "comp_algorithm").write_text(algorithms + "\n")
+        program = "set -euo pipefail\n" + self.STUBS + self.function("ensure_zram_swap") + "ensure_zram_swap\n" + extra
+        result = subprocess.run(["bash", "-c", program], env={**self.env, **env}, capture_output=True, text=True,
+                                timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = Path(self.env["CALLS"]).read_text().split() if Path(self.env["CALLS"]).exists() else []
+        Path(self.env["CALLS"]).unlink(missing_ok=True)
+        return calls, result.stderr
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_zstd_half_of_ram_at_a_higher_priority_and_idempotent(self):
+        calls, _ = self.run_zram()
+        self.assertEqual(calls, ["modprobe:zram", "num_devices=1", "mkswap:zram0", "swapon:100:zram0"])
+        self.assertEqual((self.sys / "comp_algorithm").read_text(), "zstd\n")
+        self.assertEqual((self.sys / "disksize").read_text(), f"{1004300 * 1024 // 2}\n")
+        self.assertEqual(self.run_zram()[0], [])  # already active: nothing changes
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_lz4_fallback_then_kernel_default(self):
+        calls, _ = self.run_zram("lzo [lzo-rle] lz4 lz4hc")
+        self.assertEqual((self.sys / "comp_algorithm").read_text(), "lz4\n")
+        self.assertIn("swapon:100:zram0", calls)
+        Path(self.env["ACTIVE"]).unlink()
+        (self.sys / "disksize").write_text("0\n")
+        calls, stderr = self.run_zram("[lzo-rle] lzo")
+        self.assertEqual((self.sys / "comp_algorithm").read_text(), "[lzo-rle] lzo\n")  # left alone
+        self.assertIn("neither zstd nor lz4", stderr)
+        self.assertIn("swapon:100:zram0", calls)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_sized_device_from_an_interrupted_boot_is_reused(self):
+        (self.sys / "disksize").write_text("4096\n")
+        calls, _ = self.run_zram()
+        self.assertEqual(calls[-2:], ["mkswap:zram0", "swapon:100:zram0"])
+        self.assertEqual((self.sys / "disksize").read_text(), "4096\n")
+        self.assertEqual((self.sys / "comp_algorithm").read_text(), "lzo lzo-rle lz4 [zstd]\n")
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_missing_zram_is_logged_and_the_swap_file_still_comes_up(self):
+        swap_stubs = r"""
+stat() { wc -c <"$3" | tr -d ' '; }
+chown() { :; }
+fallocate() { head -c "$2" /dev/zero >"$3"; echo fallocate >>"$CALLS"; }
+swapoff() { :; }
+"""
+        extra = swap_stubs + self.function("ensure_swap") + f'SWAP_FILE={self.tmp}/swapfile\nSWAP_FILE_PRIORITY=10\n' \
+            'ensure_swap 1\n'
+        calls, stderr = self.run_zram(extra=extra, MODPROBE_RC="1")
+        self.assertIn("zram is unavailable", stderr)
+        self.assertNotIn("mkswap:zram0", calls)
+        self.assertEqual(calls[-3:], ["fallocate", "mkswap:swapfile.partial", "swapon:10:swapfile"])
+        # The module loads but exposes no device: also not fatal.
+        calls, stderr = self.run_zram(ZRAM_SYS=str(self.tmp / "absent"))
+        self.assertIn("zram is unavailable", stderr)
+        self.assertEqual(calls, ["modprobe:zram", "num_devices=1"])
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_zram_errors_are_not_fatal(self):
+        calls, stderr = self.run_zram(MKSWAP_RC="1")
+        self.assertIn("could not enable zram swap", stderr)
+        self.assertNotIn("swapon:100:zram0", calls)
+        (self.tmp / "meminfo").write_text("garbage\n")
+        (self.sys / "disksize").write_text("0\n")
+        calls, stderr = self.run_zram()
+        self.assertIn("could not read MemTotal", stderr)
+        self.assertNotIn("mkswap:zram0", calls)

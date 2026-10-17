@@ -1,7 +1,8 @@
-"""Lifecycle of the Spot "control" VM that hosts the web dashboard.
+"""Lifecycle of the "control" VM that hosts the web dashboard.
 
-Exactly one control VM (slot ``a`` or ``b``, named ``spot-control-<slot>``) serves the dashboard at a
-time. The Cloudflare Worker routes to whichever slot the KV key ``origin:active`` names; each slot is
+The control VM is a Spot VM by default (``SPOT_CONTROL_PROVISIONING=spot``) or the always-on free-tier
+e2-micro (``standard``). Exactly one control VM (slot ``a`` or ``b``, named ``spot-control-<slot>``) serves
+the dashboard at a time. The Cloudflare Worker routes to whichever slot the KV key ``origin:active`` names; each slot is
 reachable only through its Cloudflare Tunnel hostname behind Cloudflare Access.
 
 This module has three layers:
@@ -80,9 +81,31 @@ BOOT_DISK_TYPE = "pd-balanced"
 IMAGE_FAMILY = "debian-12"
 IMAGE_PROJECT = "debian-cloud"
 
+# Provisioning modes (SPOT_CONTROL_PROVISIONING / --provisioning). "spot" picks the cheapest Spot shape under the
+# daily cap and rotates for price. "standard" runs the always-on Compute Engine free-tier VM: one non-preemptible
+# e2-micro per billing account, only in us-west1, us-central1 or us-east1, with up to 30 GB-months of pd-standard.
+PROVISIONING_SPOT = "spot"
+PROVISIONING_STANDARD = "standard"
+PROVISIONING_MODES = (PROVISIONING_SPOT, PROVISIONING_STANDARD)
+ENV_PROVISIONING = "SPOT_CONTROL_PROVISIONING"
+STANDARD_MACHINE_TYPES = ("e2-micro",)
+FREE_TIER_REGIONS = ("us-central1", "us-east1", "us-west1")
+STANDARD_DEFAULT_REGIONS = ("us-central1",)
+# 15 GB holds Debian 12 (about 2 GB), docker.io, the 2 GiB swap file, the dashboard and cloudflared images, and
+# capped container logs with room to spare. Two such disks (make-before-break, or a retained boot disk) still fit
+# the 30 GB-month pd-standard free tier.
+STANDARD_BOOT_DISK_GB = 15
+STANDARD_BOOT_DISK_TYPE = "pd-standard"
+FREE_TIER_DISK_GB = 30
+# GCE provisioning models as parsed from the inventory (``scheduling.provisioningModel``); "" when unknown.
+MODEL_SPOT = "SPOT"
+MODEL_STANDARD = "STANDARD"
+
 DEFAULT_REGIONS = ("us-central1", "us-east1", "us-west1")
 DEFAULT_MAX_DAILY_USD = Decimal("0.50")
 DEFAULT_DASHBOARD_REPO = "swack-tools/spot-github-runners"
+# Published by .github/workflows/dashboard-image.yml for every push to main of DEFAULT_DASHBOARD_REPO.
+DEFAULT_DASHBOARD_IMAGE_REPO = "ghcr.io/swack-tools/spot-dashboard"
 DEFAULT_CLOUDFLARED_IMAGE = "cloudflare/cloudflared:2026.9.3@sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c"
 
 SECRET_NAMES = (
@@ -162,6 +185,9 @@ _DIGEST_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ID_RE = re.compile(r"^[A-Za-z0-9]+$")
 _IMAGE_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+|@sha256:[0-9a-f]{64})$")
+# The commit tag .github/workflows/dashboard-image.yml publishes (name:<40 hex>). Accepted only in standard mode,
+# where a digest is preferred. Mirrors dashboard_image_ok in cloud-init/control-vm-startup.sh.
+_SHA_TAG_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*:[0-9a-f]{40}$")
 
 
 # --------------------------------------------------------------------------------------------
@@ -190,15 +216,24 @@ class ControlConfig:
     config_repo: str = ""
     controlled_targets: str = ""
     global_admins: str = ""
+    provisioning: str = PROVISIONING_SPOT
 
     @classmethod
     def from_env(cls, project: str, env: Mapping[str, str] | None = None, **overrides: Any) -> ControlConfig:
         env = os.environ if env is None else env
         regions = tuple(r.strip() for r in env.get("SPOT_CONTROL_REGIONS", "").split(",") if r.strip())
         external = env.get("SPOT_CONTROL_EXTERNAL_IP", "1").strip().lower() not in ("0", "false", "no", "off")
+        provisioning = overrides.get("provisioning")
+        if provisioning is None:
+            provisioning = env.get(ENV_PROVISIONING, "")
+        # Normalized but never defaulted when set: a misspelt mode is reported by runtime_problems() and
+        # pauses every lifecycle change, instead of silently running the other mode.
+        provisioning = str(provisioning or "").strip().lower() or PROVISIONING_SPOT
         values: dict[str, Any] = dict(
             project=project,
-            regions=regions or DEFAULT_REGIONS,
+            # The free-tier VM defaults to one free-tier region; Spot keeps its wider default search.
+            regions=regions or (STANDARD_DEFAULT_REGIONS if provisioning == PROVISIONING_STANDARD
+                                else DEFAULT_REGIONS),
             max_daily_usd=Decimal(env.get("SPOT_CONTROL_MAX_DAILY_USD") or DEFAULT_MAX_DAILY_USD),
             external_ip=external,
             service_account=env.get("SPOT_CONTROL_SERVICE_ACCOUNT", ""),
@@ -219,10 +254,39 @@ class ControlConfig:
             global_admins=str(env.get(ENV_GLOBAL_ADMINS, "") or "").strip(),
         )
         values.update({key: value for key, value in overrides.items() if value is not None})
+        values["provisioning"] = provisioning
         if isinstance(values["regions"], str):
             values["regions"] = tuple(r.strip() for r in values["regions"].split(",") if r.strip())
         values["max_daily_usd"] = Decimal(str(values["max_daily_usd"]))
         return cls(**values)
+
+    @property
+    def standard(self) -> bool:
+        """True for the always-on free-tier e2-micro mode."""
+        return self.provisioning == PROVISIONING_STANDARD
+
+    @property
+    def machine_types(self) -> tuple[str, ...]:
+        """Control VM shapes this mode may create."""
+        return STANDARD_MACHINE_TYPES if self.standard else CONTROL_MACHINE_TYPES
+
+    @property
+    def boot_disk(self) -> tuple[int, str]:
+        """(size in GB, disk type) of a new control VM's boot disk."""
+        return (STANDARD_BOOT_DISK_GB, STANDARD_BOOT_DISK_TYPE) if self.standard else (BOOT_DISK_GB, BOOT_DISK_TYPE)
+
+    def provisioning_problems(self) -> list[str]:
+        """Problems with the provisioning mode and, for the free-tier mode, its regions."""
+        if self.provisioning not in PROVISIONING_MODES:
+            return [f"{ENV_PROVISIONING} must be {' or '.join(PROVISIONING_MODES)}, not {self.provisioning!r}"]
+        if not self.standard:
+            return []
+        outside = [r for r in self.regions if r not in FREE_TIER_REGIONS]
+        if outside:
+            # A standard e2-micro anywhere else is billed at the full on-demand rate.
+            return [f"{ENV_PROVISIONING}=standard runs the free-tier e2-micro, which is free only in "
+                    f"{', '.join(FREE_TIER_REGIONS)}; SPOT_CONTROL_REGIONS also lists {', '.join(outside)}"]
+        return []
 
     def runtime_problems(self) -> list[str]:
         """Settings without which the manager cannot observe or control the VMs safely."""
@@ -233,12 +297,36 @@ class ControlConfig:
             problems.append(f"{edge_state.ENV_CONTROL_SECRET} is not set (freeze/import need control tokens)")
         if not self.regions:
             problems.append("no control VM regions are allowed")
+        problems.extend(self.provisioning_problems())
         return problems
+
+    @property
+    def effective_dashboard_image(self) -> str:
+        """The dashboard image a new control VM pulls, or "" when it builds from ``dashboard_source_ref``.
+
+        The free-tier e2-micro never builds on the box: without SPOT_DASHBOARD_IMAGE it pulls the commit tag
+        that .github/workflows/dashboard-image.yml publishes for SPOT_DASHBOARD_SOURCE_REF, but only for the
+        repository that workflow publishes. A digest (SPOT_DASHBOARD_IMAGE) is preferred: a tag can be moved.
+        """
+        if self.dashboard_image or not self.standard:
+            return self.dashboard_image
+        if _SHA_RE.match(self.dashboard_source_ref) and self.dashboard_repo == DEFAULT_DASHBOARD_REPO:
+            return f"{DEFAULT_DASHBOARD_IMAGE_REPO}:{self.dashboard_source_ref}"
+        return ""
 
     def create_problems(self) -> list[str]:
         """Settings that must be valid before a control VM is created."""
-        problems = []
-        if self.dashboard_image:
+        problems = self.provisioning_problems()
+        if self.standard:
+            image = self.effective_dashboard_image
+            if not image:
+                problems.append("the standard (e2-micro) control VM never builds the dashboard image: set "
+                                "SPOT_DASHBOARD_IMAGE to the published digest (name@sha256:<64 hex>), or "
+                                f"SPOT_DASHBOARD_SOURCE_REF to a commit published as {DEFAULT_DASHBOARD_IMAGE_REPO}:<sha>")
+            elif not (_DIGEST_RE.match(image) or _SHA_TAG_IMAGE_RE.match(image)):
+                problems.append("the standard control VM's dashboard image must be pinned by digest "
+                                "(name@sha256:<64 hex>) or by a 40-hex commit tag (name:<sha>)")
+        elif self.dashboard_image:
             if not _DIGEST_RE.match(self.dashboard_image):
                 problems.append("dashboard image must be pinned by digest (name@sha256:<64 hex>)")
         elif not _SHA_RE.match(self.dashboard_source_ref):
@@ -391,9 +479,10 @@ def metadata_items(config: ControlConfig, slot: str) -> dict[str, str]:
     edge_state.validate_slot(slot)
     items = {
         "spot-control-slot": slot,
-        "dashboard-image": config.dashboard_image,
+        "dashboard-image": config.effective_dashboard_image,
         "dashboard-repo": config.dashboard_repo,
-        "dashboard-source-ref": config.dashboard_source_ref,
+        # Never on the free-tier VM, which only pulls (an empty value is dropped below).
+        "dashboard-source-ref": "" if config.standard else config.dashboard_source_ref,
         "dashboard-public-url": config.public_url,
         "cloudflare-account-id": config.cloudflare_account_id,
         "cloudflare-kv-namespace-id": config.cloudflare_kv_namespace_id,
@@ -434,6 +523,7 @@ class ControlVm:
     slot: str
     machine_type: str = ""
     instance_id: str = ""
+    provisioning_model: str = ""  # MODEL_SPOT, MODEL_STANDARD, or "" when the inventory did not say
 
     @property
     def region(self) -> str:
@@ -442,6 +532,32 @@ class ControlVm:
     @property
     def running(self) -> bool:
         return self.status == "RUNNING"
+
+    @property
+    def standard(self) -> bool:
+        """A known non-preemptible VM: TERMINATED means stopped (never preempted), and price never moves it."""
+        return self.provisioning_model == MODEL_STANDARD
+
+    @property
+    def spot(self) -> bool:
+        return self.provisioning_model == MODEL_SPOT
+
+
+def provisioning_model_of(row: Mapping[str, Any]) -> str:
+    """MODEL_SPOT, MODEL_STANDARD, or "" from an inventory row's ``scheduling``.
+
+    A legacy preemptible VM counts as Spot. Without a ``scheduling`` object the model is unknown and the VM is
+    handled the way every control VM was before standard mode existed (as Spot).
+    """
+    scheduling = row.get("scheduling")
+    if not isinstance(scheduling, dict):
+        return ""
+    model = str(scheduling.get("provisioningModel") or "").upper()
+    if model == MODEL_SPOT or scheduling.get("preemptible") is True:
+        return MODEL_SPOT
+    if model == MODEL_STANDARD or (not model and scheduling.get("preemptible") is False):
+        return MODEL_STANDARD
+    return ""
 
 
 def parse_control_vms(rows: Any) -> list[ControlVm]:
@@ -467,6 +583,7 @@ def parse_control_vms(rows: Any) -> list[ControlVm]:
             slot=slot,
             machine_type=str(row.get("machineType", "")).rsplit("/", 1)[-1],
             instance_id=str(row.get("id", "")),
+            provisioning_model=provisioning_model_of(row),
         ))
     return result
 
@@ -541,6 +658,25 @@ def price_control_offers(regions: Sequence[str], zones_by_shape: Mapping[str, Se
     return offers
 
 
+def standard_control_offers(regions: Sequence[str],
+                            zones_by_shape: Mapping[str, Sequence[str]]) -> list[ControlOffer]:
+    """Fixed free-tier offers: e2-micro in every listed zone of the free-tier ``regions``, at $0/day.
+
+    No Spot or billing catalog lookup: the free tier covers the VM and up to 30 GB-months of pd-standard. The
+    external IPv4 address (about $0.005/hour) is billed separately and deliberately not counted, because every
+    control VM needs it. Ordered by the configured region preference, then zone, so a stockout falls through to
+    the next zone of the same region first.
+    """
+    offers: list[ControlOffer] = []
+    for region in dict.fromkeys(regions):  # configured order, duplicates dropped
+        if region not in FREE_TIER_REGIONS:
+            continue  # never offered: ControlConfig.provisioning_problems() also refuses such a region
+        for machine_type in STANDARD_MACHINE_TYPES:
+            zones = sorted({z for z in zones_by_shape.get(machine_type, ()) if z.rsplit("-", 1)[0] == region})
+            offers.extend(ControlOffer(machine_type, region, zone, Decimal("0")) for zone in zones)
+    return offers
+
+
 def choose_offer(offers: Sequence[ControlOffer] | None, max_daily_usd: Decimal,
                  exclude_zones: Sequence[str] = ()) -> ControlOffer | None:
     """Cheapest offer under the cap, preferring zones outside ``exclude_zones``."""
@@ -590,8 +726,16 @@ def _wait(reason: str, **kw: Any) -> Plan:
 def plan_next(*, vms: Sequence[ControlVm], origin: OriginRecord | None, origin_known: bool,
               health: Mapping[str, HealthResult], offers: Sequence[ControlOffer] | None,
               control_state: Mapping[str, Any], now: float, max_daily_usd: Decimal,
-              force_rotate: bool = False) -> Plan:
-    """Return the single next action for the control VM pair. Pure: no I/O, no mutation."""
+              force_rotate: bool = False, provisioning: str = PROVISIONING_SPOT) -> Plan:
+    """Return the single next action for the control VM pair. Pure: no I/O, no mutation.
+
+    ``provisioning`` is the configured mode. The observed VM's own provisioning model decides how a stopped
+    VM is read: a stopped Spot VM was preempted (start it, then replace it after a grace period), while a
+    stopped standard VM is restarted and replaced only when its restart fails. Price never rotates away from
+    a standard VM. With ``provisioning`` standard, a healthy active Spot VM is replaced by the free-tier VM
+    through the same make-before-break rotation (freeze, import, version floor, fence, cutover) as a price
+    rotation.
+    """
     transition = control_state.get("transition")
     if transition:
         mode = transition.get("mode")
@@ -640,6 +784,15 @@ def plan_next(*, vms: Sequence[ControlVm], origin: OriginRecord | None, origin_k
             return recreate(f"active {control_vm_name(slot)} missing for {int(down_for)}s")
         return _wait(f"active {control_vm_name(slot)} missing; grace {START_GRACE_SECONDS}s", slot=slot)
     if active.status in STOPPED_STATES:
+        if active.standard:
+            # Not preempted capacity: a standard VM stops only when someone (or a guest shutdown) stopped it,
+            # and it keeps its zone. Restart it; replace it only once the restarts themselves fail.
+            failed_at = (control_state.get("start_failed_at") or {}).get(slot)
+            if down_for >= START_GRACE_SECONDS and failed_at is not None:
+                return recreate(f"standard {active.name} {active.status} for {int(down_for)}s and its last "
+                                f"start failed")
+            return start_or_wait(active, f"standard {active.name} is {active.status} (stopped, not preempted); "
+                                         f"restarting it")
         if down_for >= START_GRACE_SECONDS:
             return recreate(f"{active.name} {active.status} for {int(down_for)}s; start did not restore it")
         return start_or_wait(active, f"{active.name} is {active.status} (preempted)")
@@ -664,10 +817,26 @@ def plan_next(*, vms: Sequence[ControlVm], origin: OriginRecord | None, origin_k
         return Plan("noop", f"{active.name} healthy; no offer under the ${max_daily_usd}/day cap", slot=slot)
     if force_rotate:
         return Plan("rotate", "operator requested rotation", slot=slot, target_slot=other_slot(slot), offer=best)
+    last_end = max(control_state.get("last_transition_end_at") or 0, control_state.get("last_abort_at") or 0)
+    cooling = bool(last_end and now - last_end < ROTATION_COOLDOWN_SECONDS)
+    if provisioning == PROVISIONING_STANDARD and active.spot:
+        # Mode switch: only a VM the inventory positively reports as Spot is replaced, so a VM whose model is
+        # unknown never rotates in a loop. The cooldown also spaces out retries after an aborted switch.
+        if cooling:
+            return Plan("noop", f"{active.name} is Spot and {ENV_PROVISIONING}=standard; rotation cooldown "
+                                f"active", slot=slot)
+        return Plan("rotate", f"{ENV_PROVISIONING}=standard: replace Spot {active.name} with the free-tier "
+                              f"{best.machine_type}@{best.zone}", slot=slot, target_slot=other_slot(slot), offer=best)
+    if active.standard:
+        # Never rotate away from the always-on VM for price, and never automatically back to Spot: switching
+        # back is an explicit operator rotation, so controllers with different settings cannot flap.
+        why = "standard VMs are never rotated for price"
+        if provisioning != PROVISIONING_STANDARD:
+            why += f"; {ENV_PROVISIONING} is {provisioning}, run rotate to move back to Spot"
+        return Plan("noop", f"{active.name} healthy; {why}", slot=slot)
     if current is None:
         return Plan("noop", f"{active.name} healthy; its shape/region has no current price", slot=slot)
-    last_end = max(control_state.get("last_transition_end_at") or 0, control_state.get("last_abort_at") or 0)
-    if last_end and now - last_end < ROTATION_COOLDOWN_SECONDS:
+    if cooling:
         return Plan("noop", f"{active.name} healthy; rotation cooldown active", slot=slot)
     savings = current.daily_usd - best.daily_usd
     over_cap = current.daily_usd > max_daily_usd
@@ -690,6 +859,7 @@ def update_tracking(control_state: dict, origin: OriginRecord | None, vms: Seque
     if healthy:
         down.pop(origin.slot, None)
         control_state.setdefault("last_start_at", {}).pop(origin.slot, None)
+        control_state.get("start_failed_at", {}).pop(origin.slot, None)
     else:
         down.setdefault(origin.slot, now)
 
@@ -761,14 +931,16 @@ def inventory_stderr_problem(stderr: str) -> str | None:
 
 
 def list_command(project: str) -> list[str]:
+    # scheduling tells a Spot VM (TERMINATED means preempted) from a standard one (TERMINATED means stopped).
     return ["gcloud", "compute", "instances", "list", f"--project={project}",
             f"--filter=labels.{ROLE_LABEL}={ROLE_VALUE}",
-            "--format=json(name,zone,status,labels,id,machineType)"]
+            "--format=json(name,zone,status,labels,id,machineType,scheduling.provisioningModel,"
+            "scheduling.preemptible)"]
 
 
-def zones_command(project: str) -> list[str]:
+def zones_command(project: str, machine_types: Sequence[str] = CONTROL_MACHINE_TYPES) -> list[str]:
     return ["gcloud", "compute", "machine-types", "list", f"--project={project}",
-            f"--filter=name=({' '.join(CONTROL_MACHINE_TYPES)})", "--format=json(name,zone)"]
+            f"--filter=name=({' '.join(machine_types)})", "--format=json(name,zone)"]
 
 
 def start_command(vm: ControlVm, project: str) -> list[str]:
@@ -793,15 +965,26 @@ def create_command(config: ControlConfig, slot: str, offer: ControlOffer, startu
     problems = config.create_problems()
     if problems:
         raise ValueError("; ".join(problems))
-    if offer.machine_type not in CONTROL_MACHINE_TYPES:
-        raise ValueError(f"{offer.machine_type} is not an allowed control VM shape")
+    if offer.machine_type not in config.machine_types:
+        raise ValueError(f"{offer.machine_type} is not an allowed {config.provisioning} control VM shape")
+    zone_region = offer.zone.rsplit("-", 1)[0]
+    if config.standard and (zone_region not in FREE_TIER_REGIONS or zone_region not in config.regions):
+        raise ValueError(f"zone {offer.zone} is outside the free-tier regions allowed for the standard control VM")
     metadata = ",".join(f"{key}={value}" for key, value in metadata_items(config, slot).items())
+    if config.standard:
+        # Always-on: live-migrated through host maintenance. --no-restart-on-failure keeps the invariant the
+        # rollback and recovery fences rely on: a stopped control VM stays stopped until this manager starts it
+        # (GCE would otherwise restart it on its own after a host failure). The manager restarts it instead.
+        scheduling = ["--provisioning-model=STANDARD", "--maintenance-policy=MIGRATE", "--no-restart-on-failure"]
+    else:
+        scheduling = ["--provisioning-model=SPOT", "--instance-termination-action=STOP"]
+    disk_gb, disk_type = config.boot_disk
     command = [
         "gcloud", "compute", "instances", "create", control_vm_name(slot),
         f"--project={config.project}", f"--zone={offer.zone}", f"--machine-type={offer.machine_type}",
-        "--provisioning-model=SPOT", "--instance-termination-action=STOP",
+        *scheduling,
         f"--image-family={IMAGE_FAMILY}", f"--image-project={IMAGE_PROJECT}",
-        f"--boot-disk-size={BOOT_DISK_GB}GB", f"--boot-disk-type={BOOT_DISK_TYPE}", "--boot-disk-auto-delete",
+        f"--boot-disk-size={disk_gb}GB", f"--boot-disk-type={disk_type}", "--boot-disk-auto-delete",
         f"--labels={ROLE_LABEL}={ROLE_VALUE},{SLOT_LABEL}={slot}",
         "--scopes=cloud-platform",
         "--shielded-secure-boot", "--shielded-vtpm", "--shielded-integrity-monitoring",
@@ -837,17 +1020,22 @@ def default_gcloud(argv: list[str]) -> Any:
 
 
 def default_offer_source(config: ControlConfig, gcloud: Callable[[list[str]], Any]) -> list[ControlOffer]:
-    """Price the allowed shapes in the allowed regions from the billing catalog (read-only)."""
-    from .runner_manager import spot_rates
-    from .storage_selection import storage_rates
+    """Price the allowed shapes in the allowed regions from the billing catalog (read-only).
 
-    result = gcloud(zones_command(config.project))
+    The standard mode lists only the zones that offer e2-micro and never reads a price: its offers are fixed.
+    """
+    result = gcloud(zones_command(config.project, config.machine_types))
     if result.returncode != 0:
         raise RuntimeError(f"machine-type inventory failed: {(result.stderr or '').strip()[:300]}")
     zones: dict[str, list[str]] = {}
     for row in json.loads(result.stdout or "[]"):
         zone = str(row.get("zone", "")).rsplit("/", 1)[-1]
         zones.setdefault(str(row.get("name", "")), []).append(zone)
+    if config.standard:
+        return standard_control_offers(config.regions, zones)
+    from .runner_manager import spot_rates
+    from .storage_selection import storage_rates
+
     return price_control_offers(config.regions, zones, rates=spot_rates, storage=storage_rates)
 
 
@@ -991,6 +1179,8 @@ class ControlVmManager:
         active = obs.vm(obs.origin.slot)
         if active is None or not active.running or not obs.health.get(obs.origin.slot, HealthResult.unknown()).ok:
             return True
+        if self.config.standard and active.spot:
+            return True  # the switch to the free-tier VM needs its (fixed, price-free) offers now
         last = self.cstate.get("last_price_check_at") or 0
         return self.clock() - last >= PRICE_CHECK_INTERVAL_SECONDS
 
@@ -1000,9 +1190,17 @@ class ControlVmManager:
             return _wait("; ".join(obs.problems))
         if force_rotate and obs.offers is None and not self.cstate.get("transition"):
             return _wait("rotation requested but no price scan is available")
-        return plan_next(vms=obs.vms, origin=obs.origin, origin_known=obs.origin_known, health=obs.health,
+        plan = plan_next(vms=obs.vms, origin=obs.origin, origin_known=obs.origin_known, health=obs.health,
                          offers=obs.offers, control_state=control_state or self.cstate, now=self.clock(),
-                         max_daily_usd=self.config.max_daily_usd, force_rotate=force_rotate)
+                         max_daily_usd=self.config.max_daily_usd, force_rotate=force_rotate,
+                         provisioning=self.config.provisioning)
+        if self.config.standard and plan.offer is not None and not plan.resume:
+            # Refuse before a transition begins (for example the switch from Spot) rather than after it fails
+            # to create: a free-tier VM without a pinned published image would have to build on 1 GB.
+            problems = self.config.create_problems()
+            if problems:
+                return _wait(f"{plan.action} refused: " + "; ".join(problems), slot=plan.slot)
+        return plan
 
     def tick(self, *, apply: bool, force_rotate: bool = False) -> Plan:
         """One lifecycle step. Without ``apply`` only reads happen and nothing is saved."""
@@ -1048,10 +1246,19 @@ class ControlVmManager:
         self.save()
         result = self.gcloud(start_command(vm, self.config.project))
         if result.returncode == 0:
+            self.cstate.get("start_failed_at", {}).pop(vm.slot, None)
+            down = self.cstate.get("down_since", {})
+            if vm.standard and vm.slot in down:
+                # A standard VM that started is not lost capacity: its boot gets the full stuck and unhealthy
+                # grace periods from now. (A Spot VM keeps the original time, so repeated preemptions still
+                # lead to a replacement.)
+                down[vm.slot] = self.clock()
             self._note("started %s in %s", vm.name, vm.zone)
             return True
         failures = self.cstate.setdefault("start_failures", {})
         failures[vm.slot] = failures.get(vm.slot, 0) + 1
+        # The planner replaces a stopped standard VM only while its latest start failed.
+        self.cstate.setdefault("start_failed_at", {})[vm.slot] = self.clock()
         self._note("start of %s failed: %s", vm.name, (result.stderr or "").strip()[:300], level=logging.WARNING)
         return False
 
@@ -1076,6 +1283,8 @@ class ControlVmManager:
                        "machine_type": existing.machine_type if existing else (offer.machine_type if offer else ""),
                        "instance_id": (existing.instance_id or None) if existing else None},
             "offer": offer.to_dict() if offer else None,
+            # Reporting only: every mode runs the same steps, fences, and version checks.
+            "provisioning": self.config.provisioning,
             "excluded_zones": ([old_vm.zone] if (old_vm and mode == MODE_RECOVER) else [])
                               + self._retained_zones(new_slot),
             # Create failures are tracked per placement ("machine_type@zone", see _offer_key): a stockout of one
@@ -1329,6 +1538,13 @@ class ControlVmManager:
                 return "wait"
             self._note("slot %s VM %s exists (%s); waiting for health", t["new_slot"], vm.name, vm.status)
             return self._advance_step(t)
+        planned_mode = t.get("provisioning")
+        if planned_mode and planned_mode != self.config.provisioning:
+            # Controllers share the project's transitions. One configured for the other mode must not create
+            # the replacement this transition planned (a Spot VM for a switch to the free-tier VM, or the
+            # reverse); every controller in the project needs the same SPOT_CONTROL_PROVISIONING.
+            return self._create_failed(t, f"this transition creates a {planned_mode} control VM, but this controller "
+                                          f"is configured for {ENV_PROVISIONING}={self.config.provisioning}")
         offers = obs.offers
         if offers is None:
             try:
@@ -2031,6 +2247,7 @@ class ControlVmManager:
     # -- reporting -----------------------------------------------------------------------
     def status(self, obs: Observation) -> dict[str, Any]:
         return {
+            "provisioning": self.config.provisioning,
             "vms": [vm.__dict__ for vm in obs.vms],
             "origin": json.loads(obs.origin.to_json()) if obs.origin else None,
             "origin_known": obs.origin_known,
@@ -2216,6 +2433,9 @@ def args_parser() -> "argparse.ArgumentParser":
     common.add_argument("--control-state-dir", type=Path, default=None,
                         help=f"Directory of the project-scoped control VM state and lock (or "
                              f"{ENV_CONTROL_STATE_DIR}; default: {DEFAULT_STATE_FILE.parent})")
+    common.add_argument("--provisioning", choices=PROVISIONING_MODES, default=None,
+                        help=f"spot: cheapest Spot shape under the daily cap; standard: the always-on free-tier "
+                             f"e2-micro in {', '.join(FREE_TIER_REGIONS)} (or {ENV_PROVISIONING}; default: spot)")
     common.add_argument("--regions", help="Comma-separated allowed regions (or SPOT_CONTROL_REGIONS)")
     common.add_argument("--max-daily-usd", type=Decimal,
                         help="Daily compute plus boot-disk cap per control VM (or SPOT_CONTROL_MAX_DAILY_USD)")
@@ -2238,7 +2458,7 @@ def args_parser() -> "argparse.ArgumentParser":
                              f"(or {ENV_GLOBAL_ADMINS}; default: the dashboard default)")
 
     parser = argparse.ArgumentParser(
-        description="Inspect and manage the Spot control VM that hosts the web dashboard. "
+        description="Inspect and manage the control VM (Spot or free-tier e2-micro) that hosts the web dashboard. "
                     "Nothing is created, started, deleted, or written without --apply.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", parents=[common], help="Show control VMs, origin:active, health, and transition state")
@@ -2255,7 +2475,7 @@ def args_parser() -> "argparse.ArgumentParser":
 def _overrides(args: Any) -> dict[str, Any]:
     keys = ("regions", "max_daily_usd", "external_ip", "service_account", "dashboard_image", "dashboard_repo",
             "dashboard_source_ref", "public_url", "cloudflared_image", "origin_domain", "config_repo",
-            "controlled_targets", "global_admins")
+            "controlled_targets", "global_admins", "provisioning")
     return {key: getattr(args, key, None) for key in keys}
 
 
