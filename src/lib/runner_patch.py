@@ -9,6 +9,7 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, field
@@ -728,13 +729,58 @@ def load_patch_from_file(path: Path) -> RunnerPatch:
     return validate_patch_dict(parse_manifest_text(raw))
 
 
+GITHUB_API_BASE = "https://api.github.com"
+GH_API_TIMEOUT_SECONDS = 30.0
+MAX_GH_API_RESPONSE_BYTES = 16 * 1024 * 1024
+_ENDPOINT_RE = re.compile(r"^[A-Za-z0-9._~/?=&%:+,@-]+$")
+
+
+def _gh_token(run_env: dict[str, str]) -> str:
+    return run_env.get("SPOT_CONFIG_GH_TOKEN") or run_env.get("GH_TOKEN") or ""
+
+
+def _gh_api_json_urllib(endpoint: str, token: str) -> Any:
+    """REST fallback used when the ``gh`` command-line tool is not installed (for example in a container)."""
+    import urllib.error
+    import urllib.request
+
+    clean = endpoint.lstrip("/")
+    if not _ENDPOINT_RE.match(clean) or ".." in clean.split("?", 1)[0].split("/"):
+        raise RuntimeError(f"gh api {endpoint} failed: refusing unexpected endpoint")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "spot-runner-patch/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(f"{GITHUB_API_BASE}/{clean}", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=GH_API_TIMEOUT_SECONDS) as response:  # noqa: S310 - fixed HTTPS host
+            body = response.read(MAX_GH_API_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        reason = "Not Found" if exc.code == 404 else (exc.reason or "error")
+        exc.close()
+        raise RuntimeError(f"gh api {endpoint} failed (HTTP {exc.code}): {reason}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"gh api {endpoint} failed: {type(exc).__name__}") from exc
+    if len(body) > MAX_GH_API_RESPONSE_BYTES:
+        raise RuntimeError(f"gh api {endpoint} failed: response exceeded the size limit")
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"gh api {endpoint} failed: non-JSON response") from exc
+
+
 def _gh_api_json(endpoint: str, *, env: dict[str, str] | None = None) -> Any:
     run_env = dict(os.environ)
     if env:
         run_env.update(env)
-    token = run_env.get("SPOT_CONFIG_GH_TOKEN") or run_env.get("GH_TOKEN")
+    token = _gh_token(run_env)
     if token:
         run_env["GH_TOKEN"] = token
+    if shutil.which("gh", path=run_env.get("PATH")) is None:
+        return _gh_api_json_urllib(endpoint, token)
     result = subprocess.run(
         ["gh", "api", endpoint],
         text=True,
@@ -744,6 +790,48 @@ def _gh_api_json(endpoint: str, *, env: dict[str, str] | None = None) -> Any:
     if result.returncode != 0:
         raise RuntimeError(f"gh api {endpoint} failed ({result.returncode}): {(result.stderr or result.stdout).strip()}")
     return json.loads(result.stdout)
+
+
+_CONFIG_REPO_TARGET_RE = re.compile(r"^repos/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})\.yaml$")
+
+
+def list_config_repo_targets(
+    config_repo: str | None = None,
+    *,
+    org: str = "swack-tools",
+    env: dict[str, str] | None = None,
+) -> tuple[list[str], str]:
+    """List ``owner/repo`` for every ``repos/<owner>/<repo>.yaml`` in the config repo at its default-branch HEAD.
+
+    Returns ``(sorted targets, commit_sha)``. Raises RuntimeError when the listing cannot be read completely,
+    so callers can fail closed.
+    """
+    resolved = config_repo or f"{org}/{DEFAULT_CONFIG_REPO_NAME}"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", resolved):
+        raise ValueError(f"config_repo must be in OWNER/REPO format, got {resolved!r}")
+    _branch, sha = resolve_repo_default_branch(resolved, env=env)
+    tree = _gh_api_json(f"repos/{resolved}/git/trees/{sha}?recursive=1", env=env)
+    if not isinstance(tree, dict) or not isinstance(tree.get("tree"), list):
+        raise RuntimeError(f"Unexpected git tree payload for {resolved}@{sha}")
+    if tree.get("truncated"):
+        raise RuntimeError(f"Git tree listing for {resolved}@{sha} was truncated; refusing a partial target list")
+    targets: set[str] = set()
+    for entry in tree["tree"]:
+        if not isinstance(entry, dict) or entry.get("type") != "blob":
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str) or not path.startswith("repos/"):
+            continue
+        match = _CONFIG_REPO_TARGET_RE.match(path)
+        if match is None:
+            if path.endswith(".yaml") and path.count("/") == 2:
+                raise RuntimeError(f"Config repo {resolved} has an invalid repository manifest path {path!r}")
+            continue
+        repo = match.group(2)
+        if repo in (".", ".."):
+            raise RuntimeError(f"Config repo {resolved} has an invalid repository manifest path {path!r}")
+        targets.add(f"{match.group(1)}/{repo}")
+    return sorted(targets, key=str.lower), sha
 
 
 def resolve_repo_default_branch(repo_full_name: str, *, env: dict[str, str] | None = None) -> tuple[str, str]:

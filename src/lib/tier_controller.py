@@ -53,7 +53,7 @@ def evidence_for(vms,runners,args,state):
     state['host_health']=health
     state['seen_oom_ids']=sorted(seen)[-1000:]
     data=state.get('job_tracking',{})
-    repositories=args.job_repository or [args.org+'/oxidex']
+    repositories=controller.tracked_job_repositories(args)
     complete=(current_job_coverage(data,repositories,timestamp)
               and len(health)==len(fleet))
     signals=workload_signals(list(data.get('capacity_jobs',{}).values()),
@@ -185,10 +185,10 @@ def dry_run(args,saved):
     from . import spot_runner_autoscaler as controller
     from .job_recovery import JobRecovery,utc_now
     state=copy.deepcopy(saved)
-    vms=controller.list_gcloud_vms(args.project,name_prefix='oxidex-runners-')
-    runners=controller.list_github_runners(args.org)
+    vms=controller.scope_fleet_to_target(controller.list_gcloud_vms(args.project,name_prefix='oxidex-runners-'),args,state)
+    runners=controller.list_github_runners(controller._active_target(args))
     # Read job endpoints only. Never invoke recovery polling or a POST rerun.
-    tracker=JobRecovery(state,lambda:None,args.job_repository or [args.org+'/oxidex'])
+    tracker=JobRecovery(state,lambda:None,controller.tracked_job_repositories(args))
     for repo in tracker.repositories:
         try:
             observed=utc_now()

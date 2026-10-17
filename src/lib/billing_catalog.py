@@ -7,11 +7,23 @@ from urllib.parse import urlencode
 from decimal import Decimal
 from datetime import datetime, timezone
 
+from .compute_api import metadata_access_token, token_source_is_metadata
+
+
+def _access_token() -> str:
+    """gcloud access token; GCE metadata server token when gcloud is absent or SPOT_GCP_TOKEN_SOURCE=metadata."""
+    if token_source_is_metadata():
+        return metadata_access_token()
+    try:
+        return subprocess.run(['gcloud', 'auth', 'print-access-token'], check=True,
+                              text=True, capture_output=True, timeout=60).stdout.strip()
+    except FileNotFoundError:
+        return metadata_access_token()
+
 
 @lru_cache(maxsize=1)
 def catalog_skus() -> tuple[dict, ...]:
-    token = subprocess.run(['gcloud', 'auth', 'print-access-token'], check=True,
-                           text=True, capture_output=True, timeout=60).stdout.strip()
+    token = _access_token()
     if not token:
         raise RuntimeError('No credentials for Billing Catalog price lookup')
     rows = []

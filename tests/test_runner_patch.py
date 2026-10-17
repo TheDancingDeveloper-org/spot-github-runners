@@ -18,10 +18,13 @@ from lib.launch_candidates import LaunchInventory, candidate_key, launchable_can
 from lib.machine_profiles import platform_preferences, machine_profile, configure_storage
 from lib.runner_assets import RUNNER_DOCKERFILE
 from lib.runner_fleet import GceVm
+import urllib.error
+from lib import runner_patch as runner_patch_mod
 from lib.runner_patch import (
     RunnerPatch,
     classify_patch_diff,
     fetch_patch_from_config_repo,
+    list_config_repo_targets,
     parse_manifest_text,
     render_dockerfile,
     render_host_patch_script,
@@ -102,6 +105,9 @@ class RunnerPatchTests(unittest.TestCase):
         blocker = patch("subprocess.run", side_effect=AssertionError("Unexpected external command"))
         blocker.start()
         self.addCleanup(blocker.stop)
+        gh_present = patch("lib.runner_patch.shutil.which", return_value="/usr/bin/gh")
+        gh_present.start()
+        self.addCleanup(gh_present.stop)
 
     def test_yaml_and_json_manifests_parse_to_identical_patch(self):
         parsed_yaml = validate_patch_dict(parse_manifest_text(YAML_NNTMUX_MANIFEST))
@@ -511,6 +517,102 @@ min_ram_gib = 16
         self.assertEqual(profile.disk_type, "hyperdisk-balanced")
         self.assertEqual(args.disk_type, "hyperdisk-balanced")
         self.assertEqual(args.disk_interface, "NVME")
+
+
+class _FakeUrlResponse:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode()
+        self.status = 200
+
+    def read(self, _limit=-1):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class GhApiFallbackTests(unittest.TestCase):
+    """runner_patch._gh_api_json uses urllib against api.github.com when the gh CLI is absent."""
+
+    def setUp(self):
+        blocker = patch("subprocess.run", side_effect=AssertionError("gh must not run when it is not on PATH"))
+        blocker.start()
+        self.addCleanup(blocker.stop)
+        no_gh = patch("lib.runner_patch.shutil.which", return_value=None)
+        no_gh.start()
+        self.addCleanup(no_gh.stop)
+
+    def test_urllib_fallback_sends_token_and_parses_json(self):
+        seen = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append((request.full_url, dict(request.header_items()), timeout))
+            return _FakeUrlResponse({"default_branch": "main"})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            data = runner_patch_mod._gh_api_json("repos/o/r", env={"SPOT_CONFIG_GH_TOKEN": "cfg-token", "GH_TOKEN": "other"})
+        self.assertEqual(data, {"default_branch": "main"})
+        url, headers, timeout = seen[0]
+        self.assertEqual(url, "https://api.github.com/repos/o/r")
+        self.assertEqual(headers.get("Authorization"), "Bearer cfg-token")
+        self.assertGreater(timeout, 0)
+
+    def test_urllib_fallback_maps_404_for_missing_files(self):
+        def not_found(request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+        with patch("urllib.request.urlopen", side_effect=not_found):
+            self.assertIsNone(runner_patch_mod._fetch_repo_file_at_ref("o/r", "defaults.yaml", "a" * 40, env={"GH_TOKEN": "t"}))
+            with self.assertRaisesRegex(RuntimeError, "404"):
+                runner_patch_mod._gh_api_json("repos/o/r", env={"GH_TOKEN": "t"})
+
+    def test_urllib_fallback_rejects_path_traversal(self):
+        with patch("urllib.request.urlopen", side_effect=AssertionError("no request expected")):
+            with self.assertRaises(RuntimeError):
+                runner_patch_mod._gh_api_json("repos/../../evil", env={})
+
+    def _tree_responses(self, tree_payload):
+        sha = "e" * 40
+
+        def fake_urlopen(request, timeout=None):
+            url = request.full_url
+            if url.endswith("/repos/swack-tools/spot-runners-config"):
+                return _FakeUrlResponse({"default_branch": "main"})
+            if url.endswith("/repos/swack-tools/spot-runners-config/commits/main"):
+                return _FakeUrlResponse({"sha": sha})
+            if url.endswith(f"/repos/swack-tools/spot-runners-config/git/trees/{sha}?recursive=1"):
+                return _FakeUrlResponse(tree_payload)
+            raise AssertionError(f"unexpected URL {url}")
+
+        return sha, fake_urlopen
+
+    def test_list_config_repo_targets(self):
+        sha, fake = self._tree_responses({"truncated": False, "tree": [
+            {"path": "defaults.yaml", "type": "blob"},
+            {"path": "repos", "type": "tree"},
+            {"path": "repos/swack-tools", "type": "tree"},
+            {"path": "repos/swack-tools/oxidex.yaml", "type": "blob"},
+            {"path": "repos/xbmc4lyfe/newznab-tmux.yaml", "type": "blob"},
+            {"path": "repos/README.md", "type": "blob"},
+        ]})
+        with patch("urllib.request.urlopen", side_effect=fake):
+            targets, got_sha = list_config_repo_targets(env={"GH_TOKEN": "t"})
+        self.assertEqual(targets, ["swack-tools/oxidex", "xbmc4lyfe/newznab-tmux"])
+        self.assertEqual(got_sha, sha)
+
+    def test_list_config_repo_targets_fails_closed(self):
+        for payload in (
+            {"truncated": True, "tree": [{"path": "repos/a/b.yaml", "type": "blob"}]},
+            {"truncated": False, "tree": [{"path": "repos/-bad/x.yaml", "type": "blob"}]},
+            {"message": "Not Found"},
+        ):
+            _sha, fake = self._tree_responses(payload)
+            with patch("urllib.request.urlopen", side_effect=fake):
+                with self.assertRaises(RuntimeError, msg=payload):
+                    list_config_repo_targets(env={"GH_TOKEN": "t"})
 
 
 if __name__ == "__main__":

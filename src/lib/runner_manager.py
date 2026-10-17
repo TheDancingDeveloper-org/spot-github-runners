@@ -30,7 +30,7 @@ from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED,
                             RUNNER_DOCKERFILE, RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
 from .builder_assets import BUILDER_DOCKERFILE, BUILDER_ENTRYPOINT, HOST_LAUNCHER
-from .target_config import TargetConfig, resolve_target
+from .target_config import TARGET_LABEL_KEY, TargetConfig, resolve_target, target_label_value
 from .runner_patch import (
     RunnerPatch,
     classify_patch_diff,
@@ -419,6 +419,11 @@ def write_deployment_receipt(args: argparse.Namespace, vm: GceVm) -> None:
     temporary.replace(path)
 
 
+def launch_target_label(args: argparse.Namespace) -> str:
+    """Return the ownership label value that scopes this host to its GitHub target's controller."""
+    return target_label_value(resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG)))
+
+
 def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     configure_storage(args)
     configure_cpu_platform(args)
@@ -518,6 +523,7 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                         image_family, "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
                         network, f"--metadata-from-file=startup-script={script_path}",
+                        f"--labels={TARGET_LABEL_KEY}={launch_target_label(args)}",
                         "--format=json(id,name,zone,status,disks,cpuPlatform,minCpuPlatform)",
                         "--quiet"], quiet=True)
                 if getattr(args, "deployment_receipt", None):

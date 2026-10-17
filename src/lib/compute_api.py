@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
@@ -98,8 +100,62 @@ async def wait_for_quota_cooldown(project: str) -> None:
         await asyncio.sleep(remaining)
 
 
+METADATA_HOST = "metadata.google.internal"
+METADATA_TOKEN_URL = (
+    f"http://{METADATA_HOST}/computeMetadata/v1/instance/service-accounts/default/token"
+)
+METADATA_PROJECT_URL = f"http://{METADATA_HOST}/computeMetadata/v1/project/project-id"
+ENV_TOKEN_SOURCE = "SPOT_GCP_TOKEN_SOURCE"
+METADATA_TIMEOUT_SECONDS = 5.0
+MAX_METADATA_RESPONSE_BYTES = 65_536
+
+
+def _metadata_get(url: str, timeout: float = METADATA_TIMEOUT_SECONDS) -> str:
+    """GET a GCE metadata server URL (never through a proxy) and return the decoded body."""
+    request = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310 - fixed metadata URL
+            if int(getattr(response, "status", 200)) != 200:
+                raise RuntimeError(f"GCE metadata server returned HTTP {response.status}")
+            if response.headers.get("Metadata-Flavor", "Google") != "Google":
+                raise RuntimeError("GCE metadata response is missing Metadata-Flavor: Google")
+            return response.read(MAX_METADATA_RESPONSE_BYTES).decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"GCE metadata server returned HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"GCE metadata server is unreachable: {type(exc).__name__}") from exc
+
+
+def metadata_access_token(timeout: float = METADATA_TIMEOUT_SECONDS) -> str:
+    """Return the default service account access token from the GCE metadata server."""
+    raw = _metadata_get(METADATA_TOKEN_URL, timeout)
+    try:
+        token = json.loads(raw).get("access_token")
+    except (ValueError, AttributeError) as exc:
+        raise RuntimeError("GCE metadata server returned an invalid token response") from exc
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("GCE metadata server returned an empty access token")
+    return token.strip()
+
+
+def metadata_project_id(timeout: float = METADATA_TIMEOUT_SECONDS) -> str:
+    return _metadata_get(METADATA_PROJECT_URL, timeout).strip()
+
+
+def token_source_is_metadata(env: dict[str, str] | None = None) -> bool:
+    source = (os.environ if env is None else env).get(ENV_TOKEN_SOURCE, "")
+    return source.strip().lower() == "metadata"
+
+
 def get_auth(project_arg: str | None) -> Auth:
-    """Get active project and user access token from the logged-in gcloud command-line tool."""
+    """Get the active project and an access token.
+
+    Uses the logged-in gcloud command-line tool. When gcloud is not on PATH, or
+    ``SPOT_GCP_TOKEN_SOURCE=metadata`` is set, uses the GCE metadata server's default service account.
+    """
+    if token_source_is_metadata():
+        return _metadata_auth(project_arg)
     try:
         project = project_arg or subprocess.run(
             ["gcloud", "config", "get", "project"], check=True,
@@ -110,7 +166,12 @@ def get_auth(project_arg: str | None) -> Auth:
             check=True, capture_output=True, text=True, timeout=15,
         ).stdout.strip()
     except FileNotFoundError as exc:
-        raise RuntimeError("gcloud is required for Application Default Credentials") from exc
+        try:
+            return _metadata_auth(project_arg)
+        except RuntimeError as meta_exc:
+            raise RuntimeError(
+                f"gcloud is not installed and the GCE metadata server fallback failed: {meta_exc}"
+            ) from exc
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.strip() or "No Application Default Credentials found"
         raise RuntimeError(f"Unable to read project or access token from gcloud: {detail}") from exc
@@ -120,6 +181,14 @@ def get_auth(project_arg: str | None) -> Auth:
         raise RuntimeError("No active project; use --project PROJECT_ID or `gcloud config set project PROJECT_ID`")
     if not token:
         raise RuntimeError("gcloud returned an empty ADC access token")
+    return Auth(token, project)
+
+
+def _metadata_auth(project_arg: str | None) -> Auth:
+    token = metadata_access_token()
+    project = project_arg or metadata_project_id()
+    if not project:
+        raise RuntimeError("No active project; use --project PROJECT_ID (metadata server returned none)")
     return Auth(token, project)
 
 

@@ -97,14 +97,28 @@ def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
 
 def record_loss_restoration_target(vms, state, state_path):
     """Record all new losses together so a launch transition cannot undercount."""
-    from .spot_runner_autoscaler import spot_instances, write_scale_state
+    from .spot_runner_autoscaler import (identity_matches, rotation_host_identities, spot_instances,
+                                        write_scale_state)
 
     pending = state.get('pending_vm_recovery', {})
-    new_losses = sum(not record.get('_target_recorded') for record in pending.values())
-    if not new_losses:
+    new = [record for record in pending.values() if not record.get('_target_recorded')]
+    if not new:
         return
-    state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
-                                            len(spot_instances(vms)) + new_losses)
+    # A make-before-break rotation owns its replacement: that host is temporary overlap, and the
+    # rotation relaunches it itself. Count neither its loss nor the overlap toward restoration.
+    outgoing, replacements = rotation_host_identities(state)
+    def owned(row):
+        return any(identity_matches(rep, row.get('name'), row.get('zone'), row.get('instance_id'))
+                   for rep in replacements)
+    survivors = [vm for vm in spot_instances(vms)
+                 if not owned({'name': vm.name, 'zone': vm.zone, 'instance_id': vm.instance_id})]
+    for record in new:
+        if owned(record):
+            record['_rotation_owned'] = True  # Retired on cleanup; never restored by this path.
+    new_losses = sum(not owned(record) for record in new)
+    if new_losses:
+        state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
+                                                len(survivors) + new_losses)
     for record in pending.values():
         record['_target_recorded'] = True
     write_scale_state(state_path, state)
@@ -112,7 +126,7 @@ def record_loss_restoration_target(vms, state, state_path):
 
 def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
     """Share a persisted restoration target with price recovery; launch each deficit once."""
-    from .spot_runner_autoscaler import (begin_host_operation, reconcile_prices,
+    from .spot_runner_autoscaler import (begin_host_operation, reconcile_prices, retire_completed_recoveries,
                                         write_scale_state,protected_heavy_routes,runner_inventory_stale,heavy_route_capacity_hold)
 
     pending = state.get('pending_vm_recovery', {})
@@ -139,6 +153,10 @@ def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning('Recovery pending for %s; retrying next loop: %s', vm_details(vm), error_detail(exc))
         return True  # Finish this cleanup and deregistration before touching another host.
+    # The rotation relaunches its own replacement; once cleaned up, its loss record is done.
+    retire_completed_recoveries(state, state_path, only=lambda record: record.get('_rotation_owned'))
+    if not pending:
+        return False
     if getattr(args,'scaling_mode','resource')=='tiered':
         return False  # Tier orchestration now owns exact-topology restoration.
     protected_heavy_routes(vms,runners,state)

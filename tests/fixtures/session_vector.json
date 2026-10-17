@@ -1,0 +1,26 @@
+{
+  "secret": "test-vector-secret-not-for-production-0123456789abcdef",
+  "purpose_label": "spot-dashboard/session/v1",
+  "valid_session": {
+    "token": "eyJleHAiOjE3OTIwNDMyMDAsImlhdCI6MTc5MjAwMDAwMCwic3ViIjoic3dhY2toYW1lciIsInRndCI6WyJzd2Fjay10b29scy9veGlkZXgiXSwidWlkIjo2MTk2MjQsInYiOjF9.8bdb3cded7569ea20047397d097b233bd994d33a71a54a50e27da3bc37702caa",
+    "payload": {
+      "v": 1,
+      "sub": "swackhamer",
+      "uid": 619624,
+      "iat": 1792000000,
+      "exp": 1792043200,
+      "tgt": [
+        "swack-tools/oxidex"
+      ]
+    },
+    "now": 1792000100
+  },
+  "tampered_session_token": "eyJleHAiOjE3OTIwNDMyMDAsImlhdCI6MTc5MjAwMDAwMCwic3ViIjoic3dhY2toYW1lciIsInRndCI6WyJzd2Fjay10b29scy9veGlkZXgiXSwidWlkIjo2MTk2MjQsInYiOjF9.8bdb3cded7569ea20047397d097b233bd994d33a71a54a50e27da3bc37702ca0",
+  "expired_now": 1792043200,
+  "control": {
+    "token": "eyJleHAiOjE3OTIwMDAxMjAsImlhdCI6MTc5MjAwMDAwMCwib3AiOiJmcmVlemUiLCJzbG90IjoiYSIsInYiOjF9.6649c36e3bf4100a12134552d3ae8ce3a9efc4f210612fd29ee43fb94f2e6d74",
+    "op": "freeze",
+    "slot": "a",
+    "now": 1792000010
+  }
+}

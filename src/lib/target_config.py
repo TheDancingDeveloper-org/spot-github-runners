@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any
+
+# GCE instance label that records which GitHub target a runner host registers with.
+TARGET_LABEL_KEY = "spot-target"
+DEFAULT_ORG = "swack-tools"
 
 
 @dataclass
@@ -104,3 +110,29 @@ def resolve_target(target: str | TargetConfig | None, default_org: str = "swack-
     if not name:
         raise ValueError("Target name cannot be empty")
     return TargetConfig(name=name)
+
+
+def target_label_value(target: str | TargetConfig) -> str:
+    """Return a GCE-label-safe, collision-resistant ownership value for a GitHub target.
+
+    GitHub names are case-insensitive, so the value is derived from the lowercased name: a
+    readable sanitized prefix plus a digest of the exact name, within GCE's 63-character limit.
+    """
+    name = resolve_target(target).name.lower()
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:10]
+    readable = re.sub(r"[^a-z0-9_-]", "_", name.replace("/", "--"))[:52]
+    return f"{readable}-{digest}"
+
+
+def target_owns_vm_label(label: str | None, target: str | TargetConfig,
+                         default_org: str | None = DEFAULT_ORG) -> bool:
+    """Return whether a host carrying ``label`` belongs to ``target``.
+
+    Labeled hosts belong only to the target whose label value matches. Unlabeled hosts predate
+    target labels and belong only to the default organization target (backward compatibility).
+    """
+    resolved = resolve_target(target)
+    if label:
+        return label == target_label_value(resolved)
+    default = (default_org or DEFAULT_ORG).strip().lower()
+    return resolved.is_org and resolved.name.lower() == default

@@ -27,26 +27,43 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 
 from .dashboard_auth import (
-    MAX_DYNAMIC_CONTROLLED_TARGETS,
     OAUTH_STATE_COOKIE_NAME,
     SESSION_COOKIE_NAME,
-    AuthCapacityError,
+    ConfigRepoTargets,
+    ConfigTargetsError,
     GitHubApiError,
     GitHubOAuthManager,
-    TargetChange,
-    target_list_digest,
+    audit_login,
     format_cleared_session_cookie,
     format_cleared_state_cookie,
     format_session_cookie,
     format_state_cookie,
-    parse_allowed_admins,
     parse_controlled_targets,
     parse_controlled_targets_env,
     parse_cookie_header,
     render_login_gate_html,
     safe_return_path,
-    ENV_ALLOWED_ADMINS,
     ENV_CONTROLLED_TARGETS,
+    ENV_DEVICE_FLOW,
+    ENV_REDIRECT_URI,
+)
+from .edge_state import (
+    CONTROL_OPS,
+    CONTROL_SLOTS,
+    DEFAULT_RETRY_AFTER_SECONDS,
+    ENV_CONTROL_SECRET,
+    KV_ORIGIN_KEY,
+    KV_STATE_KEY,
+    MAX_KV_VALUE_BYTES,
+    CloudflareKv,
+    KvConfig,
+    KvError,
+    OriginRecord,
+    build_snapshot,
+    parse_snapshot,
+    unavailable_payload,
+    validate_slot,
+    verify_control_token,
 )
 from .dashboard_models import (
     DEFAULT_RUNNER_CLOUD_INIT,
@@ -87,19 +104,48 @@ from .rust_build_telemetry import (
 
 MAX_JSON_BODY_BYTES = 262_144
 MAX_LOGIN_BODY_BYTES = 4_096
-MAX_CONTROLLED_TARGETS_HISTORY = 50
-SESSION_TOO_LARGE_ERROR = "Controlled target list is too long to fit in a session cookie; use fewer or shorter targets"
-NOT_PERSISTENT_TARGETS_WARNING = (
-    "Controlled targets are kept in memory only (the dashboard runs without --state-file); "
-    "this change is lost when the process restarts."
-)
+MAX_CONTROL_BODY_BYTES = MAX_KV_VALUE_BYTES + 65_536
 
-_AUDIT_LOG = logging.getLogger("spot_runner_autoscaler.dashboard_auth")
-_AUDIT_LOG.addHandler(logging.NullHandler())  # Records propagate to handlers set up by main().
+IDEMPOTENCY_STATE_KEY = "idempotency"
+IDEMPOTENCY_MAX_KEYS = 500
+IDEMPOTENCY_TTL_SECONDS = 86_400
+IDEMPOTENCY_MAX_BODY_BYTES = 65_536
+_IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{8,128}")
+
+KV_WRITE_DEBOUNCE_SECONDS = 1.0
+KV_WRITE_MAX_DELAY_SECONDS = 5.0
+KV_WRITER_RECHECK_SECONDS = 30.0
+KV_RETRY_BACKOFF_SECONDS = 5.0
+KV_LOOP_INTERVAL_SECONDS = 0.25
+HYDRATE_RETRY_DELAYS_SECONDS = (4.0, 5.0)  # 3 KV reads over roughly 10 seconds
+# With no local state and KV unreachable, hydration keeps retrying with this backoff (seconds).
+HYDRATE_BACKOFF_INITIAL_SECONDS = 5.0
+HYDRATE_BACKOFF_MAX_SECONDS = 60.0
+KV_STALE_REFUSAL_BACKOFF_SECONDS = 30.0
+
+MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# POST endpoints that compute a response without changing dashboard state; they skip idempotency storage.
+NON_MUTATING_POST_PATHS = frozenset({"/api/qualify", "/api/cloud-init/parse", "/api/ip-intel"})
+FORWARDED_CLIENT_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "X-Forwarded-For")
+# Public browser origin (for example https://spot.swacktech.com) when a proxy such as the Cloudflare
+# Worker reaches this server under a different Host (the tunnel hostname). Defaults to the origin of
+# GITHUB_OAUTH_REDIRECT_URI.
+ENV_PUBLIC_ORIGIN = "DASHBOARD_PUBLIC_ORIGIN"
+# Central runner configuration repository whose repos/<owner>/<repo>.yaml files are controlled targets.
+ENV_CONFIG_REPO = "SPOT_CONFIG_REPO"
+CONFIG_REPO_NAME = "spot-runners-config"
+_CONFIG_REPO_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}")
+FREEZE_MARKER_SUFFIX = ".frozen"
+
+LOG = logging.getLogger("spot_dashboard")
 
 
 class _PayloadTooLargeError(ValueError):
     """Raised when an incoming HTTP JSON request body exceeds the configured byte limit."""
+
+
+class DashboardFrozenError(RuntimeError):
+    """Raised when a state mutation is attempted while the control VM is frozen for a handover."""
 
 
 
@@ -907,28 +953,11 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         "rust_builds": rust_builds,
         # Dynamic GitHub OAuth controlled targets (empty by default); see dashboard_auth.
         "controlled_targets": [],
-        # Bounded audit history of committed controlled-target changes.
-        "controlled_targets_history": [],
     }
 
 
-class ControlledTargetsUnavailableError(RuntimeError):
-    """The dynamic controlled-target policy could not be loaded; OAuth access fails closed."""
-
-
-class ControlledTargetsConflictError(RuntimeError):
-    """A pending controlled-target change was based on a list that has since changed."""
-
-
 class DashboardStore:
-    """Thread-safe controller store backing the Web UI Dashboard API.
-
-    Dynamic GitHub OAuth controlled targets live in the state file, so they require a persistent
-    ``state_path`` (``--state-file``); without one, changes last only for the process lifetime. If the
-    state file exists but cannot be read or parsed, the store keeps working from defaults for every
-    other feature, but ``controlled_targets_error`` is set (OAuth sessions are refused with 503) and
-    the unreadable file is never overwritten, so the operator can inspect and repair it.
-    """
+    """Thread-safe controller store backing the Web UI Dashboard API."""
 
     def __init__(
         self,
@@ -936,61 +965,669 @@ class DashboardStore:
         *,
         project: str = "homelab-424523",
         org: str = "swack-tools",
+        control_slot: str | None = None,
+        kv: CloudflareKv | None = None,
+        clock: Any = time.time,
+        sleep: Any = time.sleep,
     ) -> None:
         self._lock = threading.RLock()
         self.state_path = state_path
         self.project = project
         self.org = org
-        self.hydrated = True
-        self.controlled_targets_error = ""
-        # Read the file directly: Path.exists() also reports False when stat fails (for example
-        # EACCES on a parent directory), which would silently load an empty, fail-open policy.
-        # Only a genuinely absent file starts from defaults.
-        raw_state: str | None = None
-        read_error: Exception | None = None
-        if state_path:
+        self.control_slot = validate_slot(control_slot) if control_slot else None
+        if kv is not None and self.control_slot is None:
+            LOG.warning("Cloudflare KV is configured but --control-slot is not; dashboard state stays local only")
+        self.kv = kv if self.control_slot is not None else None
+        self._clock = clock
+        self._sleep = sleep
+        self.hydrate_retry_delays: tuple[float, ...] = HYDRATE_RETRY_DELAYS_SECONDS
+        # Durability flags: requests (other than health and control) are refused until hydrated.
+        self.hydrated = False
+        self.frozen = False
+        # False after starting from the local file while KV was configured but unreachable: GETs work,
+        # mutations get the wait response, and KV is retried until the two copies are reconciled.
+        self.reconciled = True
+        self._unreconciled_base_version: int | None = None
+        self._reconcile_next_at = 0.0
+        self._reconcile_delay = HYDRATE_BACKOFF_INITIAL_SECONDS
+        self.kv_writer = False
+        # True when the last successful read of origin:active named the other slot: a Worker with a cached
+        # origin may still send requests here, but changes would never reach the active dashboard.
+        self.known_inactive = False
+        self.hydration_source = ""
+        self._writer_checked_at: float | None = None
+        self._kv_dirty = False
+        self._kv_dirty_first_at = 0.0
+        self._kv_dirty_last_at = 0.0
+        self._kv_next_attempt_at = 0.0
+        self.kv_last_written_version: int | None = None
+        # Every KV snapshot write (background write-behind and freeze) runs under this lock, in version order.
+        self._kv_write_lock = threading.Lock()
+        # True once this VM, as the KV writer, has compared its state with the KV snapshot (and adopted a
+        # newer one). Reset whenever it is not the writer, so a VM that becomes active by cutover catches up
+        # with KV before it accepts a change or publishes.
+        self._writer_synced = False
+        self._defer: dict[str, Any] | None = None
+        self._stop_event = threading.Event()
+        self._threads: list[threading.Thread] = []
+        # A freeze survives container and VM restarts: the marker sits next to the state file until an
+        # explicit unfreeze or a successful import, so a restarted old VM never accepts writes that the
+        # replacement did not import.
+        self.freeze_marker_path = (
+            state_path.parent / f"{state_path.name}{FREEZE_MARKER_SUFFIX}" if state_path else None
+        )
+        if self.freeze_marker_path is not None and os.path.lexists(self.freeze_marker_path):
+            self.frozen = True
+            LOG.warning("Dashboard starts frozen: freeze marker %s is present", self.freeze_marker_path)
+        self.loaded_from_file = False
+        if state_path and state_path.exists():
             try:
-                raw_state = state_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                raw_state = None
-            except (OSError, ValueError) as exc:
-                read_error = exc
-        if raw_state is not None or read_error is not None:
-            try:
-                if read_error is not None:
-                    raise read_error
-                loaded = json.loads(raw_state)
-                if not isinstance(loaded, dict):
-                    raise ValueError("state file does not contain a JSON object")
-                base = default_dashboard_state(project=project, org=org)
-                base.update(loaded)
-                self.state = base
-                self._normalize_project_derived_fields()
-                self._normalize_github_ci_runs()
-                self._sync_fleet_telemetry()
-            except (OSError, ValueError) as exc:
-                # Fail closed for the access policy; do not rewrite the unreadable file.
-                self.controlled_targets_error = (
-                    f"Dashboard state file {state_path} could not be loaded ({type(exc).__name__}); "
-                    "the dynamic controlled-target policy is unavailable. Repair or restore the file and restart."
-                )
-                _AUDIT_LOG.error("%s", self.controlled_targets_error)
+                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                self._apply_loaded_state(loaded)
+            except (OSError, ValueError, TypeError):
                 self.state = default_dashboard_state(project=project, org=org)
                 self._sync_fleet_telemetry()
             else:
+                self.loaded_from_file = True
                 try:
-                    self._persist()
+                    # Normalization write-back keeps the loaded state_version (not a new change).
+                    self._persist(bump=False)
                 except OSError:
                     # Preserve loaded and normalized in-memory state when startup write-back fails.
                     pass
+        elif self.kv is not None:
+            # No local state yet: hydrate from KV first. Writing version-0 defaults here would let a
+            # restart before hydration mistake them for real local state.
+            self.state = default_dashboard_state(project=project, org=org)
+            self._sync_fleet_telemetry()
         else:
             self.state = default_dashboard_state(project=project, org=org)
             self._sync_fleet_telemetry()
             try:
-                self._persist()
+                self._persist(bump=False)
             except OSError:
                 # Preserve default in-memory state when initial persistence fails on a read-only path.
                 pass
+
+    # -- durability: load, version, hydration, KV write-behind, freeze/import, idempotency --
+
+    def _apply_loaded_state(self, loaded: Any) -> None:
+        """Validate and normalize a loaded state dict through the standard load path (atomic on failure)."""
+        if not isinstance(loaded, dict):
+            raise ValueError("dashboard state must be a JSON object")
+        version = loaded.get("state_version", 0)
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise ValueError("dashboard state_version must be a non-negative integer")
+        base = default_dashboard_state(project=self.project, org=self.org)
+        for key, default_value in base.items():
+            if key in loaded and isinstance(default_value, (list, dict)) and not isinstance(loaded[key], type(default_value)):
+                raise ValueError(f"dashboard state field {key!r} must be a JSON {type(default_value).__name__}")
+        base.update(copy.deepcopy(loaded))
+        previous = getattr(self, "state", None)
+        self.state = base
+        try:
+            self._normalize_project_derived_fields()
+            self._normalize_github_ci_runs()
+            self._sync_fleet_telemetry()
+        except Exception as exc:
+            if previous is not None:
+                self.state = previous
+            raise ValueError(f"invalid dashboard state: {type(exc).__name__}: {exc}") from exc
+
+    def state_version(self) -> int:
+        version = self.state.get("state_version", 0)
+        return version if isinstance(version, int) and not isinstance(version, bool) and version >= 0 else 0
+
+    def start(self) -> None:
+        """Hydrate (in a background thread when KV is configured) and start KV write-behind."""
+        if self.kv is None:
+            self.hydrate()
+            return
+        thread = threading.Thread(target=self._background_main, name="dashboard-kv-sync", daemon=True)
+        self._threads.append(thread)
+        thread.start()
+
+    def close(self, timeout: float = 5.0) -> None:
+        self._stop_event.set()
+        for thread in self._threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=timeout)
+
+    def _background_main(self) -> None:
+        delay = HYDRATE_BACKOFF_INITIAL_SECONDS
+        while not self._stop_event.is_set():
+            try:
+                self.hydrate()
+            except Exception:  # noqa: BLE001 - keep retrying; serve local state when there is some
+                LOG.exception("Dashboard hydration failed")
+                if self.loaded_from_file:
+                    with self._lock:
+                        if not self.hydrated:
+                            self._mark_unreconciled()
+                            self.hydrated = True
+            if self.hydrated:
+                break
+            # No local state and KV unreachable: stay unhydrated (health 503) rather than serve defaults.
+            self._stop_event.wait(delay)
+            delay = min(delay * 2, HYDRATE_BACKOFF_MAX_SECONDS)
+        while not self._stop_event.is_set():
+            try:
+                self.kv_tick()
+            except Exception:  # noqa: BLE001 - the write-behind loop must keep running
+                LOG.exception("Dashboard KV write-behind iteration failed")
+            self._stop_event.wait(KV_LOOP_INTERVAL_SECONDS)
+
+    def _read_kv_snapshot(self) -> tuple[dict[str, Any] | None, bool]:
+        """Return (snapshot or None, kv_reachable). Tries 3 times over roughly 10 seconds."""
+        assert self.kv is not None
+        attempts = len(self.hydrate_retry_delays) + 1
+        for attempt in range(attempts):
+            if self._stop_event.is_set():
+                break
+            try:
+                raw = self.kv.get(KV_STATE_KEY)
+            except KvError as exc:
+                LOG.warning("Dashboard KV snapshot read %d/%d failed: %s", attempt + 1, attempts, exc)
+                if attempt < attempts - 1:
+                    self._sleep(self.hydrate_retry_delays[attempt])
+                continue
+            if raw is None:
+                return None, True
+            snapshot = parse_snapshot(raw)
+            if snapshot is None:
+                LOG.warning("Ignoring malformed dashboard KV snapshot")
+            return snapshot, True
+        return None, False
+
+    def hydrate(self) -> str:
+        """Choose the newer of the local state file and the KV snapshot (tie: local), then mark hydrated.
+
+        Returns the chosen source: ``local``, ``kv``, or ``default``, or ``unavailable`` (still unhydrated)
+        when there is no local state and KV is configured but unreachable. Defaults are used only when KV
+        is not configured or positively reports that no snapshot exists.
+        """
+        snapshot: dict[str, Any] | None = None
+        reachable = True
+        if self.kv is not None:
+            snapshot, reachable = self._read_kv_snapshot()
+            if not reachable:
+                if not self.loaded_from_file:
+                    LOG.error("Cloudflare KV unreachable and no local dashboard state; staying unhydrated "
+                              "and retrying instead of serving defaults")
+                    return "unavailable"
+                LOG.warning("Cloudflare KV unreachable during hydration; serving local dashboard state "
+                            "read-only until KV is reachable again")
+            self.refresh_writer()
+        with self._lock:
+            if self.hydrated:
+                # A control-plane import hydrated the store meanwhile; it is authoritative.
+                return self.hydration_source
+            if not reachable:
+                self._mark_unreconciled()
+            source = "local" if self.loaded_from_file else "default"
+            if snapshot is not None:
+                newer = snapshot["state_version"] > self.state_version()
+                if newer or not self.loaded_from_file:
+                    try:
+                        self._adopt_snapshot(snapshot)
+                        source = "kv"
+                    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                        LOG.warning("Ignoring invalid dashboard KV snapshot: %s", exc)
+            if source == "local" and reachable and (snapshot is None or snapshot["state_version"] < self.state_version()):
+                # The local file is ahead of KV (for example a preemption interrupted write-behind after a
+                # successful local save): publish it once this VM is the writer.
+                self._mark_kv_dirty()
+            self.hydration_source = source
+            self.hydrated = True
+            self._writer_synced = bool(reachable and self.kv_writer)
+        LOG.info("Dashboard hydrated from %s at state_version %d", source, self.state_version())
+        return source
+
+    def _adopt_snapshot(self, snapshot: dict[str, Any], *, require_persist: bool = False) -> None:
+        """Replace state with a validated snapshot envelope and keep its state_version (no bump).
+
+        With ``require_persist`` a failed local write restores the previous state and raises OSError.
+        """
+        previous = self.state
+        loaded = dict(snapshot["state"])
+        loaded["state_version"] = int(snapshot["state_version"])
+        self._apply_loaded_state(loaded)
+        self.state["state_version"] = int(snapshot["state_version"])
+        try:
+            self._persist(bump=False)
+        except OSError as exc:
+            if require_persist:
+                self.state = previous
+                raise
+            LOG.warning("Could not write adopted dashboard snapshot to the local state file: %s", exc)
+
+    # -- reconciliation after a start from local state while KV was unreachable --
+
+    def _mark_unreconciled(self) -> None:
+        if self.kv is None:
+            return
+        self.reconciled = False
+        self._unreconciled_base_version = self.state_version()
+        self._reconcile_next_at = 0.0
+        self._reconcile_delay = HYDRATE_BACKOFF_INITIAL_SECONDS
+
+    def reconcile(self) -> bool:
+        """Compare the local start state with KV once KV answers; True when mutations may resume.
+
+        KV at or above the version the store started from wins (it is imported). Only when KV is older
+        or empty is the local state published (by the active slot). The comparison uses the starting
+        version, so local counter growth while unreconciled never authorizes overwriting KV.
+        """
+        if self.reconciled or self.kv is None:
+            return True
+        try:
+            raw = self.kv.get(KV_STATE_KEY)
+        except KvError as exc:
+            LOG.warning("Dashboard still unreconciled; KV unreachable: %s", exc)
+            return False
+        snapshot = parse_snapshot(raw) if raw is not None else None
+        base = self._unreconciled_base_version or 0
+        if snapshot is not None and snapshot["state_version"] >= base:
+            with self._lock:
+                if self.reconciled:
+                    return True
+                try:
+                    self._adopt_snapshot(snapshot)
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    LOG.error("KV snapshot is invalid; dashboard stays unreconciled: %s", exc)
+                    return False
+                self._finish_reconcile("kv")
+            return True
+        if self.refresh_writer():
+            try:
+                written = self._publish_snapshot()
+            except KvError as exc:
+                LOG.warning("Could not publish local dashboard state during reconciliation: %s", exc)
+                return False
+            if written is None:
+                return False
+        with self._lock:
+            self._finish_reconcile("local")
+        return True
+
+    def _finish_reconcile(self, source: str) -> None:
+        self.reconciled = True
+        self._unreconciled_base_version = None
+        LOG.warning("Dashboard reconciled with KV using the %s copy at state_version %d", source,
+                    self.state_version())
+
+    def import_snapshot(self, envelope: Any) -> dict[str, Any]:
+        """Import a snapshot envelope when its state_version >= local; always marks the store hydrated.
+
+        Only the control plane's handover target receives an import, so a successful import also clears
+        any freeze (in memory and the durable marker): this VM is about to become the active slot.
+        """
+        snapshot = parse_snapshot(envelope)
+        if snapshot is None:
+            raise ValueError("Invalid dashboard snapshot envelope")
+        with self._lock:
+            imported = snapshot["state_version"] >= self.state_version()
+            if imported:
+                # A failed local write raises OSError (state unchanged, not hydrated): the caller gets a
+                # 500 and must not treat the import as done.
+                self._adopt_snapshot(snapshot, require_persist=True)
+                self._mark_kv_dirty()
+            if self.frozen or (self.freeze_marker_path is not None and os.path.lexists(self.freeze_marker_path)):
+                self._clear_freeze_marker()
+                self.frozen = False
+                LOG.info("Import cleared the dashboard freeze")
+            self.hydrated = True
+            self.reconciled = True
+            self._unreconciled_base_version = None
+            self.hydration_source = "import" if imported else self.hydration_source
+            return {"state_version": self.state_version(), "imported": imported}
+
+    def snapshot_envelope(self) -> dict[str, Any]:
+        if self.control_slot is None:
+            raise ValueError("Snapshots require --control-slot")
+        with self._lock:
+            return build_snapshot(copy.deepcopy(self.state), self.state_version(), self.control_slot,
+                                  now=self._clock())
+
+    def refresh_writer(self) -> bool:
+        """This VM writes KV iff ``origin:active`` names its slot or is unset. Unchanged on KV errors."""
+        if self.kv is None or self.control_slot is None:
+            self.kv_writer = False
+            return False
+        try:
+            raw = self.kv.get(KV_ORIGIN_KEY)
+        except KvError as exc:
+            LOG.warning("Could not read %s from Cloudflare KV: %s", KV_ORIGIN_KEY, exc)
+            return self.kv_writer
+        if raw is None:
+            writer = True
+            self.known_inactive = False
+        else:
+            record = OriginRecord.from_json(raw)
+            writer = record is not None and record.slot == self.control_slot
+            self.known_inactive = record is not None and record.slot != self.control_slot
+        if not writer:
+            self._writer_synced = False
+        self.kv_writer = writer
+        self._writer_checked_at = self._clock()
+        return writer
+
+    def sync_with_kv_as_writer(self) -> bool:
+        """When this VM is (or just became) the writer, adopt a newer KV snapshot before going further.
+
+        Returns True when it is safe to accept a change or publish: not the writer, or the writer and
+        already compared with KV. Returns False when KV could not be read after becoming the writer.
+        """
+        if self.kv is None:
+            return True
+        if self.kv_writer and self._writer_synced:
+            return True
+        if not self.refresh_writer():
+            return True
+        if self._writer_synced:
+            return True
+        try:
+            snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY))
+        except KvError as exc:
+            LOG.warning("Became the KV writer but could not read the KV snapshot: %s", exc)
+            return False
+        with self._lock:
+            if snapshot is not None and snapshot["state_version"] > self.state_version():
+                try:
+                    self._adopt_snapshot(snapshot)
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    LOG.error("Became the KV writer but the newer KV snapshot is invalid: %s", exc)
+                    return False
+                self._kv_dirty = False  # Local state now equals the KV copy.
+                LOG.warning("Became the KV writer; adopted newer KV snapshot at state_version %d",
+                            snapshot["state_version"])
+            self._writer_synced = True
+        return True
+
+    def _mark_kv_dirty(self) -> None:
+        if self.kv is None:
+            return
+        now = self._clock()
+        if not self._kv_dirty:
+            self._kv_dirty_first_at = now
+        self._kv_dirty = True
+        self._kv_dirty_last_at = now
+
+    def _restore_kv_dirty(self) -> None:
+        with self._lock:
+            if not self._kv_dirty:
+                self._kv_dirty = True
+                self._kv_dirty_first_at = self._kv_dirty_last_at = self._clock()
+
+    def _publish_snapshot(self, envelope: dict[str, Any] | None = None) -> int | None:
+        """Write a snapshot to KV, serialized with every other KV snapshot write.
+
+        ``envelope`` None captures the current state inside the write lock. Returns the state_version now
+        in KV from this writer, or None when the write was refused because it would move KV backwards
+        (older than this process's last write, or older than the snapshot already in KV). Raises KvError.
+        """
+        assert self.kv is not None
+        with self._kv_write_lock:
+            captured = envelope is None
+            if captured:
+                with self._lock:
+                    if self.frozen:
+                        # A freeze (and maybe a handover) happened while this write waited for the lock.
+                        return None
+                    envelope = self.snapshot_envelope()
+                    self._kv_dirty = False
+            version = int(envelope["state_version"])
+            last = self.kv_last_written_version
+            if last is not None and version <= last:
+                if version < last:
+                    LOG.error("Refusing to write dashboard snapshot state_version %d to KV after already "
+                              "writing state_version %d", version, last)
+                    return None
+                return version  # Already published.
+            try:
+                # Under the write lock, immediately before the put: this VM must still own origin:active and
+                # KV must not already hold a newer snapshot. (Equal versions share one history: a handover
+                # target imports the frozen version before changing anything.)
+                raw_origin = self.kv.get(KV_ORIGIN_KEY)
+                if raw_origin is not None:
+                    record = OriginRecord.from_json(raw_origin)
+                    if record is None or record.slot != self.control_slot:
+                        self.kv_writer = False
+                        self._writer_synced = False
+                        self.known_inactive = record is not None
+                        self._writer_checked_at = self._clock()
+                        LOG.warning("Skipping dashboard KV write: origin:active names slot %s, not %s",
+                                    record.slot if record else None, self.control_slot)
+                        if captured:
+                            self._restore_kv_dirty()
+                        return None
+                current = parse_snapshot(self.kv.get(KV_STATE_KEY))
+                if current is not None and current["state_version"] > version:
+                    LOG.error("REFUSING to overwrite the KV dashboard snapshot at state_version %d (slot %s) with "
+                              "local state_version %d; this VM's state is stale",
+                              current["state_version"], current.get("writer_slot"), version)
+                    if captured:
+                        self._restore_kv_dirty()
+                    return None
+                self.kv.put(KV_STATE_KEY, json.dumps(envelope, separators=(",", ":"), allow_nan=False))
+            except KvError:
+                if captured:
+                    self._restore_kv_dirty()
+                raise
+            self.kv_last_written_version = version
+            return version
+
+    def _kv_put_snapshot(self) -> int | None:
+        """Background write of the current state. Returns the written state_version (None when refused)."""
+        return self._publish_snapshot()
+
+    def kv_tick(self) -> bool:
+        """One write-behind iteration. Returns True when a snapshot was written to KV."""
+        if self.kv is None:
+            return False
+        now = self._clock()
+        if self.hydrated and not self.reconciled:
+            if now >= self._reconcile_next_at and not self.reconcile():
+                self._reconcile_next_at = now + self._reconcile_delay
+                self._reconcile_delay = min(self._reconcile_delay * 2, HYDRATE_BACKOFF_MAX_SECONDS)
+            return False
+        if self._writer_checked_at is None or now - self._writer_checked_at >= KV_WRITER_RECHECK_SECONDS:
+            self.refresh_writer()
+        if self.hydrated and self.kv_writer and not self._writer_synced and not self.sync_with_kv_as_writer():
+            self._kv_next_attempt_at = now + KV_RETRY_BACKOFF_SECONDS
+            return False
+        if not (self.hydrated and not self.frozen and self.kv_writer and self._kv_dirty):
+            return False
+        quiet = now - self._kv_dirty_last_at >= KV_WRITE_DEBOUNCE_SECONDS
+        overdue = now - self._kv_dirty_first_at >= KV_WRITE_MAX_DELAY_SECONDS
+        if not (quiet or overdue) or now < self._kv_next_attempt_at:
+            return False
+        try:
+            written = self._kv_put_snapshot()
+        except KvError as exc:
+            LOG.warning("Dashboard KV write-behind failed: %s", exc)
+            self._kv_next_attempt_at = now + KV_RETRY_BACKOFF_SECONDS
+            return False
+        if written is None:
+            self._kv_next_attempt_at = now + KV_STALE_REFUSAL_BACKOFF_SECONDS
+            return False
+        return True
+
+    def _fsync_state_dir(self) -> None:
+        assert self.freeze_marker_path is not None
+        try:
+            fd = os.open(str(self.freeze_marker_path.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _write_freeze_marker(self, state_version: int) -> None:
+        """Atomically write the 0600 freeze marker next to the state file. Raises OSError."""
+        if self.freeze_marker_path is None:
+            return
+        marker = self.freeze_marker_path
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        if marker.is_symlink():
+            raise OSError(f"Refusing symlinked freeze marker path: {marker}")
+        payload = json.dumps({"frozen": True, "state_version": state_version, "slot": self.control_slot,
+                              "frozen_at": self._clock()}, allow_nan=False)
+        tmp = marker.parent / f".{marker.name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                os.chmod(tmp, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp.replace(marker)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        self._fsync_state_dir()
+
+    def _clear_freeze_marker(self) -> None:
+        """Remove the freeze marker (durably). Raises OSError when it cannot be removed."""
+        if self.freeze_marker_path is None or not os.path.lexists(self.freeze_marker_path):
+            return
+        self.freeze_marker_path.unlink()
+        self._fsync_state_dir()
+
+    def freeze(self) -> dict[str, Any]:
+        """Stop accepting mutations, persist the freeze marker, and synchronously flush the snapshot to KV.
+
+        Raises OSError (the store stays frozen in memory) when the durable marker cannot be written, so the
+        caller reports failure instead of a freeze that a restart would silently undo.
+        """
+        with self._lock:
+            self.frozen = True
+            self._write_freeze_marker(self.state_version())
+            envelope = self.snapshot_envelope()
+        flushed = False
+        if self.kv is not None and self.refresh_writer():
+            try:
+                # Waits for any in-flight background write, which can therefore never land after this one.
+                written = self._publish_snapshot(envelope)
+                flushed = written is not None and written >= int(envelope["state_version"])
+                if flushed:
+                    with self._lock:
+                        if self.state_version() == envelope["state_version"]:
+                            self._kv_dirty = False
+            except KvError as exc:
+                LOG.warning("Dashboard KV flush during freeze failed: %s", exc)
+        return {"state_version": envelope["state_version"], "snapshot": envelope, "kv_flushed": flushed}
+
+    def unfreeze(self) -> dict[str, Any]:
+        """Accept mutations again. Raises OSError (and stays frozen) when the marker cannot be removed."""
+        with self._lock:
+            self._clear_freeze_marker()
+            self.frozen = False
+        return {"frozen": False}
+
+    def health(self) -> dict[str, Any]:
+        with self._lock:
+            hydrated, frozen, reconciled = bool(self.hydrated), bool(self.frozen), bool(self.reconciled)
+            status = "frozen" if frozen else ("ok" if hydrated and reconciled else "starting")
+            return {
+                "status": status,
+                "hydrated": hydrated,
+                "frozen": frozen,
+                "reconciled": reconciled,
+                "active": not self.known_inactive,
+                "state_version": self.state_version(),
+                "slot": self.control_slot,
+                "kv_writer": bool(self.kv_writer),
+            }
+
+    def _prune_idempotency(self, records: dict[str, Any], now: float) -> dict[str, Any]:
+        fresh = {
+            k: v for k, v in records.items()
+            if isinstance(v, dict) and isinstance(v.get("t"), (int, float)) and now - float(v["t"]) < IDEMPOTENCY_TTL_SECONDS
+        }
+        if len(fresh) > IDEMPOTENCY_MAX_KEYS:
+            keep = sorted(fresh, key=lambda k: float(fresh[k]["t"]), reverse=True)[:IDEMPOTENCY_MAX_KEYS]
+            fresh = {k: fresh[k] for k in keep}
+        return fresh
+
+    def run_request(self, key: str | None, method: str, path: str, fn: Any, *, mutating: bool = True,
+                    ) -> tuple[int, Any, bool]:
+        """Run ``fn() -> (status, body)`` with frozen and idempotency handling. Returns (status, body, replayed).
+
+        With a key, the stored response and the mutation are written in the SAME atomic persist: store
+        writes inside ``fn`` are deferred and the state is rolled back when the request fails.
+        """
+        if not mutating:
+            status, body = fn()
+            return status, body, False
+        if self.hydrated and not self.frozen and not self.sync_with_kv_as_writer():
+            raise DashboardFrozenError("Dashboard became the active slot but cannot read Cloudflare KV yet")
+        if self.known_inactive:
+            # sync_with_kv_as_writer re-read origin:active just now (unless KV is unreachable, in which case
+            # the last successful read stands).
+            raise DashboardFrozenError("This control VM is not the active slot; changes go to the active one")
+        with self._lock:
+            if self.frozen:
+                raise DashboardFrozenError("Dashboard is frozen for a control VM handover")
+            if not self.reconciled:
+                raise DashboardFrozenError("Dashboard state is not yet reconciled with Cloudflare KV")
+            if not key:
+                status, body = fn()
+                return status, body, False
+            now = self._clock()
+            raw_records = self.state.get(IDEMPOTENCY_STATE_KEY)
+            records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, now)
+            existing = records.get(key)
+            if existing is not None:
+                if existing.get("m") != method or existing.get("p") != path:
+                    return 422, {"error": "Idempotency-Key was already used for a different request"}, False
+                return int(existing.get("s", 200)), copy.deepcopy(existing.get("b")), True
+            snapshot = copy.deepcopy(self.state)
+            self._defer = {"thread": threading.get_ident(), "dirty": False}
+            try:
+                status, body = fn()
+            except BaseException:
+                self.state = snapshot
+                raise
+            finally:
+                self._defer = None
+            if status >= 400:
+                self.state = snapshot
+            if status >= 500:
+                return status, body, False
+            try:
+                # Store an independent copy: the response may share objects with live state that later
+                # requests change.
+                serialized = json.dumps(body, allow_nan=False)
+                if len(serialized) > IDEMPOTENCY_MAX_BODY_BYTES:
+                    stored_body = {
+                        "status": "ok" if status < 400 else "error",
+                        "detail": "The original response was too large to store for replay; reload to see current state.",
+                    }
+                else:
+                    stored_body = json.loads(serialized)
+            except (TypeError, ValueError):
+                stored_body = {"status": "ok" if status < 400 else "error"}
+            records = self._prune_idempotency(
+                {**records, key: {"m": method, "p": path, "s": int(status), "b": stored_body, "t": now}}, now
+            )
+            self.state[IDEMPOTENCY_STATE_KEY] = records
+            try:
+                self._persist()
+            except Exception:  # noqa: BLE001 - roll back the mutation and its idempotency record together
+                self.state = snapshot
+                LOG.exception("Failed to persist dashboard state for an idempotent request")
+                return 500, {"error": "Failed to persist dashboard state; retry the request"}, False
+            return status, body, False
 
     def _normalize_project_derived_fields(self) -> None:
         """Ensure project/org metadata and gcloud SSH commands match the active store configuration."""
@@ -1418,15 +2055,19 @@ class DashboardStore:
             r["is_oom"] = cls_info["is_oom"]
             r["is_self_hosted_runner"] = cls_info["is_self_hosted_runner"]
 
-    def _persist(self) -> None:
+    def _persist(self, bump: bool = True) -> None:
+        """Atomically write state. ``bump`` increments the monotonic ``state_version`` (every real change)."""
         new_updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        candidate_state = {**self.state, "updated_at": new_updated_at}
+        defer = self._defer
+        if defer is not None and defer.get("thread") == threading.get_ident():
+            # Inside an idempotent request: the single atomic write happens when the request completes.
+            defer["dirty"] = True
+            self.state["updated_at"] = new_updated_at
+            return
+        new_version = self.state_version() + (1 if bump else 0)
+        candidate_state = {**self.state, "updated_at": new_updated_at, "state_version": new_version}
         serialized = json.dumps(candidate_state, indent=2, allow_nan=False)
-        if self.state_path and self.controlled_targets_error:
-            # Never replace an unreadable state file: writing defaults would silently turn a
-            # fail-closed access policy into an empty (fail-open) one after the next restart.
-            _AUDIT_LOG.warning("Not persisting dashboard state: %s", self.controlled_targets_error)
-        elif self.state_path:
+        if self.state_path:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             if self.state_path.is_symlink():
                 raise OSError(f"Refusing symlinked state file path: {self.state_path}")
@@ -1459,6 +2100,9 @@ class DashboardStore:
                 raise
             tmp.replace(self.state_path)
         self.state["updated_at"] = new_updated_at
+        self.state["state_version"] = new_version
+        if bump:
+            self._mark_kv_dirty()
 
     def _refresh_instances_pricing(self) -> None:
         """Recompute active instance pricing using current live/catalog machine rates while preserving historical rates on deleted instances."""
@@ -2374,91 +3018,27 @@ class DashboardStore:
             }
 
     def get_controlled_targets(self) -> list[str]:
-        """Return the dynamic controlled target names (orgs and owner/repo) stored in dashboard state.
-
-        Callers that make access decisions should check ``controlled_targets_error`` first; as defense
-        in depth an unloadable policy also yields an unparseable sentinel, so any authorization check
-        that consumes it denies access.
-        """
+        """Return the dynamic controlled target names (orgs and owner/repo) stored in dashboard state."""
         with self._lock:
-            if self.controlled_targets_error:
-                return ["!unavailable-controlled-targets"]
             raw = self.state.get("controlled_targets", [])
             if not isinstance(raw, list):
                 # Fail closed: an unparseable entry makes every OAuth authorization check deny access.
                 return ["!invalid-controlled-targets"]
             return [t if isinstance(t, str) else "!invalid-controlled-target" for t in raw]
 
-    def get_controlled_targets_history(self) -> list[dict[str, Any]]:
-        with self._lock:
-            raw = self.state.get("controlled_targets_history", [])
-            return copy.deepcopy([e for e in raw if isinstance(e, dict)]) if isinstance(raw, list) else []
-
-    @staticmethod
-    def validate_controlled_targets(targets: Any) -> list[str]:
-        """Validate a proposed dynamic target list and return canonical names; raises ValueError."""
+    def set_controlled_targets(self, targets: Any) -> list[str]:
+        """Validate and replace the dynamic controlled target list; raises ValueError on any invalid entry."""
         if not isinstance(targets, list):
             raise ValueError("targets must be a JSON array of organization or owner/repo names")
         names = [t.name for t in parse_controlled_targets(targets)]
-        if len(names) > MAX_DYNAMIC_CONTROLLED_TARGETS:
-            raise ValueError(f"At most {MAX_DYNAMIC_CONTROLLED_TARGETS} dynamic controlled targets are supported")
-        return names
-
-    def set_controlled_targets(
-        self,
-        targets: Any,
-        *,
-        actor: str = "internal",
-        actor_uid: int | None = None,
-        method: str = "internal",
-        expected_digest: str | None = None,
-    ) -> list[str]:
-        """Validate, replace, persist, and audit the dynamic controlled target list.
-
-        Raises ValueError on any invalid entry, ControlledTargetsUnavailableError when the stored
-        policy could not be loaded, and ControlledTargetsConflictError when ``expected_digest`` (see
-        ``target_list_digest``) no longer matches the stored list. Every committed change is logged and
-        appended to the bounded ``controlled_targets_history``.
-        """
-        names = self.validate_controlled_targets(targets)
         with self._lock:
-            if self.controlled_targets_error:
-                raise ControlledTargetsUnavailableError(self.controlled_targets_error)
-            previous_names = self.get_controlled_targets()
-            if expected_digest is not None and not hmac.compare_digest(
-                expected_digest, target_list_digest(previous_names)
-            ):
-                raise ControlledTargetsConflictError(
-                    "Controlled targets changed after this change was requested; review and submit it again"
-                )
             previous = copy.deepcopy(self.state.get("controlled_targets", []))
-            previous_history = copy.deepcopy(self.state.get("controlled_targets_history", []))
-            now = time.time()
-            entry = {
-                "at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "epoch": int(now),
-                "actor": str(actor),
-                "actor_uid": actor_uid,
-                "method": str(method),
-                "previous": previous_names,
-                "targets": list(names),
-                "persistent": self.state_path is not None,
-            }
-            history = previous_history if isinstance(previous_history, list) else []
             self.state["controlled_targets"] = names
-            self.state["controlled_targets_history"] = (history + [entry])[-MAX_CONTROLLED_TARGETS_HISTORY:]
             try:
                 self._persist()
             except Exception:
                 self.state["controlled_targets"] = previous
-                self.state["controlled_targets_history"] = previous_history
                 raise
-            log = _AUDIT_LOG.warning if actor in ("legacy-token", "unauthenticated") else _AUDIT_LOG.info
-            log(
-                "Controlled targets changed by %s (uid=%s, method=%s): %s -> %s%s",
-                entry["actor"], actor_uid, entry["method"], json.dumps(previous_names), json.dumps(names),
-                "" if self.state_path else " (not persistent: no --state-file)",
-            )
             return list(names)
 
     def update_regions(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3501,6 +4081,72 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _origin_key(value: str) -> tuple[str, str, int] | None:
+    """(scheme, lowercase host, port) of an http(s) origin or URL, or None when it is not one."""
+    try:
+        parsed = urlparse(str(value or "").strip())
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if scheme not in ("http", "https") or not host or parsed.username or parsed.password:
+        return None
+    return scheme, host, port if port is not None else (443 if scheme == "https" else 80)
+
+
+def normalize_public_origin(value: str | None) -> str | None:
+    """Validate a configured public origin (``scheme://host[:port]``, no path, query, or credentials).
+
+    Returns the canonical lowercase origin, None for an empty value, and raises ValueError otherwise.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urlparse(text)
+    except ValueError as exc:
+        raise ValueError(f"{ENV_PUBLIC_ORIGIN} is not a valid URL: {exc}") from exc
+    origin = origin_of_url(text)
+    if origin is None or parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.params:
+        raise ValueError(f"{ENV_PUBLIC_ORIGIN} must be an http(s) origin such as https://spot.example.com")
+    return origin
+
+
+def origin_of_url(url: str | None) -> str | None:
+    """Origin (``scheme://host[:port]``) of an absolute http(s) URL, or None."""
+    key = _origin_key(url or "")
+    if key is None:
+        return None
+    scheme, host, port = key
+    shown_host = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{shown_host}" + ("" if port == (443 if scheme == "https" else 80) else f":{port}")
+
+
+def resolve_public_origin(explicit: str | None = None, *, redirect_uri: str | None = None,
+                          environ: Any = None) -> str | None:
+    """Public browser origin: the explicit value, else DASHBOARD_PUBLIC_ORIGIN, else the redirect URI's origin."""
+    env = os.environ if environ is None else environ
+    for candidate in (explicit, env.get(ENV_PUBLIC_ORIGIN)):
+        normalized = normalize_public_origin(candidate)
+        if normalized:
+            return normalized
+    for candidate in (redirect_uri, env.get(ENV_REDIRECT_URI)):
+        derived = origin_of_url(candidate)
+        if derived:
+            return derived
+    return None
+
+
+def resolve_config_repo(explicit: str | None = None, *, org: str, environ: Any = None) -> str:
+    """Config repo: the explicit value, else SPOT_CONFIG_REPO, else ``<org>/spot-runners-config``."""
+    env = os.environ if environ is None else environ
+    value = str(explicit or env.get(ENV_CONFIG_REPO) or f"{org}/{CONFIG_REPO_NAME}").strip()
+    if not _CONFIG_REPO_RE.fullmatch(value) or value.split("/", 1)[1] in (".", ".."):
+        raise ValueError(f"{ENV_CONFIG_REPO} must be owner/repo, got {value!r}")
+    return value
+
+
 _HOST_HEADER_RE = re.compile(r"[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?|\[[0-9A-Fa-f:.]{2,45}\](?::[0-9]{1,5})?")
 
 
@@ -3511,22 +4157,30 @@ def make_handler(
     require_secure_cookie: bool = False,
     oauth_manager: GitHubOAuthManager | None = None,
     controlled_targets: list[str] | tuple[str, ...] | None = None,
+    config_targets_provider: Any = None,
+    control_secret: str | None = None,
+    public_origin: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create the HTTP handler bound to a DashboardStore instance.
 
-    Authentication precedence for protected routes: an explicit ``Authorization``/``X-Dashboard-Token``
-    header is checked against the legacy ``auth_token`` first (a wrong token is rejected with 401);
-    then the legacy ``dashboard_session`` cookie; then the GitHub OAuth ``__Host-spot_session`` cookie,
-    which must be signed, unexpired, issued after ``DASHBOARD_SESSION_NOT_BEFORE``, carry a GitHub numeric
-    id, be allowlisted, and be verified for every controlled target (otherwise 403). When the stored
-    controlled-target policy could not be loaded, OAuth sessions are refused with 503.
+    Authentication precedence for protected routes: the legacy ``auth_token`` (an explicit
+    ``Authorization``/``X-Dashboard-Token`` header, then the ``dashboard_session`` cookie) is considered
+    only when the TCP peer is loopback and no ``Cf-Connecting-Ip``/``Cf-Ray``/``X-Forwarded-For`` header is
+    present (a wrong explicit token is rejected with 401); then the GitHub OAuth ``spot_session`` cookie,
+    which must be signed, unexpired, for the hardcoded administrator, and verified for every controlled
+    target (static, stored, and config-repo targets; otherwise 403). ``/api/health`` is public and
+    ``/api/control/*`` uses short-lived control tokens instead.
 
-    Unauthenticated login endpoints are rate limited per client address (``client_address``; behind a
-    proxy every client shares the proxy's bucket) and globally, answering 429 with ``Retry-After``.
+    Browser POSTs must come from this server's own Host origin or from ``public_origin`` (the URL users
+    open when a proxy such as the Cloudflare Worker forwards to a different Host). ``X-Forwarded-Host``
+    is never trusted for this check.
     """
     from .dashboard_ui_assets import render_dashboard_html
 
     static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
+    control_secret_value = str(control_secret or "").strip()
+    public_origin_value = normalize_public_origin(public_origin)
+    public_origin_key = _origin_key(public_origin_value) if public_origin_value else None
     auth_required = bool(str(auth_token).strip() if auth_token else "") or oauth_manager is not None
     unauthorized_message = (
         "Unauthorized: sign in with GitHub or provide a valid dashboard token"
@@ -3639,65 +4293,41 @@ def make_handler(
                 candidate = hdr_token
             return candidate
 
+        def _legacy_token_allowed(self) -> bool:
+            """The legacy dashboard token is honoured only for direct loopback clients (never via a proxy)."""
+            if not expected_token:
+                return False
+            peer = str((self.client_address or ("",))[0] or "")
+            if peer.startswith("::ffff:"):
+                peer = peer[len("::ffff:"):]
+            if not _is_loopback_host(peer):
+                return False
+            return not any(self.headers.get(name) for name in FORWARDED_CLIENT_HEADERS)
+
+        def _config_targets(self) -> list[str]:
+            """Config-repo targets (cached by the provider); raises ConfigTargetsError to fail closed."""
+            if config_targets_provider is None:
+                return []
+            return list(config_targets_provider())
+
         def _effective_controlled_targets(self) -> list[str]:
-            return static_targets + store.get_controlled_targets()
-
-        def _targets_view(self) -> dict[str, Any]:
-            view: dict[str, Any] = {
-                "static_targets": list(static_targets),
-                "dynamic_targets": store.get_controlled_targets(),
-                "controlled_targets": self._effective_controlled_targets(),
-                "persistent": store.state_path is not None,
-                "history": store.get_controlled_targets_history()[-10:],
-            }
-            if store.controlled_targets_error:
-                view["error"] = store.controlled_targets_error
-            return view
-
-        def _client_ip(self) -> str:
-            address = getattr(self, "client_address", None) or ("",)
-            return str(address[0])
-
-        def _send_too_many(self, retry_after: float, message: str) -> None:
-            seconds = max(1, int(math.ceil(retry_after)))
-            self._send_json(
-                {"error": message, "retry_after": seconds},
-                status=HTTPStatus.TOO_MANY_REQUESTS,
-                extra_headers={"Retry-After": str(seconds)},
-            )
-
-        def _rate_limited(self, group: str) -> bool:
-            """Count this request against the login rate limiter; respond 429 and return True when over."""
-            if oauth_manager is None:
-                return False
-            limiter = oauth_manager.rate_limiters.get(group)
-            if limiter is None:
-                return False
-            retry_after = limiter.check(self._client_ip())
-            if retry_after <= 0:
-                return False
-            self._send_too_many(retry_after, "Too many sign-in requests; try again later")
-            return True
-
-        def _policy_unavailable_body(self) -> dict[str, Any]:
-            return {
-                "status": "unavailable",
-                "error": "Service unavailable: GitHub sign-in is disabled because the controlled-target policy "
-                "could not be loaded",
-                "detail": store.controlled_targets_error,
-            }
+            """Union of static, stored, and config-repo targets. Raises ConfigTargetsError when unlisted."""
+            combined = static_targets + store.get_controlled_targets()
+            if oauth_manager is not None:
+                combined += self._config_targets()
+            return combined
 
         def _evaluate_auth(self) -> tuple[str, dict[str, Any]]:
-            """Classify the request as ("ok" | "unauthenticated" | "forbidden" | "unavailable", details)."""
+            """Classify the request as ("ok" | "unauthenticated" | "forbidden", details) without responding."""
             if not auth_required:
                 return "ok", {"method": "none"}
-            candidate = self._header_token_candidate()
-            if candidate and expected_token:
-                if hmac.compare_digest(candidate.encode("utf-8"), expected_token.encode("utf-8")):
-                    return "ok", {"method": "token"}
-                return "unauthenticated", {"explicit_token_rejected": True}
             cookies = parse_cookie_header(self.headers.get("Cookie"))
-            if expected_token:
+            if self._legacy_token_allowed():
+                candidate = self._header_token_candidate()
+                if candidate:
+                    if hmac.compare_digest(candidate.encode("utf-8"), expected_token.encode("utf-8")):
+                        return "ok", {"method": "token"}
+                    return "unauthenticated", {"explicit_token_rejected": True}
                 sess_val = cookies.get("dashboard_session", "").strip()
                 if sess_val and hmac.compare_digest(
                     sess_val.encode("utf-8"), expected_session_cookie.encode("utf-8")
@@ -3706,33 +4336,110 @@ def make_handler(
             if oauth_manager is not None:
                 oauth_cookie = cookies.get(SESSION_COOKIE_NAME, "")
                 if oauth_cookie:
-                    if store.controlled_targets_error:
-                        # Fail closed: without a trustworthy target policy no OAuth session is honoured.
-                        session = oauth_manager.decode_session(oauth_cookie)
-                        if session is None:
-                            return "unauthenticated", {}
-                        return "unavailable", {
-                            "method": "github_oauth",
-                            "user": session.user_login,
-                            "uid": session.user_id,
-                            "message": self._policy_unavailable_body()["error"],
-                        }
-                    check = oauth_manager.check_session(oauth_cookie, self._effective_controlled_targets())
-                    if check.status == "ok" and check.session is not None:
-                        return "ok", {
-                            "method": "github_oauth",
-                            "user": check.session.user_login,
-                            "uid": check.session.user_id,
-                        }
-                    if check.status == "forbidden" and check.session is not None:
+                    identity = oauth_manager.check_session(oauth_cookie, [])
+                    if identity.status == "forbidden" and identity.session is not None:
                         return "forbidden", {
                             "method": "github_oauth",
-                            "user": check.session.user_login,
-                            "uid": check.session.user_id,
-                            "message": check.message,
-                            "missing_targets": list(check.missing_targets),
+                            "user": identity.session.user_login,
+                            "message": identity.message,
+                            "missing_targets": [],
                         }
+                    if identity.status == "ok" and identity.session is not None:
+                        try:
+                            targets = self._effective_controlled_targets()
+                        except ConfigTargetsError as exc:
+                            return "forbidden", {
+                                "method": "github_oauth",
+                                "user": identity.session.user_login,
+                                "message": f"Forbidden: {exc}",
+                                "missing_targets": [],
+                            }
+                        check = oauth_manager.check_session(oauth_cookie, targets)
+                        if check.status == "ok" and check.session is not None:
+                            return "ok", {"method": "github_oauth", "user": check.session.user_login}
+                        if check.session is not None:
+                            return "forbidden", {
+                                "method": "github_oauth",
+                                "user": check.session.user_login,
+                                "message": check.message,
+                                "missing_targets": list(check.missing_targets),
+                            }
             return "unauthenticated", {}
+
+        def _send_unavailable(self, extra: dict[str, Any] | None = None) -> None:
+            """The contract 503 wait response: the browser waits and retries the same request."""
+            payload = unavailable_payload()
+            if extra:
+                payload.update(extra)
+            self._send_json(
+                payload,
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                extra_headers={"Retry-After": str(DEFAULT_RETRY_AFTER_SECONDS)},
+            )
+
+        def _durability_gate(self, method: str, path: str) -> bool:
+            """Refuse requests until hydrated, and mutations while frozen. Returns True when it responded."""
+            if path == "/api/health" or path.startswith("/api/control/"):
+                return False
+            if not store.hydrated:
+                self._send_unavailable()
+                return True
+            if method in MUTATING_METHODS and (store.frozen or not store.reconciled):
+                self._send_unavailable()
+                return True
+            return False
+
+        def _send_health(self) -> None:
+            info = store.health()
+            if info["hydrated"] and not info["frozen"] and info["reconciled"]:
+                self._send_json(info)
+            else:
+                self._send_unavailable(info)
+
+        def _handle_control(self, method: str, path: str) -> None:
+            """``/api/control/<op>``: bearer control token for this op and this VM's slot; no OAuth."""
+            self.close_connection = True  # freeze/unfreeze bodies are not read; never reuse the connection
+            op = path[len("/api/control/"):]
+            if not control_secret_value or store.control_slot is None or op not in CONTROL_OPS:
+                self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
+                return
+            expected_method = "GET" if op == "snapshot" else "POST"
+            if method != expected_method:
+                self._send_json({"error": "Method not allowed"}, status=HTTPStatus.METHOD_NOT_ALLOWED,
+                                extra_headers={"Allow": expected_method})
+                return
+            auth_hdr = (self.headers.get("Authorization") or "").strip()
+            token = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+            if not verify_control_token(control_secret_value, token, op, store.control_slot):
+                self._send_json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            try:
+                if op == "freeze":
+                    result = store.freeze()
+                    LOG.info("Control freeze at state_version %s (kv_flushed=%s)", result["state_version"],
+                             result["kv_flushed"])
+                    self._send_json(result)
+                elif op == "unfreeze":
+                    LOG.info("Control unfreeze")
+                    self._send_json(store.unfreeze())
+                elif op == "snapshot":
+                    self._send_json(store.snapshot_envelope())
+                else:
+                    envelope = self._read_json(max_bytes=MAX_CONTROL_BODY_BYTES)
+                    result = store.import_snapshot(envelope)
+                    LOG.info("Control import: %s", result)
+                    self._send_json(result)
+            except _PayloadTooLargeError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            except (ValueError, TypeError) as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except OSError as exc:
+                LOG.error("Control %s failed on a local write: %s", op, exc)
+                body: dict[str, Any] = {"error": f"Control {op} failed on a local write "
+                                                 f"(state file or freeze marker): {exc}"}
+                if op == "import":
+                    body["imported"] = False
+                self._send_json(body, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
         def _send_forbidden(self, info: dict[str, Any]) -> None:
             self._send_json(
@@ -3745,14 +4452,12 @@ def make_handler(
             )
 
         def _oauth_redirect_uri(self) -> str | None:
-            """Return the configured callback URL, or derive one from Host (development only).
-
-            Production deployments must set GITHUB_OAUTH_REDIRECT_URI; X-Forwarded-Host is never trusted.
-            """
             if oauth_manager is None:
                 return None
             if oauth_manager.redirect_uri:
                 return oauth_manager.redirect_uri
+            if public_origin_value:
+                return f"{public_origin_value}/auth/github/callback"
             host = (self.headers.get("Host") or "").strip()
             if not _HOST_HEADER_RE.fullmatch(host):
                 return None
@@ -3778,72 +4483,6 @@ def make_handler(
                 status=status,
                 cookies=cookies,
             )
-
-        def _finish_oauth_login(
-            self, access_token: str, change: TargetChange | None
-        ) -> tuple[int, dict[str, Any], list[str]]:
-            """Authorize a fresh GitHub token, commit a bound target change, and issue a session.
-
-            Without a change, the token must satisfy the current policy (positive cache allowed). With a
-            change, the token must belong to the requesting GitHub id and pass a FRESH (uncached) admin
-            check on the static targets plus the union of the current and proposed dynamic lists, so the
-            change can neither loosen a target the user no longer administers nor lock the user out. The
-            change commits only if the stored list still matches the one it was based on.
-            """
-            assert oauth_manager is not None
-            if store.controlled_targets_error:
-                return HTTPStatus.SERVICE_UNAVAILABLE, self._policy_unavailable_body(), []
-            if change is None:
-                decision = oauth_manager.authorize(access_token, self._effective_controlled_targets())
-            else:
-                current = store.get_controlled_targets()
-                if not hmac.compare_digest(change.base, target_list_digest(current)):
-                    return HTTPStatus.CONFLICT, {
-                        "status": "conflict",
-                        "error": "Controlled targets changed after this change was requested; review and submit it again",
-                    }, []
-                decision = oauth_manager.authorize(
-                    access_token,
-                    static_targets + current + list(change.targets),
-                    use_cache=False,
-                    expected_uid=change.uid,
-                )
-            if not decision.authorized:
-                return HTTPStatus.FORBIDDEN, {
-                    "status": "forbidden",
-                    "error": decision.message,
-                    "message": decision.message,
-                    "user": decision.user_login,
-                    "missing_targets": decision.missing_targets,
-                }, []
-            body: dict[str, Any] = {"status": "authorized", "user": decision.user_login}
-            if not oauth_manager.session_fits(decision.verified_targets):
-                return HTTPStatus.BAD_REQUEST, {"status": "error", "error": SESSION_TOO_LARGE_ERROR}, []
-            if change is not None:
-                try:
-                    store.set_controlled_targets(
-                        list(change.targets),
-                        actor=decision.user_login,
-                        actor_uid=decision.user_id,
-                        method="github_oauth",
-                        expected_digest=change.base,
-                    )
-                except ControlledTargetsConflictError as exc:
-                    return HTTPStatus.CONFLICT, {"status": "conflict", "error": str(exc)}, []
-                except ControlledTargetsUnavailableError:
-                    return HTTPStatus.SERVICE_UNAVAILABLE, self._policy_unavailable_body(), []
-                except ValueError as exc:
-                    return HTTPStatus.BAD_REQUEST, {"status": "error", "error": str(exc)}, []
-                except Exception as exc:  # noqa: BLE001
-                    return HTTPStatus.INTERNAL_SERVER_ERROR, {
-                        "status": "error",
-                        "error": f"Could not save controlled targets ({type(exc).__name__})",
-                    }, []
-                body["target_change"] = {"committed": True, **self._targets_view()}
-                if store.state_path is None:
-                    body["warning"] = NOT_PERSISTENT_TARGETS_WARNING
-            cookies = [format_session_cookie(oauth_manager.issue_session(decision), oauth_manager.session_ttl_seconds)]
-            return HTTPStatus.OK, body, cookies
 
         def _handle_oauth_get(self, path: str, qs: dict[str, list[str]]) -> bool:
             """Serve public OAuth GET routes. Returns True when the request was handled."""
@@ -3873,22 +4512,12 @@ def make_handler(
                     status=HTTPStatus.NOT_FOUND,
                 )
                 return True
-            if self._rate_limited("start" if path == "/auth/github/login" else "complete"):
-                return True
             redirect_uri = self._oauth_redirect_uri()
             if not redirect_uri:
                 self._send_json({"error": "Cannot determine OAuth redirect URI"}, status=HTTPStatus.BAD_REQUEST)
                 return True
             if path == "/auth/github/login":
-                if store.controlled_targets_error:
-                    self._login_gate(message=self._policy_unavailable_body()["error"],
-                                     status=HTTPStatus.SERVICE_UNAVAILABLE)
-                    return True
-                try:
-                    state = oauth_manager.create_state(safe_return_path(qs.get("next", ["/"])[0]))
-                except AuthCapacityError as exc:
-                    self._send_too_many(exc.retry_after, str(exc))
-                    return True
+                state = oauth_manager.create_state(safe_return_path(qs.get("next", ["/"])[0]))
                 self._send_redirect(
                     oauth_manager.create_authorize_url(redirect_uri, state),
                     cookies=[format_state_cookie(state)],
@@ -3901,23 +4530,31 @@ def make_handler(
                                  cookies=clear_state)
                 return True
             cookie_state = parse_cookie_header(self.headers.get("Cookie")).get(OAUTH_STATE_COOKIE_NAME, "")
-            result = oauth_manager.validate_state(qs.get("state", [""])[0], cookie_state)
-            if not result.ok:
+            ok_state, return_to = oauth_manager.validate_state(qs.get("state", [""])[0], cookie_state)
+            if not ok_state:
                 self._login_gate(message="Sign-in request expired or is invalid. Please try again.",
                                  status=HTTPStatus.BAD_REQUEST, cookies=clear_state)
                 return True
             try:
                 token = oauth_manager.exchange_code_for_token(
-                    qs.get("code", [""])[0], redirect_uri, result.code_verifier
+                    qs.get("code", [""])[0], redirect_uri, qs.get("state", [""])[0]
                 )["access_token"]
             except GitHubApiError:
+                audit_login("", None, "denied", "code exchange failed")
                 self._login_gate(message="GitHub sign-in failed.", status=HTTPStatus.FORBIDDEN, cookies=clear_state)
                 return True
-            status, body, cookies = self._finish_oauth_login(token, result.target_change)
-            if status != HTTPStatus.OK:
-                self._login_gate(message=str(body.get("error", "Sign-in failed")), status=status, cookies=clear_state)
+            try:
+                targets = self._effective_controlled_targets()
+            except ConfigTargetsError as exc:
+                audit_login("", None, "denied", "config repo targets unavailable")
+                self._login_gate(message=f"Forbidden: {exc}", status=HTTPStatus.FORBIDDEN, cookies=clear_state)
                 return True
-            self._send_redirect(result.return_to, cookies=clear_state + cookies)
+            decision = oauth_manager.authorize(token, targets)
+            if not decision.authorized:
+                self._login_gate(message=decision.message, status=HTTPStatus.FORBIDDEN, cookies=clear_state)
+                return True
+            session_cookie = format_session_cookie(oauth_manager.issue_session(decision), oauth_manager.session_ttl_seconds)
+            self._send_redirect(return_to, cookies=clear_state + [session_cookie])
             return True
 
         def _handle_oauth_post(self, path: str) -> bool:
@@ -3938,35 +4575,34 @@ def make_handler(
                     cleared.insert(0, self._format_cleared_session_cookie())
                 self._send_json({"status": "ok", "authenticated": False}, cookies=cleared)
                 return True
-            if oauth_manager is None:
-                self._send_json({"error": "GitHub login is not configured (set GITHUB_OAUTH_CLIENT_ID)"},
+            if oauth_manager is None or not oauth_manager.device_flow_enabled:
+                self._send_json({"error": f"GitHub device login is disabled (set {ENV_DEVICE_FLOW}=1)"},
                                 status=HTTPStatus.NOT_FOUND)
                 return True
             if path == "/auth/device/code":
-                if self._rate_limited("start"):
-                    return True
-                if store.controlled_targets_error:
-                    self._send_json(self._policy_unavailable_body(), status=HTTPStatus.SERVICE_UNAVAILABLE)
-                    return True
                 try:
-                    started = oauth_manager.begin_device_login()
-                except AuthCapacityError as exc:
-                    self._send_too_many(exc.retry_after, str(exc))
-                    return True
+                    started = oauth_manager.start_device_flow()
                 except GitHubApiError:
                     self._send_json({"error": "GitHub device authorization is unavailable"}, status=HTTPStatus.BAD_GATEWAY)
                     return True
-                self._send_json(started)
+                self._send_json(
+                    {
+                        "user_code": started["user_code"],
+                        "verification_uri": started["verification_uri"],
+                        "expires_in": started["expires_in"],
+                        "interval": started["interval"],
+                        "device_handle": oauth_manager.seal_device_code(started["device_code"], started["expires_in"]),
+                    }
+                )
                 return True
             # /auth/device/token
-            if self._rate_limited("complete"):
-                return True
-            polled = oauth_manager.poll_device_login(payload.get("device_handle"))
-            result = polled.get("status")
-            if result == "invalid":
+            device_code = oauth_manager.open_device_handle(payload.get("device_handle"))
+            if device_code is None:
                 self._send_json({"status": "invalid", "error": "Invalid or expired device handle"},
                                 status=HTTPStatus.BAD_REQUEST)
                 return True
+            polled = oauth_manager.poll_device_token(device_code)
+            result = polled.get("status")
             if result in ("pending", "slow_down"):
                 body: dict[str, Any] = {"status": result}
                 if result == "slow_down":
@@ -3980,141 +4616,44 @@ def make_handler(
                 self._send_json({"status": "denied", "error": "GitHub authorization was denied"},
                                 status=HTTPStatus.FORBIDDEN)
                 return True
-            if result == "error" and polled.get("error") == "github_unavailable":
-                # The handshake is kept for retry; tell the browser to keep polling until the code expires.
-                self._send_json({"status": "retry", "retryable": True, "error": "GitHub is temporarily unreachable"},
-                                status=HTTPStatus.SERVICE_UNAVAILABLE, extra_headers={"Retry-After": "10"})
-                return True
             if result != "success":
                 self._send_json({"status": "error", "error": "GitHub device token request failed"},
                                 status=HTTPStatus.BAD_GATEWAY)
                 return True
-            status, body, cookies = self._finish_oauth_login(
-                str(polled.get("access_token", "")), polled.get("target_change")
+            try:
+                targets = self._effective_controlled_targets()
+            except ConfigTargetsError as exc:
+                audit_login("", None, "denied", "config repo targets unavailable")
+                self._send_json({"status": "forbidden", "error": f"Forbidden: {exc}", "message": f"Forbidden: {exc}",
+                                 "user": "", "missing_targets": []}, status=HTTPStatus.FORBIDDEN)
+                return True
+            decision = oauth_manager.authorize(str(polled.get("access_token", "")), targets)
+            if not decision.authorized:
+                self._send_json(
+                    {
+                        "status": "forbidden",
+                        "error": decision.message,
+                        "message": decision.message,
+                        "user": decision.user_login,
+                        "missing_targets": decision.missing_targets,
+                    },
+                    status=HTTPStatus.FORBIDDEN,
+                )
+                return True
+            self._send_json(
+                {"status": "authorized", "user": decision.user_login},
+                cookies=[format_session_cookie(oauth_manager.issue_session(decision), oauth_manager.session_ttl_seconds)],
             )
-            self._send_json(body, status=status, cookies=cookies)
             return True
 
-        def _handle_targets_post(self, payload: dict[str, Any]) -> None:
-            """Change the dynamic controlled-target list.
-
-            OAuth sessions never commit directly: the response (202) starts a fresh GitHub sign-in (web
-            ``authorize_url`` or a device code) bound to the proposed list; the change commits when that
-            sign-in proves admin rights on the static targets plus the current and proposed lists. The
-            legacy dashboard token is a break-glass operator credential and commits immediately. Every
-            committed change is audit-logged and kept in a bounded history.
-            """
-            info = getattr(self, "_auth_info", None) or {}
-            method = str(info.get("method") or "")
-            try:
-                names = store.validate_controlled_targets(payload.get("targets"))
-            except ValueError as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            if store.controlled_targets_error:
-                self._send_json(self._policy_unavailable_body(), status=HTTPStatus.SERVICE_UNAVAILABLE)
-                return
-            current = store.get_controlled_targets()
-            if names == current:
-                self._send_json({"status": "unchanged", **self._targets_view()})
-                return
-            warning = {} if store.state_path is not None else {"warning": NOT_PERSISTENT_TARGETS_WARNING}
-            if oauth_manager is not None:
-                # OAuth sign-ins after this change carry the verified targets inside the session cookie.
-                sized = static_targets + (current + names if method == "github_oauth" else names)
-                try:
-                    fits = oauth_manager.session_fits(t.name for t in parse_controlled_targets(sized))
-                except ValueError:
-                    fits = True  # Reported below with the specific validation error.
-                if not fits:
-                    self._send_json({"error": SESSION_TOO_LARGE_ERROR}, status=HTTPStatus.BAD_REQUEST)
-                    return
-            if method == "github_oauth":
-                assert oauth_manager is not None
-                if self._rate_limited("start"):
-                    return
-                uid, login = info.get("uid"), info.get("user")
-                if not isinstance(uid, int) or not isinstance(login, str):
-                    self._send_json({"error": "Session identity is incomplete; sign in again"},
-                                    status=HTTPStatus.UNAUTHORIZED)
-                    return
-                change = TargetChange(tuple(names), target_list_digest(current), uid, login)
-                try:
-                    verify = [t.name for t in parse_controlled_targets(static_targets + current + names)]
-                except ValueError as exc:
-                    self._send_json({"error": f"Stored controlled targets are invalid ({exc})"},
-                                    status=HTTPStatus.SERVICE_UNAVAILABLE)
-                    return
-                flow = str(payload.get("flow") or ("web" if oauth_manager.web_flow_enabled else "device")).lower()
-                body: dict[str, Any] = {
-                    "status": "reauth_required",
-                    "message": "Confirm this change by signing in with GitHub again; it is applied only after "
-                    "GitHub confirms you administer every listed target.",
-                    "flow": flow,
-                    "current_targets": current,
-                    "proposed_targets": names,
-                    "verify_targets": verify,
-                    **warning,
-                }
-                if flow == "web":
-                    redirect_uri = self._oauth_redirect_uri() if oauth_manager.web_flow_enabled else None
-                    if not redirect_uri:
-                        self._send_json({"error": "GitHub web sign-in is not available; use flow=device"},
-                                        status=HTTPStatus.BAD_REQUEST)
-                        return
-                    try:
-                        state = oauth_manager.create_state(
-                            safe_return_path(payload.get("next") or "/"), target_change=change
-                        )
-                    except AuthCapacityError as exc:
-                        self._send_too_many(exc.retry_after, str(exc))
-                        return
-                    except ValueError as exc:
-                        self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                        return
-                    body["authorize_url"] = oauth_manager.create_authorize_url(redirect_uri, state)
-                    self._send_json(body, status=HTTPStatus.ACCEPTED, cookies=[format_state_cookie(state)])
-                    return
-                if flow == "device":
-                    try:
-                        body["device"] = oauth_manager.begin_device_login(target_change=change)
-                    except AuthCapacityError as exc:
-                        self._send_too_many(exc.retry_after, str(exc))
-                        return
-                    except GitHubApiError:
-                        self._send_json({"error": "GitHub device authorization is unavailable"},
-                                        status=HTTPStatus.BAD_GATEWAY)
-                        return
-                    self._send_json(body, status=HTTPStatus.ACCEPTED)
-                    return
-                self._send_json({"error": "flow must be 'web' or 'device'"}, status=HTTPStatus.BAD_REQUEST)
-                return
-            actor = "legacy-token" if method in ("token", "dashboard_session") else "unauthenticated"
-            try:
-                store.set_controlled_targets(names, actor=actor, method=method or "none")
-            except ControlledTargetsUnavailableError:
-                self._send_json(self._policy_unavailable_body(), status=HTTPStatus.SERVICE_UNAVAILABLE)
-                return
-            except ValueError as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            except Exception as exc:  # noqa: BLE001
-                self._send_json({"error": f"Could not save controlled targets ({type(exc).__name__})"},
-                                status=HTTPStatus.INTERNAL_SERVER_ERROR)
-                return
-            self._send_json({"status": "updated", "actor": actor, **self._targets_view(), **warning})
-
-        def _check_auth(self, *, allow_html_shell: bool = False) -> bool:
-            """Verify credentials for a protected route; respond 401, 403, or 503 (policy unavailable)."""
-            status, info = self._evaluate_auth()
-            self._auth_info = info
+        def _check_auth(self, *, allow_html_shell: bool = False,
+                        evaluated: tuple[str, dict[str, Any]] | None = None) -> bool:
+            """Verify credentials for a protected route; respond 401 (unauthenticated) or 403 (unauthorized)."""
+            status, info = evaluated if evaluated is not None else self._evaluate_auth()
             if status == "ok":
                 return True
             if status == "forbidden":
                 self._send_forbidden(info)
-                return False
-            if status == "unavailable":
-                self._send_json(self._policy_unavailable_body(), status=HTTPStatus.SERVICE_UNAVAILABLE)
                 return False
             if allow_html_shell and not info.get("explicit_token_rejected"):
                 return True
@@ -4145,8 +4684,13 @@ def make_handler(
                 parsed_origin = urlparse(origin)
                 req_host = (self.headers.get("Host") or "").strip().lower()
                 origin_host = parsed_origin.netloc.lower()
+                matches_public = (
+                    public_origin_key is not None
+                    and parsed_origin.path == ""
+                    and _origin_key(origin) == public_origin_key
+                )
                 if parsed_origin.scheme not in ("http", "https") or (
-                    req_host and origin_host != req_host
+                    req_host and origin_host != req_host and not matches_public
                 ):
                     return (
                         False,
@@ -4208,6 +4752,15 @@ def make_handler(
             path = parsed.path
             qs = parse_qs(parsed.query)
 
+            if self._durability_gate("GET", path):
+                return
+            if path == "/api/health":
+                self._send_health()
+                return
+            if path.startswith("/api/control/"):
+                self._handle_control("GET", path)
+                return
+
             if path in ("/", "/index.html"):
                 if oauth_manager is not None:
                     gate_status, gate_info = self._evaluate_auth()
@@ -4215,13 +4768,11 @@ def make_handler(
                         if gate_info.get("explicit_token_rejected"):
                             self._check_auth()
                             return
-                        if gate_status in ("forbidden", "unavailable"):
+                        if gate_status == "forbidden":
                             self._login_gate(
                                 message=str(gate_info.get("message", "")),
                                 user=str(gate_info.get("user", "")),
-                                status=HTTPStatus.FORBIDDEN
-                                if gate_status == "forbidden"
-                                else HTTPStatus.SERVICE_UNAVAILABLE,
+                                status=HTTPStatus.FORBIDDEN,
                             )
                         else:
                             self._login_gate()
@@ -4229,7 +4780,7 @@ def make_handler(
                 elif not self._check_auth(allow_html_shell=True):
                     return
                 extra_hdrs: dict[str, str] | None = None
-                if expected_token:
+                if self._legacy_token_allowed():
                     auth_hdr = (self.headers.get("Authorization") or "").strip()
                     hdr_token = (self.headers.get("X-Dashboard-Token") or "").strip()
                     supplied = (
@@ -4247,17 +4798,6 @@ def make_handler(
                 )
                 return
 
-            # Unauthenticated health check endpoint for external readiness gates and proxies
-            if path == "/api/health":
-                self._send_json({
-                    "status": "healthy",
-                    "hydrated": getattr(store, "hydrated", True),
-                    "project": store.project,
-                    "org": store.org,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                })
-                return
-
             if self._handle_oauth_get(path, qs):
                 return
 
@@ -4265,7 +4805,7 @@ def make_handler(
                 return
 
             if path == "/api/auth/targets":
-                self._send_json(self._targets_view())
+                self._send_targets()
                 return
 
             try:
@@ -4324,9 +4864,84 @@ def make_handler(
 
             self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
 
+        def _send_targets(self) -> None:
+            try:
+                body = self._targets_body()
+            except ConfigTargetsError as exc:
+                self._send_json({"error": f"Forbidden: {exc}"}, status=HTTPStatus.FORBIDDEN)
+                return
+            self._send_json(body)
+
+        def _targets_body(self) -> dict[str, Any]:
+            config_targets = self._config_targets() if oauth_manager is not None else []
+            return {
+                "static_targets": list(static_targets),
+                "dynamic_targets": store.get_controlled_targets(),
+                "config_targets": config_targets,
+                "locked_targets": sorted(set(static_targets + config_targets), key=str.lower),
+                "controlled_targets": self._effective_controlled_targets(),
+            }
+
+        def _dispatch_post(self, path: str, payload: dict[str, Any]) -> tuple[int, Any]:
+            """Run one protected POST route and return (status, JSON body) without writing the response."""
+            try:
+                if path == "/api/auth/targets":
+                    store.set_controlled_targets(payload.get("targets"))
+                    return HTTPStatus.OK, self._targets_body()
+                if path == "/api/budget":
+                    return HTTPStatus.OK, store.update_budget(payload)
+                if path == "/api/profile/cicd_runner":
+                    return HTTPStatus.OK, store.update_profile("cicd_runner", payload)
+                if path == "/api/profile/rust_builder":
+                    return HTTPStatus.OK, store.update_profile("rust_builder", payload)
+                if path == "/api/qualify":
+                    role = str(payload.get("role", "cicd_runner")).strip()
+                    if role not in ("cicd_runner", "rust_builder"):
+                        raise ValueError(f"Unsupported workload role: {role}")
+                    merged = {**store.state["profiles"].get(role, {}), **payload}
+                    return HTTPStatus.OK, qualify_instances(
+                        merged,
+                        store.state["regions_enabled"],
+                        store.project,
+                        region_latencies_ms=store.state.get("region_latencies_ms"),
+                    )
+                if path == "/api/scaling":
+                    return HTTPStatus.OK, store.update_scaling(payload)
+                if path == "/api/regions":
+                    return HTTPStatus.OK, store.update_regions(payload)
+                if path == "/api/cloud-init/save":
+                    return HTTPStatus.OK, store.save_cloud_init_template(payload)
+                if path == "/api/cloud-init/parse":
+                    return HTTPStatus.OK, parse_cloud_init(str(payload.get("content", "")))
+                if path == "/api/vm-templates/from-instance":
+                    return HTTPStatus.OK, store.create_vm_template_from_instance(payload)
+                if path == "/api/instances/delete":
+                    return HTTPStatus.OK, store.delete_instance(payload)
+                if path == "/api/instances/scale-region":
+                    return HTTPStatus.OK, store.scale_region_instances(payload)
+                if path == "/api/rust-builds":
+                    return HTTPStatus.OK, store.record_rust_build(payload)
+                if path == "/api/ip-intel":
+                    return HTTPStatus.OK, classify_ip_and_network(
+                        str(payload.get("ip_address", "")),
+                        payload.get("hostname"),
+                    )
+                return HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {path}"}
+            except ConfigTargetsError as exc:
+                return HTTPStatus.FORBIDDEN, {"error": f"Forbidden: {exc}"}
+            except _PayloadTooLargeError as exc:
+                return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)}
+            except Exception as exc:  # noqa: BLE001
+                return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             path = parsed.path
+            if self._durability_gate("POST", path):
+                return
+            if path.startswith("/api/control/"):
+                self._handle_control("POST", path)
+                return
             ok_req, err_status, err_msg = self._validate_same_origin_json_post()
             if not ok_req:
                 self._send_json({"error": err_msg}, status=err_status)
@@ -4349,6 +4964,14 @@ def make_handler(
                         )
                         return
                     self._send_json({"status": "ok", "authenticated": True})
+                    return
+                if not self._legacy_token_allowed():
+                    audit_login("", None, "denied", "legacy token from a non-loopback or proxied client")
+                    self._send_json(
+                        {"error": "Dashboard token login is accepted only from a direct local connection"},
+                        status=HTTPStatus.UNAUTHORIZED,
+                        extra_headers={"WWW-Authenticate": 'Bearer realm="Spot Dashboard"'},
+                    )
                     return
                 if token_candidate and hmac.compare_digest(
                     token_candidate.encode("utf-8"), expected_token.encode("utf-8")
@@ -4382,79 +5005,64 @@ def make_handler(
                 return
             if self._handle_oauth_post(path):
                 return
-            if not self._check_auth():
+            auth_status, auth_info = self._evaluate_auth()
+            if not self._check_auth(evaluated=(auth_status, auth_info)):
+                return
+            if path == "/api/auth/targets" and auth_info.get("method") != "github_oauth":
+                self._send_json(
+                    {"error": "Changing controlled targets requires a GitHub OAuth session"},
+                    status=HTTPStatus.FORBIDDEN,
+                )
                 return
             try:
                 payload = self._read_json(max_bytes=MAX_JSON_BODY_BYTES)
-                if path == "/api/auth/targets":
-                    self._handle_targets_post(payload)
-                    return
-                if path == "/api/budget":
-                    self._send_json(store.update_budget(payload))
-                    return
-                if path == "/api/profile/cicd_runner":
-                    self._send_json(store.update_profile("cicd_runner", payload))
-                    return
-                if path == "/api/profile/rust_builder":
-                    self._send_json(store.update_profile("rust_builder", payload))
-                    return
-                if path == "/api/qualify":
-                    role = str(payload.get("role", "cicd_runner")).strip()
-                    if role not in ("cicd_runner", "rust_builder"):
-                        raise ValueError(f"Unsupported workload role: {role}")
-                    merged = {**store.state["profiles"].get(role, {}), **payload}
-                    self._send_json(
-                        qualify_instances(
-                            merged,
-                            store.state["regions_enabled"],
-                            store.project,
-                            region_latencies_ms=store.state.get("region_latencies_ms"),
-                        )
-                    )
-                    return
-                if path == "/api/scaling":
-                    self._send_json(store.update_scaling(payload))
-                    return
-                if path == "/api/regions":
-                    self._send_json(store.update_regions(payload))
-                    return
-                if path == "/api/cloud-init/save":
-                    self._send_json(store.save_cloud_init_template(payload))
-                    return
-                if path == "/api/cloud-init/parse":
-                    self._send_json(parse_cloud_init(str(payload.get("content", ""))))
-                    return
-                if path == "/api/vm-templates/from-instance":
-                    self._send_json(store.create_vm_template_from_instance(payload))
-                    return
-                if path == "/api/instances/delete":
-                    self._send_json(store.delete_instance(payload))
-                    return
-                if path == "/api/instances/scale-region":
-                    self._send_json(store.scale_region_instances(payload))
-                    return
-                if path == "/api/rust-builds":
-                    self._send_json(store.record_rust_build(payload))
-                    return
-                if path == "/api/ip-intel":
-                    self._send_json(
-                        classify_ip_and_network(
-                            str(payload.get("ip_address", "")),
-                            payload.get("hostname"),
-                        )
-                    )
-                    return
-                self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
             except _PayloadTooLargeError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            key = (self.headers.get("Idempotency-Key") or "").strip() or None
+            if key is not None and not _IDEMPOTENCY_KEY_RE.fullmatch(key):
+                self._send_json({"error": "Invalid Idempotency-Key header"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                status, body, replayed = store.run_request(
+                    key, "POST", path, lambda: self._dispatch_post(path, payload),
+                    mutating=path not in NON_MUTATING_POST_PATHS,
+                )
+            except DashboardFrozenError:
+                self._send_unavailable()
+                return
+            self._send_json(body, status=status, extra_headers={"Idempotent-Replay": "true"} if replayed else None)
+
+        def _reject_method(self, method: str) -> None:
+            parsed = urlparse(self.path)
+            if self._durability_gate(method, parsed.path):
+                return
+            self._send_json({"error": "Method not allowed"}, status=HTTPStatus.METHOD_NOT_ALLOWED,
+                            extra_headers={"Allow": "GET, POST"})
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._reject_method("PUT")
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._reject_method("PATCH")
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._reject_method("DELETE")
 
     return DashboardRequestHandler
 
 
 class DashboardThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    dashboard_store: DashboardStore | None = None
+
+    def server_close(self) -> None:
+        super().server_close()
+        if self.dashboard_store is not None:
+            self.dashboard_store.close()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         exc = sys.exc_info()[1]
@@ -4475,12 +5083,24 @@ def create_dashboard_server(
     allow_insecure_non_loopback: bool | None = None,
     oauth_manager: GitHubOAuthManager | None = None,
     controlled_targets: list[str] | tuple[str, ...] | None = None,
+    config_targets_provider: Any = None,
+    control_slot: str | None = None,
+    control_secret: str | None = None,
+    kv: CloudflareKv | None = None,
+    public_origin: str | None = None,
+    config_repo: str | None = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
-    """Instantiate the ThreadingHTTPServer and DashboardStore.
+    """Instantiate the ThreadingHTTPServer and DashboardStore, then start hydration.
 
     ``oauth_manager`` enables GitHub OAuth login (additive to ``auth_token``); ``controlled_targets`` are
     static organization or ``owner/repo`` targets on which OAuth users must be administrators, in
-    addition to the dynamic list stored in dashboard state.
+    addition to the dynamic list stored in dashboard state and every repository in the private config
+    repo (``config_targets_provider``; defaults to :class:`ConfigRepoTargets` for ``config_repo``, else
+    ``SPOT_CONFIG_REPO``, else ``<org>/spot-runners-config``, when OAuth is enabled).
+    ``control_slot``/``kv`` enable Cloudflare KV hydration and write-behind; ``control_secret`` enables
+    ``/api/control/*``. Nothing is read from Cloudflare unless ``kv`` is passed. ``public_origin``
+    (else ``DASHBOARD_PUBLIC_ORIGIN``, else the OAuth redirect URI's origin) is the browser-facing origin
+    accepted on POSTs in addition to the request's own Host.
     """
     resolved_token = (
         auth_token
@@ -4530,26 +5150,24 @@ def create_dashboard_server(
                 "--allow-insecure-non-loopback (DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1) if a trusted network proxy terminates TLS."
             )
     static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
-    if oauth_manager is not None and not oauth_manager.session_fits(static_targets):
-        raise ValueError(SESSION_TOO_LARGE_ERROR.replace("Controlled target list", "Static controlled target list"))
-    if oauth_manager is not None and oauth_manager.web_flow_enabled and not oauth_manager.redirect_uri:
-        _AUDIT_LOG.warning(
-            "GITHUB_OAUTH_REDIRECT_URI is unset; the OAuth callback URL is derived from the request Host header. "
-            "Set it explicitly in production."
-        )
-    store = DashboardStore(state_path=state_path, project=project, org=org)
-    if oauth_manager is not None and state_path is None:
-        _AUDIT_LOG.warning(
-            "No --state-file: dynamic controlled targets changed through the API are not persistent."
-        )
+    resolved_public_origin = resolve_public_origin(
+        public_origin, redirect_uri=oauth_manager.redirect_uri if oauth_manager is not None else None
+    )
+    if oauth_manager is not None and config_targets_provider is None:
+        config_targets_provider = ConfigRepoTargets(resolve_config_repo(config_repo, org=org))
+    store = DashboardStore(state_path=state_path, project=project, org=org, control_slot=control_slot, kv=kv)
     handler = make_handler(
         store,
         auth_token=cleaned_token or None,
         require_secure_cookie=has_tls or not _is_loopback_host(host),
         oauth_manager=oauth_manager,
         controlled_targets=static_targets,
+        config_targets_provider=config_targets_provider,
+        control_secret=control_secret,
+        public_origin=resolved_public_origin,
     )
     server = DashboardThreadingHTTPServer((host, port), handler)
+    server.dashboard_store = store
     if has_tls:
         try:
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -4563,12 +5181,12 @@ def create_dashboard_server(
         except Exception:
             server.server_close()
             raise
+    store.start()
     return server, store
 
 
 def build_oauth_config(
     *,
-    allowed_admins: str | None = None,
     controlled_targets: str | None = None,
     redirect_uri: str | None = None,
     environ: dict[str, str] | None = None,
@@ -4576,14 +5194,14 @@ def build_oauth_config(
     """Resolve GitHub OAuth settings from CLI values (preferred) and the environment.
 
     Returns ``(None, targets)`` when ``GITHUB_OAUTH_CLIENT_ID`` is unset. Raises ValueError when OAuth is
-    enabled without an adequate ``DASHBOARD_SESSION_SECRET`` or when any setting is invalid.
+    enabled without an adequate ``DASHBOARD_SESSION_SECRET`` or when any setting is invalid. The admin
+    identity is hardcoded (``swackhamer``, ID 619624) and cannot be configured.
     """
     env = os.environ if environ is None else environ
-    admins = parse_allowed_admins(allowed_admins) if allowed_admins is not None else None
     extra: dict[str, Any] = {}
     if redirect_uri:
         extra["redirect_uri"] = redirect_uri
-    manager = GitHubOAuthManager.from_environ(env, allowed_admins=admins, **extra)
+    manager = GitHubOAuthManager.from_environ(env, **extra)
     raw_targets = controlled_targets if controlled_targets is not None else env.get(ENV_CONTROLLED_TARGETS, "")
     targets = [t.name for t in parse_controlled_targets_env(raw_targets)]
     return manager, targets
@@ -4621,25 +5239,47 @@ def args_parser():
         help="Explicitly allow plaintext HTTP on a non-loopback --host when behind a trusted TLS-terminating proxy (or set DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK=1)",
     )
     parser.add_argument(
-        "--allowed-admins",
+        "--control-slot",
+        choices=CONTROL_SLOTS,
         default=None,
-        help=f"Comma-separated GitHub logins allowed to sign in with GitHub OAuth (overrides {ENV_ALLOWED_ADMINS}; default: swackhamer,xbmc4lyfe)",
+        help=(
+            "Control VM slot (a or b). Enables Cloudflare KV hydration and write-behind when "
+            "CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_KV_NAMESPACE_ID, and CLOUDFLARE_KV_API_TOKEN are set, and "
+            f"/api/control/* when {ENV_CONTROL_SECRET} is set"
+        ),
     )
     parser.add_argument(
         "--controlled-targets",
         default=None,
-        help=f"Comma-separated orgs and owner/repo targets on which OAuth users must be admins (overrides {ENV_CONTROLLED_TARGETS}; default: none)",
+        help=f"Comma-separated orgs and owner/repo targets on which OAuth users must be admins, in addition to every repo in the --config-repo repository (overrides {ENV_CONTROLLED_TARGETS}; default: none)",
     )
     parser.add_argument(
         "--oauth-redirect-uri",
         default=None,
-        help="Absolute GitHub OAuth callback URL, for example https://spot.example.com/auth/github/callback (or set GITHUB_OAUTH_REDIRECT_URI; required in production; default: derived from the Host header for local development)",
+        help="Absolute GitHub OAuth callback URL, for example https://spot.example.com/auth/github/callback (or set GITHUB_OAUTH_REDIRECT_URI; default: derived from the Host header)",
+    )
+    parser.add_argument(
+        "--config-repo",
+        default=None,
+        help=(
+            f"Runner configuration repository whose repos/<owner>/<repo>.yaml files are controlled targets "
+            f"(or set {ENV_CONFIG_REPO}; default: <org>/{CONFIG_REPO_NAME})"
+        ),
+    )
+    parser.add_argument(
+        "--public-origin",
+        default=None,
+        help=(
+            f"Browser-facing origin, for example https://spot.example.com, accepted on POSTs when a proxy "
+            f"forwards under a different Host (or set {ENV_PUBLIC_ORIGIN}; default: the origin of the OAuth "
+            "redirect URI)"
+        ),
     )
     parser.add_argument(
         "--state-file",
         type=Path,
         default=None,
-        help="Optional path to persist dashboard state JSON (required for dynamic GitHub OAuth controlled targets to survive restarts)",
+        help="Optional path to persist dashboard state JSON",
     )
     parser.add_argument(
         "--dump-overview",
@@ -4658,12 +5298,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     from .log_format import configure_logging
 
-    configure_logging()  # Audit records for controlled-target changes go to stderr.
+    configure_logging()
     oauth_manager, controlled_targets = build_oauth_config(
-        allowed_admins=args.allowed_admins,
         controlled_targets=args.controlled_targets,
         redirect_uri=args.oauth_redirect_uri,
     )
+    kv_config = KvConfig.from_env()
+    kv = CloudflareKv(kv_config) if kv_config is not None and args.control_slot else None
+    if kv_config is not None and not args.control_slot:
+        LOG.warning("Cloudflare KV credentials are set but --control-slot is not; state stays local only")
     server, _ = create_dashboard_server(
         host=args.host,
         port=args.port,
@@ -4676,6 +5319,11 @@ def main(argv: list[str] | None = None) -> int:
         allow_insecure_non_loopback=args.allow_insecure_non_loopback,
         oauth_manager=oauth_manager,
         controlled_targets=controlled_targets,
+        control_slot=args.control_slot,
+        control_secret=os.environ.get(ENV_CONTROL_SECRET) or None,
+        kv=kv,
+        public_origin=args.public_origin,
+        config_repo=args.config_repo,
     )
     actual_host, actual_port = server.server_address[:2]
     scheme = "https" if isinstance(server.socket, ssl.SSLSocket) else "http"
