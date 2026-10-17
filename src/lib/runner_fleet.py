@@ -530,7 +530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--project", default="homelab-424523")
     parser.add_argument("--label", help="Optional runner label to count only a subset")
     parser.add_argument("--vm-name-prefix", help="Optional GCE VM name prefix filter")
-    parser.add_argument("--minimum-runners", type=int, default=20)
+    parser.add_argument("--minimum-runners", type=int, default=1)
     parser.add_argument("--runners-per-vm", type=int, default=8)
     parser.add_argument("--gh-binary", default="gh")
     parser.add_argument("--gcloud-binary", default="gcloud")

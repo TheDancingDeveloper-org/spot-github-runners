@@ -27,9 +27,9 @@ kv_namespaces = [
   { binding = "SPOT_KV", id = "REPLACE_WITH_SPOT_KV_NAMESPACE_ID" },
 ]
 
+# The Worker only authenticates the session cookie. Which GitHub accounts may use the dashboard (the owner
+# plus the administrators added on its Admins page) is decided by the control VM on every request.
 [vars]
-ALLOWED_ADMIN_LOGIN = "swackhamer"
-ALLOWED_ADMIN_ID = "619624"
 ORIGIN_HOST_SUFFIX = ".swacktech.com"
 # Bulk sign-out: Unix time; sessions issued before it are rejected. Empty means none. Set the same value as
 # DASHBOARD_SESSION_NOT_BEFORE for the control VM (see docs/edge-dashboard.md), then deploy.

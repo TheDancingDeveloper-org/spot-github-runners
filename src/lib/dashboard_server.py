@@ -28,15 +28,20 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 
 from .dashboard_auth import (
+    MAX_ADDED_ADMINS,
     MAX_DYNAMIC_CONTROLLED_TARGETS,
     OAUTH_STATE_COOKIE_NAME,
+    OWNER_IDENTITIES,
     SESSION_COOKIE_NAME,
     AuthCapacityError,
     ConfigRepoTargets,
     ConfigTargetsError,
     GitHubApiError,
     GitHubOAuthManager,
+    GitHubUserLookupError,
+    audit_admin_change,
     audit_login,
+    normalize_github_login,
     format_cleared_session_cookie,
     format_cleared_state_cookie,
     format_session_cookie,
@@ -52,7 +57,7 @@ from .dashboard_auth import (
     ENV_DEVICE_FLOW,
     ENV_REDIRECT_URI,
 )
-from .patch_console import PatchConsole, PatchConsoleError, executor_from_env, host_source_from_env
+from .patch_console import PatchConsole, PatchConsoleError, config_repo_token, executor_from_env, host_source_from_env
 from .edge_state import (
     CONTROL_OPS,
     CONTROL_SLOTS,
@@ -145,6 +150,11 @@ NON_MUTATING_POST_PATHS = frozenset({"/api/qualify", "/api/cloud-init/parse", "/
 # POST endpoints whose side effect is outside dashboard state (a GitHub pull request, live runner hosts): they
 # need an Idempotency-Key and run through DashboardStore.run_external.
 EXTERNAL_MUTATION_PATHS = frozenset({"/api/patches/save", "/api/patches/hot-patch"})
+# Owner-only routes that change the added-administrator list (dashboard state); they need an Idempotency-Key
+# and "confirm": true.
+ADMIN_MUTATION_PATHS = frozenset({"/api/admins/add", "/api/admins/remove"})
+MAX_DASHBOARD_ADMINS_HISTORY = 50
+OWNER_REQUIRED_ERROR = "Only the dashboard owner can view or change dashboard administrators"
 # The edge Worker sets this header to the browser's IP (from Cloudflare's CF-Connecting-IP) and strips any
 # client-supplied X-Spot-* header. It is trusted only from a loopback peer (the local cloudflared), and
 # only for rate-limit bucketing.
@@ -196,6 +206,14 @@ class ControlledTargetsUnavailableError(RuntimeError):
 
 class ControlledTargetsConflictError(RuntimeError):
     """A pending controlled-target change was based on a list that has since changed."""
+
+
+class DashboardAdminError(ValueError):
+    """An added-administrator change was refused; ``status`` is the HTTP status to answer with."""
+
+    def __init__(self, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.status = int(status)
 
 
 
@@ -1012,6 +1030,11 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         "controlled_targets": [],
         # Bounded audit history of committed controlled-target changes.
         "controlled_targets_history": [],
+        # Administrators the owner added on the Admins page: {login, uid, added_by, added_by_uid, added_at}.
+        # They may sign in (matched by uid) and travel with every snapshot, so they survive a cutover.
+        "dashboard_admins": [],
+        # Bounded audit history of added-administrator changes.
+        "dashboard_admins_history": [],
     }
 
 
@@ -2090,7 +2113,8 @@ class DashboardStore:
                     return 422, {"error": "Idempotency-Key was already used for a different request"}, False
                 return int(existing.get("s", 200)), copy.deepcopy(existing.get("b")), True
             snapshot = copy.deepcopy(self.state)
-            self._defer = {"thread": threading.get_ident(), "dirty": False}
+            self._defer = {"thread": threading.get_ident(), "dirty": False, "after_commit": []}
+            defer = self._defer
             try:
                 status, body = fn()
             except BaseException:
@@ -2113,7 +2137,23 @@ class DashboardStore:
                 self.state = snapshot
                 LOG.exception("Failed to persist dashboard state for an idempotent request")
                 return 500, {"error": "Failed to persist dashboard state; retry the request"}, False
+            if status < 400:
+                for callback in defer["after_commit"]:
+                    callback()
             return status, body, False
+
+    def _after_commit(self, callback: Any) -> None:
+        """Run ``callback`` once the current change is durable.
+
+        Inside an idempotent request the write is deferred to :meth:`run_request`, so the callback waits for
+        that commit and is dropped when the request rolls back. Outside one, the change was already persisted
+        synchronously (a failure raised before reaching here), so it runs now.
+        """
+        defer = self._defer
+        if defer is not None and defer.get("thread") == threading.get_ident():
+            defer.setdefault("after_commit", []).append(callback)
+        else:
+            callback()
 
     def _mutation_preflight(self) -> None:
         """Gates every change shares (outside the lock): fresh ownership, writer sync, active slot."""
@@ -3701,6 +3741,146 @@ class DashboardStore:
             )
             return list(names)
 
+    # -- added administrators (Admins page) --
+
+    @staticmethod
+    def _valid_admin_entry(entry: Any) -> dict[str, Any] | None:
+        """A well-formed stored administrator record, or None (malformed records never grant access)."""
+        if not isinstance(entry, dict):
+            return None
+        login, uid = entry.get("login"), entry.get("uid")
+        if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+            return None
+        try:
+            normalize_github_login(login)
+        except ValueError:
+            return None
+        if any(uid == owner_uid for _, owner_uid in OWNER_IDENTITIES):
+            return None  # Owners are deploy-configured; a stored copy never changes how they are treated.
+        return entry
+
+    def _admin_entries(self) -> list[dict[str, Any]]:
+        raw = self.state.get("dashboard_admins", [])
+        entries: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for item in raw if isinstance(raw, list) else []:
+            entry = self._valid_admin_entry(item)
+            if entry is not None and entry["uid"] not in seen:
+                seen.add(entry["uid"])
+                entries.append(entry)
+        return entries
+
+    def dashboard_admin_uids(self) -> frozenset[int]:
+        """GitHub IDs of the added administrators, for sign-in and per-request session checks.
+
+        Fails closed to owners only: while the state file could not be loaded (or is still being recovered),
+        this is empty.
+        """
+        with self._lock:
+            if self.controlled_targets_error or self.recovery_pending:
+                return frozenset()
+            return frozenset(e["uid"] for e in self._admin_entries())
+
+    def get_dashboard_admins(self) -> list[dict[str, Any]]:
+        with self._lock:
+            if self.controlled_targets_error or self.recovery_pending:
+                return []
+            return [
+                {"login": e["login"], "uid": e["uid"], "added_by": e.get("added_by"),
+                 "added_by_uid": e.get("added_by_uid"), "added_at": e.get("added_at")}
+                for e in copy.deepcopy(self._admin_entries())
+            ]
+
+    def get_dashboard_admins_history(self) -> list[dict[str, Any]]:
+        with self._lock:
+            raw = self.state.get("dashboard_admins_history", [])
+            return copy.deepcopy([e for e in raw if isinstance(e, dict)]) if isinstance(raw, list) else []
+
+    def _change_dashboard_admins(self, entries: list[dict[str, Any]], history_entry: dict[str, Any]) -> None:
+        """Replace the list and append history in one persist (caller holds the lock); rolls back on failure."""
+        previous = copy.deepcopy(self.state.get("dashboard_admins", []))
+        previous_history = copy.deepcopy(self.state.get("dashboard_admins_history", []))
+        history = previous_history if isinstance(previous_history, list) else []
+        self.state["dashboard_admins"] = entries
+        self.state["dashboard_admins_history"] = (history + [history_entry])[-MAX_DASHBOARD_ADMINS_HISTORY:]
+        try:
+            self._persist()
+        except Exception:
+            self.state["dashboard_admins"] = previous
+            self.state["dashboard_admins_history"] = previous_history
+            raise
+
+    def _admin_change_preflight(self) -> None:
+        if self.controlled_targets_error or self.recovery_pending:
+            raise ControlledTargetsUnavailableError(self.controlled_targets_error or "dashboard state is being recovered")
+        self._mutation_locked_checks()
+
+    def add_dashboard_admin(self, login: str, uid: int, *, actor: str, actor_uid: int | None) -> dict[str, Any]:
+        """Add a GitHub user (already resolved to its numeric ID) as an administrator. Raises DashboardAdminError."""
+        clean_login = normalize_github_login(login)
+        if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+            raise DashboardAdminError("uid must be a positive integer GitHub user ID")
+        with self._lock:
+            self._admin_change_preflight()
+            if any(uid == owner_uid for _, owner_uid in OWNER_IDENTITIES):
+                raise DashboardAdminError(f"'{clean_login}' is a dashboard owner already", 409)
+            entries = self._admin_entries()
+            for entry in entries:
+                if entry["uid"] == uid:
+                    raise DashboardAdminError(
+                        f"'{clean_login}' is already an administrator (added as '{entry['login']}')", 409)
+            if len(entries) >= MAX_ADDED_ADMINS:
+                raise DashboardAdminError(f"At most {MAX_ADDED_ADMINS} administrators can be added", 409)
+            now = self._clock()
+            at = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            record = {"login": clean_login, "uid": uid, "added_by": str(actor), "added_by_uid": actor_uid,
+                      "added_at": at}
+            self._change_dashboard_admins(
+                copy.deepcopy(entries) + [record],
+                {"at": at, "epoch": int(now), "action": "added", "login": clean_login, "uid": uid,
+                 "actor": str(actor), "actor_uid": actor_uid},
+            )
+            self._after_commit(lambda: audit_admin_change("added", clean_login, uid, actor, actor_uid))
+            return dict(record)
+
+    def remove_dashboard_admin(self, uid: Any, *, actor: str, actor_uid: int | None) -> dict[str, Any]:
+        """Remove an added administrator by GitHub ID. Its sessions stop working on their next request."""
+        if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+            raise DashboardAdminError("uid must be a positive integer GitHub user ID")
+        with self._lock:
+            self._admin_change_preflight()
+            if any(uid == owner_uid for _, owner_uid in OWNER_IDENTITIES):
+                raise DashboardAdminError("Dashboard owners are configured at deploy time and can't be removed here", 400)
+            entries = self._admin_entries()
+            removed = next((e for e in entries if e["uid"] == uid), None)
+            if removed is None:
+                raise DashboardAdminError(f"No added administrator has GitHub ID {uid}", 404)
+            now = self._clock()
+            at = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self._change_dashboard_admins(
+                copy.deepcopy([e for e in entries if e["uid"] != uid]),
+                {"at": at, "epoch": int(now), "action": "removed", "login": removed["login"], "uid": uid,
+                 "actor": str(actor), "actor_uid": actor_uid},
+            )
+            removed_login = removed["login"]
+            self._after_commit(lambda: audit_admin_change("removed", removed_login, uid, actor, actor_uid))
+            return {"login": removed["login"], "uid": uid}
+
+    def peek_idempotent(self, key: str, method: str, path: str, fingerprint: str) -> tuple[int, Any, bool] | None:
+        """The stored outcome for ``key`` (a replay, or 422 for a different request), or None when unused.
+
+        Lets a route skip slow work (a GitHub lookup) on a retry; :meth:`run_request` checks again atomically.
+        """
+        with self._lock:
+            raw_records = self.state.get(IDEMPOTENCY_STATE_KEY)
+            records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, self._clock())
+            existing = records.get(key)
+            if existing is None:
+                return None
+            if existing.get("m") != method or existing.get("p") != path or existing.get("f") != fingerprint:
+                return 422, {"error": "Idempotency-Key was already used for a different request"}, False
+            return int(existing.get("s", 200)), copy.deepcopy(existing.get("b")), True
+
     def update_regions(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Enable/disable regions individually or by latency/capability filter."""
         with self._lock:
@@ -4821,6 +5001,7 @@ def make_handler(
     control_secret: str | None = None,
     public_origin: str | None = None,
     patch_console: PatchConsole | None = None,
+    github_token_provider: Any = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create the HTTP handler bound to a DashboardStore instance.
 
@@ -4829,8 +5010,11 @@ def make_handler(
     only when the TCP peer is loopback and no ``Cf-Connecting-Ip``/``Cf-Ray``/``X-Forwarded-For`` header is
     present (a wrong explicit token is rejected with 401); then the GitHub OAuth ``__Host-spot_session``
     cookie, which must be signed, unexpired, issued after ``DASHBOARD_SESSION_NOT_BEFORE``, for the
-    hardcoded administrator, and verified for every controlled target (static, stored, and config-repo
-    targets; otherwise 403). When the stored controlled-target policy could not be loaded, OAuth sessions
+    owner or a CURRENTLY listed added administrator (re-checked on every request), and verified for every
+    controlled target unless the identity is a global administrator (static, stored, and config-repo
+    targets; otherwise 403). ``/api/admins`` (owner only) lists and changes the added administrators;
+    ``github_token_provider`` (default: ``SPOT_CONFIG_GH_TOKEN`` or ``GH_TOKEN``) returns the token for
+    the GitHub user lookup. When the stored controlled-target policy could not be loaded, OAuth sessions
     and sign-ins are refused with HTTP 500 ``controlled_targets_unavailable`` (not 503, which the edge
     Worker would turn into an endless wait). ``/api/health`` is public and ``/api/control/*`` uses
     short-lived control tokens instead.
@@ -4846,6 +5030,7 @@ def make_handler(
     from .dashboard_ui_assets import render_dashboard_html
 
     static_targets = [t.name for t in parse_controlled_targets(controlled_targets or [])]
+    lookup_token = github_token_provider if github_token_provider is not None else config_repo_token
     control_secret_value = str(control_secret or "").strip()
     public_origin_value = normalize_public_origin(public_origin)
     public_origin_key = _origin_key(public_origin_value) if public_origin_value else None
@@ -5040,6 +5225,15 @@ def make_handler(
             # does not repair an unreadable state file.
             self._send_json(self._policy_unavailable_body(), status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
+        @staticmethod
+        def _added_admins() -> frozenset[int]:
+            """The added administrators' GitHub IDs, read from state for THIS request; owners only on any error."""
+            try:
+                return store.dashboard_admin_uids()
+            except Exception:  # noqa: BLE001 - an unreadable list must never grant access
+                LOG.exception("Could not read the added administrators; only owners can sign in")
+                return frozenset()
+
         def _evaluate_auth(self) -> tuple[str, dict[str, Any]]:
             """Classify the request as ("ok" | "unauthenticated" | "forbidden" | "unavailable", details)."""
             if not auth_required:
@@ -5059,7 +5253,8 @@ def make_handler(
             if oauth_manager is not None:
                 oauth_cookie = cookies.get(SESSION_COOKIE_NAME, "")
                 if oauth_cookie:
-                    identity = oauth_manager.check_session(oauth_cookie, [])
+                    added_admins = self._added_admins()
+                    identity = oauth_manager.check_session(oauth_cookie, [], added_admins)
                     if identity.status == "forbidden" and identity.session is not None:
                         return "forbidden", {
                             "method": "github_oauth",
@@ -5085,7 +5280,7 @@ def make_handler(
                                 "message": f"Forbidden: {exc}",
                                 "missing_targets": [],
                             }
-                        check = oauth_manager.check_session(oauth_cookie, targets)
+                        check = oauth_manager.check_session(oauth_cookie, targets, added_admins)
                         if check.status == "ok" and check.session is not None:
                             return "ok", {
                                 "method": "github_oauth",
@@ -5232,6 +5427,8 @@ def make_handler(
                         "status": status,
                         "method": info.get("method"),
                         "user": info.get("user"),
+                        # The browser shows the Admins page only to owners; /api/admins enforces it.
+                        "owner": self._is_owner_session(info) if status == "ok" else False,
                         "missing_targets": info.get("missing_targets", []),
                         "oauth": {
                             "enabled": oauth_manager is not None,
@@ -5323,7 +5520,8 @@ def make_handler(
                                               "user": "", "missing_targets": []}, []
             if change is None:
                 decision = oauth_manager.authorize(
-                    access_token, static_targets + store.get_controlled_targets() + config_targets
+                    access_token, static_targets + store.get_controlled_targets() + config_targets,
+                    added_admins=self._added_admins(),
                 )
             else:
                 current = store.get_controlled_targets()
@@ -5337,6 +5535,7 @@ def make_handler(
                     static_targets + config_targets + current + list(change.targets),
                     use_cache=False,
                     expected_uid=change.uid,
+                    added_admins=self._added_admins(),
                 )
             if not decision.authorized:
                 return HTTPStatus.FORBIDDEN, {
@@ -5721,11 +5920,17 @@ def make_handler(
             if self._handle_oauth_get(path, qs):
                 return
 
-            if not self._check_auth():
+            auth_status, auth_info = self._evaluate_auth()
+            if not self._check_auth(evaluated=(auth_status, auth_info)):
                 return
 
             if path == "/api/auth/targets":
                 self._send_targets()
+                return
+
+            if path == "/api/admins":
+                if self._require_owner(auth_info):
+                    self._send_json(self._admins_body())
                 return
 
             if path in ("/api/patches", "/api/patches/manifest"):
@@ -5787,6 +5992,111 @@ def make_handler(
                 return
 
             self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
+
+        # -- added administrators (/api/admins, owner only) --
+
+        def _is_owner_session(self, auth_info: dict[str, Any]) -> bool:
+            return (
+                oauth_manager is not None
+                and auth_info.get("method") == "github_oauth"
+                and oauth_manager.is_owner(auth_info.get("user"), auth_info.get("uid"))
+            )
+
+        def _require_owner(self, auth_info: dict[str, Any]) -> bool:
+            """Answer 403 unless the request carries a GitHub session of a dashboard owner."""
+            if self._is_owner_session(auth_info):
+                return True
+            self._send_json({"error": OWNER_REQUIRED_ERROR, "code": "owner_required"}, status=HTTPStatus.FORBIDDEN)
+            return False
+
+        def _admins_body(self) -> dict[str, Any]:
+            assert oauth_manager is not None
+            body: dict[str, Any] = {
+                "owners": [
+                    {"login": login, "uid": uid, "global_admin": oauth_manager.is_global_admin(login, uid)}
+                    for login, uid in sorted(OWNER_IDENTITIES)
+                ],
+                "admins": store.get_dashboard_admins(),
+                "history": store.get_dashboard_admins_history()[-20:],
+                # False when DASHBOARD_GLOBAL_ADMINS is "none": added administrators then need administrator
+                # permission on every controlled target, like the owner.
+                "added_admins_exempt": bool(oauth_manager.global_admins),
+                "max_admins": MAX_ADDED_ADMINS,
+            }
+            if store.controlled_targets_error:
+                body["error"] = store.controlled_targets_error
+            return body
+
+        def _admins_post(self, path: str, payload: dict[str, Any], key: str | None, auth_info: dict[str, Any]) -> None:
+            if not self._require_owner(auth_info):
+                return
+            assert oauth_manager is not None
+            if path not in ADMIN_MUTATION_PATHS:
+                self._send_json({"error": f"Unknown endpoint: {path}"}, status=HTTPStatus.NOT_FOUND)
+                return
+            if key is None:
+                self._send_json({"error": "This change needs an Idempotency-Key header"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if payload.get("confirm") is not True:
+                self._send_json({"error": "Changing dashboard administrators needs \"confirm\": true"},
+                                status=HTTPStatus.BAD_REQUEST)
+                return
+            actor, actor_uid = str(auth_info.get("user")), auth_info.get("uid")
+            fingerprint = request_fingerprint(payload)
+            if path == "/api/admins/add":
+                try:
+                    login = normalize_github_login(payload.get("login"))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                stored = store.peek_idempotent(key, "POST", path, fingerprint)
+                if stored is not None:
+                    status, body, replayed = stored
+                    self._send_json(body, status=status, extra_headers={"Idempotent-Replay": "true"} if replayed else None)
+                    return
+                try:
+                    token = str(lookup_token() or "")
+                except Exception:  # noqa: BLE001 - no token means an anonymous lookup
+                    token = ""
+                try:
+                    user = oauth_manager.lookup_user(login, token)
+                except GitHubUserLookupError as exc:
+                    error: dict[str, Any] = {"error": str(exc)}
+                    if exc.status == HTTPStatus.FAILED_DEPENDENCY:
+                        error["code"] = "upstream_error"
+                    if exc.retryable:
+                        error["retry_same_key"] = True  # Nothing changed; the same key may try again.
+                    self._send_json(error, status=exc.status)
+                    return
+
+                def commit() -> tuple[int, Any]:
+                    added = store.add_dashboard_admin(user["login"], user["uid"], actor=actor, actor_uid=actor_uid)
+                    return HTTPStatus.OK, {"status": "added", "admin": added, **self._admins_body()}
+            else:
+                uid = payload.get("uid")
+                if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+                    self._send_json({"error": "uid must be a positive integer GitHub user ID"},
+                                    status=HTTPStatus.BAD_REQUEST)
+                    return
+
+                def commit() -> tuple[int, Any]:
+                    removed = store.remove_dashboard_admin(uid, actor=actor, actor_uid=actor_uid)
+                    return HTTPStatus.OK, {"status": "removed", "admin": removed, **self._admins_body()}
+
+            def run() -> tuple[int, Any]:
+                try:
+                    return commit()
+                except DashboardAdminError as exc:
+                    return exc.status, {"error": str(exc)}
+                except ControlledTargetsUnavailableError:
+                    return HTTPStatus.INTERNAL_SERVER_ERROR, self._policy_unavailable_body()
+
+            try:
+                status, body, replayed = store.run_request(key, "POST", path, run, fingerprint=fingerprint)
+            except DashboardFrozenError:
+                self._send_unavailable()
+                return
+            self._send_json(body, status=status, extra_headers={"Idempotent-Replay": "true"} if replayed else None)
 
         def _send_targets(self) -> None:
             try:
@@ -5959,6 +6269,9 @@ def make_handler(
             if path.startswith("/api/patches/"):
                 self._patches_post(path, payload, key)
                 return
+            if path == "/api/admins" or path.startswith("/api/admins/"):
+                self._admins_post(path, payload, key, auth_info)
+                return
             try:
                 status, body, replayed = store.run_request(
                     key, "POST", path, lambda: self._dispatch_post(path, payload),
@@ -6092,6 +6405,7 @@ def create_dashboard_server(
     public_origin: str | None = None,
     config_repo: str | None = None,
     patch_console: PatchConsole | None = None,
+    github_token_provider: Any = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
     """Instantiate the ThreadingHTTPServer and DashboardStore, then start hydration.
 
@@ -6173,6 +6487,7 @@ def create_dashboard_server(
         patch_console=patch_console if patch_console is not None else PatchConsole(
             resolve_config_repo(config_repo, org=org), executor=executor_from_env(project),
             host_source=host_source_from_env(project)),
+        github_token_provider=github_token_provider,
     )
     server = DashboardThreadingHTTPServer((host, port), handler)
     server.dashboard_store = store
@@ -6202,8 +6517,9 @@ def build_oauth_config(
     """Resolve GitHub OAuth settings from CLI values (preferred) and the environment.
 
     Returns ``(None, targets)`` when ``GITHUB_OAUTH_CLIENT_ID`` is unset. Raises ValueError when OAuth is
-    enabled without an adequate ``DASHBOARD_SESSION_SECRET`` or when any setting is invalid. The admin
-    identity is hardcoded (``swackhamer``, ID 619624) and cannot be configured.
+    enabled without an adequate ``DASHBOARD_SESSION_SECRET`` or when any setting is invalid. The owner
+    identity is hardcoded (``swackhamer``, ID 619624) and cannot be configured; other administrators are
+    added on the dashboard's Admins page and stored in dashboard state.
     """
     env = os.environ if environ is None else environ
     extra: dict[str, Any] = {}

@@ -47,8 +47,6 @@ function makeEnv(overrides = {}) {
   const store = new Map([["origin:active", ORIGIN_RECORD]]);
   return {
     SESSION_SECRET: vector.secret,
-    ALLOWED_ADMIN_LOGIN: "swackhamer",
-    ALLOWED_ADMIN_ID: "619624",
     CF_ACCESS_CLIENT_ID: "access-id.example",
     CF_ACCESS_CLIENT_SECRET: "access-secret-example",
     SPOT_KV: {
@@ -122,22 +120,64 @@ test("tampered, expired, future, wrong-secret, and malformed tokens fail", async
   assert.equal(await verifySession(vector.control.token, env, vector.control.now), null);
 });
 
-test("wrong sub or uid fails even when correctly signed", async () => {
+test("malformed sub or uid fails even when correctly signed", async () => {
   const base = { ...vector.valid_session.payload };
   const env = makeEnv();
   assert.ok(await verifySession(await signPayload(base), env, NOW));
-  assert.equal(await verifySession(await signPayload({ ...base, sub: "someone" }), env, NOW), null);
-  assert.equal(await verifySession(await signPayload({ ...base, sub: "Swackhamer" }), env, NOW), null);
-  assert.equal(await verifySession(await signPayload({ ...base, uid: 1 }), env, NOW), null);
-  assert.equal(await verifySession(await signPayload({ ...base, uid: "619624" }), env, NOW), null);
+  for (const sub of ["", "-lead", "has space", "a".repeat(40), "bad/login", 619624, null]) {
+    assert.equal(await verifySession(await signPayload({ ...base, sub }), env, NOW), null, String(sub));
+  }
+  for (const uid of [0, -1, 1.5, "619624", true, null, 2 ** 53]) {
+    assert.equal(await verifySession(await signPayload({ ...base, uid }), env, NOW), null, String(uid));
+  }
   assert.equal(await verifySession(await signPayload({ ...base, v: 2 }), env, NOW), null);
   assert.equal(await verifySession(await signPayload({ ...base, exp: base.iat + 604801 }), env, NOW), null);
+  assert.equal(await verifySession(await signPayload({ ...base, tgt: "x" }), env, NOW), null);
+});
+
+test("an added administrator's session passes the edge; the origin decides membership", async () => {
+  // The Worker only authenticates: which accounts may use the dashboard changes at run time (Admins page)
+  // and is enforced by the control VM on every request, so the Worker must not hard-code the owner.
+  const base = { ...vector.valid_session.payload, sub: "alice-admin", uid: 4242 };
+  const token = await signPayload(base);
+  assert.deepEqual(await verifySession(token, makeEnv(), NOW), base);
+  const f = fakeFetch(() => new Response('{"error":"Forbidden"}', {
+    status: 403, headers: { "Content-Type": "application/json", [ORIGIN_MARKER_HEADER]: ORIGIN_MARKER_VALUE },
+  }));
+  const res = await handleRequest(req("/api/overview", { cookie: `${SESSION_COOKIE_NAME}=${token}` }), makeEnv(),
+    { fetch: f, now: NOW });
+  assert.equal(f.calls.length, 1); // forwarded to the origin with the cookie
+  assert.match(f.calls[0].init.headers.get("Cookie"), new RegExp(`${SESSION_COOKIE_NAME}=`));
+  assert.equal(res.status, 403); // the origin's refusal (for example a removed administrator) passes through
+  // Even with stale owner vars from an older wrangler.toml, the Worker no longer filters on them.
+  assert.ok(await verifySession(token, makeEnv({ ALLOWED_ADMIN_LOGIN: "swackhamer", ALLOWED_ADMIN_ID: "619624" }), NOW));
+});
+
+test("a forged session for any identity still fails without the shared secret", async () => {
+  const base = { ...vector.valid_session.payload, sub: "alice-admin", uid: 4242 };
+  assert.equal(await verifySession(await signPayload(base, "not-the-shared-secret-0123456789abcdef"), makeEnv(), NOW), null);
 });
 
 test("missing bindings fail closed", async () => {
-  for (const key of ["SESSION_SECRET", "ALLOWED_ADMIN_LOGIN", "ALLOWED_ADMIN_ID"]) {
+  for (const key of ["SESSION_SECRET"]) {
     assert.equal(await verifySession(TOKEN, makeEnv({ [key]: undefined }), NOW), null, key);
+    assert.equal(await verifySession(TOKEN, makeEnv({ [key]: "" }), NOW), null, key);
   }
+});
+
+test("the 503 control_vm_unavailable wait still applies to added administrators", async () => {
+  const token = await signPayload({ ...vector.valid_session.payload, sub: "alice-admin", uid: 4242 });
+  const env = makeEnv();
+  env.SPOT_KV.store.delete("origin:active");
+  const res = await handleRequest(req("/api/overview", { cookie: `${SESSION_COOKIE_NAME}=${token}` }), env,
+    { fetch: okFetch(), now: NOW });
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).error, UNAVAILABLE_ERROR);
+  const down = fakeFetch(() => new Response("bad gateway", { status: 502 }));
+  const res2 = await handleRequest(req("/api/overview", { cookie: `${SESSION_COOKIE_NAME}=${token}` }), makeEnv(),
+    { fetch: down, now: NOW });
+  assert.equal(res2.status, 503);
+  assert.equal((await res2.json()).error, UNAVAILABLE_ERROR);
 });
 
 test("cookie parsing takes the first occurrence", () => {

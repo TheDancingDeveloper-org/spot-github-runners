@@ -1804,5 +1804,106 @@ const NATIVE_FETCH = async (input, init) => {
         self.assertEqual(out["assigned"], [["assign", "/"]])
 
 
+
+class AddedAdminDurabilityTests(unittest.TestCase):
+    """Added administrators live in dashboard state, so every snapshot, import, and KV hydration carries them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = FakeKvRequester()
+        no_live_pricing(self)
+
+    def store(self, name: str, slot: str = "a", *, kv: bool = False) -> DashboardStore:
+        return DashboardStore(Path(self.tmp.name) / name, control_slot=slot, kv=make_kv(self.fake) if kv else None,
+                              sleep=lambda _s: None)
+
+    def test_snapshot_import_carries_admins_to_the_other_slot(self):
+        old = self.store("a.json")
+        old.hydrate()
+        old.add_dashboard_admin("alice", 4242, actor="swackhamer", actor_uid=619624)
+        envelope = old.freeze()["snapshot"]
+        self.assertEqual([a["uid"] for a in envelope["state"]["dashboard_admins"]], [4242])
+        new = self.store("b.json", "b")
+        self.assertEqual(new.dashboard_admin_uids(), frozenset())
+        self.assertTrue(new.import_snapshot(json.loads(json.dumps(envelope)))["imported"])
+        self.assertEqual(new.dashboard_admin_uids(), frozenset({4242}))
+        self.assertEqual(new.get_dashboard_admins()[0]["added_by"], "swackhamer")
+        self.assertEqual([h["action"] for h in new.get_dashboard_admins_history()], ["added"])
+        # And the replacement keeps them across its own restart.
+        self.assertEqual(self.store("b.json", "b").dashboard_admin_uids(), frozenset({4242}))
+
+    def test_admin_audit_lines_are_written_only_after_the_change_is_durable(self):
+        store = self.store("audit.json")
+        store.hydrate()
+        store.add_dashboard_admin("alice", 4242, actor="swackhamer", actor_uid=619624)
+        original_persist = store._persist
+
+        def failing_commit(bump=True):
+            if store._defer is not None:
+                return original_persist(bump)
+            raise OSError("simulated disk full at commit")
+
+        def remove():
+            return 200, store.remove_dashboard_admin(4242, actor="swackhamer", actor_uid=619624)
+
+        def add():
+            return 200, store.add_dashboard_admin("bob", 5151, actor="swackhamer", actor_uid=619624)
+
+        with mock.patch("lib.dashboard_server.audit_admin_change") as audit:
+            with mock.patch.object(store, "_persist", side_effect=failing_commit), \
+                    self.assertLogs("spot_dashboard", "ERROR"):
+                self.assertEqual(store.run_request("k-rm", "POST", "/api/admins/remove", remove,
+                                                   fingerprint="rm")[0], 500)
+                self.assertEqual(store.run_request("k-add", "POST", "/api/admins/add", add,
+                                                   fingerprint="add")[0], 500)
+            audit.assert_not_called()
+            self.assertEqual(store.dashboard_admin_uids(), frozenset({4242}))
+            status, _, replayed = store.run_request("k-rm2", "POST", "/api/admins/remove", remove, fingerprint="rm2")
+            self.assertEqual((status, replayed), (200, False))
+            audit.assert_called_once_with("removed", "alice", 4242, "swackhamer", 619624)
+            # An idempotent replay of the committed request writes no second audit line.
+            self.assertTrue(store.run_request("k-rm2", "POST", "/api/admins/remove", remove, fingerprint="rm2")[2])
+            audit.assert_called_once()
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+
+    def test_a_rolled_back_client_error_writes_no_admin_audit_line(self):
+        store = self.store("audit4xx.json")
+        store.hydrate()
+
+        def add_then_refuse():
+            store.add_dashboard_admin("bob", 5151, actor="swackhamer", actor_uid=619624)
+            return 409, {"error": "refused after the change"}
+
+        with mock.patch("lib.dashboard_server.audit_admin_change") as audit:
+            self.assertEqual(store.run_request("k", "POST", "/api/admins/add", add_then_refuse, fingerprint="f")[0], 409)
+            audit.assert_not_called()
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+
+    def test_fresh_vm_hydrates_admins_from_the_kv_snapshot(self):
+        state = {"dashboard_admins": [{"login": "alice", "uid": 4242, "added_by": "swackhamer",
+                                       "added_by_uid": 619624, "added_at": "2026-10-01T00:00:00Z"}]}
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot(state, 9, "a", now=1))
+        store = self.store("fresh.json", kv=True)
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())  # nothing local before hydration
+        self.assertEqual(store.hydrate(), "kv")
+        self.assertEqual(store.dashboard_admin_uids(), frozenset({4242}))
+
+    def test_snapshot_without_admins_from_an_older_dashboard_means_none(self):
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot({"controlled_targets": []}, 3, "a", now=1))
+        store = self.store("old.json", kv=True)
+        self.assertEqual(store.hydrate(), "kv")
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+        self.assertEqual(store.state["dashboard_admins"], [])
+
+    def test_failed_save_rolls_back_the_change(self):
+        store = self.store("a.json")
+        store.hydrate()
+        with mock.patch.object(store, "_persist", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            store.add_dashboard_admin("alice", 4242, actor="swackhamer", actor_uid=619624)
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+        self.assertEqual(store.get_dashboard_admins_history(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

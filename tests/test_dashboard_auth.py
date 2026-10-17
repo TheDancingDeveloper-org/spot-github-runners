@@ -2231,10 +2231,6 @@ class StoreTargetPolicyTests(unittest.TestCase):
         self.assertEqual(reloaded.get_controlled_targets_history()[-1]["method"], "github_oauth")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class GlobalAdminTests(unittest.TestCase):
     """Configured global administrators skip per-target admin checks (pinned to login and uid)."""
 
@@ -2281,3 +2277,574 @@ class GlobalAdminTests(unittest.TestCase):
         mgr = make_manager(fake, global_admins=[("swackhamer", 1)])  # wrong uid: no exception
         self.assertFalse(mgr.authorize("tok", ["xbmc4lyfe/newznab-tmux"]).authorized)
 
+
+
+OWNER = ("swackhamer", 619624)
+
+
+def _user_payload(login: str, uid: int, kind: str = "User") -> dict:
+    return {"login": login, "id": uid, "type": kind}
+
+
+class AddedAdminAuthTests(unittest.TestCase):
+    """Added administrators (Admins page): sign-in by numeric ID, per-request membership, owner fallback."""
+
+    def manager(self, fake, **kwargs):
+        kwargs.setdefault("global_admins", [OWNER])
+        return make_manager(fake, **kwargs)
+
+    def test_added_admin_signs_in_and_skips_target_checks(self):
+        fake = FakeGitHub()
+        fake.add_user("tok", "alice", 4242)
+        fake.set_repo("tok", "swack-tools/oxidex", admin=False)
+        mgr = self.manager(fake)
+        self.assertFalse(mgr.authorize("tok", ["swack-tools/oxidex"]).authorized)  # not listed
+        self.assertFalse(mgr.authorize("tok", ["swack-tools/oxidex"], added_admins=None).authorized)
+        decision = mgr.authorize("tok", ["swack-tools/oxidex"], added_admins=[4242])
+        self.assertTrue(decision.authorized, decision.message)
+        self.assertEqual((decision.user_login, decision.user_id, decision.verified_targets), ("alice", 4242, []))
+        session = mgr.issue_session(decision)
+        self.assertEqual(mgr.check_session(session, ["swack-tools/oxidex"], {4242}).status, "ok")
+        self.assertEqual(mgr.verify_session_cookie_value(session, {4242}), (True, "alice"))
+
+    def test_removed_admin_session_is_rejected_on_the_next_check(self):
+        fake = FakeGitHub()
+        fake.add_user("tok", "alice", 4242)
+        mgr = self.manager(fake)
+        session = mgr.issue_session(mgr.authorize("tok", [], added_admins={4242}))
+        self.assertEqual(mgr.check_session(session, [], {4242}).status, "ok")
+        for current in (frozenset(), None, [1, 2], "4242"):
+            with self.subTest(current=current):
+                check = mgr.check_session(session, [], current)
+                self.assertEqual(check.status, "forbidden")
+                self.assertIn("not an authorized administrator", check.message)
+        self.assertEqual(mgr.verify_session_cookie_value(session), (False, ""))
+
+    def test_uid_match_survives_a_rename_and_a_recycled_login_gets_nothing(self):
+        fake = FakeGitHub()
+        fake.add_user("renamed", "alice-renamed", 4242)  # same account, new login
+        fake.add_user("recycled", "alice", 9999)  # someone else took the old login
+        mgr = self.manager(fake)
+        renamed = mgr.authorize("renamed", [], added_admins={4242})
+        self.assertTrue(renamed.authorized, renamed.message)
+        self.assertEqual(renamed.user_login, "alice-renamed")
+        recycled = mgr.authorize("recycled", [], added_admins={4242})
+        self.assertFalse(recycled.authorized)
+        # An older session issued under the previous login still matches by ID.
+        old = mgr.create_session_cookie_value("alice", 3600, user_id=4242)
+        self.assertEqual(mgr.check_session(old, [], {4242}).status, "ok")
+        self.assertEqual(mgr.check_session(mgr.create_session_cookie_value("alice", 3600, user_id=9999), [], {4242}).status,
+                         "forbidden")
+
+    def test_owner_is_unaffected_and_owner_id_never_works_as_an_added_id(self):
+        fake = FakeGitHub()
+        fake.add_user("tok-owner", "Swackhamer", ADMIN_ID)
+        mgr = self.manager(fake)
+        decision = mgr.authorize("tok-owner", [], added_admins=frozenset())
+        self.assertTrue(decision.authorized)
+        self.assertEqual(decision.user_login, "swackhamer")  # canonical owner login
+        forged = mgr.create_session_cookie_value("eve", 3600, user_id=ADMIN_ID)
+        self.assertEqual(mgr.check_session(forged, [], {ADMIN_ID}).status, "forbidden")
+        self.assertEqual(dashboard_auth.normalize_added_admin_uids([ADMIN_ID, 5, 0, -1, True, "7", 5.0]),
+                         frozenset({5}))
+        self.assertTrue(mgr.is_owner("SWACKHAMER", ADMIN_ID))
+        self.assertFalse(mgr.is_owner("swackhamer", 4242))
+        self.assertFalse(mgr.is_owner("alice", ADMIN_ID))
+
+    def test_global_admins_none_holds_added_admins_to_target_checks(self):
+        fake = FakeGitHub()
+        fake.add_user("tok", "alice", 4242)
+        fake.set_repo("tok", "swack-tools/oxidex", admin=False)
+        strict = self.manager(fake, global_admins=[])
+        self.assertFalse(strict.authorize("tok", ["swack-tools/oxidex"], added_admins={4242}).authorized)
+        fake.set_repo("tok", "swack-tools/oxidex", admin=True)
+        decision = strict.authorize("tok", ["swack-tools/oxidex"], added_admins={4242})
+        self.assertTrue(decision.authorized, decision.message)
+        self.assertEqual(decision.verified_targets, ["swack-tools/oxidex"])
+        session = strict.issue_session(decision)
+        self.assertEqual(strict.check_session(session, ["swack-tools/oxidex"], {4242}).status, "ok")
+        self.assertEqual(strict.check_session(session, ["swack-tools/oxidex", "swack-tools/other"], {4242}).status,
+                         "forbidden")
+
+    def test_lookup_user(self):
+        fake = FakeGitHub()
+        fake.resources[("tok", "/users/alice")] = (200, _user_payload("Alice", 4242))
+        fake.resources[("tok", "/users/acme")] = (200, _user_payload("acme", 77, "Organization"))
+        fake.resources[("tok", "/users/robot")] = (200, _user_payload("robot", 78, "Bot"))
+        fake.resources[("tok", "/users/broken")] = (500, {"message": "boom"})
+        fake.resources[("tok", "/users/limited")] = (403, {"message": "rate limited"})
+        fake.resources[("tok", "/users/weird")] = (200, {"login": "weird", "id": "1", "type": "User"})
+        fake.resources[("tok", "/users/other")] = (200, _user_payload("someone-else", 5))
+        fake.resources[("", "/users/anon")] = (200, _user_payload("anon", 6))
+        mgr = make_manager(fake)
+        self.assertEqual(mgr.lookup_user("@alice ", "tok"), {"login": "Alice", "uid": 4242, "type": "User"})
+        self.assertEqual(fake.calls[-1]["headers"].get("Authorization"), "Bearer tok")
+        self.assertEqual(mgr.lookup_user("anon")["uid"], 6)
+        self.assertNotIn("Authorization", fake.calls[-1]["headers"])
+        fake.resources[("tok", "/users/old--name-")] = (200, _user_payload("old--name-", 8))  # legacy login
+        self.assertEqual(mgr.lookup_user("old--name-", "tok")["uid"], 8)
+        for login, status, retryable in (("nobody", 404, False), ("acme", 400, False), ("robot", 400, False),
+                                         ("broken", 424, True), ("limited", 424, True), ("weird", 424, True),
+                                         ("other", 424, False)):
+            with self.subTest(login=login), self.assertRaises(dashboard_auth.GitHubUserLookupError) as ctx:
+                mgr.lookup_user(login, "tok")
+            self.assertEqual((ctx.exception.status, ctx.exception.retryable), (status, retryable))
+        calls = len(fake.calls)
+        for bad in ("", "-x", "@", "@@x", "a b", "a/b", "a.b", "x" * 40, None, 42, "../user", "x\ny"):
+            with self.subTest(bad=bad), self.assertRaises(dashboard_auth.GitHubUserLookupError) as ctx:
+                mgr.lookup_user(bad, "tok")
+            self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(len(fake.calls), calls)  # invalid logins never reach GitHub
+        fake.raise_on_api = True
+        with self.assertRaises(dashboard_auth.GitHubUserLookupError) as ctx:
+            mgr.lookup_user("alice", "tok")
+        self.assertEqual((ctx.exception.status, ctx.exception.retryable), (424, True))
+
+
+class AdminStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "state.json"
+
+    def store(self):
+        store = DashboardStore(state_path=self.path)
+        store.hydrate()
+        return store
+
+    def test_add_remove_persist_and_history(self):
+        store = self.store()
+        with self.assertLogs("spot_dashboard.auth", "INFO") as logs:
+            record = store.add_dashboard_admin("alice", 4242, actor="swackhamer", actor_uid=ADMIN_ID)
+        self.assertEqual({k: record[k] for k in ("login", "uid", "added_by", "added_by_uid")},
+                         {"login": "alice", "uid": 4242, "added_by": "swackhamer", "added_by_uid": ADMIN_ID})
+        self.assertRegex(record["added_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertIn("dashboard admin added login=alice uid=4242 by=swackhamer by_uid=619624", logs.output[0])
+        reopened = self.store()  # survives a restart from the local state file
+        self.assertEqual(reopened.dashboard_admin_uids(), frozenset({4242}))
+        with self.assertRaises(dashboard_server_module().DashboardAdminError) as ctx:
+            reopened.add_dashboard_admin("alice-renamed", 4242, actor="swackhamer", actor_uid=ADMIN_ID)
+        self.assertEqual(ctx.exception.status, 409)
+        with self.assertRaises(dashboard_server_module().DashboardAdminError) as ctx:
+            reopened.add_dashboard_admin("swackhamer", ADMIN_ID, actor="swackhamer", actor_uid=ADMIN_ID)
+        self.assertEqual(ctx.exception.status, 409)
+        with self.assertLogs("spot_dashboard.auth", "INFO") as logs:
+            reopened.remove_dashboard_admin(4242, actor="swackhamer", actor_uid=ADMIN_ID)
+        self.assertIn("dashboard admin removed login=alice uid=4242", logs.output[0])
+        self.assertEqual(self.store().dashboard_admin_uids(), frozenset())
+        history = self.store().get_dashboard_admins_history()
+        self.assertEqual([(h["action"], h["login"], h["uid"], h["actor"]) for h in history],
+                         [("added", "alice", 4242, "swackhamer"), ("removed", "alice", 4242, "swackhamer")])
+        for uid, status in ((4242, 404), (ADMIN_ID, 400), (0, 400), (True, 400), ("4242", 400)):
+            with self.subTest(uid=uid), self.assertRaises(dashboard_server_module().DashboardAdminError) as ctx:
+                reopened.remove_dashboard_admin(uid, actor="swackhamer", actor_uid=ADMIN_ID)
+            self.assertEqual(ctx.exception.status, status)
+
+    def test_cap_on_added_admins(self):
+        store = self.store()
+        for i in range(dashboard_auth.MAX_ADDED_ADMINS):
+            store.add_dashboard_admin(f"user{i}", 10_000 + i, actor="swackhamer", actor_uid=ADMIN_ID)
+        with self.assertRaises(dashboard_server_module().DashboardAdminError) as ctx:
+            store.add_dashboard_admin("onemore", 99_999, actor="swackhamer", actor_uid=ADMIN_ID)
+        self.assertEqual(ctx.exception.status, 409)
+
+    def test_malformed_stored_entries_never_grant_access(self):
+        self.path.write_text(json.dumps({"state_version": 3, "dashboard_admins": [
+            {"login": "bad login", "uid": 5}, {"login": "x", "uid": True}, {"login": "y", "uid": "6"},
+            {"login": "eve", "uid": ADMIN_ID}, "alice", {"login": "ok-user", "uid": 7}, {"login": "dup", "uid": 7},
+        ]}), encoding="utf-8")
+        store = self.store()
+        self.assertEqual(store.dashboard_admin_uids(), frozenset({7}))
+        self.assertEqual([a["login"] for a in store.get_dashboard_admins()], ["ok-user"])
+
+    def test_wrong_type_is_an_unreadable_state_file(self):
+        self.path.write_text(json.dumps({"state_version": 3, "dashboard_admins": {"uid": 7}}), encoding="utf-8")
+        with self.assertLogs("spot_dashboard", "ERROR"):
+            store = DashboardStore(state_path=self.path)
+        self.assertTrue(store.recovery_pending)
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+
+    def test_unavailable_state_falls_back_to_owners_only(self):
+        store = self.store()
+        store.add_dashboard_admin("alice", 4242, actor="swackhamer", actor_uid=ADMIN_ID)
+        fake = FakeGitHub()
+        fake.add_user("tok-alice", "alice", 4242)
+        fake.add_user("tok-owner", "swackhamer", ADMIN_ID)
+        mgr = make_manager(fake, global_admins=[OWNER])
+        self.assertTrue(mgr.authorize("tok-alice", [], added_admins=store.dashboard_admin_uids()).authorized)
+        store.controlled_targets_error = "simulated unreadable state"
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+        self.assertEqual(store.get_dashboard_admins(), [])
+        self.assertFalse(mgr.authorize("tok-alice", [], added_admins=store.dashboard_admin_uids()).authorized)
+        self.assertTrue(mgr.authorize("tok-owner", [], added_admins=store.dashboard_admin_uids()).authorized)
+        with self.assertRaises(dashboard_server_module().ControlledTargetsUnavailableError):
+            store.add_dashboard_admin("bob", 5, actor="swackhamer", actor_uid=ADMIN_ID)
+        store.controlled_targets_error = ""
+        store.recovery_pending = True
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+
+    def test_frozen_store_refuses_changes(self):
+        store = self.store()
+        store.frozen = True
+        with self.assertRaises(DashboardFrozenError):
+            store.add_dashboard_admin("alice", 4242, actor="swackhamer", actor_uid=ADMIN_ID)
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+
+
+def dashboard_server_module():
+    from lib import dashboard_server
+    return dashboard_server
+
+
+class AdminsApiTests(unittest.TestCase):
+    """HTTP: /api/admins is owner-only; added administrators sign in and lose access as soon as they're removed."""
+
+    LOOKUP_TOKEN = "lookup-token"
+
+    setUp = OAuthServerIntegrationTests.setUp
+    config_lister = OAuthServerIntegrationTests.config_lister
+    request = OAuthServerIntegrationTests.request
+    cookie_pair = staticmethod(OAuthServerIntegrationTests.cookie_pair)
+    complete_device = OAuthServerIntegrationTests.complete_device
+    device_login = OAuthServerIntegrationTests.device_login
+    login_cookie = OAuthServerIntegrationTests.login_cookie
+
+    def start(self, *, controlled_targets=None, global_admins=(OWNER,), auth_token=None):
+        self.fake.add_user("tok-alice", "alice", 4242)
+        self.fake.add_user("tok-bob", "bob", 5151)
+        self.fake.resources[(self.LOOKUP_TOKEN, "/users/alice")] = (200, _user_payload("alice", 4242))
+        self.fake.resources[(self.LOOKUP_TOKEN, "/users/bob")] = (200, _user_payload("bob", 5151))
+        self.fake.resources[(self.LOOKUP_TOKEN, "/users/acme")] = (200, _user_payload("acme", 77, "Organization"))
+        self.mgr = GitHubOAuthManager(CLIENT_ID, "web-secret", None, SECRET, http_requester=self.fake,
+                                      device_flow=True, clock=self.clock, global_admins=list(global_admins))
+        self.provider = ConfigRepoTargets(lister=self.config_lister, ttl_seconds=0)
+        server, store = create_dashboard_server(
+            host="127.0.0.1", port=0, state_path=Path(self.tmp.name) / "state.json", auth_token=auth_token,
+            oauth_manager=self.mgr, controlled_targets=controlled_targets, config_targets_provider=self.provider,
+            github_token_provider=lambda: self.LOOKUP_TOKEN,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(stop)
+        self.port = server.server_address[1]
+        self.store = store
+        return store
+
+    def post(self, path, body, *, cookie, key="admin-key-0001", headers=None):
+        hdrs = {"Cookie": cookie, **({"Idempotency-Key": key} if key else {}), **(headers or {})}
+        status, msg, raw = self.request("POST", path, headers=hdrs, body=body)
+        return status, msg, json.loads(raw or b"{}")
+
+    def get(self, path, cookie):
+        status, _, raw = self.request("GET", path, headers={"Cookie": cookie})
+        return status, json.loads(raw or b"{}")
+
+    def lookups(self):
+        return [p for p in self.fake.api_paths() if p.startswith("/users/")]
+
+    def add_alice(self, owner):
+        status, _, body = self.post("/api/admins/add", {"login": "alice", "confirm": True}, cookie=owner,
+                                    key="add-alice-0001")
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_owner_lists_adds_and_removes(self):
+        self.start()
+        owner = self.login_cookie("tok-admin")
+        status, body = self.get("/api/admins", owner)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["owners"], [{"login": "swackhamer", "uid": ADMIN_ID, "global_admin": True}])
+        self.assertEqual((body["admins"], body["added_admins_exempt"]), ([], True))
+        self.assertTrue(self.get("/api/auth/status", owner)[1]["owner"])
+        with self.assertLogs("spot_dashboard.auth", "INFO") as logs:
+            body = self.add_alice(owner)
+        self.assertTrue(any("dashboard admin added login=alice uid=4242 by=swackhamer" in line for line in logs.output))
+        self.assertEqual(body["status"], "added")
+        self.assertEqual({k: body["admin"][k] for k in ("login", "uid", "added_by", "added_by_uid")},
+                         {"login": "alice", "uid": 4242, "added_by": "swackhamer", "added_by_uid": ADMIN_ID})
+        self.assertEqual([a["uid"] for a in body["admins"]], [4242])
+        self.assertEqual(self.fake.calls[-1]["headers"]["Authorization"], f"Bearer {self.LOOKUP_TOKEN}")
+        self.assertEqual(self.store.dashboard_admin_uids(), frozenset({4242}))
+        status, _, body = self.post("/api/admins/remove", {"uid": 4242, "confirm": True}, cookie=owner,
+                                    key="remove-alice-0001")
+        self.assertEqual((status, body["status"], body["admin"]), (200, "removed", {"login": "alice", "uid": 4242}))
+        self.assertEqual(self.get("/api/admins", owner)[1]["admins"], [])
+        history = self.get("/api/admins", owner)[1]["history"]
+        self.assertEqual([h["action"] for h in history], ["added", "removed"])
+
+    def test_added_admin_signs_in_without_target_admin_and_loses_access_on_removal(self):
+        self.start(controlled_targets=["swack-tools/oxidex"])
+        self.fake.set_repo("tok-alice", "swack-tools/oxidex", admin=False)
+        status, _, raw = self.device_login("tok-alice")
+        self.assertEqual(status, 403, raw)  # not listed yet
+        owner = self.login_cookie("tok-admin")
+        self.add_alice(owner)
+        alice = self.login_cookie("tok-alice")
+        self.assertEqual(self.get("/api/overview", alice)[0], 200)
+        status, info = self.get("/api/auth/status", alice)
+        self.assertEqual((info["authenticated"], info["user"], info["owner"]), (True, "alice", False))
+        status, _, body = self.post("/api/admins/remove", {"uid": 4242, "confirm": True}, cookie=owner,
+                                    key="remove-alice-0001")
+        self.assertEqual(status, 200, body)
+        # The very next request with the old cookie is refused: membership is checked on every request.
+        status, body = self.get("/api/overview", alice)
+        self.assertEqual(status, 403)
+        self.assertIn("not an authorized administrator", body["error"])
+        status, _, raw = self.request("GET", "/", headers={"Cookie": alice})
+        self.assertEqual(status, 403)
+        self.assertIn("Spot Dashboard sign-in", raw.decode())
+        self.assertFalse(self.get("/api/auth/status", alice)[1]["authenticated"])
+        status, _, raw = self.device_login("tok-alice")
+        self.assertEqual(status, 403, raw)
+        self.assertEqual(self.get("/api/overview", owner)[0], 200)  # the owner is unaffected
+
+    def test_non_owners_get_403(self):
+        self.start(auth_token="legacy-dashboard-token-123")
+        owner = self.login_cookie("tok-admin")
+        self.add_alice(owner)
+        alice = self.login_cookie("tok-alice")
+        status, body = self.get("/api/admins", alice)
+        self.assertEqual((status, body.get("code")), (403, "owner_required"))
+        for path, payload in (("/api/admins/add", {"login": "bob", "confirm": True}),
+                              ("/api/admins/remove", {"uid": 4242, "confirm": True}),
+                              ("/api/admins/remove", {"uid": ADMIN_ID, "confirm": True})):
+            with self.subTest(path=path, payload=payload):
+                status, _, body = self.post(path, payload, cookie=alice, key="nonowner-key-01")
+                self.assertEqual((status, body.get("code")), (403, "owner_required"))
+        self.assertEqual(self.store.dashboard_admin_uids(), frozenset({4242}))
+        self.assertNotIn("/users/bob", self.lookups())
+        # The loopback operator token is not a GitHub owner session either.
+        status, _, raw = self.request("GET", "/api/admins",
+                                      headers={"Authorization": "Bearer legacy-dashboard-token-123"})
+        self.assertEqual(status, 403, raw)
+        status, _, raw = self.request("GET", "/api/admins")
+        self.assertEqual(status, 401, raw)
+
+    def test_csrf_idempotency_and_confirmation(self):
+        self.start()
+        owner = self.login_cookie("tok-admin")
+        add = {"login": "alice", "confirm": True}
+        status, _, body = self.post("/api/admins/add", add, cookie=owner, key=None)
+        self.assertEqual(status, 400)
+        self.assertIn("Idempotency-Key", body["error"])
+        status, _, body = self.post("/api/admins/add", add, cookie=owner, key="bad key!")
+        self.assertEqual(status, 400)
+        for missing in ({"login": "alice"}, {"login": "alice", "confirm": "yes"}, {"uid": 4242}):
+            path = "/api/admins/remove" if "uid" in missing else "/api/admins/add"
+            status, _, body = self.post(path, missing, cookie=owner, key="confirm-key-001")
+            self.assertEqual(status, 400, missing)
+            self.assertIn("confirm", body["error"])
+        status, _, body = self.post("/api/admins/add", add, cookie=owner, headers={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        status, _, body = self.post("/api/admins/add", add, cookie=owner, headers={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(status, 403)
+        status, _, _ = self.post("/api/admins/add", add, cookie=owner, headers={"Content-Type": "text/plain"})
+        self.assertEqual(status, 415)
+        self.assertEqual(self.lookups(), [])
+        self.assertEqual(self.store.dashboard_admin_uids(), frozenset())
+        # Lost response: the same key replays the stored result without a second GitHub lookup or change.
+        status, _, first = self.post("/api/admins/add", add, cookie=owner, key="add-alice-0001")
+        self.assertEqual(status, 200, first)
+        status, msg, again = self.post("/api/admins/add", add, cookie=owner, key="add-alice-0001")
+        self.assertEqual((status, msg.get("Idempotent-Replay")), (200, "true"))
+        self.assertEqual(again["admin"], first["admin"])
+        self.assertEqual(self.lookups(), ["/users/alice"])
+        status, _, body = self.post("/api/admins/add", {"login": "bob", "confirm": True}, cookie=owner,
+                                    key="add-alice-0001")
+        self.assertEqual(status, 422, body)
+        self.assertEqual(self.lookups(), ["/users/alice"])
+        # A new key for the same user is a duplicate.
+        status, _, body = self.post("/api/admins/add", {"login": "@alice", "confirm": True}, cookie=owner,
+                                    key="add-alice-0002")
+        self.assertEqual(status, 409, body)
+        self.assertEqual(self.store.dashboard_admin_uids(), frozenset({4242}))
+
+    def test_validation_and_github_failures(self):
+        self.start()
+        owner = self.login_cookie("tok-admin")
+        for bad in ("", "a b", "-x", "x" * 40, "../etc", 7, None):
+            status, _, body = self.post("/api/admins/add", {"login": bad, "confirm": True}, cookie=owner,
+                                        key="bad-login-0001")
+            self.assertEqual(status, 400, (bad, body))
+        self.assertEqual(self.lookups(), [])
+        status, _, body = self.post("/api/admins/add", {"login": "nobody", "confirm": True}, cookie=owner,
+                                    key="nobody-key-0001")
+        self.assertEqual(status, 404, body)
+        status, _, body = self.post("/api/admins/add", {"login": "acme", "confirm": True}, cookie=owner,
+                                    key="acme-key-00001")
+        self.assertEqual(status, 400, body)
+        self.assertIn("not a user", body["error"])
+        status, _, body = self.post("/api/admins/add", {"login": "swackhamer", "confirm": True}, cookie=owner,
+                                    key="owner-key-0001")
+        self.assertEqual(status, 404, body)  # FakeGitHub has no /users/swackhamer
+        self.fake.resources[(self.LOOKUP_TOKEN, "/users/swackhamer")] = (200, _user_payload("swackhamer", ADMIN_ID))
+        status, _, body = self.post("/api/admins/add", {"login": "swackhamer", "confirm": True}, cookie=owner,
+                                    key="owner-key-0002")
+        self.assertEqual(status, 409, body)
+        # GitHub outage: 424 with retry_same_key, nothing stored; the same key succeeds once GitHub answers.
+        self.fake.raise_on_api = True
+        status, _, body = self.post("/api/admins/add", {"login": "bob", "confirm": True}, cookie=owner,
+                                    key="bob-key-000001")
+        self.assertEqual((status, body.get("code"), body.get("retry_same_key")), (424, "upstream_error", True))
+        self.fake.raise_on_api = False
+        self.fake.resources[(self.LOOKUP_TOKEN, "/users/bob")] = (502, {"message": "bad gateway"})
+        status, msg, body = self.post("/api/admins/add", {"login": "bob", "confirm": True}, cookie=owner,
+                                      key="bob-key-000001")
+        self.assertEqual((status, body.get("retry_same_key")), (424, True))
+        self.assertEqual(msg.get("X-Spot-Origin"), "dashboard")
+        self.assertEqual(self.store.dashboard_admin_uids(), frozenset())
+        self.fake.resources[(self.LOOKUP_TOKEN, "/users/bob")] = (200, _user_payload("bob", 5151))
+        status, msg, body = self.post("/api/admins/add", {"login": "bob", "confirm": True}, cookie=owner,
+                                      key="bob-key-000001")
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(msg.get("Idempotent-Replay"))
+        for uid in (0, -1, True, "5151", None, 1.5):
+            status, _, body = self.post("/api/admins/remove", {"uid": uid, "confirm": True}, cookie=owner,
+                                        key="bad-uid-00001")
+            self.assertEqual(status, 400, (uid, body))
+        status, _, body = self.post("/api/admins/remove", {"uid": 999, "confirm": True}, cookie=owner,
+                                    key="missing-uid-01")
+        self.assertEqual(status, 404, body)
+        status, _, body = self.post("/api/admins/remove", {"uid": ADMIN_ID, "confirm": True}, cookie=owner,
+                                    key="owner-remove-1")
+        self.assertEqual(status, 400, body)
+        self.assertIn("can't be removed", body["error"])
+
+    def test_frozen_dashboard_answers_the_wait_response(self):
+        self.start()
+        owner = self.login_cookie("tok-admin")
+        self.store.frozen = True
+        status, _, body = self.post("/api/admins/add", {"login": "alice", "confirm": True}, cookie=owner)
+        self.assertEqual((status, body.get("error")), (503, "control_vm_unavailable"))
+        self.assertEqual(self.store.dashboard_admin_uids(), frozenset())
+
+    def test_unreadable_admin_list_means_owners_only(self):
+        self.start()
+        owner = self.login_cookie("tok-admin")
+        self.add_alice(owner)
+        alice = self.login_cookie("tok-alice")
+        with mock.patch.object(self.store, "dashboard_admin_uids", side_effect=RuntimeError("boom")), \
+                self.assertLogs("spot_dashboard", "ERROR"):
+            self.assertEqual(self.get("/api/overview", alice)[0], 403)
+            self.assertEqual(self.get("/api/overview", owner)[0], 200)
+        self.assertEqual(self.get("/api/overview", alice)[0], 200)
+
+    def test_global_admins_none_requires_target_admin_for_added_admins(self):
+        self.start(controlled_targets=["swack-tools/oxidex"], global_admins=())
+        self.fake.set_repo("tok-admin", "swack-tools/oxidex", admin=True)
+        self.fake.set_repo("tok-alice", "swack-tools/oxidex", admin=False)
+        owner = self.login_cookie("tok-admin")
+        body = self.add_alice(owner)
+        self.assertFalse(body["added_admins_exempt"])
+        self.assertFalse(self.get("/api/admins", owner)[1]["owners"][0]["global_admin"])
+        status, _, raw = self.device_login("tok-alice")
+        self.assertEqual(status, 403, raw)
+        self.assertIn("swack-tools/oxidex", json.loads(raw)["missing_targets"])
+        self.fake.set_repo("tok-alice", "swack-tools/oxidex", admin=True)
+        alice = self.login_cookie("tok-alice")
+        self.assertEqual(self.get("/api/overview", alice)[0], 200)
+
+    def test_admins_page_markup_is_owner_gated(self):
+        from lib.dashboard_ui_assets import render_dashboard_html
+        page = render_dashboard_html()
+        self.assertRegex(page, r'<button class="tab-btn" data-tab="tab-admins" id="tab-btn-admins"[^>]*\bhidden>')
+        self.assertRegex(page, r'<section id="tab-admins" class="tab-pane" hidden>')
+        self.assertIn("[hidden] { display: none !important; }", page)
+        self.assertIn('S.owner = Boolean(d && d.owner === true);', page)
+        self.assertIn('"/api/admins/add", { login, confirm: true }', page)
+        self.assertIn('"/api/admins/remove", { uid: admin.uid, confirm: true }', page)
+        self.assertIn('"Idempotency-Key": S.pending.key', page)
+        admins_js = page[page.index("const DashboardAdmins"):page.index("window.DashboardAdmins")]
+        self.assertNotIn("innerHTML", admins_js)
+        self.assertEqual(admins_js.count("window.confirm("), 2)
+
+
+
+_ADMINS_PANEL_HARNESS = r"""
+const [script, cfg] = [process.argv[1], JSON.parse(process.argv[2])];
+const els = {};
+function mk(tag) {
+  return {tag, hidden: false, disabled: false, value: "", textContent: "", children: [], listeners: {}, className: "",
+    type: "", colSpan: 1, appendChild(c) { this.children.push(c); return c; },
+    removeChild(c) { this.children = this.children.filter(x => x !== c); },
+    get firstChild() { return this.children[0] || null; },
+    addEventListener(t, fn) { this.listeners[t] = fn; }};
+}
+["adm-owners", "adm-admins", "adm-history", "adm-status", "adm-exempt", "adm-login", "adm-add", "adm-add-form",
+ "adm-refresh", "badge-admins", "tab-btn-admins", "tab-admins"].forEach(id => { els[id] = mk("x"); });
+els["tab-btn-admins"].hidden = true; els["tab-admins"].hidden = true;
+global.document = {getElementById: id => els[id] || null, createElement: tag => mk(tag)};
+const out = {calls: [], confirms: 0};
+global.window = {confirm: () => { out.confirms += 1; return cfg.confirm !== false; }};
+let keys = 0;
+global.newIdempotencyKey = () => `key-${++keys}`;
+global.formatLocalTime = v => String(v);
+const listing = {owners: [{login: "swackhamer", uid: 619624, global_admin: true}], admins: [], history: [],
+  added_admins_exempt: true};
+let adds = 0;
+global.fetch = async (url, init = {}) => {
+  out.calls.push({url, method: init.method || "GET", body: init.body ? JSON.parse(init.body) : null,
+    key: init.headers ? init.headers["Idempotency-Key"] || null : null});
+  const reply = (status, body) => ({ok: status < 400, status, json: async () => body});
+  if (url === "/api/auth/status") return reply(200, {authenticated: true, owner: cfg.owner});
+  if (url === "/api/admins") return cfg.owner ? reply(200, listing) : reply(403, {error: "owner only"});
+  if (url === "/api/admins/add") {
+    adds += 1;
+    if (adds <= (cfg.add_failures || 0)) return reply(424, {error: "GitHub down", retry_same_key: true});
+    return reply(200, {...listing, status: "added", admin: {login: "alice", uid: 4242},
+      admins: [{login: "alice", uid: 4242, added_by: "swackhamer", added_at: "2026-10-01T00:00:00Z"}]});
+  }
+  return reply(404, {});
+};
+new Function(script + "; globalThis.DashboardAdmins = DashboardAdmins;")();
+(async () => {
+  await DashboardAdmins.init();
+  out.tab_hidden = els["tab-btn-admins"].hidden; out.pane_hidden = els["tab-admins"].hidden;
+  for (const login of cfg.adds || []) {
+    els["adm-login"].value = login;
+    await els["adm-add-form"].listeners.submit({preventDefault() {}});
+  }
+  out.status = els["adm-status"].textContent;
+  out.rows = els["adm-admins"].children.length;
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+
+class AdminsPanelScriptTests(unittest.TestCase):
+    def run_panel(self, cfg):
+        from lib.dashboard_ui_assets import render_dashboard_html
+        page = render_dashboard_html()
+        block = page[page.index("    const DashboardAdmins = (function () {"):page.index("    window.DashboardAdmins")]
+        return _run_node(_ADMINS_PANEL_HARNESS, block, cfg)
+
+    def test_tab_stays_hidden_for_non_owners(self):
+        out = self.run_panel({"owner": False})
+        self.assertEqual((out["tab_hidden"], out["pane_hidden"]), (True, True))
+        self.assertEqual([c["url"] for c in out["calls"]], ["/api/auth/status"])  # never asks for the list
+
+    def test_owner_adds_with_confirmation_and_reuses_the_key_for_a_retry(self):
+        out = self.run_panel({"owner": True, "adds": ["@alice", "alice"], "add_failures": 1})
+        self.assertEqual((out["tab_hidden"], out["pane_hidden"]), (False, False))
+        posts = [c for c in out["calls"] if c["method"] == "POST"]
+        self.assertEqual([p["body"] for p in posts], [{"login": "alice", "confirm": True}] * 2)
+        self.assertEqual(posts[0]["key"], posts[1]["key"])  # same change after retry_same_key: same key
+        self.assertEqual(out["confirms"], 2)
+        self.assertIn("Added alice", out["status"])
+        self.assertEqual(out["rows"], 1)
+
+    def test_declined_confirmation_and_bad_login_send_nothing(self):
+        out = self.run_panel({"owner": True, "adds": ["alice"], "confirm": False})
+        self.assertEqual([c for c in out["calls"] if c["method"] == "POST"], [])
+        out = self.run_panel({"owner": True, "adds": ["bad login", "-x", ""]})
+        self.assertEqual([c for c in out["calls"] if c["method"] == "POST"], [])
+        self.assertEqual(out["confirms"], 0)
+
+if __name__ == "__main__":
+    unittest.main()

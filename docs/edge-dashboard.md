@@ -1,14 +1,15 @@
 # Edge dashboard on a spot control VM
 
 The web dashboard runs on one small Spot VM, the control VM, behind a Cloudflare Worker at
-`https://spot.swacktech.com`. Only GitHub user `swackhamer` can sign in. It must administer every
-controlled repository unless it's a configured global administrator, which it is by default.
+`https://spot.swacktech.com`. The owner, GitHub user `swackhamer`, can sign in, and so can the
+administrators that the owner adds on the **Admins** page. Each of them must administer every
+controlled repository unless global administrators are enabled, which they are by default.
 
 ## Architecture
 
 | Component | Location | Role |
 | --- | --- | --- |
-| Cloudflare Worker | `cloudflare/worker.js` | Verifies the session cookie, proxies to the active control VM, and returns a wait response while the control VM is down. |
+| Cloudflare Worker | `cloudflare/worker.js` | Verifies the session cookie's signature and expiry, proxies to the active control VM, and returns a wait response while the control VM is down. |
 | Workers KV | Binding `SPOT_KV` | `origin:active` names the active slot. `dashboard:state` holds the latest dashboard state snapshot. |
 | Control VM | `spot-control-a` or `spot-control-b` | Runs the dashboard container and a `cloudflared` tunnel. Created by `src/control_vm.py`. |
 | Tunnel hostnames | `spot-origin-a.swacktech.com`, `spot-origin-b.swacktech.com` | One Cloudflare Tunnel per slot, protected by a Cloudflare Access service token. |
@@ -22,14 +23,18 @@ The dashboard listens only on `127.0.0.1:8787`. The control VM has no inbound fi
 The dashboard uses a GitHub OAuth 2.0 app with the authorization-code flow and PKCE. Sign-in succeeds only
 when all of these are true:
 
-- The GitHub login is `swackhamer` and the numeric user ID is `619624`.
+- The user is the owner, GitHub login `swackhamer` with numeric user ID `619624`, or an administrator
+  that the owner added. Added administrators are matched by numeric user ID only, so a renamed
+  account keeps access and a new account that takes an old login gets none. See
+  [Dashboard administrators](#dashboard-administrators).
 - The user is a global administrator, or has administrator permission on every controlled target.
   `DASHBOARD_GLOBAL_ADMINS` lists global administrators as `login:numeric_id` entries and defaults to
-  `swackhamer:619624`, which is also the only identity it may list, because only that account can sign in. A
-  global administrator skips the per-target checks, and those skipped checks are never recorded in its
-  session, so setting `none` takes effect for existing sessions too. On a managed control VM it travels
-  as the `dashboard-global-admins` metadata, like the other target policy settings. Set it to `none` to require
-  administrator permission on every target. Targets are the union of
+  `swackhamer:619624`, which is also the only identity it may list. While it lists the owner, added
+  administrators are global administrators too. A global administrator skips the per-target checks, and
+  those skipped checks are never recorded in its session, so setting `none` takes effect for existing
+  sessions too. On a managed control VM it travels as the `dashboard-global-admins` metadata, like the
+  other target policy settings. Set it to `none` to require administrator permission on every target from
+  everyone, added administrators included. Targets are the union of
   `DASHBOARD_CONTROLLED_TARGETS`, targets saved in the dashboard, and every `repos/<owner>/<repo>.yaml`
   file in the config repository. The config repository is `--config-repo`, then `SPOT_CONFIG_REPO`,
   then `<org>/spot-runners-config` with the organization from `--org` (default `swack-tools`).
@@ -40,8 +45,16 @@ every control VM share that secret, so sessions survive VM replacement. The `__H
 reject the cookie unless it is `Secure`, has `Path=/`, and has no `Domain`, so another `swacktech.com`
 subdomain can't set or shadow it. The sign-in `state` cookie is `__Host-spot_oauth_state`.
 
-A session can't be revoked on its own, and a lost GitHub administrator permission takes effect at the
-next sign-in. To sign everyone out, set a cut-off time that rejects every session issued before it:
+The Worker only authenticates the cookie: it checks the signature, the expiry, the cut-off below, and
+that the payload holds a well-formed GitHub login and numeric ID. It doesn't decide who may sign in. The
+dashboard decides that on every request from its durable state, because the list of added
+administrators changes at run time. A copy at the edge would lag behind, since Workers KV is eventually
+consistent. Only the dashboard mints sessions, and only after it authorized that identity.
+
+Removing an added administrator ends its sessions on their next request, because the dashboard checks
+membership on every request. Otherwise a session can't be revoked on its own, and a lost GitHub
+administrator permission takes effect at the next sign-in. To sign everyone out, set a cut-off time that
+rejects every session issued before it:
 
 1. Choose the cut-off, for example `NOW="$(date +%s)"`. It can't be in the future.
 2. Set `SESSION_NOT_BEFORE = "<NOW>"` in `cloudflare/wrangler.toml` and deploy the Worker.
@@ -69,6 +82,37 @@ dashboard's `MAX_JSON_BODY_BYTES`. A `Content-Length` over the cap gets HTTP 413
 A body without a length, such as a chunked upload, is counted as it streams and cut off with HTTP 413
 past the cap. A malformed `Content-Length` gets HTTP 400. The Worker forwards the body it read
 unchanged, so a retry with the same `Idempotency-Key` sends the same bytes.
+
+### Dashboard administrators
+
+The **Admins** tab appears only for the owner, and `/api/admins` answers HTTP 403 with
+`"code": "owner_required"` to everyone else. That includes added administrators and the local
+dashboard token. The tab lists the owners, which are read-only, and the added administrators, each with a
+**Remove** button.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/admins` | Lists the owners, the added administrators, and the last 20 changes. |
+| `POST /api/admins/add` | Adds `{"login": "<github username>", "confirm": true}`. Needs an `Idempotency-Key`. |
+| `POST /api/admins/remove` | Removes `{"uid": <numeric user ID>, "confirm": true}`. Needs an `Idempotency-Key`. |
+
+- Owners are set at deploy time and can't be added or removed here. At most 50 administrators can be
+  added.
+- Adding a user looks up the login with `GET https://api.github.com/users/<login>`, using
+  `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` when set. The dashboard stores the login, the numeric user ID,
+  who added it, and when. It refuses an invalid login and an account that isn't a user, such as an
+  organization, with HTTP 400. An unknown login gets HTTP 404, and a user who is already an owner or an
+  administrator gets HTTP 409.
+- When GitHub fails, the add answers HTTP 424 with `"retry_same_key": true` and changes nothing, so the
+  browser retries with the same key.
+- A retry with the same `Idempotency-Key` replays the stored answer without a second lookup. The same
+  key with a different body gets HTTP 422.
+- Every change is logged to the `spot_dashboard.auth` audit log and kept in a history of the last 50
+  changes.
+- The list lives in dashboard state, so it's part of every KV snapshot, freeze, and import, and it
+  survives a control VM cutover. Like every change, it gets the wait response while the dashboard is
+  frozen, unhydrated, or not the active slot.
+- If the state can't be read, only owners can sign in.
 
 ### Controlled target changes
 

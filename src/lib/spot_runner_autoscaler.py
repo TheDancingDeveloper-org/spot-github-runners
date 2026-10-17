@@ -2994,7 +2994,7 @@ def args_parser() -> argparse.ArgumentParser:
                         help="Execute zero-downtime make-before-break rotation on price spikes")
     parser.add_argument("--github-user",help="Select an existing gh account without persisting its credential")
     parser.add_argument("--project", default="homelab-424523")
-    parser.add_argument("--minimum-runners", type=int, default=25)
+    parser.add_argument("--minimum-runners", type=int, default=1)
     parser.add_argument("--label", default="spot")
     parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("10"),
                         help='Maximum daily compute plus boot/data storage cost per VM')

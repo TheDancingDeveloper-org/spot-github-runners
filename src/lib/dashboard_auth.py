@@ -4,9 +4,11 @@ This module is standard-library only. It provides:
 
 * GitHub OAuth 2.0 Authorization Code flow with PKCE (S256), enabled when a client secret is configured.
 * GitHub OAuth 2.0 Device Flow (RFC 8628), disabled unless ``GITHUB_OAUTH_DEVICE_FLOW=1``.
-* Fail-closed authorization: the GitHub identity must be exactly login ``swackhamer`` with numeric
-  ID 619624 (hardcoded; there is no override) AND, for every configured controlled target, the user
-  must be an administrator
+* Fail-closed authorization: the GitHub identity must be the dashboard owner (login ``swackhamer`` with
+  numeric ID 619624, hardcoded; there is no override) or an administrator that the owner added on the
+  dashboard's Admins page (matched by numeric GitHub ID only, so a rename keeps access and a recycled
+  login never inherits it; the caller passes the current list on every check) AND, unless the identity
+  is a global administrator, the user must be an administrator of every configured controlled target
   (``GET /repos/{owner}/{repo}`` -> ``permissions.admin is True``; ``GET /user/memberships/orgs/{org}``
   -> ``state == "active"`` and ``role == "admin"``). Any API error denies access.
 * Stateless HMAC-SHA256 tokens for sessions and CSRF ``state`` values. The GitHub access token is
@@ -24,8 +26,11 @@ edge worker or a replacement VM)::
 ``<purpose>`` is ``session`` or ``oauth-state``. Session payloads are
 ``{"v": 1, "sub": login, "uid": github_id, "iat": epoch, "exp": epoch, "tgt": [verified target keys]}``
 and travel in the ``__Host-spot_session`` cookie. A session grants access only while
-``iat - 60 <= now < exp``, ``iat >= DASHBOARD_SESSION_NOT_BEFORE``, ``sub == "swackhamer"``,
-``uid == 619624``, and every currently configured controlled target key appears in ``tgt``.
+``iat - 60 <= now < exp``, ``iat >= DASHBOARD_SESSION_NOT_BEFORE``, the identity is the owner
+(``sub == "swackhamer"`` and ``uid == 619624``) or ``uid`` is in the added-administrator list passed to
+:meth:`GitHubOAuthManager.check_session` for THIS request (so removing an administrator rejects its
+existing sessions on their next request), and, unless the identity is a global administrator, every
+currently configured controlled target key appears in ``tgt``.
 
 A pending controlled-target change travels inside the signed ``state`` (web flow) or the server-side
 device handshake, never in the session. It commits only after a fresh, uncached GitHub check.
@@ -64,10 +69,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# The only identity allowed to sign in. Hardcoded on purpose: there is no environment or CLI override.
+# The dashboard owner. Hardcoded on purpose: there is no environment or CLI override. The owner can always
+# sign in (subject to the per-target policy) and is the only identity that may change the list of added
+# administrators. Added administrators live in dashboard state and are matched by numeric ID only.
 ALLOWED_ADMIN_LOGIN = "swackhamer"
 ALLOWED_ADMIN_ID = 619624
 DEFAULT_ALLOWED_ADMINS: frozenset[str] = frozenset({ALLOWED_ADMIN_LOGIN})
+OWNER_IDENTITIES: frozenset[tuple[str, int]] = frozenset({(ALLOWED_ADMIN_LOGIN, ALLOWED_ADMIN_ID)})
+MAX_ADDED_ADMINS = 50
 
 ENV_CLIENT_ID = "GITHUB_OAUTH_CLIENT_ID"
 ENV_CLIENT_SECRET = "GITHUB_OAUTH_CLIENT_SECRET"
@@ -137,16 +146,43 @@ HttpRequester = Callable[..., "tuple[int, bytes]"]
 AUDIT_LOG = logging.getLogger("spot_dashboard.auth")
 
 
+def _audit_login_field(login: Any) -> str:
+    return str(login or "-") if _LOGIN_RE.match(str(login or "")) else "-"
+
+
 def audit_login(login: str, uid: Any, result: str, detail: str = "") -> None:
     """Write one login audit line. Never pass tokens, codes, or secrets here."""
-    clean_login = str(login or "-") if _LOGIN_RE.match(str(login or "")) else "-"
+    clean_login = _audit_login_field(login)
     clean_uid = str(uid) if _is_int(uid) else "-"
     clean_detail = re.sub(r"[^A-Za-z0-9 ._:/,'()=-]", "?", str(detail or ""))[:300]
     AUDIT_LOG.info("dashboard login login=%s uid=%s result=%s detail=%s", clean_login, clean_uid, result, clean_detail)
 
 
+def audit_admin_change(action: str, login: Any, uid: Any, actor: Any, actor_uid: Any) -> None:
+    """Write one audit line for an added-administrator change (``action`` is ``added`` or ``removed``)."""
+    clean_action = action if action in ("added", "removed") else "-"
+    AUDIT_LOG.info(
+        "dashboard admin %s login=%s uid=%s by=%s by_uid=%s", clean_action, _audit_login_field(login),
+        str(uid) if _is_int(uid) else "-", _audit_login_field(actor), str(actor_uid) if _is_int(actor_uid) else "-",
+    )
+
+
 class GitHubApiError(RuntimeError):
     """Raised when a GitHub OAuth or REST call fails or returns an unusable response."""
+
+
+class GitHubUserLookupError(RuntimeError):
+    """A GitHub login could not be resolved to a user account.
+
+    ``status`` is the HTTP status the dashboard answers with: 400 (invalid login, or the account is not a
+    user, for example an organization), 404 (no such account), or 424 (GitHub failed or gave an unusable
+    answer; ``retryable`` is True and nothing was changed).
+    """
+
+    def __init__(self, message: str, status: int, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.status = int(status)
+        self.retryable = bool(retryable)
 
 
 class AuthCapacityError(RuntimeError):
@@ -242,8 +278,9 @@ def parse_global_admins(raw: str | None) -> frozenset[tuple[str, int]]:
 
     Global administrators may sign in without being an administrator of every controlled target.
     Each entry is pinned to the numeric GitHub user ID so a renamed or recycled login never
-    inherits the exception. Unset or empty means the default (the hardcoded administrator), so an
-    empty line copied from .env.example changes nothing; ``none`` disables global administrators.
+    inherits the exception. Unset or empty means the default (the hardcoded owner), so an
+    empty line copied from .env.example changes nothing; ``none`` disables global administrators,
+    which also holds administrators added on the Admins page to the per-target checks.
     """
     text = str(raw or "").strip() or DEFAULT_GLOBAL_ADMINS
     if text.lower() == "none":
@@ -254,22 +291,54 @@ def parse_global_admins(raw: str | None) -> frozenset[tuple[str, int]]:
         if not sep or not _LOGIN_RE.match(login) or not uid.isdigit() or int(uid) <= 0:
             raise ValueError(f"{ENV_GLOBAL_ADMINS} entries must be login:numeric_id, got {item!r}")
         if not is_allowed_identity(login, int(uid)):
-            # Only the hardcoded identity can sign in at all (dashboard and edge Worker); an entry for
-            # anyone else could never take effect, so refuse it instead of accepting a dead setting.
-            raise ValueError(f"{ENV_GLOBAL_ADMINS} may only list the dashboard administrator "
-                             f"{ALLOWED_ADMIN_LOGIN}:{ALLOWED_ADMIN_ID}, got {item!r}")
+            # Owners stay deploy-configured and fixed: this setting may list only the hardcoded owner. Other
+            # administrators are added on the dashboard's Admins page, which only the owner can change.
+            raise ValueError(f"{ENV_GLOBAL_ADMINS} may only list the dashboard owner "
+                             f"{ALLOWED_ADMIN_LOGIN}:{ALLOWED_ADMIN_ID}, got {item!r}; add other "
+                             "administrators on the dashboard's Admins page")
         out.add((login.lower(), int(uid)))
     return frozenset(out)
 
 
 def is_allowed_identity(login: Any, uid: Any) -> bool:
-    """True only for the hardcoded dashboard administrator (login compared case-insensitively, ID exactly)."""
+    """True only for the hardcoded dashboard owner (login compared case-insensitively, ID exactly)."""
     return (
         isinstance(login, str)
         and login.lower() == ALLOWED_ADMIN_LOGIN
         and _is_int(uid)
         and uid == ALLOWED_ADMIN_ID
     )
+
+
+def normalize_added_admin_uids(values: Any) -> frozenset[int]:
+    """The positive integer GitHub IDs in ``values``; anything else is dropped (it never grants access).
+
+    Owner IDs are dropped too: an owner is recognized only by login AND ID, so a session that carries an
+    owner's ID under another login can never pass as an added administrator.
+    """
+    if values is None or isinstance(values, (str, bytes)):
+        return frozenset()
+    try:
+        items = list(values)
+    except TypeError:
+        return frozenset()
+    owner_ids = {uid for _, uid in OWNER_IDENTITIES}
+    return frozenset(v for v in items if _is_int(v) and v > 0 and v not in owner_ids)
+
+
+def normalize_github_login(value: Any) -> str:
+    """Validate a GitHub login typed into the Admins page (one leading ``@`` allowed). Raises ValueError."""
+    if not isinstance(value, str):
+        raise ValueError("login must be a GitHub username")
+    clean = value.strip()
+    if clean.startswith("@"):
+        clean = clean[1:]
+    # The same login syntax as everywhere else in this module (it admits legacy GitHub logins with double
+    # or trailing hyphens); GitHub itself then decides whether the account exists.
+    if not _LOGIN_RE.match(clean):
+        raise ValueError("login must be a GitHub username: 1-39 letters, digits, or hyphens, not starting "
+                         "with a hyphen")
+    return clean
 
 
 def is_admin_login(login: str, allowed_admins: Iterable[str]) -> bool:
@@ -1189,6 +1258,50 @@ class GitHubOAuthManager:
             raise GitHubApiError("GitHub /user returned an invalid identity")
         return login, uid
 
+    def lookup_user(self, login: Any, token: str = "") -> dict[str, Any]:
+        """Resolve a GitHub login to ``{"login", "uid", "type"}`` with ``GET /users/{login}``.
+
+        Uses the injectable transport. ``token`` (optional) raises the API rate limit; without it the
+        request is anonymous. Raises :class:`GitHubUserLookupError`: 400 for an invalid login or an
+        account that is not a user (organizations, bots), 404 when GitHub has no such account, and 424
+        (retryable) when GitHub fails or answers with something unusable.
+        """
+        try:
+            clean = normalize_github_login(login)
+        except ValueError as exc:
+            raise GitHubUserLookupError(str(exc), 400) from exc
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": USER_AGENT,
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if token and token.strip():
+            headers["Authorization"] = f"Bearer {token.strip()}"
+        path = "/users/" + urllib.parse.quote(clean, safe="")
+        try:
+            status, data = self._call("GET", GITHUB_API_BASE + path, headers, None)
+        except GitHubApiError as exc:
+            raise GitHubUserLookupError(f"Could not look up GitHub user '{clean}': {exc}", 424, retryable=True) from exc
+        if status == 404:
+            raise GitHubUserLookupError(f"GitHub has no user named '{clean}'", 404)
+        if status != 200:
+            raise GitHubUserLookupError(f"GitHub user lookup for '{clean}' returned HTTP {status}", 424, retryable=True)
+        try:
+            body = _json_object(data)
+        except GitHubApiError as exc:
+            raise GitHubUserLookupError(f"GitHub user lookup for '{clean}' failed: {exc}", 424, retryable=True) from exc
+        found_login, uid, kind = body.get("login"), body.get("id"), body.get("type")
+        if not isinstance(found_login, str) or not _LOGIN_RE.match(found_login) or not _is_int(uid) or uid <= 0:
+            raise GitHubUserLookupError(f"GitHub returned an invalid identity for '{clean}'", 424, retryable=True)
+        if found_login.lower() != clean.lower():
+            raise GitHubUserLookupError(
+                f"GitHub answered the lookup for '{clean}' with a different account '{found_login}'", 424)
+        if kind != "User":
+            raise GitHubUserLookupError(
+                f"'{found_login}' is a GitHub {kind if isinstance(kind, str) else 'account'} account, not a user; "
+                "only user accounts can sign in", 400)
+        return {"login": found_login, "uid": uid, "type": kind}
+
     def check_target_admin(
         self,
         access_token: str,
@@ -1231,13 +1344,17 @@ class GitHubOAuthManager:
         *,
         use_cache: bool = True,
         expected_uid: int | None = None,
+        added_admins: Iterable[int] | None = None,
     ) -> AuthorizationDecision:
-        """Fail-closed authorization: the hardcoded admin identity AND admin on every controlled target.
+        """Fail-closed authorization: the owner or an added administrator AND admin on every controlled target.
 
-        ``use_cache=False`` forces a fresh GitHub check of every target (used before committing a
-        controlled-target change). ``expected_uid`` requires the token to belong to that GitHub id.
+        ``added_admins`` is the current list of added administrator GitHub IDs (from dashboard state; None
+        or an unreadable list means owners only). ``use_cache=False`` forces a fresh GitHub check of every
+        target (used before committing a controlled-target change). ``expected_uid`` requires the token to
+        belong to that GitHub id. Global administrators skip the per-target checks.
         """
-        decision = self._authorize(access_token, controlled_targets, use_cache=use_cache, expected_uid=expected_uid)
+        decision = self._authorize(access_token, controlled_targets, use_cache=use_cache, expected_uid=expected_uid,
+                                   added_admins=added_admins)
         audit_login(
             decision.user_login, decision.user_id, "allowed" if decision.authorized else "denied",
             "" if decision.authorized else decision.message,
@@ -1251,7 +1368,9 @@ class GitHubOAuthManager:
         *,
         use_cache: bool = True,
         expected_uid: int | None = None,
+        added_admins: Iterable[int] | None = None,
     ) -> AuthorizationDecision:
+        added = normalize_added_admin_uids(added_admins)
         if not isinstance(access_token, str) or not access_token.strip():
             return AuthorizationDecision(False, 403, "Forbidden: missing GitHub access token")
         token = access_token.strip()
@@ -1264,7 +1383,7 @@ class GitHubOAuthManager:
             login, uid = self.fetch_user(token)
         except GitHubApiError as exc:
             return AuthorizationDecision(False, 403, f"Forbidden: could not verify GitHub identity ({exc})", controlled_targets=names)
-        if not is_allowed_identity(login, uid):
+        if not self.may_sign_in(login, uid, added):
             return AuthorizationDecision(
                 False, 403, f"Forbidden: GitHub user '{login}' is not an authorized administrator",
                 user_login=login, user_id=uid, controlled_targets=names,
@@ -1275,8 +1394,9 @@ class GitHubOAuthManager:
                 f"Forbidden: GitHub user '{login}' is not the account that requested this change",
                 user_login=login, user_id=uid, controlled_targets=names,
             )
-        login = ALLOWED_ADMIN_LOGIN
-        if self.is_global_admin(login, uid):
+        if self.is_owner(login, uid):
+            login = ALLOWED_ADMIN_LOGIN  # Canonical case, so the session matches the owner identity exactly.
+        if self.is_global_admin(login, uid, added):
             # Configured exception: a global administrator is not required to administer every target.
             # No target was checked, so none is recorded as verified: if the policy later stops treating
             # this identity as global, its existing session no longer passes the target coverage check.
@@ -1371,25 +1491,57 @@ class GitHubOAuthManager:
             return None
         return session
 
-    def is_global_admin(self, login: Any, uid: Any) -> bool:
-        return isinstance(login, str) and _is_int(uid) and (login.lower(), uid) in self.global_admins
-
     @staticmethod
-    def _session_identity_ok(session: SessionData) -> bool:
-        return session.user_login == ALLOWED_ADMIN_LOGIN and session.user_id == ALLOWED_ADMIN_ID
+    def is_owner(login: Any, uid: Any) -> bool:
+        """True only for the hardcoded owner: login (case-insensitive) AND numeric ID. Owners manage the admin list."""
+        return isinstance(login, str) and _is_int(uid) and (login.lower(), uid) in OWNER_IDENTITIES
 
-    def verify_session_cookie_value(self, cookie_val: Any) -> tuple[bool, str]:
-        """Return (True, login) for a correctly signed, unexpired session of the hardcoded administrator."""
+    def may_sign_in(self, login: Any, uid: Any, added_admins: Iterable[int] | None = None) -> bool:
+        """The owner (login and ID) or an added administrator (ID only, so a renamed account keeps access)."""
+        if self.is_owner(login, uid):
+            return True
+        return _is_int(uid) and uid > 0 and uid in normalize_added_admin_uids(added_admins)
+
+    def is_global_admin(self, login: Any, uid: Any, added_admins: Iterable[int] | None = None) -> bool:
+        """Exempt from per-target admin checks: a configured global administrator, or an added administrator
+        while global administrators are enabled (``DASHBOARD_GLOBAL_ADMINS`` is not ``none``)."""
+        if not isinstance(login, str) or not _is_int(uid):
+            return False
+        if (login.lower(), uid) in self.global_admins:
+            return True
+        return bool(self.global_admins) and uid > 0 and uid in normalize_added_admin_uids(added_admins)
+
+    def _session_identity_ok(self, session: SessionData, added_admins: Iterable[int] | None = None) -> bool:
+        if session.user_id is None:
+            return False
+        if self.is_owner(session.user_login, session.user_id):
+            # Owner sessions carry the canonical login (see _authorize), as before.
+            return session.user_login == ALLOWED_ADMIN_LOGIN
+        return self.may_sign_in(session.user_login, session.user_id, added_admins)
+
+    def verify_session_cookie_value(self, cookie_val: Any, added_admins: Iterable[int] | None = None) -> tuple[bool, str]:
+        """Return (True, login) for a correctly signed, unexpired session of the owner or an added administrator."""
         session = self.decode_session(cookie_val)
-        if session is None or not self._session_identity_ok(session):
+        if session is None or not self._session_identity_ok(session, added_admins):
             return False, ""
         return True, session.user_login
 
-    def check_session(self, cookie_val: Any, controlled_targets: Iterable[Any] | None) -> SessionCheck:
+    def check_session(
+        self,
+        cookie_val: Any,
+        controlled_targets: Iterable[Any] | None,
+        added_admins: Iterable[int] | None = None,
+    ) -> SessionCheck:
+        """Validate a session against the CURRENT policy; call it on every request.
+
+        ``added_admins`` is the current added-administrator ID list, so removing an administrator rejects
+        its existing sessions on their next request. None means owners only (fail closed).
+        """
+        added = normalize_added_admin_uids(added_admins)
         session = self.decode_session(cookie_val)
         if session is None:
             return SessionCheck("none", message="No valid dashboard session")
-        if not self._session_identity_ok(session):
+        if not self._session_identity_ok(session, added):
             return SessionCheck(
                 "forbidden", session, f"Forbidden: GitHub user '{session.user_login}' is not an authorized administrator"
             )
@@ -1397,7 +1549,7 @@ class GitHubOAuthManager:
             targets = parse_controlled_targets(controlled_targets)
         except ValueError as exc:
             return SessionCheck("forbidden", session, f"Forbidden: controlled target configuration is invalid ({exc})")
-        if self.is_global_admin(session.user_login, session.user_id):
+        if self.is_global_admin(session.user_login, session.user_id, added):
             return SessionCheck("ok", session)
         verified = {t.lower() for t in session.verified_targets}
         missing = tuple(t.name for t in targets if t.key not in verified)
@@ -1640,8 +1792,8 @@ __DEVICE_JS__  const form = document.getElementById("token-form");
         "border-radius:6px;text-decoration:none}.msg{color:#cf222e}code{font-size:1.4rem}"
         "section{margin-top:1.5rem}</style></head><body>"
         "<h1>Spot Dashboard sign-in</h1>"
-        "<p>Access is limited to the GitHub account swackhamer, which must be an administrator of every "
-        "controlled repository and organization.</p>"
+        "<p>Access is limited to the dashboard owner and the GitHub accounts the owner added as "
+        "administrators.</p>"
         f"{msg_html}{who}{web}{device}{legacy}"
         f"<script>{script}</script></body></html>"
     )

@@ -216,6 +216,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     .tab-pane { display: none; }
     .tab-pane.active { display: block; }
+    /* Keeps owner-only controls (the Admins tab) hidden despite the display rules above. */
+    [hidden] { display: none !important; }
 
     /* Grid & Cards */
     .kpi-grid {
@@ -603,6 +605,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </button>
       <button class="tab-btn" data-tab="tab-patches" onclick="switchTab('tab-patches')">
         🧩 Runner Patches <span class="tab-badge" id="badge-patches">config repo</span>
+      </button>
+      <button class="tab-btn" data-tab="tab-admins" id="tab-btn-admins" onclick="switchTab('tab-admins')" hidden>
+        🔑 Admins <span class="tab-badge" id="badge-admins">owner</span>
       </button>
     </nav>
   </header>
@@ -1504,6 +1509,45 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <p id="rp-executor" style="font-size:12px;"></p>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section id="tab-admins" class="tab-pane" hidden>
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">🔑 Dashboard administrators</div>
+            <div class="panel-subtitle">Owners are set at deploy time and can't be removed here. Administrators you add can sign in with GitHub; they're matched by numeric GitHub user ID, so a renamed account keeps access. Removing one ends their sessions on their next request. Only owners can see or change this list.</div>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-sm btn-secondary" id="adm-refresh">Reload</button>
+          </div>
+        </div>
+        <p id="adm-status" role="status" aria-live="polite" style="font-size:12.5px;"></p>
+        <p id="adm-exempt" style="font-size:12.5px;"></p>
+        <h3 style="font-size:14px; margin:12px 0 6px;">Owners</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>GitHub user</th><th>User ID</th><th>Per-target checks</th></tr></thead>
+            <tbody id="adm-owners"></tbody>
+          </table>
+        </div>
+        <h3 style="font-size:14px; margin:16px 0 6px;">Added administrators</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>GitHub user (when added)</th><th>User ID</th><th>Added by</th><th>Added at</th><th></th></tr></thead>
+            <tbody id="adm-admins"></tbody>
+          </table>
+        </div>
+        <form id="adm-add-form" style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; margin-top:12px;">
+          <div class="field" style="margin:0;">
+            <label for="adm-login">Add GitHub username</label>
+            <input type="text" id="adm-login" autocomplete="off" spellcheck="false" maxlength="40" placeholder="octocat" />
+          </div>
+          <button type="submit" class="btn btn-sm btn-emerald" id="adm-add">Add administrator</button>
+        </form>
+        <h3 style="font-size:14px; margin:16px 0 6px;">Recent changes</h3>
+        <ul id="adm-history" style="font-size:12.5px; padding-left:18px;"></ul>
       </div>
     </section>
   </main>
@@ -3343,8 +3387,140 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     window.RunnerPatches = RunnerPatches;
     // --- end runner patches panel ---
 
+    // --- dashboard administrators panel (owners only; /api/admins answers 403 to everyone else) ---
+    // Renders server data with textContent and createElement only. Each change needs a confirmation, carries
+    // "confirm": true, and reuses its Idempotency-Key until a final answer arrives.
+    const DashboardAdmins = (function () {
+      const S = { data: null, pending: null, owner: false };
+      function el(id) { return document.getElementById(id); }
+      function node(tag, text) {
+        const n = document.createElement(tag);
+        if (text !== undefined && text !== null) n.textContent = String(text);
+        return n;
+      }
+      function clear(n) { while (n && n.firstChild) n.removeChild(n.firstChild); }
+      function setStatus(text) { el("adm-status").textContent = text || ""; }
+      async function api(url, init) {
+        const res = await fetch(url, init || {});
+        let data = {};
+        try { data = await res.json(); } catch (_e) { data = {}; }
+        return [res, data || {}];
+      }
+      async function postChange(url, body) {
+        const fingerprint = url + "\n" + JSON.stringify(body);
+        if (!S.pending || S.pending.fingerprint !== fingerprint) {
+          S.pending = { fingerprint, key: newIdempotencyKey() };
+        }
+        const result = await api(url, { method: "POST", body: JSON.stringify(body),
+          headers: { "Content-Type": "application/json", "Idempotency-Key": S.pending.key } });
+        const [res, d] = result;
+        if (!(d && (d.retry_same_key === true || d.pending_retry === true)) && res.status !== 0) {
+          S.pending = null;  // a final answer: the next change gets a new key
+        }
+        return result;
+      }
+      function render(data) {
+        S.data = data;
+        const owners = el("adm-owners");
+        clear(owners);
+        (data.owners || []).forEach(o => {
+          const tr = node("tr");
+          [o.login, o.uid, o.global_admin ? "Skipped (global administrator)" : "Required"].forEach(v => tr.appendChild(node("td", v)));
+          owners.appendChild(tr);
+        });
+        const admins = el("adm-admins");
+        clear(admins);
+        (data.admins || []).forEach(a => {
+          const tr = node("tr");
+          [a.login, a.uid, a.added_by || "", a.added_at ? formatLocalTime(a.added_at) : ""].forEach(v => tr.appendChild(node("td", v)));
+          const td = node("td");
+          const b = node("button", "Remove");
+          b.type = "button";
+          b.className = "btn btn-sm btn-danger";
+          b.addEventListener("click", () => remove(a));
+          td.appendChild(b);
+          tr.appendChild(td);
+          admins.appendChild(tr);
+        });
+        if (!(data.admins || []).length) {
+          const tr = node("tr");
+          const td = node("td", "No administrators added yet.");
+          td.colSpan = 5;
+          tr.appendChild(td);
+          admins.appendChild(tr);
+        }
+        el("adm-exempt").textContent = data.added_admins_exempt
+          ? "Added administrators skip the per-target administrator checks, like the owner."
+          : "DASHBOARD_GLOBAL_ADMINS is none: added administrators must administer every controlled target, like the owner.";
+        const history = el("adm-history");
+        clear(history);
+        (data.history || []).slice().reverse().forEach(h => {
+          history.appendChild(node("li", `${h.at || ""} ${h.actor || ""} ${h.action || ""} ${h.login || ""} (ID ${h.uid})`));
+        });
+        el("badge-admins").textContent = String((data.admins || []).length);
+        if (data.error) setStatus(data.error);
+      }
+      async function refresh() {
+        if (!S.owner) return;
+        setStatus("Loading administrators...");
+        const [res, d] = await api("/api/admins");
+        if (!res.ok) { setStatus(d.error || `Could not load administrators (HTTP ${res.status})`); return; }
+        render(d);
+        if (!d.error) setStatus("");
+      }
+      async function add(ev) {
+        if (ev) ev.preventDefault();
+        const login = el("adm-login").value.trim().replace(/^@/, "");
+        if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(login)) {
+          setStatus("Enter a GitHub username: letters, digits, or hyphens, up to 39 characters.");
+          return;
+        }
+        if (!window.confirm(`Add GitHub user ${login} as a dashboard administrator? They will be able to sign in and change the fleet.`)) return;
+        el("adm-add").disabled = true;
+        try {
+          setStatus(`Looking up ${login} on GitHub...`);
+          const [res, d] = await postChange("/api/admins/add", { login, confirm: true });
+          if (d.retry_same_key === true) {
+            setStatus((d.error || "GitHub did not answer.") + " Click Add again to retry.");
+            return;
+          }
+          if (!res.ok) { setStatus(d.error || `Could not add ${login} (HTTP ${res.status})`); return; }
+          el("adm-login").value = "";
+          render(d);
+          setStatus(`Added ${d.admin.login} (GitHub user ID ${d.admin.uid}).`);
+        } finally {
+          el("adm-add").disabled = false;
+        }
+      }
+      async function remove(admin) {
+        if (!window.confirm(`Remove ${admin.login} (GitHub user ID ${admin.uid})? Their sessions stop working immediately.`)) return;
+        const [res, d] = await postChange("/api/admins/remove", { uid: admin.uid, confirm: true });
+        if (!res.ok) { setStatus(d.error || `Could not remove ${admin.login} (HTTP ${res.status})`); return; }
+        render(d);
+        setStatus(`Removed ${d.admin.login} (GitHub user ID ${d.admin.uid}).`);
+      }
+      async function init() {
+        el("adm-refresh").addEventListener("click", refresh);
+        el("adm-add-form").addEventListener("submit", add);
+        try {
+          const res = await fetch("/api/auth/status", { cache: "no-store" });
+          const d = res.ok ? await res.json() : {};
+          S.owner = Boolean(d && d.owner === true);
+        } catch (_e) {
+          S.owner = false;
+        }
+        el("tab-btn-admins").hidden = !S.owner;
+        el("tab-admins").hidden = !S.owner;
+        if (S.owner) await refresh();
+      }
+      return { init, refresh, add, remove, render, state: S };
+    })();
+    window.DashboardAdmins = DashboardAdmins;
+    // --- end dashboard administrators panel ---
+
     window.addEventListener("DOMContentLoaded", async () => {
       RunnerPatches.init();
+      DashboardAdmins.init();
       const params = new URLSearchParams(window.location.search);
       if (params.get("show_deleted") === "1") {
         const cb = document.getElementById("inst-show-deleted");

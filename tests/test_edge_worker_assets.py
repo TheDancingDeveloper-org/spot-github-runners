@@ -122,8 +122,9 @@ class WranglerConfigTests(unittest.TestCase):
         self.assertRegex(self.text, r'(?m)^main = "worker\.js"$')
         self.assertIn('{ pattern = "spot.swacktech.com", custom_domain = true }', self.text)
         self.assertIn('binding = "SPOT_KV", id = "REPLACE_WITH_SPOT_KV_NAMESPACE_ID"', self.text)
-        self.assertRegex(self.text, r'(?m)^ALLOWED_ADMIN_LOGIN = "swackhamer"$')
-        self.assertRegex(self.text, r'(?m)^ALLOWED_ADMIN_ID = "619624"$')
+        # The Worker only authenticates; the control VM decides which accounts may sign in (owner plus the
+        # administrators added on the Admins page), so no identity is pinned here.
+        self.assertNotRegex(self.text, r'(?m)^ALLOWED_ADMIN_(LOGIN|ID)\s*=')
         # Optional bulk sign-out cut-off: empty (none) or Unix seconds, read by worker.js sessionNotBefore().
         self.assertRegex(self.text, r'(?m)^SESSION_NOT_BEFORE = "([0-9]{1,15})?"$')
         date = re.search(r'(?m)^compatibility_date = "(\d{4}-\d{2}-\d{2})"$', self.text)

@@ -190,7 +190,7 @@ python3 src/runner_fleet.py \
   --org swack-tools \
   --project YOUR_PROJECT \
   --label spot \
-  --minimum-runners 25 \
+  --minimum-runners 1 \
   --runners-per-vm 8
 ```
 

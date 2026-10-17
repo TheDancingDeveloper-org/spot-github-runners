@@ -156,7 +156,8 @@ controlled_targets_csv() {
 
 # Print the dashboard-global-admins metadata value as DASHBOARD_GLOBAL_ADMINS: empty stays empty (dashboard
 # default), "none" stays "none", otherwise ;-separated login:numeric_id entries become a comma list. The only
-# identity accepted is the dashboard administrator swackhamer:619624.
+# identity accepted is the dashboard owner swackhamer:619624. Owners stay deploy-configured; other
+# administrators are added on the dashboard's Admins page and live in dashboard state.
 # Mirrors global_admins_metadata() in src/lib/control_vm.py.
 global_admins_csv() {
   local raw="$1" entry joined=""
@@ -166,7 +167,7 @@ global_admins_csv() {
   [[ "$raw" != *';' ]] || return 1
   IFS=';' read -r -a entries <<<"$raw"
   for entry in "${entries[@]}"; do
-    # Only the dashboard administrator can sign in, so it is the only identity that may be listed.
+    # The dashboard owner is the only identity that may be listed (dashboard_auth.parse_global_admins).
     [[ "$(printf '%s' "$entry" | tr 'A-Z' 'a-z')" == swackhamer:619624 ]] || return 1
     joined+="${joined:+,}$entry"
   done

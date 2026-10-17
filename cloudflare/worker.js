@@ -2,6 +2,15 @@
 //
 // Gates the Spot dashboard with the dashboard's own signed session cookie, then proxies to the control
 // VM that the KV key `origin:active` names (a Cloudflare Tunnel hostname behind Cloudflare Access).
+//
+// Authorization split: the Worker only authenticates. It proves the cookie was minted by a dashboard (HMAC
+// with the shared secret), is unexpired, is not older than SESSION_NOT_BEFORE, and is well formed. WHO may
+// use the dashboard (the owner plus the administrators the owner added on the Admins page) is decided by
+// the control VM on every request, against its durable state; that list changes at run time, and a copy
+// here would lag behind it (KV is eventually consistent), so a removed administrator could keep passing
+// the edge or a new one could be locked out. A session is only ever minted after the dashboard authorized
+// that identity, and the dashboard re-checks membership on every request, so a removed administrator's
+// cookie gets 403 from the origin on its next request.
 // While the control VM is restarting or being replaced, the Worker answers with the shared 503 "wait"
 // contract so browsers keep the page open and retry automatically.
 //
@@ -13,8 +22,6 @@
 //   SESSION_SECRET           Secret; same value as DASHBOARD_SESSION_SECRET on the control VM.
 //   CF_ACCESS_CLIENT_ID      Secret; Cloudflare Access service token id for the origin hostnames.
 //   CF_ACCESS_CLIENT_SECRET  Secret; Cloudflare Access service token secret.
-//   ALLOWED_ADMIN_LOGIN      Var; the only GitHub login allowed through (swackhamer).
-//   ALLOWED_ADMIN_ID         Var; that login's numeric GitHub id (619624).
 //   ORIGIN_HOST_SUFFIX       Optional var; origin hostnames must end with it (default ".swacktech.com").
 //   SESSION_NOT_BEFORE       Optional var; Unix time. Sessions issued before it are rejected (bulk sign-out,
 //                            same meaning as DASHBOARD_SESSION_NOT_BEFORE on the control VM).
@@ -51,6 +58,8 @@ export const MAX_AUTH_BODY_BYTES = 16_384;
 // patch_console.MAX_MANIFEST_BYTES). tests/test_edge_worker_assets.py keeps these in sync.
 export const MAX_DASHBOARD_BODY_BYTES = 262_144;
 const CONTROL_SLOTS = new Set(["a", "b"]);
+// GitHub login syntax, as dashboard_auth._LOGIN_RE.
+const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 
 // Reachable without a session cookie. "/" is public for GET/HEAD only (it renders the login gate).
 // The device-flow routes are sign-in steps, so a signed-out browser must reach them; the backend still
@@ -177,13 +186,13 @@ export function sessionNotBefore(env) {
   return Number(text);
 }
 
-// Full session check: signature, v == 1, iat - 60 <= now < exp, bounded TTL, iat >= SESSION_NOT_BEFORE,
-// and the single allowed admin (login AND numeric id). Fails closed when any binding is missing.
+// Session authentication: signature, v == 1, iat - 60 <= now < exp, bounded TTL, iat >= SESSION_NOT_BEFORE,
+// and a well-formed identity (GitHub login syntax, positive integer id). It does not decide which identities
+// may use the dashboard: the control VM does that on every request (see the header comment). Fails closed
+// when SESSION_SECRET is missing or SESSION_NOT_BEFORE is malformed.
 export async function verifySession(token, env, nowSeconds = Math.floor(Date.now() / 1000)) {
   const secret = env && env.SESSION_SECRET;
-  const login = env && env.ALLOWED_ADMIN_LOGIN;
-  const adminId = env && Number(env.ALLOWED_ADMIN_ID);
-  if (!secret || !login || !isInt(adminId) || adminId <= 0) return null;
+  if (!secret) return null;
   const notBefore = sessionNotBefore(env);
   if (notBefore === null) return null;
   let payload;
@@ -197,8 +206,8 @@ export async function verifySession(token, env, nowSeconds = Math.floor(Date.now
   if (!isInt(iat) || !isInt(exp) || exp <= iat || exp - iat > MAX_SESSION_TTL_SECONDS) return null;
   if (!(iat - CLOCK_SKEW_SECONDS <= nowSeconds && nowSeconds < exp)) return null;
   if (iat < notBefore) return null;
-  if (typeof sub !== "string" || sub !== login) return null;
-  if (!isInt(uid) || uid !== adminId) return null;
+  if (typeof sub !== "string" || !LOGIN_RE.test(sub)) return null;
+  if (!isInt(uid) || uid <= 0) return null;
   if (tgt !== undefined && (!Array.isArray(tgt) || !tgt.every((t) => typeof t === "string"))) return null;
   return payload;
 }
