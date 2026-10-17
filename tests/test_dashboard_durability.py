@@ -1060,6 +1060,84 @@ class StrictSnapshotClassificationTests(unittest.TestCase):
         self.assertFalse(store.sync_with_kv_as_writer())
 
 
+class FreezeDrainsExternalChangesTests(unittest.TestCase):
+    """Codex round 2 P1: a freeze must not snapshot without the idempotency record of an in-flight external change."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = DashboardStore(Path(self.tmp.name) / "state.json", control_slot="a", clock=FakeClock())
+        self.store.hydrate()
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.runs = 0
+
+    def external(self):
+        self.runs += 1
+        self.started.set()
+        self.release.wait(10)
+        return 200, {"pull_request": {"number": 7}}
+
+    def run_in_thread(self, key="ext-key-0001"):
+        out = []
+        worker = threading.Thread(target=lambda: out.append(
+            self.store.run_external(key, "POST", "/api/patches/save", self.external)))
+        worker.start()
+        self.assertTrue(self.started.wait(5))
+        return worker, out
+
+    def test_freeze_waits_and_snapshots_the_record(self):
+        from lib.dashboard_server import DashboardFrozenError
+
+        worker, out = self.run_in_thread()
+        frozen = []
+        freezer = threading.Thread(target=lambda: frozen.append(self.store.freeze()))
+        freezer.start()
+        time.sleep(0.2)
+        self.assertEqual(frozen, [])  # still waiting for the in-flight change
+        self.assertTrue(self.store.frozen)  # but no new change may start meanwhile
+        with self.assertRaises(DashboardFrozenError):
+            self.store.run_external("ext-key-0002", "POST", "/api/patches/save", self.external)
+        self.release.set()
+        worker.join(5)
+        freezer.join(5)
+        self.assertEqual(out[0][:2], (200, {"pull_request": {"number": 7}}))
+        snapshot = frozen[0]["snapshot"]
+        self.assertIn("ext-key-0001", snapshot["state"]["idempotency"])
+        # The replacement imports the snapshot; a retry with the same key replays instead of re-running.
+        replacement = DashboardStore(Path(self.tmp.name) / "new.json", control_slot="b", clock=FakeClock())
+        replacement.import_snapshot(snapshot)
+        status, body, replayed = replacement.run_external("ext-key-0001", "POST", "/api/patches/save", self.external)
+        self.assertEqual((status, body["pull_request"]["number"], replayed, self.runs), (200, 7, True, 1))
+
+    def test_freeze_times_out_unfrozen_and_retry_includes_the_record(self):
+        from lib.dashboard_server import FreezeBusyError
+
+        self.store.freeze_drain_seconds = 0.2
+        worker, _out = self.run_in_thread()
+        with self.assertRaises(FreezeBusyError):
+            self.store.freeze()
+        self.assertFalse(self.store.frozen)
+        self.assertFalse(os.path.lexists(self.store.freeze_marker_path))
+        self.release.set()
+        worker.join(5)
+        result = self.store.freeze()
+        self.assertIn("ext-key-0001", result["snapshot"]["state"]["idempotency"])
+
+    def test_completed_result_is_kept_when_the_save_fails(self):
+        self.release.set()
+        with mock.patch.object(self.store, "_persist", side_effect=OSError("disk full")), \
+                self.assertLogs("spot_dashboard", "ERROR"):
+            status, body, _ = self.store.run_external("ext-key-0003", "POST", "/api/patches/save", self.external)
+        self.assertEqual(status, 200)
+        self.assertIn("kept in memory", body["warning"])
+        self.assertIn("ext-key-0003", self.store.freeze()["snapshot"]["state"]["idempotency"])
+        self.store.unfreeze()
+        _, _, replayed = self.store.run_external("ext-key-0003", "POST", "/api/patches/save", self.external)
+        self.assertTrue(replayed)
+        self.assertEqual(self.runs, 1)
+
+
 class InactiveSlotServerTests(ServerHarness):
     def test_browser_change_on_inactive_slot_gets_wait_body_and_health_stays_200(self):
         fake = FakeKvRequester()
@@ -1177,6 +1255,29 @@ class ControlEndpointTests(ServerHarness):
         self.assertFalse(store.frozen)
         self.assertEqual(self.request("GET", "/api/control/freeze", headers=self.auth("freeze"))[0], 405)
         self.assertEqual(self.request("POST", "/api/control/bogus", headers=self.auth("freeze"))[0], 404)
+
+    def test_freeze_is_refused_retryably_while_an_external_change_runs(self):
+        store = self.start(control_slot="a", control_secret=CONTROL_SECRET)
+        store.freeze_drain_seconds = 0.2
+        release, started = threading.Event(), threading.Event()
+
+        def external():
+            started.set()
+            release.wait(10)
+            return 200, {"ok": True}
+
+        worker = threading.Thread(target=lambda: store.run_external("ext-key-0009", "POST", "/api/patches/save",
+                                                                    external))
+        worker.start()
+        self.assertTrue(started.wait(5))
+        status, _, body = self.request("POST", "/api/control/freeze", headers=self.auth("freeze"))
+        self.assertEqual((status, body["retryable"]), (409, True))
+        self.assertFalse(store.frozen)
+        release.set()
+        worker.join(5)
+        status, _, body = self.request("POST", "/api/control/freeze", headers=self.auth("freeze"))
+        self.assertEqual(status, 200)
+        self.assertIn("ext-key-0009", body["snapshot"]["state"]["idempotency"])
 
     def test_freeze_snapshot_unfreeze_import(self):
         fake = FakeKvRequester()

@@ -52,7 +52,7 @@ from .dashboard_auth import (
     ENV_DEVICE_FLOW,
     ENV_REDIRECT_URI,
 )
-from .patch_console import PatchConsole, PatchConsoleError, executor_from_env
+from .patch_console import PatchConsole, PatchConsoleError, executor_from_env, host_source_from_env
 from .edge_state import (
     CONTROL_OPS,
     CONTROL_SLOTS,
@@ -155,6 +155,9 @@ ENV_CONFIG_REPO = "SPOT_CONFIG_REPO"
 CONFIG_REPO_NAME = "spot-runners-config"
 _CONFIG_REPO_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}")
 FREEZE_MARKER_SUFFIX = ".frozen"
+# How long a freeze waits for in-flight external changes (pull requests, hot-patches) to finish and persist
+# their idempotency records; kept under the control VM manager's 60-second control-call timeout.
+FREEZE_EXTERNAL_DRAIN_SECONDS = 45.0
 
 LOG = logging.getLogger("spot_dashboard")
 
@@ -165,6 +168,10 @@ class _PayloadTooLargeError(ValueError):
 
 class DashboardFrozenError(RuntimeError):
     """Raised when a state mutation is attempted while the control VM is frozen for a handover."""
+
+
+class FreezeBusyError(RuntimeError):
+    """A freeze could not start because external changes were still running; the caller retries."""
 
 
 class ControlledTargetsUnavailableError(RuntimeError):
@@ -1051,6 +1058,9 @@ class DashboardStore:
         self._writer_synced = False
         self._defer: dict[str, Any] | None = None
         self._external_inflight: set[str] = set()
+        # Signalled whenever an external change finishes, so a freeze can wait for in-flight ones to persist.
+        self._external_done = threading.Condition(self._lock)
+        self.freeze_drain_seconds = FREEZE_EXTERNAL_DRAIN_SECONDS
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
         # A freeze survives container and VM restarts: the marker sits next to the state file until an
@@ -1752,8 +1762,21 @@ class DashboardStore:
         if self.controlled_targets_error:
             raise ValueError(f"Refusing to freeze for a handover: {self.controlled_targets_error}")
         with self._lock:
+            was_frozen = self.frozen
+            # Frozen first: no new change (internal or external) can start from here on.
             self.frozen = True
-            self._write_freeze_marker(self.state_version())
+            # An external change that is still running must land its idempotency record in this snapshot, or
+            # a retry with the same key on the replacement would repeat the external side effect.
+            deadline = time.monotonic() + self.freeze_drain_seconds
+            while self._external_inflight:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if not was_frozen:
+                        self.frozen = False
+                    raise FreezeBusyError(
+                        f"{len(self._external_inflight)} external change(s) still running; retry the freeze")
+                self._external_done.wait(remaining)
+            self._write_freeze_marker(self.state_version())  # On failure the store stays frozen in memory.
             envelope = self.snapshot_envelope()
         flushed = False
         if self.kv is not None and self.refresh_writer():
@@ -1934,25 +1957,30 @@ class DashboardStore:
         except BaseException:
             with self._lock:
                 self._external_inflight.discard(key)
+                self._external_done.notify_all()
             raise
         with self._lock:
-            self._external_inflight.discard(key)
-            if status >= 500:
-                return status, body, False
-            raw_records = self.state.get(IDEMPOTENCY_STATE_KEY)
-            records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, self._clock())
-            records[key] = {"m": method, "p": path, "s": int(status), "b": self._replay_copy(status, body),
-                            "t": self._clock()}
-            previous = self.state.get(IDEMPOTENCY_STATE_KEY)
-            self.state[IDEMPOTENCY_STATE_KEY] = self._prune_idempotency(records, self._clock())
             try:
-                self._persist()
-            except Exception:  # noqa: BLE001 - the side effect already happened; report it, warn about replay
-                self.state[IDEMPOTENCY_STATE_KEY] = previous
-                LOG.exception("Could not persist the idempotency record for %s %s", method, path)
-                if isinstance(body, dict):
-                    body = {**body, "warning": "The result could not be saved for replay; do not resubmit blindly."}
-            return status, body, False
+                if status >= 500:
+                    return status, body, False
+                raw_records = self.state.get(IDEMPOTENCY_STATE_KEY)
+                records = self._prune_idempotency(raw_records if isinstance(raw_records, dict) else {}, self._clock())
+                records[key] = {"m": method, "p": path, "s": int(status), "b": self._replay_copy(status, body),
+                                "t": self._clock()}
+                # Recorded in memory first and kept there even if the write fails: a completed external result
+                # is never dropped, and the next successful save or a freeze snapshot carries it.
+                self.state[IDEMPOTENCY_STATE_KEY] = self._prune_idempotency(records, self._clock())
+                try:
+                    self._persist()
+                except Exception:  # noqa: BLE001 - the side effect already happened; report it
+                    LOG.exception("Could not persist the idempotency record for %s %s", method, path)
+                    if isinstance(body, dict):
+                        body = {**body, "warning": "The result is kept in memory but could not be saved to disk yet."}
+                return status, body, False
+            finally:
+                # Released only after the record is in state, so a waiting freeze snapshots it.
+                self._external_inflight.discard(key)
+                self._external_done.notify_all()
 
     def _normalize_project_derived_fields(self) -> None:
         """Ensure project/org metadata and gcloud SSH commands match the active store configuration."""
@@ -4887,6 +4915,9 @@ def make_handler(
                     self._send_json(result)
             except _PayloadTooLargeError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            except FreezeBusyError as exc:
+                LOG.warning("Control freeze refused: %s", exc)
+                self._send_json({"error": str(exc), "retryable": True}, status=HTTPStatus.CONFLICT)
             except (ValueError, TypeError) as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             except OSError as exc:
@@ -5885,7 +5916,8 @@ def create_dashboard_server(
         control_secret=control_secret,
         public_origin=resolved_public_origin,
         patch_console=patch_console if patch_console is not None else PatchConsole(
-            resolve_config_repo(config_repo, org=org), executor=executor_from_env(project)),
+            resolve_config_repo(config_repo, org=org), executor=executor_from_env(project),
+            host_source=host_source_from_env(project)),
     )
     server = DashboardThreadingHTTPServer((host, port), handler)
     server.dashboard_store = store

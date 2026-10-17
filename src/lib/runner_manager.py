@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -24,7 +25,23 @@ from .billing_catalog import catalog_skus, unit_price, monthly_to_daily
 from .storage_selection import storage_rates, cheapest_storage, throughput_floor, observed_storage_monthly, disk_monthly_cost
 from .project_costs import log_project_costs
 from .fleet_logging import vm_details
-from .runner_fleet import GceVm, list_gcloud_vms
+from .runner_fleet import (
+    MAX_PATCH_METADATA_BYTES,
+    NO_PATCH,
+    PATCH_LABEL_KEY,
+    PATCH_LABEL_SHA_CHARS,
+    PATCH_METADATA_KEY,
+    PATCH_SHA_METADATA_KEY,
+    PATCH_TARGET_METADATA_KEY,
+    RUNNER_COUNT_METADATA_KEY,
+    RUNNER_HEAVY_POOL_METADATA_KEY,
+    RUNNER_LABEL_METADATA_KEY,
+    RUNNER_PREFIX_METADATA_KEY,
+    RUNNER_REGION_METADATA_KEY,
+    GceVm,
+    gce_metadata_items,
+    list_gcloud_vms,
+)
 from .log_format import configure_logging, error_detail, single_line
 from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, DOCKER_WRAPPER, JOB_COMPLETED,
@@ -424,6 +441,74 @@ def launch_target_label(args: argparse.Namespace) -> str:
     return target_label_value(resolve_target(getattr(args, "target", None) or getattr(args, "org", ORG)))
 
 
+def runner_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) -> tuple[dict[str, str], str | None, str]:
+    """(plain metadata, canonical manifest JSON or None when too large, label value) recording ``patch``.
+
+    Nothing here is secret: the manifest is the reviewed config-repo patch, never the registration token.
+    """
+    target = (patch.repository if patch is not None and patch.repository else "") or str(getattr(args, "target", "") or "")
+    plain: dict[str, str] = {}
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target):
+        plain[PATCH_TARGET_METADATA_KEY] = target
+    prefix = str(getattr(args, "runner_prefix", "") or "")
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,63}", prefix):
+        plain[RUNNER_PREFIX_METADATA_KEY] = prefix
+    count = getattr(args, "runner_count", None)
+    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        plain[RUNNER_COUNT_METADATA_KEY] = str(count)
+    # What sync_runner_labels needs to keep the host's real GitHub scheduling labels after a live patch.
+    runner_label = str(getattr(args, "runner_label", "") or "")
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", runner_label):
+        plain[RUNNER_LABEL_METADATA_KEY] = runner_label
+    region = str(getattr(args, "region", "") or "")
+    if re.fullmatch(r"[a-z0-9-]{1,40}", region):
+        plain[RUNNER_REGION_METADATA_KEY] = region
+    heavy = getattr(args, "heavy_runner_pool", None)
+    if heavy in (2, 3):
+        plain[RUNNER_HEAVY_POOL_METADATA_KEY] = str(heavy)
+    if patch is None:
+        plain[PATCH_SHA_METADATA_KEY] = NO_PATCH
+        return plain, None, NO_PATCH
+    plain[PATCH_SHA_METADATA_KEY] = patch.patch_sha256
+    manifest = json.dumps(patch.to_canonical_dict(), sort_keys=True, separators=(",", ":"))
+    if len(manifest.encode("utf-8")) > MAX_PATCH_METADATA_BYTES:
+        LOG.warning("Patch %s manifest is %d bytes; recording its sha256 only", patch.patch_sha256[:12],
+                    len(manifest.encode("utf-8")))
+        manifest = None
+    return plain, manifest, patch.patch_sha256[:PATCH_LABEL_SHA_CHARS]
+
+
+def _plain_metadata_flag(plain: dict[str, str]) -> str:
+    for key, value in plain.items():
+        if any(c in value for c in ",=\n\r") or any(c in key for c in ",=\n\r"):
+            raise RuntimeError(f"Refusing metadata value with a separator for {key}")
+    return "--metadata=" + ",".join(f"{k}={v}" for k, v in plain.items())
+
+
+def record_patch_metadata(args: argparse.Namespace, zone: str, patch: RunnerPatch | None, *,
+                          existing_keys: set[str] | None = None) -> None:
+    """Record the patch a running host now runs (instance metadata plus a sha-prefix label)."""
+    plain, manifest, label = runner_patch_record(args, patch)
+    manifest_path = None
+    try:
+        command = ["compute", "instances", "add-metadata", args.instance_name, f"--zone={zone}",
+                   _plain_metadata_flag(plain)]
+        if manifest is not None:
+            with tempfile.NamedTemporaryFile("w", prefix="gha-patch-", suffix=".json", delete=False) as temp:
+                temp.write(manifest)
+                manifest_path = temp.name
+            command.append(f"--metadata-from-file={PATCH_METADATA_KEY}={manifest_path}")
+        gcloud(command)
+        if manifest is None and (existing_keys is None or PATCH_METADATA_KEY in existing_keys):
+            gcloud(["compute", "instances", "remove-metadata", args.instance_name, f"--zone={zone}",
+                    f"--keys={PATCH_METADATA_KEY}"])
+        gcloud(["compute", "instances", "add-labels", args.instance_name, f"--zone={zone}",
+                f"--labels={PATCH_LABEL_KEY}={label}"])
+    finally:
+        if manifest_path:
+            Path(manifest_path).unlink(missing_ok=True)
+
+
 def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     configure_storage(args)
     configure_cpu_platform(args)
@@ -481,6 +566,14 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
     with tempfile.NamedTemporaryFile("w", prefix="gha-startup-", delete=False) as temp:
         temp.write(script)
         script_path = temp.name
+    # Record the patch this startup script applies (runner_fleet / the dashboard read it back).
+    patch_plain, patch_manifest, patch_label = runner_patch_record(args, resolve_runner_patch(args))
+    patch_path = None
+    if patch_manifest is not None:
+        with tempfile.NamedTemporaryFile("w", prefix="gha-patch-", suffix=".json", delete=False) as temp:
+            temp.write(patch_manifest)
+            patch_path = temp.name
+    metadata_files = f"startup-script={script_path}" + (f",{PATCH_METADATA_KEY}={patch_path}" if patch_path else "")
     try:
         if vm:
             for boot_disk in vm.get("disks", []):
@@ -497,7 +590,12 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                 gcloud(["compute", "instances", "set-disk-auto-delete", args.instance_name,
                         f"--zone={zone}", f"--disk={args.disk_device_name}", "--auto-delete", "--quiet"])
             gcloud(["compute", "instances", "add-metadata", args.instance_name, f"--zone={zone}",
-                    f"--metadata-from-file=startup-script={script_path}"])
+                    f"--metadata-from-file={metadata_files}", _plain_metadata_flag(patch_plain)])
+            if patch_path is None and PATCH_METADATA_KEY in gce_metadata_items(vm):
+                gcloud(["compute", "instances", "remove-metadata", args.instance_name, f"--zone={zone}",
+                        f"--keys={PATCH_METADATA_KEY}"])
+            gcloud(["compute", "instances", "add-labels", args.instance_name, f"--zone={zone}",
+                    f"--labels={PATCH_LABEL_KEY}={patch_label}"])
             if vm.get("status") == "RUNNING":
                 gcloud(["compute", "instances", "reset", args.instance_name, f"--zone={zone}", "--quiet"])
             elif vm.get("status") in {"STOPPED", "TERMINATED"}:
@@ -522,8 +620,8 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                         f"--boot-disk-interface={args.boot_disk_interface}", *boot_performance,
                         image_family, "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
-                        network, f"--metadata-from-file=startup-script={script_path}",
-                        f"--labels={TARGET_LABEL_KEY}={launch_target_label(args)}",
+                        network, f"--metadata-from-file={metadata_files}", _plain_metadata_flag(patch_plain),
+                        f"--labels={TARGET_LABEL_KEY}={launch_target_label(args)},{PATCH_LABEL_KEY}={patch_label}",
                         "--format=json(id,name,zone,status,disks,cpuPlatform,minCpuPlatform)",
                         "--quiet"], quiet=True)
                 if getattr(args, "deployment_receipt", None):
@@ -565,6 +663,8 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                 raise
     finally:
         Path(script_path).unlink(missing_ok=True)
+        if patch_path:
+            Path(patch_path).unlink(missing_ok=True)
 
 
 def online_runners(args: argparse.Namespace) -> list[str]:
@@ -704,6 +804,8 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     action = classify_patch_diff(current_manifest, patch)
     if action == "noop":
         LOG.info("VM %s is already at patch %s", args.instance_name, patch.patch_sha256[:12])
+        # The host's own receipt confirms the patch: record it (backfills hosts provisioned before recording).
+        record_patch_metadata(args, zone, patch)
         return "noop"
     if action == "replace_vm":
         raise RuntimeError(
@@ -730,6 +832,8 @@ def apply_live_patch(args: argparse.Namespace, zone: str) -> str:
     )
     if f"LIVE_PATCH_APPLIED:{patch.patch_sha256}" not in output:
         raise RuntimeError(f"Live patch execution did not confirm completion on {args.instance_name}")
+    # Only now, after the host confirmed this exact patch, does the recorded patch change.
+    record_patch_metadata(args, zone, patch)
     sync_runner_labels(args)
     LOG.info("Applied live patch %s to %s", patch.patch_sha256[:12], args.instance_name)
     return "hot_patch"

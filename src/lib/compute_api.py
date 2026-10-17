@@ -322,6 +322,60 @@ async def list_regions(api: AsyncGoogleApi, project: str) -> list[dict]:
             return rows
 
 
+async def list_instances(api: AsyncGoogleApi, project: str) -> tuple[list[dict], list[str]]:
+    """List every VM instance (name, zone, status, machine type, labels, metadata items) with one aggregated
+    stream. Callers keep only the metadata keys they need; startup scripts are never stored."""
+    path = f"{API_ROOT}/projects/{quote(project, safe='')}/aggregated/instances"
+    query = {
+        "maxResults": "500",
+        "returnPartialSuccess": "true",
+        "fields": "nextPageToken,unreachables,items/*/instances(name,zone,status,machineType,labels,metadata/items)",
+    }
+    rows: list[dict] = []
+    unreachables: list[str] = []
+    while True:
+        data = await api.get_json(path, query)
+        for scoped in data.get("items", {}).values():
+            rows.extend(scoped.get("instances", []))
+        unreachables.extend(data.get("unreachables", []))
+        token = data.get("nextPageToken")
+        if not token:
+            return rows, unreachables
+        query["pageToken"] = token
+
+
+def runner_host_records(items: list[dict]) -> list[dict]:
+    """Dashboard host records for runner hosts in a GCE instance listing.
+
+    A runner host carries the ``spot-target`` label or recorded patch metadata. Only the recorded patch and
+    deployment keys are kept (see runner_fleet); every other metadata value, including startup scripts, is
+    dropped.
+    """
+    from .runner_fleet import patch_record_from_gce_item, runner_deployment_from_gce_item
+    from .target_config import TARGET_LABEL_KEY
+
+    hosts = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
+        record = patch_record_from_gce_item(item)
+        target_label = str(labels.get(TARGET_LABEL_KEY, "") or "")
+        if not target_label and not record["patch_sha256"]:
+            continue
+        hosts.append({
+            "name": item["name"],
+            "zone": str(item.get("zone", "")).rsplit("/", 1)[-1],
+            "status": str(item.get("status", "UNKNOWN")),
+            "machine_type": str(item.get("machineType", "")).rsplit("/", 1)[-1],
+            "role": "cicd_runner",
+            "target_label": target_label,
+            **runner_deployment_from_gce_item(item),
+            **record,
+        })
+    return hosts
+
+
 async def list_machines(api: AsyncGoogleApi, project: str,
                         min_vcpu: int, min_ram_mb: int) -> tuple[list[dict], list[str]]:
     """Fetch qualifying machine types for all zones with one aggregated-list stream."""

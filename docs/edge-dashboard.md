@@ -122,9 +122,23 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   moved, or GitHub reports that the file changed, the dashboard answers HTTP 409. The token in
   `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` needs contents and pull-request write access to the config
   repository.
-- The preview covers running `cicd_runner` instances whose `patch_target` names the repository. The
-  current patch comes from the host, or from a recorded `patch_manifest` field. Otherwise the host is
-  `unknown`.
+- `src/spot_runner_manager.py` records the patch on each runner host as instance metadata. It does this
+  when it provisions the host, and after a live patch, but only once the host confirms
+  `LIVE_PATCH_APPLIED:<sha256>`. The keys are:
+  - `spot-runner-patch`: the canonical manifest JSON. It's left out when larger than 64 KiB, and then
+    only the sha256 is recorded.
+  - `spot-runner-patch-sha256`: the sha256, or `none` when the host has no patch.
+  - `spot-runner-patch-target`: the repository.
+  - `spot-runner-prefix`, `spot-runner-count`, `spot-runner-label`, `spot-runner-region`, and
+    `spot-runner-heavy-pool`: the deployment details that a live patch needs.
+- The `spot-runner-patch` label holds the first 16 characters of the sha256, or `none`, for filtering.
+- On the control VM, `DASHBOARD_FLEET_INVENTORY=gce` makes the preview list runner hosts from Compute
+  Engine. A runner host carries the `spot-target` label or the patch metadata. The control VM's
+  service account needs `compute.instances.list`. Elsewhere the preview uses the host records in the
+  dashboard state.
+- The preview classifies each host from its recorded manifest, after checking it against the recorded
+  sha256. Hosts provisioned before patch recording show as `unknown`, with a reason. They stay that way
+  until they're reprovisioned or hot-patched once with `--patch-live`.
 - Hot-patching applies the saved effective patch, never a draft. It runs only when every host is
   `hot_patch` or `noop` and the `patch_sha256` from the preview is still current. It reports a result per
   host. A repeated request with the same `Idempotency-Key` returns the stored result without touching
@@ -134,8 +148,13 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   there answers HTTP 501 with `"code": "hot_patch_unavailable"`. Run
   `src/spot_runner_manager.py --patch-repo OWNER/REPO --patch-live` from an operator workstation instead. A
   dashboard that runs where `gcloud` and operator credentials exist can set
-  `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`. Each host record then needs `name`, `zone`, `machine_type`,
-  `runner_prefix`, and `runners_count`.
+  `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`. That path takes the region, runner label, repository, runner
+  count, and heavy pool size from the host's recorded metadata. It refuses a host that's missing any
+  of them, because the live patch would otherwise reset the host's GitHub scheduling labels to the
+  `spot_runner_manager.py` defaults.
+- A freeze waits up to 45 seconds for running saves and hot-patches to finish, so the handover snapshot
+  includes their results. If they're still running after that, the freeze answers HTTP 409 with
+  `"retryable": true`, and the autoscaler tries again.
 
 When `GITHUB_OAUTH_DEVICE_FLOW=1`, the Worker also passes `/auth/device/code` and `/auth/device/token`
 through without a session cookie. The dashboard still refuses them unless device login is enabled. The

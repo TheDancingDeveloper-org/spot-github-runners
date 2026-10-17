@@ -85,6 +85,12 @@ class InvalidRequestError(PatchConsoleError):
     status = 400
 
 
+class HostRefusedError(PatchConsoleError):
+    """One host cannot be hot-patched safely (its deployment details are not recorded)."""
+
+    status = 409
+
+
 class HotPatchUnavailable(PatchConsoleError):
     # 501 rather than 503: the edge Worker would turn a 503 into an endless control-VM wait.
     status = 501
@@ -334,19 +340,51 @@ def patch_summary(patch: RunnerPatch) -> dict[str, Any]:
 # --------------------------------------------------------------------------------------------------
 
 
+UNRECORDED_REASON = (
+    "no spot-runner-patch metadata: the host was provisioned before patch recording. It stays unknown until it is "
+    "reprovisioned or hot-patched once from a workstation (src/spot_runner_manager.py --patch-live records it)"
+)
+
+
 def runner_hosts(instances: Iterable[Mapping[str, Any]], repository: str) -> list[dict[str, Any]]:
-    """Running CI runner hosts recorded for ``repository`` (instance field ``patch_target``)."""
+    """Running CI runner hosts of ``repository``: recorded ``patch_target``, or the host's ``spot-target`` label."""
+    from .target_config import target_label_value
+
     wanted = repository.lower()
+    label = target_label_value(repository)
     hosts = []
     for inst in instances:
         if not isinstance(inst, Mapping):
             continue
         if inst.get("role") != "cicd_runner" or inst.get("status") != "RUNNING":
             continue
-        if str(inst.get("patch_target") or "").lower() != wanted:
+        if str(inst.get("patch_target") or "").lower() != wanted and inst.get("target_label") != label:
             continue
         hosts.append(dict(inst))
     return hosts
+
+
+def _recorded_manifest(host: Mapping[str, Any], target: RunnerPatch) -> tuple[bool, dict[str, Any] | None, str]:
+    """(known, current manifest or None, detail) from the ``spot-runner-patch`` metadata recorded on a host."""
+    sha = str(host.get("patch_sha256") or "")
+    if not sha:
+        return False, None, UNRECORDED_REASON
+    if sha == "none":
+        return True, None, "no patch recorded at provisioning (instance metadata)"
+    raw = host.get("patch_manifest_json") or ""
+    if not raw:
+        if sha == target.patch_sha256:
+            return True, target.to_canonical_dict(), "sha256 recorded in instance metadata (manifest too large to record)"
+        return False, None, ("only the sha256 is recorded (the manifest was larger than the metadata limit), so the "
+                             "change cannot be classified")
+    try:
+        manifest = json.loads(raw)
+        recorded_sha = validate_patch_dict(manifest).patch_sha256
+    except (ValueError, TypeError, AttributeError) as exc:
+        return False, None, f"the recorded spot-runner-patch metadata is invalid ({type(exc).__name__})"
+    if recorded_sha != sha:
+        return False, None, "the recorded spot-runner-patch metadata does not match its recorded sha256"
+    return True, manifest, "recorded in instance metadata"
 
 
 class HotPatchExecutor(Protocol):
@@ -379,7 +417,10 @@ _RUNNER_MANAGER_LOCK = threading.Lock()
 class GcloudHotPatchExecutor:
     """Runs where ``gcloud`` and operator credentials exist; wraps ``runner_manager.apply_live_patch``.
 
-    Host records must carry ``name``, ``zone``, ``machine_type``, ``runner_prefix``, and ``runners_count``.
+    Every deployment value comes from the host record (its VM metadata and labels, recorded at provisioning):
+    ``name``, ``zone``, ``machine_type``, ``runner_prefix``, ``runners_count``, ``runner_label``,
+    ``runner_region``, and ``patch_target``. A host missing any of them is refused, never patched with
+    runner_manager defaults, because ``sync_runner_labels`` would otherwise rewrite its scheduling labels.
     """
 
     def __init__(self, project: str, *, which: Callable[[str], str | None] | None = None,
@@ -412,14 +453,24 @@ class GcloudHotPatchExecutor:
     def apply(self, host: Mapping[str, Any], patch: RunnerPatch) -> dict[str, Any]:
         from . import runner_manager
 
-        missing = [k for k in ("name", "zone", "machine_type", "runner_prefix", "runners_count") if not host.get(k)]
+        required = ("name", "zone", "machine_type", "runner_prefix", "runners_count", "runner_label",
+                    "runner_region", "patch_target")
+        missing = [k for k in required if not host.get(k)]
         if missing:
-            raise PatchConsoleError(f"host record is missing {', '.join(missing)}")
+            raise HostRefusedError(f"refused: the host record does not carry {', '.join(missing)} "
+                                   "(provisioned before deployment details were recorded)")
+        zone, region = str(host["zone"]), str(host["runner_region"])
+        if not zone.startswith(region + "-"):
+            raise HostRefusedError(f"refused: recorded region {region} does not contain zone {zone}")
+        if str(host["patch_target"]).lower() != str(patch.repository).lower():
+            raise HostRefusedError(f"refused: the host belongs to {host['patch_target']}, not {patch.repository}")
+        heavy = host.get("heavy_runner_pool")
         args = runner_manager.args_parser().parse_args([
-            "--max-cost", "0", "--project", self.project, "--target", patch.repository,
-            "--instance-name", str(host["name"]), "--zone", str(host["zone"]),
+            "--max-cost", "0", "--project", self.project, "--target", str(host["patch_target"]),
+            "--instance-name", str(host["name"]), "--region", region, "--zone", zone,
             "--instance-type", str(host["machine_type"]), "--runner-prefix", str(host["runner_prefix"]),
-            "--runner-count", str(int(host["runners_count"])),
+            "--runner-count", str(int(host["runners_count"])), "--runner-label", str(host["runner_label"]),
+            *(["--heavy-runner-pool", str(int(heavy))] if heavy in (2, 3) else []),
         ])
         args.runner_patch = patch
         # runner_manager reads its project from a module global (set by its own main()); scope the override.
@@ -431,6 +482,40 @@ class GcloudHotPatchExecutor:
             finally:
                 runner_manager.PROJECT = previous
         return {"result": "applied" if outcome == "hot_patch" else str(outcome)}
+
+
+ENV_FLEET_INVENTORY = "DASHBOARD_FLEET_INVENTORY"
+
+
+def gce_host_source(project: str) -> Callable[[], list[dict[str, Any]]]:
+    """Runner hosts from a live Compute Engine listing (gcloud credentials or the GCE metadata server)."""
+
+    def source() -> list[dict[str, Any]]:
+        import asyncio
+
+        from . import compute_api
+
+        async def listing() -> list[dict[str, Any]]:
+            auth = compute_api.get_auth(project)
+            api = compute_api.AsyncGoogleApi(auth.token, 4)
+            try:
+                items, unreachables = await compute_api.list_instances(api, auth.project)
+            finally:
+                while not api.connections.empty():
+                    _reader, writer = api.connections.get_nowait()
+                    writer.close()
+            if unreachables:
+                raise RuntimeError(f"zones unreachable: {', '.join(unreachables[:5])}")
+            return compute_api.runner_host_records(items)
+
+        return asyncio.run(listing())
+
+    return source
+
+
+def host_source_from_env(project: str, env: Mapping[str, str] | None = None) -> Callable[[], list[dict[str, Any]]] | None:
+    env = os.environ if env is None else env
+    return gce_host_source(project) if str(env.get(ENV_FLEET_INVENTORY, "") or "").strip().lower() == "gce" else None
 
 
 def executor_from_env(project: str, env: Mapping[str, str] | None = None) -> HotPatchExecutor:
@@ -475,14 +560,16 @@ def classify_hosts(hosts: Iterable[Mapping[str, Any]], target: RunnerPatch,
                 current = host.get("patch_manifest")
                 source = "recorded by the fleet controller"
             else:
-                out.append(HostClassification(host, "unknown", None,
-                                              "the host's current patch is not recorded and the host is unreachable"))
-                continue
+                known, current, source = _recorded_manifest(host, target)
+                if not known:
+                    out.append(HostClassification(host, "unknown", None, source))
+                    continue
             if current is not None and not isinstance(current, dict):
                 raise ValueError("recorded patch manifest is not a mapping")
             current_sha = validate_patch_dict(current).patch_sha256 if current is not None else None
             classification = classify_patch_diff(current, target)
-            out.append(HostClassification(host, classification, current_sha, f"current patch {source}"))
+            detail = source if source.startswith(("recorded", "no patch", "sha256")) else f"current patch {source}"
+            out.append(HostClassification(host, classification, current_sha, detail))
         except Exception as exc:  # noqa: BLE001 - an unreadable host is "unknown", never a guess
             out.append(HostClassification(host, "unknown", None, f"could not determine the current patch: {exc}"))
     return out
@@ -497,11 +584,24 @@ class PatchConsole:
     """Operations behind the dashboard's ``/api/patches`` endpoints."""
 
     def __init__(self, config_repo: str, *, token: str | None = None, requester: Requester | None = None,
-                 executor: HotPatchExecutor | None = None) -> None:
+                 executor: HotPatchExecutor | None = None,
+                 host_source: Callable[[], list[dict[str, Any]]] | None = None) -> None:
         self.config_repo = config_repo
         self._token = token
         self._requester = requester
         self.executor: HotPatchExecutor = executor or UnavailableHotPatchExecutor()
+        # Live runner-host inventory (GCE instances with their recorded patch); None uses dashboard state records.
+        self.host_source = host_source
+
+    def _hosts(self, instances: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        if self.host_source is None:
+            return [dict(i) for i in instances if isinstance(i, Mapping)]
+        try:
+            return list(self.host_source())
+        except PatchConsoleError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - inventory failures are a clear 502, never "no hosts"
+            raise GitHubRestError(f"Could not list runner hosts from Compute Engine: {type(exc).__name__}: {exc}") from exc
 
     def client(self) -> ConfigRepoClient:
         token = self._token if self._token is not None else config_repo_token()
@@ -591,7 +691,7 @@ class PatchConsole:
 
     def preview(self, repository: str, instances: Iterable[Mapping[str, Any]], content: Any = None) -> dict[str, Any]:
         patch, source = self.effective_patch(repository, content)
-        hosts = classify_hosts(runner_hosts(instances, repository), patch, self.executor)
+        hosts = classify_hosts(runner_hosts(self._hosts(instances), repository), patch, self.executor)
         return {
             "repository": repository,
             "patch_sha256": patch.patch_sha256,
@@ -662,7 +762,7 @@ class PatchConsole:
                 "The effective patch changed since the preview; preview again before hot-patching",
                 body={"status": "stale_patch", "patch_sha256": patch.patch_sha256},
             )
-        hosts = classify_hosts(runner_hosts(instances, repository), patch, self.executor)
+        hosts = classify_hosts(runner_hosts(self._hosts(instances), repository), patch, self.executor)
         if not hosts:
             raise ConflictError(f"No running runner hosts are recorded for {repository}")
         blocked = [h for h in hosts if h.classification not in ("hot_patch", "noop")]
@@ -680,11 +780,14 @@ class PatchConsole:
             else:
                 try:
                     entry.update(self.executor.apply(h.host, patch))
+                except HostRefusedError as exc:
+                    entry["result"] = "refused"
+                    entry["detail"] = str(exc)
                 except Exception as exc:  # noqa: BLE001 - report per host, keep going
                     entry["result"] = "failed"
                     entry["detail"] = f"{type(exc).__name__}: {exc}"
             results.append(entry)
         applied = [r for r in results if r.get("result") == "applied"]
-        failed = [r for r in results if r.get("result") == "failed"]
+        failed = [r for r in results if r.get("result") in ("failed", "refused")]
         status = "noop" if not applied and not failed else ("applied" if not failed else ("partial" if applied else "failed"))
         return 200, {**base, "status": status, "hosts": results}

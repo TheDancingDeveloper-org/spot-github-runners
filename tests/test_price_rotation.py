@@ -1108,7 +1108,10 @@ class TargetOwnershipTests(unittest.TestCase):
                         patch("lib.runner_manager.gcloud", side_effect=cloud):
                     apply_startup(args, "zone-a", "safe-test-script")
                 create = next(c for c in calls if c[:3] == ["compute", "instances", "create"])
-                self.assertIn(f"--labels=spot-target={expected}", create)
+                [labels] = [a for a in create if a.startswith("--labels=")]
+                pairs = dict(p.split("=", 1) for p in labels[len("--labels="):].split(","))
+                self.assertEqual(pairs["spot-target"], expected)
+                self.assertEqual(set(pairs), {"spot-target", "spot-runner-patch"})  # plus the recorded-patch label
 
 
 def replace_vm(vm, **changes):

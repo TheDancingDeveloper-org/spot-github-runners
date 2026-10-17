@@ -211,6 +211,8 @@ write_dashboard_env() {
     printf 'SPOT_CONFIG_GH_TOKEN=%s\n' "$GITHUB_TOKEN"
     printf 'GH_TOKEN=%s\n' "$GITHUB_TOKEN"
     printf 'SPOT_GCP_TOKEN_SOURCE=metadata\n'
+    # Runner Patches preview: list runner hosts and their recorded spot-runner-patch metadata from Compute Engine.
+    printf 'DASHBOARD_FLEET_INVENTORY=gce\n'
   } | write_private_file "$ENV_FILE"
   printf 'TUNNEL_TOKEN=%s\n' "$tunnel_token" | write_private_file "$TUNNEL_ENV_FILE"
 }

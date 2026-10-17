@@ -354,7 +354,10 @@ container:
             result = manager.apply_live_patch(args, "asia-south2-a")
 
         self.assertEqual(result, "hot_patch")
-        self.assertEqual(len(ssh_commands), 2)
+        self.assertEqual(len([c for c in ssh_commands if c[:2] == ["compute", "ssh"]]), 2)
+        # After the confirmed apply, the recorded patch metadata and label are updated.
+        self.assertEqual([c[:3] for c in ssh_commands[2:]],
+                         [["compute", "instances", "add-metadata"], ["compute", "instances", "add-labels"]])
         sync_labels.assert_called_once_with(args)
 
         live_script = render_live_hot_patch_script(updated, base_dockerfile=RUNNER_DOCKERFILE, runner_prefix="oxidex-asia-")

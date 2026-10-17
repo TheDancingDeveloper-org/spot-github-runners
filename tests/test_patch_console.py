@@ -148,7 +148,7 @@ class FakeExecutor:
 def host(name, **extra):
     return {"name": name, "zone": "us-central1-a", "role": "cicd_runner", "status": "RUNNING",
             "patch_target": "swack-tools/oxidex", "machine_type": "n2-standard-8", "runner_prefix": "oxidex",
-            "runners_count": 2, **extra}
+            "runners_count": 2, "runner_label": "oxidex-spot-ci", "runner_region": "us-central1", **extra}
 
 
 def console(fake=None, executor=None):
@@ -378,12 +378,48 @@ class ExecutorTests(unittest.TestCase):
             self.assertEqual(ex.apply(host("h1"), patch), {"result": "applied"})
         self.assertEqual((seen, runner_manager.PROJECT), (["proj"], before))  # scoped, then restored
         args, zone = apply.call_args[0]
-        self.assertEqual((args.instance_name, args.zone, args.instance_type, args.runner_prefix, args.runner_count,
-                          args.target, zone), ("h1", "us-central1-a", "n2-standard-8", "oxidex", 2,
-                                               "swack-tools/oxidex", "us-central1-a"))
+        self.assertEqual((args.instance_name, args.zone, args.region, args.instance_type, args.runner_prefix,
+                          args.runner_count, args.runner_label, args.target, args.heavy_runner_pool, zone),
+                         ("h1", "us-central1-a", "us-central1", "n2-standard-8", "oxidex", 2, "oxidex-spot-ci",
+                          "swack-tools/oxidex", None, "us-central1-a"))
+        # Never the runner_manager defaults (asia-south2, oxidex-spot-7x27), which sync_runner_labels would apply.
+        defaults = runner_manager.args_parser().parse_args(["--max-cost", "0"])
+        self.assertNotEqual((args.region, args.runner_label), (defaults.region, defaults.runner_label))
         self.assertIs(args.runner_patch, patch)
-        with self.assertRaisesRegex(pc.PatchConsoleError, "runner_prefix"):
-            ex.apply({"name": "h", "zone": "z", "machine_type": "m", "runners_count": 1}, patch)
+        with mock.patch.object(runner_manager, "apply_live_patch", return_value="hot_patch") as apply:
+            ex.apply(host("h2", heavy_runner_pool=3), patch)
+        self.assertEqual(apply.call_args[0][0].heavy_runner_pool, 3)
+
+    def test_gcloud_executor_refuses_hosts_without_recorded_deployment_details(self):
+        from lib import runner_manager
+
+        ex = pc.GcloudHotPatchExecutor("proj", which=lambda _n: "/usr/bin/gcloud")
+        patch = validate_patch_dict(json.loads(OXIDEX))
+        with mock.patch.object(runner_manager, "apply_live_patch") as apply:
+            for key in ("runner_label", "runner_region", "patch_target", "runners_count", "runner_prefix", "zone"):
+                bad = host("h1")
+                bad.pop(key)
+                with self.subTest(missing=key), self.assertRaisesRegex(pc.HostRefusedError, key):
+                    ex.apply(bad, patch)
+            with self.assertRaisesRegex(pc.HostRefusedError, "does not contain zone"):
+                ex.apply(host("h1", runner_region="asia-south2"), patch)
+            with self.assertRaisesRegex(pc.HostRefusedError, "belongs to"):
+                ex.apply(host("h1", patch_target="someone/else"), patch)
+        apply.assert_not_called()
+
+    def test_hot_patch_reports_refused_hosts(self):
+        executor = FakeExecutor()
+
+        def apply(h, patch):
+            if h["name"] == "legacy":
+                raise pc.HostRefusedError("refused: the host record does not carry runner_label")
+            return {"result": "applied"}
+
+        executor.apply = apply
+        status, body = console(executor=executor).hot_patch("swack-tools/oxidex", TARGET_SHA,
+                                                            [host("new"), host("legacy")])
+        self.assertEqual({h["name"]: h["result"] for h in body["hosts"]}, {"new": "applied", "legacy": "refused"})
+        self.assertEqual(body["status"], "partial")
 
     def test_gcloud_executor_reads_host_receipt(self):
         receipts = {"h1": json.dumps({"manifest": OLD}), "h2": ""}

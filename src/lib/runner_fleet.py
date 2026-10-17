@@ -26,6 +26,75 @@ from .target_config import TARGET_LABEL_KEY
 
 LOG = logging.getLogger("spot_runner_autoscaler")
 
+# Which spot-runner-patch-v1 patch a runner host runs, recorded by runner_manager as instance metadata at
+# provisioning and after a confirmed live patch. ``spot-runner-patch`` holds the canonical manifest JSON (omitted
+# when larger than MAX_PATCH_METADATA_BYTES), ``spot-runner-patch-sha256`` its sha256 or ``none`` (no patch), and
+# ``spot-runner-patch-target`` the owner/repo the patch belongs to. The ``spot-runner-patch`` label carries a sha
+# prefix for filtering. Hosts provisioned before this existed have none of these keys.
+PATCH_METADATA_KEY = "spot-runner-patch"
+PATCH_SHA_METADATA_KEY = "spot-runner-patch-sha256"
+PATCH_TARGET_METADATA_KEY = "spot-runner-patch-target"
+PATCH_LABEL_KEY = "spot-runner-patch"
+# Deployment details apply_live_patch needs to hot-patch a host found by inventory (not secrets).
+RUNNER_PREFIX_METADATA_KEY = "spot-runner-prefix"
+RUNNER_COUNT_METADATA_KEY = "spot-runner-count"
+RUNNER_LABEL_METADATA_KEY = "spot-runner-label"
+RUNNER_REGION_METADATA_KEY = "spot-runner-region"
+RUNNER_HEAVY_POOL_METADATA_KEY = "spot-runner-heavy-pool"
+PATCH_LABEL_SHA_CHARS = 16
+NO_PATCH = "none"
+# GCE allows 256 KiB per metadata value and 512 KiB in total, and the startup script (with the patch embedded)
+# shares that budget; a larger manifest is recorded by sha only.
+MAX_PATCH_METADATA_BYTES = 64 * 1024
+
+
+def gce_metadata_items(item: dict) -> dict[str, str]:
+    """``{key: value}`` from a GCE instance's ``metadata.items`` (missing or malformed entries are skipped)."""
+    metadata = item.get("metadata") if isinstance(item, dict) else None
+    entries = metadata.get("items") if isinstance(metadata, dict) else None
+    out: dict[str, str] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and isinstance(entry.get("key"), str) and isinstance(entry.get("value"), str):
+            out[entry["key"]] = entry["value"]
+    return out
+
+
+def patch_record_from_gce_item(item: dict) -> dict[str, str]:
+    """The recorded runner patch of a GCE instance resource: ``patch_sha256``, ``patch_manifest_json``,
+    ``patch_target`` (empty strings when not recorded). The values are not trusted further than their shape;
+    consumers verify the manifest against its sha before using it."""
+    metadata = gce_metadata_items(item)
+    sha = metadata.get(PATCH_SHA_METADATA_KEY, "").strip().lower()
+    if sha != NO_PATCH and not (len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)):
+        sha = ""
+    manifest = metadata.get(PATCH_METADATA_KEY, "") if sha and sha != NO_PATCH else ""
+    if len(manifest.encode("utf-8")) > MAX_PATCH_METADATA_BYTES:
+        manifest = ""
+    target = metadata.get(PATCH_TARGET_METADATA_KEY, "").strip() if sha else ""
+    return {"patch_sha256": sha, "patch_manifest_json": manifest, "patch_target": target}
+
+
+def runner_deployment_from_gce_item(item: dict) -> dict[str, Any]:
+    """Recorded ``runner_prefix`` and ``runners_count`` of a runner host (absent keys are omitted)."""
+    metadata = gce_metadata_items(item)
+    out: dict[str, Any] = {}
+    prefix = metadata.get(RUNNER_PREFIX_METADATA_KEY, "").strip()
+    if prefix and all(c.isalnum() or c in "-_" for c in prefix):
+        out["runner_prefix"] = prefix
+    count = metadata.get(RUNNER_COUNT_METADATA_KEY, "").strip()
+    if count.isdigit() and 0 < int(count) <= 64:
+        out["runners_count"] = int(count)
+    label = metadata.get(RUNNER_LABEL_METADATA_KEY, "").strip()
+    if label and len(label) <= 64 and all(c.isalnum() or c in "._-" for c in label):
+        out["runner_label"] = label
+    region = metadata.get(RUNNER_REGION_METADATA_KEY, "").strip()
+    if region and len(region) <= 40 and all(c.islower() or c.isdigit() or c == "-" for c in region):
+        out["runner_region"] = region
+    heavy = metadata.get(RUNNER_HEAVY_POOL_METADATA_KEY, "").strip()
+    if heavy in ("2", "3"):
+        out["heavy_runner_pool"] = int(heavy)
+    return out
+
 
 @dataclass(frozen=True)
 class GitHubRunner:
@@ -57,6 +126,10 @@ class GceVm:
     requested_cpu_platform: str = ""
     # Value of the GCE ``spot-target`` label; empty for hosts launched before target labels.
     target_label: str = ""
+    # Recorded runner patch (see PATCH_*_METADATA_KEY); empty for hosts provisioned before patch recording.
+    patch_sha256: str = ""
+    patch_manifest_json: str = ""
+    patch_target: str = ""
 
     @property
     def running(self) -> bool:
@@ -259,6 +332,7 @@ def list_gcloud_vms(
                 requested_cpu_platform=str(item.get("minCpuPlatform", "")),
                 target_label=str((item.get("labels") or {}).get(TARGET_LABEL_KEY, "")
                                  if isinstance(item.get("labels"), dict) else ""),
+                **patch_record_from_gce_item(item),
             )
         )
     return tuple(vms)
