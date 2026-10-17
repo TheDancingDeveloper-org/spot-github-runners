@@ -644,6 +644,19 @@ def create_command(config: ControlConfig, slot: str, offer: ControlOffer, startu
     return command
 
 
+def created_instance_id(stdout: str | None, name: str) -> str:
+    """Provider instance id from ``instances create --format=json`` output, or "" when it is absent."""
+    try:
+        rows = json.loads(stdout or "[]")
+    except ValueError:
+        return ""
+    rows = [rows] if isinstance(rows, dict) else rows
+    if not isinstance(rows, list):
+        return ""
+    return next((str(row["id"]) for row in rows
+                 if isinstance(row, dict) and row.get("name") == name and row.get("id")), "")
+
+
 def default_gcloud(argv: list[str]) -> Any:
     # Never accept partial Compute results (for example a zone that could not be listed): an omitted
     # VM would look missing and could be created again, giving two VMs the same slot identity.
@@ -733,6 +746,8 @@ class ControlVmManager:
         self.offer_source = offer_source or (lambda: default_offer_source(config, self.gcloud))
         self.clock = clock or _time.time
         self._snapshot: dict[str, Any] | None = None
+        # (transition id, snapshot) captured when the rollback fence froze the replacement this run.
+        self._replacement_freeze: tuple[str, dict[str, Any] | None] | None = None
         self.log: list[str] = []
 
     # -- state ---------------------------------------------------------------------------
@@ -878,10 +893,15 @@ class ControlVmManager:
             "mode": mode,
             "old_slot": plan.slot if mode != MODE_BOOTSTRAP else None,
             "new_slot": new_slot,
-            "old_vm": {"name": old_vm.name, "zone": old_vm.zone} if old_vm else None,
+            # Provider instance ids pin the exact VMs this transition manages: a VM recreated under the
+            # same slot name later is a different instance and is never stopped or deleted (see
+            # _identity_problem). ``old_vm`` None means the outgoing slot had no VM at the start.
+            "old_vm": ({"name": old_vm.name, "zone": old_vm.zone, "instance_id": old_vm.instance_id or None}
+                       if old_vm else None),
             "new_vm": {"name": control_vm_name(new_slot),
                        "zone": existing.zone if existing else (offer.zone if offer else ""),
-                       "machine_type": existing.machine_type if existing else (offer.machine_type if offer else "")},
+                       "machine_type": existing.machine_type if existing else (offer.machine_type if offer else ""),
+                       "instance_id": (existing.instance_id or None) if existing else None},
             "offer": offer.to_dict() if offer else None,
             "excluded_zones": ([old_vm.zone] if (old_vm and mode == MODE_RECOVER) else [])
                               + self._retained_zones(new_slot),
@@ -911,8 +931,88 @@ class ControlVmManager:
         return sorted({str(d.get("zone")) for d in self.cstate.get("retained_disks", [])
                        if d.get("slot") == slot and d.get("zone")})
 
-    def _delete_vm(self, t: dict, vm: ControlVm, *, keep_boot_disk: bool, reason: str) -> bool:
-        """Delete ``vm``; with ``keep_boot_disk`` record the retained disk and log it for an operator."""
+    # -- instance identity ---------------------------------------------------------------
+    def _identity_problem(self, t: dict, role: str, vm: ControlVm, *, adopt: bool) -> str | None:
+        """None when ``vm`` is the exact instance this transition manages as ``role`` ("old" or "new").
+
+        Slot names are reused, so a VM recreated under the same name (by an operator or another
+        controller) while the transition is pending looks identical by name; only the provider instance
+        id tells them apart. With ``adopt``, an id that was never recorded (the replacement before its
+        first observation, or a transition saved before ids were recorded) is recorded now, provided the
+        VM is in the zone the transition recorded for it.
+        """
+        label = "outgoing" if role == "old" else "replacement"
+        record = t.get(f"{role}_vm")
+        if record is None:
+            if role == "old":
+                return (f"outgoing slot {vm.slot} had no VM when this transition began, but {vm.name} "
+                        f"(id {vm.instance_id or '?'}) exists now; it is not the VM this transition manages")
+            record = t["new_vm"] = {"name": vm.name, "zone": "", "machine_type": vm.machine_type}
+        if not vm.instance_id:
+            return f"{label} {vm.name} has no instance id in the inventory, so its identity cannot be confirmed"
+        recorded = record.get("instance_id")
+        if recorded:
+            if str(recorded) == vm.instance_id:
+                return None
+            return (f"{label} {vm.name} in {vm.zone} is instance {vm.instance_id}, not instance {recorded} "
+                    f"recorded by this transition; it was recreated under the same name, so this "
+                    f"transition never stops, deletes, or reactivates it; an operator must resolve it")
+        if not adopt:
+            return f"{label} {vm.name} has no recorded instance id; refusing to act on an unconfirmed VM"
+        zone = record.get("zone")
+        if zone and zone != vm.zone and not (role == "new" and t.get("step") == "create"):
+            return (f"{label} {vm.name} is in {vm.zone}, but this transition recorded zone {zone}; it is "
+                    f"not the VM this transition manages")
+        record["instance_id"] = vm.instance_id
+        self.save()
+        self._note("transition %s now tracks %s %s as instance %s", t.get("id"), label, vm.name, vm.instance_id)
+        return None
+
+    def _identity_problems(self, t: dict, obs: Observation) -> list[str]:
+        """Record unset instance ids and return every observed slot VM that is not the recorded one."""
+        problems = []
+        for role in ("old", "new"):
+            slot = t.get(f"{role}_slot")
+            vm = obs.vm(slot) if slot else None
+            if vm is not None:
+                problem = self._identity_problem(t, role, vm, adopt=True)
+                if problem:
+                    problems.append(problem)
+        return problems
+
+    def _request_stop(self, t: dict, role: str, vm: ControlVm, field_name: str, purpose: str) -> bool:
+        """Ask GCE to stop ``vm`` once, and again every STOP_RETRY_SECONDS while it is still not stopped.
+
+        False (and nothing is stopped) when ``vm`` is not the instance this transition recorded.
+        """
+        problem = self._identity_problem(t, role, vm, adopt=False)
+        if problem:
+            t["error"] = f"refusing to stop: {problem}"
+            self.save()
+            self._note(t["error"], level=logging.ERROR)
+            return False
+        requested = t.get(field_name)
+        now = self.clock()
+        if requested and now - requested < STOP_RETRY_SECONDS:
+            return True
+        t[field_name] = now
+        self.save()
+        result = self.gcloud(stop_command(vm, self.config.project))
+        self._note("stopping %s %s (exit %s)", vm.name, purpose, getattr(result, "returncode", None),
+                   level=logging.WARNING)
+        return True
+
+    def _delete_vm(self, t: dict, vm: ControlVm, *, role: str, keep_boot_disk: bool, reason: str) -> bool:
+        """Delete ``vm``; with ``keep_boot_disk`` record the retained disk and log it for an operator.
+
+        Refuses (False) unless ``vm`` is the exact instance this transition recorded as ``role``.
+        """
+        problem = self._identity_problem(t, role, vm, adopt=False)
+        if problem:
+            t["error"] = f"refusing to delete: {problem}"
+            self.save()
+            self._note(t["error"], level=logging.ERROR)
+            return False
         result = self.gcloud(delete_command(vm, self.config.project, keep_boot_disk=keep_boot_disk))
         if result.returncode != 0:
             t["error"] = f"delete of {vm.name} failed: {(result.stderr or '').strip()[:300]}"
@@ -994,6 +1094,18 @@ class ControlVmManager:
                 self._note("transition paused at step %s: %s", step, "; ".join(obs.problems),
                            level=logging.ERROR)
                 return
+            mismatches = self._identity_problems(t, obs)
+            if mismatches:
+                # A slot VM that is not the recorded instance was recreated under the same name while
+                # this transition was pending. Every step would act on it (start, stop, freeze, import,
+                # unfreeze, origin writes that depend on it, delete), so hold until an operator resolves it.
+                t["error"] = "held: " + "; ".join(mismatches)
+                t["identity_hold"] = mismatches
+                t["updated_at"] = self.clock()
+                self.save()
+                self._note("transition held at step %s: %s", step, "; ".join(mismatches), level=logging.ERROR)
+                return
+            t.pop("identity_hold", None)
             handler = getattr(self, f"_step_{step}", None)
             if handler is None:
                 self._abort(t, f"unknown step {step!r}")
@@ -1083,6 +1195,8 @@ class ControlVmManager:
                 result = self.gcloud(command)
                 if result.returncode == 0:
                     t.pop("pending_create", None)
+                    t["new_vm"]["instance_id"] = created_instance_id(result.stdout, control_vm_name(t["new_slot"])) \
+                        or None  # None: recorded at the first observation instead
                     self._note("created %s (%s) in %s at $%.4f/day", control_vm_name(t["new_slot"]),
                                offer.machine_type, offer.zone, offer.daily_usd)
                     return self._advance_step(t)
@@ -1147,6 +1261,7 @@ class ControlVmManager:
         if vm is None:
             self._note("slot %s VM disappeared before becoming healthy; creating again", t["new_slot"],
                        level=logging.WARNING)
+            t["new_vm"]["instance_id"] = None  # the recorded replacement is gone; track the next one
             self._goto(t, "create")
             return "wait"
         if vm.status in STOPPED_STATES:
@@ -1299,16 +1414,6 @@ class ControlVmManager:
         self.save()
         return True
 
-    def _replacement_ready(self, t: dict, obs: Observation) -> tuple[bool, str]:
-        """Fresh readiness of the new slot: RUNNING and passing health right now."""
-        vm = obs.vm(t["new_slot"])
-        if vm is None:
-            return False, f"slot {t['new_slot']} VM is missing"
-        if not vm.running:
-            return False, f"slot {t['new_slot']} VM is {vm.status}"
-        result = obs.health.get(t["new_slot"]) or probe_health(self.requester, self.config, t["new_slot"])
-        return (True, "") if result.ok else (False, f"slot {t['new_slot']} not healthy ({result.detail})")
-
     def _fence_old_writer(self, t: dict, obs: Observation) -> bool:
         """True once the old slot can no longer accept writes: confirmed frozen, or confirmed stopped.
 
@@ -1322,16 +1427,9 @@ class ControlVmManager:
         old = obs.vm(t["old_slot"])
         if old is None or old.status in STOPPED_STATES:
             return True
-        if not t.get("old_stop_requested_at"):
-            t["old_stop_requested_at"] = self.clock()
+        if self._request_stop(t, "old", old, "old_stop_requested_at", "(unreachable old slot) before cutover"):
+            t["error"] = f"waiting for old slot {t['old_slot']} ({old.status}) to stop before cutover"
             self.save()
-            result = self.gcloud(stop_command(old, self.config.project))
-            self._note("stopping unreachable old slot %s before cutover (exit %s)", t["old_slot"],
-                       getattr(result, "returncode", None), level=logging.WARNING)
-        elif self.clock() - t["old_stop_requested_at"] >= STOP_RETRY_SECONDS:
-            t["old_stop_requested_at"] = None  # ask again on the next tick
-        t["error"] = f"waiting for old slot {t['old_slot']} ({old.status}) to stop before cutover"
-        self.save()
         return False
 
     def _step_cutover(self, t: dict, obs: Observation) -> str:
@@ -1395,7 +1493,7 @@ class ControlVmManager:
             t.pop("replacement_unready_since", None)
             # Recovery without an import (the old VM was down) may leave changes on the old disk that never
             # reached KV, so its boot disk is kept.
-            if not self._delete_vm(t, old, keep_boot_disk=bool(t.get("import_skipped")),
+            if not self._delete_vm(t, old, role="old", keep_boot_disk=bool(t.get("import_skipped")),
                                    reason="old VM went down before its state was imported"):
                 self._fail_attempt(t, t["error"], limit=10**9)
                 return "wait"
@@ -1446,6 +1544,8 @@ class ControlVmManager:
 
     def _replacement_snapshot(self, t: dict, obs: Observation) -> dict[str, Any] | None:
         """Freeze the replacement (idempotent) and return its snapshot, or None when it is unreachable."""
+        if self._replacement_freeze is not None and self._replacement_freeze[0] == t.get("id"):
+            return self._replacement_freeze[1]  # the rollback fence froze it moments ago
         new = obs.vm(t["new_slot"])
         if new is None or not new.running:
             return None
@@ -1497,8 +1597,45 @@ class ControlVmManager:
         self.save()
         return True
 
+    def _fence_replacement(self, t: dict, obs: Observation) -> bool:
+        """True once the replacement can no longer write: confirmed frozen, or confirmed stopped or gone.
+
+        After a cutover attempt ``origin:active`` may have named the replacement (an unverified write can
+        still land), so it may be a writer. KV is eventually consistent, so restoring the origin pointer
+        cannot take that away by itself; and the delete that follows can fail. The old slot is therefore
+        unfrozen and pointed at again only after the replacement answered a freeze with its state_version
+        (the freeze marker survives restarts) or fresh inventory shows it stopped or absent. Otherwise the
+        replacement is stopped (again every STOP_RETRY_SECONDS) and the rollback waits.
+        """
+        if not t.get("cutover_attempted") or not t.get("old_slot"):
+            return True
+        new = obs.vm(t["new_slot"])
+        if new is None or new.status in STOPPED_STATES or t.get("new_frozen"):
+            return True
+        if new.running:
+            status, body = self._control(t["new_slot"], "freeze", "POST")
+            version = body.get("state_version") if isinstance(body, dict) else None
+            if status == 200 and isinstance(version, int) and not isinstance(version, bool):
+                t["new_frozen"] = True
+                self._replacement_freeze = (t["id"], parse_snapshot(body.get("snapshot")))
+                self.save()
+                self._note("froze replacement slot %s at state_version %d before rolling back", t["new_slot"],
+                           version)
+                return True
+            self._note("could not freeze replacement slot %s for rollback (HTTP %s); stopping it", t["new_slot"],
+                       status, level=logging.WARNING)
+        if self._request_stop(t, "new", new, "new_stop_requested_at",
+                              f"(replacement) before slot {t['old_slot']} serves again"):
+            t["error"] = (f"waiting for replacement slot {t['new_slot']} ({new.status}) to freeze or stop before "
+                          f"slot {t['old_slot']} is unfrozen or named by origin:active again")
+            self.save()
+        return False
+
     def _step_abort(self, t: dict, obs: Observation) -> str:
         old = obs.vm(t.get("old_slot"))
+        # Never two writable slots: fence the replacement before the old slot is reactivated.
+        if not self._fence_replacement(t, obs):
+            return "wait"
         # After a cutover attempt the replacement may have accepted changes and published them to KV
         # (even if it has since disappeared): import them into the old VM before it serves again.
         if t.get("cutover_attempted") and t.get("old_slot") and old is not None and old.running \
@@ -1541,7 +1678,7 @@ class ControlVmManager:
                 return "wait"
             # After a cutover attempt the replacement may hold changes that never reached the old VM.
             keep = bool(t.get("cutover_attempted")) and not t.get("replacement_state_transferred")
-            if not self._delete_vm(t, new, keep_boot_disk=keep,
+            if not self._delete_vm(t, new, role="new", keep_boot_disk=keep,
                                    reason="rollback could not confirm its state reached the old VM"):
                 return "wait"
         self.cstate["transition"] = None

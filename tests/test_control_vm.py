@@ -67,12 +67,18 @@ class FakeGcloud:
         self.describe_error: str | None = None  # ambiguous describe failure (not a 404)
         self.extra_rows: list[dict] = []  # additional inventory rows (for duplicate-name tests)
         self.list_stderr = ""  # diagnostics gcloud printed while still exiting 0 (partial results)
+        self.create_ids: list[str] = []  # instance ids for the next creates (default id-<slot>)
+        self.create_returns_row = True  # create prints the new instance (with its id) as JSON
 
-    def add(self, slot, status="RUNNING", zone="us-central1-a", machine="e2-small"):
+    def add(self, slot, status="RUNNING", zone="us-central1-a", machine="e2-small", instance_id=None):
         name = f"spot-control-{slot}"
         self.vms[name] = {"name": name, "zone": f"projects/proj/zones/{zone}", "status": status,
                           "labels": {"spot-role": "control", "spot-control-slot": slot},
-                          "id": f"id-{slot}", "machineType": f"zones/{zone}/machineTypes/{machine}"}
+                          "id": instance_id or f"id-{slot}", "machineType": f"zones/{zone}/machineTypes/{machine}"}
+
+    def recreate(self, slot, instance_id):
+        """Simulate an operator deleting and recreating a slot VM under the same name."""
+        self.vms[f"spot-control-{slot}"]["id"] = instance_id
 
     def status(self, slot, status):
         self.vms[f"spot-control-{slot}"]["status"] = status
@@ -95,11 +101,13 @@ class FakeGcloud:
                 return SimpleNamespace(returncode=1, stdout="", stderr="ZONE_RESOURCE_POOL_EXHAUSTED")
             slot = name.rsplit("-", 1)[1]
             machine = next(a.split("=", 1)[1] for a in argv if a.startswith("--machine-type="))
-            self.add(slot, status="PROVISIONING", zone=zone, machine=machine)
+            self.add(slot, status="PROVISIONING", zone=zone, machine=machine,
+                     instance_id=self.create_ids.pop(0) if self.create_ids else None)
             self.events.append(("create", name, zone))
             if zone in self.land_but_fail_zones:
                 return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: operation polling failed")
-            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+            rows = [dict(self.vms[name])] if self.create_returns_row else []
+            return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
         if verb == ["instances", "describe"]:
             self.events.append(("describe", name, zone))
             if self.describe_error:
@@ -1014,6 +1022,11 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         h.http.unhealthy("b")
         h.http.freeze_status = 503  # the replacement cannot be frozen
         h.tick()
+        # Not frozen and still RUNNING: it is stopped, and the old slot is not reactivated until it is.
+        self.assertEqual(h.mutations(), [("freeze", "b"), ("stop", "spot-control-b")])
+        self.assertEqual(h.kv.origin_slot(), "b")
+        h.gcloud.status("b", "TERMINATED")
+        h.tick()
         self.assertEqual(h.http.versions["a"], 9)  # KV state still carried back
         self.assertEqual(h.kv.origin_slot(), "a")
         call = delete_call(h, "spot-control-b")
@@ -1118,6 +1131,287 @@ class ResumeFromPersistedStepTests(unittest.TestCase):
         h.tick()
         self.assertIn("spot-control-b", h.gcloud.vms)
         self.assertEqual(h.transition["step"], "abort")
+
+
+class RollbackFenceTests(unittest.TestCase):
+    """Codex P1: a rollback never leaves the replacement and the old slot writable at the same time."""
+
+    setup_rotation = ResumeFromPersistedStepTests.setup_rotation
+    with_new_vm = ResumeFromPersistedStepTests.with_new_vm
+    rollback_setup = ResumeFromPersistedStepTests.rollback_setup
+
+    def old_reactivated(self, h):
+        return ("unfreeze", "a") in h.events or ("origin", "a") in h.events or ("import", "a") in h.events
+
+    def test_unfreezable_running_replacement_is_stopped_before_old_slot_serves_again(self):
+        h = self.rollback_setup()
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 9, "b", now=1))
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        h.http.freeze_status = 503  # the replacement cannot be frozen ...
+        h.gcloud.stop_rc = 1  # ... and the first stop request does not take effect
+        h.tick()
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertEqual(h.mutations(), [("freeze", "b"), ("stop", "spot-control-b")])
+        self.assertFalse(self.old_reactivated(h))
+        self.assertEqual(h.kv.origin_slot(), "b")
+        self.assertIn("to freeze or stop", h.transition["error"])
+        h.clock[0] += cv.STOP_RETRY_SECONDS - 1
+        h.tick()  # still RUNNING: freeze is retried, the stop is not repeated inside the interval
+        self.assertEqual(h.events.count(("stop", "spot-control-b")), 1)
+        self.assertFalse(self.old_reactivated(h))
+        h.gcloud.stop_rc = 0
+        h.clock[0] += 1
+        h.tick()  # interval elapsed: the stop is requested again
+        self.assertEqual(h.events.count(("stop", "spot-control-b")), 2)
+        self.assertEqual(h.gcloud.vms["spot-control-b"]["status"], "STOPPING")
+        self.assertFalse(self.old_reactivated(h))
+        h.tick()  # STOPPING is not stopped yet
+        self.assertEqual(h.events.count(("stop", "spot-control-b")), 2)
+        self.assertFalse(self.old_reactivated(h))
+        self.assertEqual(h.kv.origin_slot(), "b")
+        h.gcloud.status("b", "TERMINATED")
+        h.gcloud.delete_rc = 1  # the replacement delete fails after the old slot is restored
+        h.tick()
+        self.assertEqual(h.mutations()[-4:], [("import", "a"), ("unfreeze", "a"), ("origin", "a"),
+                                              ("delete", "spot-control-b")])
+        self.assertEqual(h.http.versions["a"], 9)
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertEqual(h.gcloud.vms["spot-control-b"]["status"], "TERMINATED")  # still not a writer
+        self.assertEqual(h.transition["step"], "abort")
+        h.gcloud.delete_rc = 0
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertNotIn("spot-control-b", h.gcloud.vms)
+        self.assertIn("--keep-disks=boot", [c for c in h.gcloud.calls if c[2:4] == ["instances", "delete"]][-1])
+        self.assertNotIn(("start", "spot-control-b"), h.events)
+
+    def test_confirmed_freeze_fences_replacement_without_a_stop(self):
+        h = self.rollback_setup()
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        h.gcloud.delete_rc = 1
+        h.tick()
+        self.assertEqual(h.mutations(), [("freeze", "b"), ("unfreeze", "a"), ("origin", "a"),
+                                         ("delete", "spot-control-b")])
+        self.assertTrue(h.transition["new_frozen"])  # delete failed: the frozen replacement still cannot write
+        h.gcloud.delete_rc = 0
+        h.tick()
+        self.assertEqual(h.mutations()[-1], ("delete", "spot-control-b"))
+        self.assertEqual(h.events.count(("freeze", "b")), 1)  # the recorded freeze still fences it
+        self.assertNotIn(("stop", "spot-control-b"), h.events)
+
+    def test_freeze_reply_without_state_version_is_not_a_fence(self):
+        h = self.rollback_setup()
+        self.with_new_vm(h, healthy=False)
+        h.http.unhealthy("b")
+        real = h.http.__call__
+
+        def no_version(method, url, headers, body, timeout):
+            status, raw = real(method, url, headers, body, timeout)
+            if url.endswith("/api/control/freeze") and "spot-origin-b" in url:
+                return 200, b'{"frozen": true}'
+            return status, raw
+
+        manager = cv.ControlVmManager(h.config, h.state, h.save, gcloud=h.gcloud, kv=h.kv, requester=no_version,
+                                      offer_source=lambda: list(h.offers), clock=lambda: h.clock[0])
+        manager.tick(apply=True)
+        self.assertEqual(h.gcloud.mutating()[-1][2:5], ["instances", "stop", "spot-control-b"])
+        self.assertFalse(self.old_reactivated(h))
+
+    def test_rollback_without_cutover_attempt_needs_no_fence(self):
+        h = self.setup_rotation("abort", freeze_requested=True, abort_reason="import failed")
+        self.with_new_vm(h)
+        h.http.freeze_status = 503
+        h.tick()
+        self.assertEqual(h.mutations(), [("unfreeze", "a"), ("delete", "spot-control-b")])
+
+
+class InstanceIdentityTests(unittest.TestCase):
+    """Codex P1: a VM recreated under a transition's slot name is never stopped, deleted, or reactivated."""
+
+    setup_rotation = ResumeFromPersistedStepTests.setup_rotation
+    with_new_vm = ResumeFromPersistedStepTests.with_new_vm
+
+    def tracked(self, step, **fields):
+        h = self.setup_rotation(step, **fields)
+        if h.transition["old_vm"] is not None:
+            h.transition["old_vm"]["instance_id"] = "id-a"
+        h.state[cv.STATE_KEY]["transition"]["new_vm"]["instance_id"] = "id-b"
+        return h
+
+    def test_begin_and_create_record_instance_ids(self):
+        h = Harness()
+        ExecutorTests.healthy_active(None, h)
+        h.gcloud.create_ids = ["id-b-created"]
+        h.tick()
+        self.assertEqual(h.transition["old_vm"]["instance_id"], "id-a")
+        self.assertEqual(h.transition["new_vm"]["instance_id"], "id-b-created")
+
+    def test_begin_pins_the_observed_instances_before_any_step(self):
+        h = Harness()
+        ExecutorTests.healthy_active(None, h)
+        h.gcloud.add("b", status="TERMINATED", zone="us-east1-b", instance_id="id-b-existing")
+        manager = h.manager()
+        obs = manager.observe(want_offers=False)
+        manager._begin(cv.MODE_RECOVER, cv.Plan("recreate_other_slot", "test", slot="a", target_slot="b"), obs)
+        self.assertEqual(h.transition["old_vm"]["instance_id"], "id-a")
+        self.assertEqual(h.transition["new_vm"]["instance_id"], "id-b-existing")
+        self.assertEqual(h.gcloud.mutating(), [])
+
+    def test_replacement_lost_before_health_adopts_the_slot_vm_found_by_create(self):
+        h = Harness()
+        ExecutorTests.healthy_active(None, h)
+        h.tick()
+        self.assertEqual(h.transition["new_vm"]["instance_id"], "id-b")
+        h.gcloud.vms.pop("spot-control-b")
+        h.tick()  # wait_health: gone, back to create
+        self.assertEqual(h.transition["step"], "create")
+        # The create step adopts whatever VM it finds in the slot (for example a create that landed late).
+        h.gcloud.add("b", status="PROVISIONING", instance_id="id-b-late")
+        h.tick()
+        self.assertEqual(h.transition["step"], "wait_health")
+        self.assertEqual(h.transition["new_vm"]["instance_id"], "id-b-late")
+        self.assertNotIn("held", h.transition.get("error") or "")
+
+    def test_replacement_swapped_right_after_create_is_held(self):
+        h = Harness()
+        ExecutorTests.healthy_active(None, h)
+        real = h.gcloud.__call__
+
+        def gcloud(argv):
+            result = real(argv)
+            if argv[2:4] == ["instances", "create"]:
+                h.gcloud.recreate("b", "id-b-other")  # replaced before the first inventory listing
+            return result
+
+        manager = cv.ControlVmManager(h.config, h.state, h.save, gcloud=gcloud, kv=h.kv, requester=h.http,
+                                      offer_source=lambda: list(h.offers), clock=lambda: h.clock[0])
+        manager.tick(apply=True)
+        h.gcloud.status("b", "RUNNING")
+        h.http.healthy("b")
+        h.tick()
+        self.assertEqual(h.mutations(), [("create", "spot-control-b", "us-central1-a")])
+        self.assertIn("id-b-other", h.transition["error"])
+
+    def test_delete_old_never_deletes_a_recreated_outgoing_vm(self):
+        h = self.tracked("delete_old", cutover_attempted=True, cutover_at=1.0)
+        h.kv.set_origin("b")
+        self.with_new_vm(h)
+        h.gcloud.recreate("a", "id-a2")
+        h.tick()
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertEqual(h.transition["step"], "delete_old")
+        self.assertTrue(h.transition["error"].startswith("held: outgoing spot-control-a"))
+        self.assertIn("id-a2", h.transition["error"])
+        self.assertIn("spot-control-a", h.gcloud.vms)
+        h.gcloud.recreate("a", "id-a")  # the recorded instance: deletion proceeds
+        h.tick()
+        self.assertEqual(h.events, [("delete", "spot-control-a")])
+        self.assertIsNone(h.transition)
+
+    def test_abort_never_touches_a_recreated_replacement(self):
+        for cutover in (False, True):
+            with self.subTest(cutover_attempted=cutover):
+                h = self.tracked("abort", freeze_requested=True, abort_reason="x", cutover_attempted=cutover)
+                if cutover:
+                    h.kv.set_origin("b")
+                self.with_new_vm(h)
+                h.gcloud.recreate("b", "id-b2")
+                h.tick()
+                self.assertEqual(h.mutations(), [])  # no freeze/stop/delete of it, no unfreeze or origin write
+                self.assertEqual(h.gcloud.mutating(), [])
+                self.assertIn("spot-control-b", h.gcloud.vms)
+                self.assertEqual(h.transition["step"], "abort")
+                self.assertIn("id-b2", h.transition["error"])
+                h.gcloud.recreate("b", "id-b")
+                h.tick()
+                self.assertIsNone(h.transition)
+                self.assertNotIn("spot-control-b", h.gcloud.vms)
+
+    def test_cutover_never_points_origin_at_a_recreated_replacement(self):
+        h = self.tracked("cutover", freeze_requested=True, frozen_version=7)
+        self.with_new_vm(h)
+        h.gcloud.recreate("b", "id-b2")
+        h.tick()
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertEqual(h.mutations(), [])
+
+    def test_recovery_fence_never_stops_a_recreated_outgoing_vm(self):
+        h = self.tracked("cutover", mode=cv.MODE_RECOVER, import_skipped=True, kv_caught_up=True)
+        h.http.unhealthy("a")
+        self.with_new_vm(h)
+        h.gcloud.recreate("a", "id-a2")
+        h.tick()
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertEqual(h.kv.origin_slot(), "a")
+
+    def test_outgoing_slot_without_a_vm_at_begin_never_adopts_a_new_one(self):
+        h = self.tracked("delete_old", mode=cv.MODE_RECOVER, cutover_attempted=True, cutover_at=1.0,
+                         import_skipped=True, old_vm=None)
+        h.kv.set_origin("b")
+        self.with_new_vm(h)
+        h.tick()  # spot-control-a exists, but the transition began without one
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertIn("had no VM when this transition began", h.transition["error"])
+
+    def test_replacement_lost_before_health_is_tracked_again_when_recreated(self):
+        h = Harness()
+        ExecutorTests.healthy_active(None, h)
+        h.gcloud.create_returns_row = False  # ids come from the inventory, not the create output
+        h.gcloud.create_ids = ["id-b1", "id-b2"]
+        h.tick()
+        h.tick()  # first observation records id-b1
+        self.assertEqual(h.transition["new_vm"]["instance_id"], "id-b1")
+        h.gcloud.vms.pop("spot-control-b")  # preempted and deleted before it became healthy
+        h.tick()
+        self.assertEqual(h.transition["step"], "create")
+        h.tick()
+        h.gcloud.status("b", "RUNNING")
+        h.http.healthy("b")
+        h.tick()
+        self.assertEqual(h.transition["new_vm"]["instance_id"], "id-b2")
+        self.assertEqual(h.transition["step"], "propagate")
+        self.assertEqual(h.kv.origin_slot(), "b")
+
+    def test_direct_delete_and_stop_guards_refuse_unconfirmed_instances(self):
+        h = self.tracked("delete_old", cutover_attempted=True, cutover_at=1.0)
+        self.with_new_vm(h)
+        h.gcloud.recreate("a", "id-a2")
+        manager = h.manager()
+        obs = manager.observe(want_offers=False)
+        t = h.transition
+        self.assertFalse(manager._delete_vm(t, obs.vm("a"), role="old", keep_boot_disk=False, reason="x"))
+        self.assertFalse(manager._request_stop(t, "old", obs.vm("a"), "old_stop_requested_at", "test"))
+        t["new_vm"]["instance_id"] = None  # never recorded: deletes and stops do not adopt
+        self.assertFalse(manager._delete_vm(t, obs.vm("b"), role="new", keep_boot_disk=False, reason="x"))
+        self.assertFalse(manager._request_stop(t, "new", obs.vm("b"), "new_stop_requested_at", "test"))
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertIn("refusing to stop", t["error"])
+
+    def test_legacy_transition_adopts_ids_on_resume_then_enforces_them(self):
+        h = self.setup_rotation("propagate", cutover_attempted=True, cutover_at=h_now() - 30)
+        self.assertNotIn("instance_id", h.transition["old_vm"])  # saved before ids were recorded
+        h.kv.set_origin("b")
+        self.with_new_vm(h)
+        h.tick()
+        self.assertEqual((h.transition["old_vm"]["instance_id"], h.transition["new_vm"]["instance_id"]),
+                         ("id-a", "id-b"))
+        h.gcloud.recreate("a", "id-a2")
+        h.clock[0] += cv.PROPAGATION_SECONDS
+        h.tick()
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertIn("spot-control-a", h.gcloud.vms)
+
+    def test_legacy_transition_holds_when_outgoing_vm_moved_zones(self):
+        h = self.setup_rotation("delete_old", cutover_attempted=True, cutover_at=1.0)
+        h.kv.set_origin("b")
+        self.with_new_vm(h)
+        h.gcloud.vms["spot-control-a"]["zone"] = "projects/proj/zones/us-west1-a"  # recreated elsewhere
+        h.tick()
+        self.assertEqual(h.gcloud.mutating(), [])
+        self.assertIsNone(h.transition["old_vm"].get("instance_id"))
+        self.assertIn("recorded zone us-central1-a", h.transition["error"])
 
 
 def delete_call(h, name):
