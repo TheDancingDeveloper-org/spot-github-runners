@@ -103,6 +103,19 @@ class HotPatchUnavailable(PatchConsoleError):
     status = 501
 
 
+def _ambiguous(exc: GitHubRestError) -> bool:
+    """True when GitHub's answer was lost (transport failure, timeout) or was a server error: the write may or
+    may not have happened."""
+    return exc.http_status == 0 or exc.http_status >= 500
+
+
+def _retry_error(step: str, exc: Exception) -> GitHubRestError:
+    error = GitHubRestError(f"GitHub did not confirm whether it could {step} ({exc}); nothing was deleted. "
+                            "Retry with the same Idempotency-Key to finish.", http_status=getattr(exc, "http_status", 0))
+    error.body["retry_same_key"] = True
+    return error
+
+
 def config_repo_token(env: Mapping[str, str] | None = None) -> str:
     env = os.environ if env is None else env
     return str(env.get("SPOT_CONFIG_GH_TOKEN") or env.get("GH_TOKEN") or "").strip()
@@ -296,8 +309,12 @@ def validate_manifest(
     """Validate manifest text for ``path``. Returns (effective patch or None, field errors, parsed dict).
 
     Errors are ``{"field": ..., "message": ...}``. Each section is checked on its own so one request reports
-    every broken section, unknown keys (typos validate_patch_dict would ignore) are errors, and a repository
-    manifest is also checked merged with ``defaults`` (the patch hosts would actually get).
+    every broken section, and unknown keys (typos validate_patch_dict would ignore) are errors.
+
+    A repository manifest is an override: anything that depends on inherited settings (``hardware.isa``
+    against the architecture, host and container checks that depend on it) uses the hardware it gets after
+    merging with ``defaults``, and the result is validated as merged (what hosts actually get). Only
+    structural checks apply to the override on its own.
     """
     errors: list[dict[str, str]] = []
     repository = repository_for_path(path)
@@ -322,6 +339,7 @@ def validate_manifest(
             errors.append({"field": "repository", "message": "defaults.yaml must not name a repository"})
         elif not isinstance(declared, str) or declared.lower() != repository.lower():
             errors.append({"field": "repository", "message": f"repository must be {repository!r} for {path}"})
+    context_arch = _context_arch(data, defaults if repository is not None else None)
     for section, allowed in SECTION_KEYS.items():
         value = data.get(section)
         if value is None:
@@ -331,21 +349,23 @@ def validate_manifest(
             continue
         for key in sorted(set(value) - allowed):
             errors.append({"field": f"{section}.{key}", "message": f"Unknown key {key!r} in {section}"})
-        probe: dict[str, Any] = {section: value}
-        if section != "hardware" and isinstance(data.get("hardware"), dict):
-            probe["hardware"] = {"arch": data["hardware"].get("arch", "x86_64")}
+        # Checked in the architecture the host will actually have (inherited from defaults.yaml when the
+        # override doesn't set one), so an override adding isa: [neon] under an arm64 default is valid.
+        if section == "hardware":
+            probe: dict[str, Any] = {"hardware": {**value, "arch": value.get("arch", context_arch)}}
+        else:
+            probe = {section: value, "hardware": {"arch": context_arch}}
         try:
             validate_patch_dict(probe)
         except (ValueError, TypeError) as exc:
             errors.append({"field": _field_of(str(exc), section), "message": str(exc)})
     if errors:
         return None, errors, data
-    try:
-        own = validate_patch_dict(data)
-    except (ValueError, TypeError) as exc:
-        return None, [{"field": _field_of(str(exc), "content"), "message": str(exc)}], data
     if repository is None:
-        return own, [], data
+        try:
+            return validate_patch_dict(data), [], data
+        except (ValueError, TypeError) as exc:
+            return None, [{"field": _field_of(str(exc), "content"), "message": str(exc)}], data
     merged = merge_patch_dicts(dict(defaults or {}), data)
     if not merged.get("repository"):
         merged["repository"] = repository
@@ -354,6 +374,20 @@ def validate_manifest(
     except (ValueError, TypeError) as exc:
         return None, [{"field": "effective", "message": f"Merged with defaults.yaml: {exc}"}], data
     return effective, [], data
+
+
+_ARCH_NAMES = {"x86_64": "x86_64", "x64": "x86_64", "amd64": "x86_64", "arm64": "arm64", "aarch64": "arm64"}
+
+
+def _context_arch(data: Mapping[str, Any], defaults: Mapping[str, Any] | None) -> str:
+    """The architecture the merged patch will have: the override's, else the inherited default's, else x86_64.
+
+    An unrecognized inherited value falls back to x86_64 here; the merged validation reports it."""
+    for source in (data, defaults or {}):
+        hardware = source.get("hardware") if isinstance(source, Mapping) else None
+        if isinstance(hardware, Mapping) and "arch" in hardware:
+            return _ARCH_NAMES.get(str(hardware.get("arch")).strip().lower(), "x86_64")
+    return "x86_64"
 
 
 def patch_summary(patch: RunnerPatch) -> dict[str, Any]:
@@ -785,21 +819,41 @@ class PatchConsole:
         blob = found[1] if found is not None else None
         if found is not None and found[0] == content:
             raise InvalidRequestError("The manifest is unchanged; nothing to save")
+        pr_body = (f"Edited in the Spot dashboard from {branch}@{base_sha[:12]}.\n\n"
+                   f"Effective patch sha256: `{patch.patch_sha256}`")
         if existing_head is None:
-            client.create_branch(new_branch, base_sha)
+            try:
+                client.create_branch(new_branch, base_sha)
+            except GitHubRestError as exc:
+                # A lost response may hide a branch that was created; only GitHub's own answer settles it.
+                if not _ambiguous(exc) and exc.http_status != 422:
+                    raise
+                if client.branch_head_or_none(new_branch) is None:
+                    raise _retry_error("create the branch", exc) from exc
         try:
             commit = client.put_file(path, new_branch, content, title, blob)
-            pr = client.open_pull_request(
-                new_branch, branch, title,
-                f"Edited in the Spot dashboard from {branch}@{base_sha[:12]}.\n\n"
-                f"Effective patch sha256: `{patch.patch_sha256}`",
-            )
-        except PatchConsoleError:
-            try:
-                client.delete_branch(new_branch)
-            except PatchConsoleError:
-                pass
+        except ConflictError:
+            # GitHub rejected the commit outright (the file's blob changed): nothing was committed, so the
+            # branch this request created, still at base_sha, can go.
+            self._delete_untouched_branch(client, new_branch, base_sha)
             raise
+        except GitHubRestError as exc:
+            if not _ambiguous(exc):
+                self._delete_untouched_branch(client, new_branch, base_sha)
+                raise
+            head_now = client.branch_head_or_none(new_branch)  # a lookup failure propagates: nothing deleted
+            on_branch = client.read_file(path, new_branch) if head_now not in (None, base_sha) else None
+            if on_branch is None or on_branch[0] != content:
+                raise _retry_error("commit the manifest", exc) from exc
+            commit = head_now or ""
+        try:
+            pr = client.open_pull_request(new_branch, branch, title, pr_body)
+        except GitHubRestError as exc:
+            # Created, or never created? Ask GitHub before deciding anything; the branch always stays, so a retry
+            # with the same key can finish the job.
+            pr = client.find_pull_request(new_branch)
+            if pr is None:
+                raise _retry_error("open the pull request", exc) if _ambiguous(exc) else exc
         return {
             "status": "pull_request_opened",
             "path": path,
@@ -810,6 +864,15 @@ class PatchConsole:
             "pull_request": pr,
             **patch_summary(patch),
         }
+
+    @staticmethod
+    def _delete_untouched_branch(client: ConfigRepoClient, branch: str, base_sha: str) -> None:
+        """Delete a branch this request created only while it provably holds no commit of ours."""
+        try:
+            if client.branch_head_or_none(branch) == base_sha:
+                client.delete_branch(branch)
+        except PatchConsoleError:
+            pass
 
     def hot_patch(self, repository: str, patch_sha256: Any, instances: Iterable[Mapping[str, Any]]) -> tuple[int, dict[str, Any]]:
         """Apply the repository's current effective patch to every recorded host, only when all are hot_patch/noop."""

@@ -112,7 +112,7 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
 | --- | --- |
 | `GET /api/patches` | Lists the manifests at the default branch HEAD. |
 | `GET /api/patches/manifest?path=...` | Returns a manifest, its blob and base commit, and the effective patch with its sha256. |
-| `POST /api/patches/validate` | Returns field errors such as `host.apt_packages`. A repository manifest is also checked merged with `defaults.yaml`. |
+| `POST /api/patches/validate` | Returns field errors such as `host.apt_packages`. A repository manifest is an override: checks that depend on inherited settings, such as `hardware.isa` against the architecture, use the settings merged with `defaults.yaml`. |
 | `POST /api/patches/preview` | Classifies each runner host as `noop`, `hot_patch`, `recreate_containers`, or `replace_vm`. |
 | `POST /api/patches/save` | Opens a pull request. Needs an `Idempotency-Key`. |
 | `POST /api/patches/hot-patch` | Hot-patches the recorded runner hosts. Needs `"confirm": true` and an `Idempotency-Key`. |
@@ -163,6 +163,10 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
     and returns its pull request instead of opening another, even on a replacement VM. It completes an
     attempt that stopped halfway, and answers HTTP 422 when the same key is reused for a different
     change.
+  - When GitHub's answer is lost or is a server error, the save never deletes its branch. It looks up
+    the branch, its commit, and any pull request first. If GitHub didn't confirm the step, the save
+    answers HTTP 424 with `"retry_same_key": true`. It deletes the branch only after GitHub rejects the
+    commit outright while the branch still holds no commit.
   - A hot-patch retry classifies each host again from its receipt and recorded patch. Hosts already at
     the patch report `noop` and aren't patched again.
 - A retry with the same `Idempotency-Key` while the first request still runs gets HTTP 202 with

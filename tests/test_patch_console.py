@@ -160,6 +160,122 @@ def console(fake=None, executor=None):
     return pc.PatchConsole(REPO, token="test-token", requester=fake or FakeGitHubRepo(), executor=executor)
 
 
+class LossyGitHub:
+    """Wraps FakeGitHubRepo and loses responses: "after" applies the call then times out, "before" fails it
+    without applying, "status" answers 502 without applying. Each rule fires once."""
+
+    def __init__(self, fake):
+        self.fake = fake
+        self.rules: list[tuple[str, str, str]] = []
+
+    def lose(self, method, route_suffix, mode):
+        self.rules.append((method, route_suffix, mode))
+
+    def __call__(self, method, url, headers, body, timeout):
+        route = url.split("?", 1)[0]
+        for rule in list(self.rules):
+            m, suffix, mode = rule
+            if m == method and route.endswith(suffix):
+                self.rules.remove(rule)
+                if mode == "before":
+                    raise TimeoutError("simulated timeout before GitHub applied the call")
+                if mode == "status":
+                    self.fake.calls.append((method, url, None))
+                    return 502, b'{"message": "Server Error"}'
+                self.fake(method, url, headers, body, timeout)
+                raise TimeoutError("simulated lost response after GitHub applied the call")
+        return self.fake(method, url, headers, body, timeout)
+
+    def count(self, method, suffix):
+        return len([c for c in self.fake.calls if c[0] == method and c[1].split("?", 1)[0].endswith(suffix)])
+
+
+class LostResponseSaveTests(unittest.TestCase):
+    """Codex round 4: an ambiguous GitHub failure never deletes the branch; it reconciles instead."""
+
+    NEW = OXIDEX.replace("ripgrep", "fd-find")
+
+    def save(self, lossy, key="lost-0001"):
+        return console(lossy).save(OXIDEX_PATH, self.NEW, HEAD, "Add fd", idempotency_key=key)
+
+    def test_pull_request_created_but_response_lost(self):
+        fake = FakeGitHubRepo()
+        lossy = LossyGitHub(fake)
+        lossy.lose("POST", "/pulls", "after")
+        first = self.save(lossy)  # reconciles by looking the PR up instead of failing
+        self.assertEqual(first["pull_request"]["number"], 1)
+        again = self.save(lossy)
+        self.assertEqual((again["reconciled"], again["pull_request"]["number"]), (True, 1))
+        self.assertEqual(len(fake.prs), 1)
+        self.assertEqual(lossy.count("DELETE", first["branch"].split("/", 1)[1]), 0)
+
+    def test_pull_request_not_created_keeps_the_branch_for_a_retry(self):
+        for mode in ("before", "status"):
+            fake = FakeGitHubRepo()
+            lossy = LossyGitHub(fake)
+            lossy.lose("POST", "/pulls", mode)
+            with self.subTest(mode), self.assertRaises(pc.GitHubRestError) as ctx:
+                self.save(lossy)
+            self.assertTrue(ctx.exception.body["retry_same_key"])
+            branch = pc.PatchConsole.branch_for(OXIDEX_PATH, "lost-0001")
+            self.assertIn(branch, fake.branches)  # never deleted
+            self.assertEqual([c for c in fake.calls if c[0] == "DELETE"], [])
+            result = self.save(lossy)  # the retry opens the PR exactly once
+            self.assertEqual((len(fake.prs), result["branch"]), (1, branch))
+            self.assertEqual(lossy.count("PUT", OXIDEX_PATH), 1)  # and does not commit again
+
+    def test_commit_applied_but_response_lost(self):
+        fake = FakeGitHubRepo()
+        lossy = LossyGitHub(fake)
+        lossy.lose("PUT", OXIDEX_PATH, "after")
+        result = self.save(lossy)
+        self.assertEqual(fake.files[fake.branches[result["branch"]]][OXIDEX_PATH], self.NEW)
+        self.assertEqual((len(fake.prs), lossy.count("PUT", OXIDEX_PATH)), (1, 1))
+
+    def test_commit_not_applied_keeps_the_branch_and_retry_finishes(self):
+        fake = FakeGitHubRepo()
+        lossy = LossyGitHub(fake)
+        lossy.lose("PUT", OXIDEX_PATH, "before")
+        with self.assertRaises(pc.GitHubRestError):
+            self.save(lossy)
+        branch = pc.PatchConsole.branch_for(OXIDEX_PATH, "lost-0001")
+        self.assertEqual(fake.branches[branch], HEAD)
+        self.assertEqual([c for c in fake.calls if c[0] == "DELETE"], [])
+        self.assertEqual(self.save(lossy)["pull_request"]["number"], 1)
+        self.assertEqual(len(fake.prs), 1)
+
+    def test_branch_created_but_response_lost(self):
+        fake = FakeGitHubRepo()
+        lossy = LossyGitHub(fake)
+        lossy.lose("POST", "/git/refs", "after")
+        self.assertEqual(self.save(lossy)["pull_request"]["number"], 1)
+        self.assertEqual(lossy.count("POST", "/git/refs"), 1)
+
+    def test_failed_lookup_never_cleans_up(self):
+        fake = FakeGitHubRepo()
+        lossy = LossyGitHub(fake)
+        lossy.lose("POST", "/pulls", "after")
+        lossy.lose("GET", "/pulls", "before")  # the reconcile lookup itself fails
+        with self.assertRaises(pc.GitHubRestError):
+            self.save(lossy)
+        self.assertEqual([c for c in fake.calls if c[0] == "DELETE"], [])
+        again = self.save(lossy)
+        self.assertEqual((again["reconciled"], len(fake.prs)), (True, 1))
+
+    def test_definite_rejections_still_clean_up_an_untouched_branch(self):
+        fake = FakeGitHubRepo()
+        real = fake.__call__
+
+        def forbidden(method, url, headers, body, timeout):
+            if method == "PUT":
+                return 403, b'{"message": "Resource not accessible by integration"}'
+            return real(method, url, headers, body, timeout)
+
+        with self.assertRaises(pc.GitHubRestError):
+            console(forbidden).save(OXIDEX_PATH, self.NEW, HEAD, idempotency_key="lost-0002")
+        self.assertEqual(set(fake.branches), {"main"})  # GitHub confirmed nothing was committed
+
+
 class ValidationTests(unittest.TestCase):
     def test_valid_repo_manifest_is_checked_merged_with_defaults(self):
         patch, errors, _ = pc.validate_manifest(OXIDEX, path=OXIDEX_PATH, defaults=json.loads(DEFAULTS))
@@ -191,6 +307,41 @@ class ValidationTests(unittest.TestCase):
             self.assertTrue(errors, text)
             if field:
                 self.assertIn(field, {e["field"] for e in errors}, text)
+
+    def test_isa_inherits_the_default_architecture(self):
+        defaults = {"schema": "spot-runner-patch-v1", "hardware": {"arch": "arm64"}}
+        override = json.dumps({"schema": "spot-runner-patch-v1", "hardware": {"isa": ["neon"]},
+                               "container": {"apt_packages": ["jq"]}})
+        patch, errors, _ = pc.validate_manifest(override, path=OXIDEX_PATH, defaults=defaults)
+        self.assertEqual(errors, [])
+        self.assertEqual((patch.hardware.arch, patch.hardware.isa), ("arm64", ("neon",)))
+        # Without the inherited architecture the same override is (correctly) invalid.
+        _, errors, _ = pc.validate_manifest(override, path=OXIDEX_PATH, defaults={})
+        self.assertEqual(errors[0]["field"], "hardware.isa")
+        # An explicit override architecture still wins over the inherited one.
+        explicit = json.dumps({"hardware": {"arch": "x86_64", "isa": ["neon"]}})
+        _, errors, _ = pc.validate_manifest(explicit, path=OXIDEX_PATH, defaults=defaults)
+        self.assertEqual(errors[0]["field"], "hardware.isa")
+
+    def test_override_invalid_only_after_merging_is_rejected(self):
+        defaults = {"hardware": {"arch": "x86_64", "isa": ["avx512-vbmi2"]}}
+        override = json.dumps({"hardware": {"arch": "arm64", "extra_labels": ["arm"]}})
+        patch, errors, _ = pc.validate_manifest(override, path=OXIDEX_PATH, defaults=defaults)
+        self.assertIsNone(patch)
+        self.assertEqual(errors[0]["field"], "effective")
+        self.assertIn("requires arch", errors[0]["message"])
+        self.assertIsNotNone(pc.validate_manifest(override, path=OXIDEX_PATH, defaults={})[0])  # fine on its own
+
+    def test_inherited_arm64_save_and_validate_over_http_paths(self):
+        fake = FakeGitHubRepo()
+        fake.files[HEAD]["defaults.yaml"] = json.dumps({"schema": "spot-runner-patch-v1",
+                                                        "hardware": {"arch": "arm64"}})
+        override = json.dumps({"schema": "spot-runner-patch-v1", "repository": "swack-tools/oxidex",
+                               "hardware": {"isa": ["neon", "sve"]}})
+        c = console(fake)
+        self.assertTrue(c.validate(OXIDEX_PATH, override)["valid"])
+        result = c.save(OXIDEX_PATH, override, HEAD, idempotency_key="arm-key-0001")
+        self.assertEqual(result["effective"]["hardware"]["arch"], "arm64")
 
     def test_merged_conflict_is_reported(self):
         defaults = {"hardware": {"arch": "x86_64", "isa": ["avx2"]}}
