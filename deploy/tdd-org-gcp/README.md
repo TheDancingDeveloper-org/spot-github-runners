@@ -16,8 +16,15 @@ Vogt WI-1155 for the full evaluation.
   registers one persistent org runner and sets `RUSTC_WRAPPER=sccache` with a
   40 GiB local cache. After `idle_minutes` with no job, the VM powers itself off.
 - `poller/gha_spot_poller.py` runs on Node B and needs only the Python standard
-  library and `openssl`. Every 30 seconds it looks for queued jobs whose labels
-  the runner serves. When it finds one, it writes a fresh one-hour registration
+  library and `openssl`. Every 60 seconds (`POLL_INTERVAL`) it lists queued runs
+  and looks for queued jobs whose labels the runner serves; runs already in
+  progress are rescanned for queued later jobs every 5 minutes
+  (`RECONCILE_INTERVAL`). On a GitHub rate-limit response, or when fewer than
+  `RATE_LIMIT_FLOOR` (200) calls remain, it makes no GitHub calls until
+  `X-RateLimit-Reset`; GCP clean-up carries on. `LOG_LEVEL=debug` logs the
+  remaining quota once per poll. Follow-up (WI-1838, not done): trigger on
+  the org `workflow_job` webhook (action `queued`) and keep a 300 s reconcile
+  poll. When it finds one, it writes a fresh one-hour registration
   token to the VM metadata and starts the VM. It also stops the VM when
   `MAX_HOURS_PER_MONTH` (default 250) is reached.
 - `budget.tf`: an A$45 (about US$30) monthly budget with alerts at 50%, 90%
