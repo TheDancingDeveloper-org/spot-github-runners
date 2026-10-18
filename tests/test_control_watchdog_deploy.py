@@ -228,6 +228,13 @@ class ValidationTests(unittest.TestCase):
                                     secrets={"SPOT_CONTROL_REGIONS": "x"})
         self.assertIn("must come from Secret Manager", " ".join(deploy.validate(leaky)))
 
+    def test_service_points_gcloud_at_a_writable_config_dir(self):
+        # An unwritable gcloud config directory makes gcloud warn on stderr, which fails the inventory read.
+        config = deploy.DeployConfig(project=PROJECT, control_vm_service_account=CONTROL_SA, env=dict(ENV))
+        self.assertEqual(config.service_env()["CLOUDSDK_CONFIG"], "/tmp/gcloud-config")
+        dockerfile = (Path(__file__).resolve().parent.parent / "watchdog" / "Dockerfile").read_text()
+        self.assertIn("ENV CLOUDSDK_CONFIG=/tmp/gcloud-config", dockerfile)
+
     def test_flag_supplied_control_vm_account_reaches_the_service(self):
         env = {k: v for k, v in ENV.items() if k != "SPOT_CONTROL_SERVICE_ACCOUNT"}
         code, script, err = dry_run(f"--image={IMAGE}", f"--control-vm-service-account={CONTROL_SA}", env=env)

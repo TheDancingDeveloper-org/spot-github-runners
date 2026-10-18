@@ -44,5 +44,7 @@ USER 10001:10001
 
 # Listens on $PORT (Cloud Run sets it). For a one-off step: --entrypoint python3 <image> -B /app/src/control_vm.py ...
 ENV PORT=8080
+# A writable gcloud config directory; gcloud's warning about an unwritable one breaks inventory parsing.
+ENV CLOUDSDK_CONFIG=/tmp/gcloud-config
 EXPOSE 8080
 ENTRYPOINT ["python3", "-B", "/app/src/control_watchdog_server.py"]

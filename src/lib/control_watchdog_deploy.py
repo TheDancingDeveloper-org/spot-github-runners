@@ -205,6 +205,9 @@ class DeployConfig:
             "SPOT_GCP_TOKEN_SOURCE": "metadata",
             "CLOUDSDK_CORE_DISABLE_PROMPTS": "1",
             "CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK": "true",
+            # gcloud writes logs and credentials under its config directory; any warning about an unwritable
+            # one reaches stderr, which the inventory parser treats as a failed read. /tmp is writable on Cloud Run.
+            "CLOUDSDK_CONFIG": "/tmp/gcloud-config",
         })
         return env
 
