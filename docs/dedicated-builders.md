@@ -16,8 +16,8 @@ fixed `/usr/local/bin/oxidex-remote-build` launcher.
 The website tool additions pin Node 24.21.0 and Playwright 1.63.0, including
 Chromium revision 1243. The package lock verifies npm archives; the official
 Node archive has a fixed SHA-256. Browser downloads and Linux libraries are
-installed during image construction. Browser files live at the read-only
-`/opt/playwright-browsers` path, selected by `PLAYWRIGHT_BROWSERS_PATH`.
+installed during image construction. Browser files live at the root-owned
+`/opt/playwright-browsers` path, which UID 1001 can read but not write,, selected by `PLAYWRIGHT_BROWSERS_PATH`.
 The tool probe checks the browser executable and shared libraries as UID 1001.
 The website audit must separately prove an actual browser launch and rendering. These source additions need a reviewed image build and actual
 tool proof before an existing host is upgraded; they do not establish that
@@ -28,7 +28,7 @@ website tools are installed on previously launched builders.
 Prepare the private JSON configuration below and a separate explicitly approved
 public uploader mapping file. Do not use a private SSH key. The mapping must
 contain exactly `schema` (`root-approved-ssh-mapping-v1`),
-`principal`, `username`, numeric `uid` (2000 is the deployment example),
+`principal`, `username`, numeric `uid` (at least 1000 and not 1001),
 `identity_receipt_sha256`, the complete single-line Ed25519 `public_key`, and
 `public_key_sha256` (SHA-256 of that complete key string). The renderer validates
 the selected mapping and computes its canonical checksum. Selecting the file
@@ -67,13 +67,42 @@ required. `cloud-config.yaml` contains the equivalent payload for images with a
 cloud-init agent, but that alternative execution path has not been live-tested.
 
 Startup verifies fresh-host identity and the absence of existing runners/work,
-installs Docker, mounts storage before starting Docker/containerd, builds, and pins
+mounts the cache disk, installs Docker, stops Docker and containerd, points both at the cache disk and
+restarts them, builds, and pins
 the immutable image, starts aggregate admission, checks actual tool/cgroup/cache
 observations, enrolls the approved restricted uploader, and writes a completion
 marker. No manual SSH installation or repository checkout is needed on the host.
 Rendering refuses an existing output directory; fresh-host startup must not be
 replayed to upgrade an occupied VM. Replacements need a new name and matching
 rendered payload.
+
+## Verify startup and readiness
+
+Startup records two files on the builder:
+
+```text
+/var/lib/oxidex-builder-bootstrap.complete
+/var/lib/oxidex-builder-readiness.json
+```
+
+The readiness JSON joins the deployment, boot, source hashes, image and container, actual cgroup limits, tool
+results, and the mounted cache identity. It sets `workload_qualified` to false: tool installation isn't
+compilation, cache-reuse, concurrency, or full qualification proof. Run the intended workload and keep its
+result before you declare the host ready for that workload.
+
+The standalone image includes:
+
+- Rust 1.99.0, rustfmt, clippy, and Linux musl and Darwin cross targets.
+- Build tools, Clang, CMake, pkg-config, OpenSSL, and archive development libraries.
+- Git, SSH, GnuPG, Perl, Python 3.11, rsync, GNU time, and compression tools.
+- `just`, cargo-nextest, cbindgen 0.29.2, Zig 0.15.2, cargo-zigbuild 0.23.4, `uv`, and LLVM tools.
+
+Some auxiliary tool installs resolve versions during the image build. Use the actual tool receipt and the
+immutable image ID rather than assuming that every dependency has a fixed version.
+
+The older shared-host image in `builder/Dockerfile` still pins Rust 1.97.1. Ordinary runner images don't
+establish the standalone builder's toolchain, because workflows select their Rust version separately.
+Provisioning a new standalone builder doesn't upgrade existing runner containers.
 
 ## Configure the build client
 
@@ -92,8 +121,9 @@ Then use `just build`; use `just build-local` for an explicit local build.
 
 The launch command uses a 40 GiB Hyperdisk Balanced boot disk and a 100 GiB
 Hyperdisk Balanced cache disk through NVMe, with 3,000 IOPS and 140 MiB/s baseline
-provisioning. The renderer also accepts the explicitly reviewed 4,000 IOPS /
-250 MiB/s pair; price that pair before launching. Compute and both disks were
+provisioning. For the cache disk only, the renderer also accepts the explicitly
+reviewed 4,000 IOPS / 250 MiB/s pair; price that pair before launching. The boot
+disk is always 3,000 IOPS / 140 MiB/s. Compute and both disks were
 quoted at $2.573746849/day in asia-east2-a on 2026-10-05; this is a historical
 quote, not a promise of future pricing or Spot availability.
 
@@ -105,8 +135,11 @@ the established host key for `oxidex-uploader`. `gcloud compute ssh/scp` can enr
 the account into broader guest permissions and is not the restricted uploader
 transport.
 
-The launcher prepares a project, executes the allowed build command under one
-aggregate lease/cache lock, exports artifacts, and cleans only owned source.
+The launcher prepares a project and starts the allowed build command in an
+admitted container; the Docker admission wrapper takes the aggregate lease and
+cache lock. The launcher's `cleanup` empties the project's source directory
+after it checks the locks and container mounts. Artifact export isn't a launcher
+step.
 Draining refuses new builds and lets actual active builds, leases and cache/upload
 locks finish before replacement. Persistent Cargo downloads and targets are not
 deleted after each build. GitHub runner drains are separate from this lifecycle.

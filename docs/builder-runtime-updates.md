@@ -32,7 +32,10 @@ python3 -I -B builder_runtime_update.py --plan plan.json \
 
 Applying takes the existing build lock, refuses active builds and uploads,
 creates an owned drain, backs up old files, and replaces only the fixed runtime
-file set. It restarts admission alone. It preserves the image, build limits,
+file set. It also writes its plan and journal to the backup directory, creates
+the `qualification-sealed` directory when it's missing, installs the boot guard
+described below, and runs `systemctl daemon-reload`. It restarts admission
+alone. It preserves the image, build limits,
 source worktrees, and caches. A partial failure retains the drain and backups
 for explicit recovery. Success verifies installed bytes and the new admission
 process while retaining the owned drain.
@@ -50,7 +53,8 @@ boot to restart admission while that marker exists. Reboot removes the permit,
 so admission stays off until explicit recovery or the verified handoff. The
 pending marker and volatile drain are separate from build leases.
 
-Preparation only writes private backups and leaves the live runtime unchanged.
+Preparation writes only the private backup directory (backups, plan, and journal) and leaves the live
+runtime unchanged.
 The first live cutover removes launcher execution permission and persists that
 mode before runtime replacement. Both the previous and installed launcher stay
 readable but non-executable (`0644`) through partial updates and reboot. Restoring
@@ -188,7 +192,7 @@ not evidence that it already happened. A completed re-hold keeps that authority
 for checked recovery after another reboot.
 
 If unlink succeeded but directory sync failed, the helper reports
-`RELEASE_UNLINKED_SYNC_UNCONFIRMED` and exits75. It states that the drain was
+`RELEASE_UNLINKED_SYNC_UNCONFIRMED` and exits with status 75. It states that the drain was
 removed and does not claim a protective hold or close launcher execution.
 Inspect actual jobs, leases and files before any further recovery; do not replay
 apply or treat this result as a held installation.

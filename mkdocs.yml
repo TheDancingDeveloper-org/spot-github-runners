@@ -1,0 +1,79 @@
+site_name: Spot GitHub runners
+site_description: Operate persistent GitHub Actions runners and dedicated Rust builders on GCP Spot instances.
+# The Documentation workflow sets SITE_URL from the Pages configuration. Local builds leave it unset.
+site_url: !ENV [SITE_URL, null]
+repo_url: https://github.com/swack-tools/spot-github-runners
+repo_name: swack-tools/spot-github-runners
+edit_uri: edit/main/docs/
+docs_dir: docs
+exclude_docs: |
+  requirements.txt
+site_dir: site
+strict: true
+
+validation:
+  nav:
+    omitted_files: warn
+    absolute_links: warn
+    not_found: warn
+  links:
+    not_found: warn
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn
+
+theme:
+  name: material
+  font: false
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Spot pricing and offers: spot-pricing.md
+  - Runner fleet:
+      - Provision runner hosts: provisioning.md
+      - Fleet and autoscaler: fleet-and-autoscaler.md
+      - Runner patches: runner-patches.md
+  - Dashboard:
+      - Dashboard: dashboard.md
+      - Edge hosting and control VM: edge-dashboard.md
+  - Dedicated builders:
+      - Set up a builder: dedicated-builders.md
+      - Runtime updates: builder-runtime-updates.md
+      - Remote builds and clients: remote-builds.md
+      - Simplify remote builds: simplification.md
+  - Local Docker runners: local-arm64-runners.md
+  - Reference:
+      - Configuration: configuration.md
+      - Commands: commands.md
+  - Operations and troubleshooting: operations.md
+  - Security model: security.md
+  - Development: development.md

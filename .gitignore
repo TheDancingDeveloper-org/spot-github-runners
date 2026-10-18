@@ -15,8 +15,8 @@
 !README.md
 !builder/standalone/website-package.json
 !builder/standalone/website-package-lock.json
-!docs/builder-runtime-updates.md
-!docs/edge-dashboard.md
+!docs/*.md
+!docs/requirements.txt
 !cloudflare/*.js
 !cloudflare/*.mjs
 !cloudflare/wrangler.toml
@@ -38,6 +38,7 @@ htmlcov/
 *.log
 .firecrawl/
 /docs/superpowers/
+/site/
 
 # Python packaging and tooling artifacts
 *.egg

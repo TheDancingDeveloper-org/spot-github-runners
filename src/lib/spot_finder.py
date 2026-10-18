@@ -208,11 +208,26 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
 
 
 def runner_count(offer: Offer, runners: int | None) -> float:
-    return float(runners) if runners is not None else offer.vcpu / 4
+    """Runners on the host: ``runners`` when given, else the manager's default of one per 4 whole vCPUs.
+
+    Like ``runner_manager``, a host below 4 vCPUs or with at most 8 GiB of RAM gets exactly one runner.
+    """
+    if runners is not None:
+        return float(runners)
+    if offer.vcpu < 4 or offer.ram_gib <= 8:
+        return 1.0
+    return float(int(offer.vcpu // 4))
 
 
 def vcpu_per_runner(offer: Offer, runners: int | None) -> float:
-    return offer.vcpu / runner_count(offer, runners)
+    count = runner_count(offer, runners)
+    return offer.vcpu / count if count else 0.0
+
+
+def per_runner_usd(total_usd: float, offer: Offer, runners: int | None) -> float:
+    """Split a total price evenly across the runners on the host; zero runners yield zero."""
+    count = runner_count(offer, runners)
+    return total_usd / count if count else 0.0
 
 
 def print_offer(offer: Offer, prefix: str = "", runners: int | None = None) -> None:
@@ -223,8 +238,8 @@ def print_offer(offer: Offer, prefix: str = "", runners: int | None = None) -> N
           f"({count:g} runners, {vcpu_share:g} vCPU/runner; "
           f"${offer.hourly_usd * 24:.4f}/day, "
           f"${offer.hourly_usd * 730:.4f}/month at 730h, "
-          f"${offer.hourly_usd * 24 / vcpu_share:.4f}/runner/day, "
-          f"${offer.hourly_usd * 730 / vcpu_share:.4f}/runner/month)", flush=True)
+          f"${per_runner_usd(offer.hourly_usd * 24, offer, runners):.4f}/runner/day, "
+          f"${per_runner_usd(offer.hourly_usd * 730, offer, runners):.4f}/runner/month)", flush=True)
 
 
 def parse_ram(value: str) -> float:
@@ -243,8 +258,8 @@ def render_table(offers: list[Offer], runners: int) -> None:
              f"${o.hourly_usd:.6f}", f"${o.hourly_usd * 24:.4f}",
              f"${o.hourly_usd * 730:.4f}",
              f"{runner_count(o, runners):g}", f"{vcpu_per_runner(o, runners):g}",
-             f"${o.hourly_usd * 24 / vcpu_per_runner(o, runners):.4f}",
-             f"${o.hourly_usd * 730 / vcpu_per_runner(o, runners):.4f}") for o in offers]
+             f"${per_runner_usd(o.hourly_usd * 24, o, runners):.4f}",
+             f"${per_runner_usd(o.hourly_usd * 730, o, runners):.4f}") for o in offers]
     widths = [max([len(headers[i]), *(len(row[i]) for row in rows)]) for i in range(len(headers))]
     print(" | ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("-+-".join("-" * width for width in widths))
@@ -259,7 +274,7 @@ def main() -> int:
     parser.add_argument("--min-vcpu", type=int, default=32, help="Minimum vCPU count (default: 32)")
     parser.add_argument("--min-ram", type=parse_ram, default=128, metavar="GB", help="Minimum RAM (e.g. 128 or 128GB; default: 128)")
     parser.add_argument("--runners", type=int,
-                        help="Runner count per instance (default: vCPU / 4; one runner per 4 vCPU)")
+                        help="Runner count per instance (default: 1 below 4 vCPU or at most 8 GiB RAM, else vCPU // 4)")
     parser.add_argument("--top", type=int, default=10, help="Number of cheapest results (default: 10)")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Concurrent API requests (default: 600)")
     parser.add_argument("--list-price", type=float, help="Optional on-demand hourly price baseline (USD) for 95%%-off alerts")

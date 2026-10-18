@@ -9,10 +9,11 @@ provides the VM startup payload and restricted host launcher.
 
 ## Setup workflow
 
-1. Select an affordable Spot offer that meets the workload's CPU and memory
-   requirements. Include the boot disk and persistent cache disk in the price.
+1. Choose a zone for the fixed `n4-highcpu-16` builder shape, and check its
+   Spot price with the 40 GB boot disk and the 100 GB persistent cache disk.
 2. Fill one builder configuration with the project, zone, instance name,
-   storage settings, and public uploader identity.
+   cache disk performance pair, and public uploader identity. The renderer
+   supplies the machine shape and the disk types and sizes.
 3. Render the startup payload and run its generated launch command once.
 4. Verify startup completed, then put the authenticated builder endpoint and
    actual image identity in OxiDex's remote configuration.
@@ -25,8 +26,8 @@ SSH is not part of the normal setup.
 
 ## Keep one control path
 
-Use the existing restricted launcher for source preparation, execution,
-artifact export, and owned source cleanup. Keep Cargo downloads and each
+Use the existing restricted launcher for source preparation, execution, and
+source cleanup. Keep Cargo downloads and each
 worktree's target directory on the persistent cache disk. Keep resource
 admission on the host, where it can account for actual active builds.
 
