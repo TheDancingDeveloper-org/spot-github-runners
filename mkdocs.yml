@@ -62,6 +62,7 @@ nav:
       - Provision runner hosts: provisioning.md
       - Fleet and autoscaler: fleet-and-autoscaler.md
       - Runner patches: runner-patches.md
+      - Runner manager (design): runner-manager.md
   - Dashboard:
       - Dashboard: dashboard.md
       - Edge hosting and control VM: edge-dashboard.md
