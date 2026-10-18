@@ -1076,9 +1076,6 @@ class CommandLineTests(unittest.TestCase):
                 rf.main(["tick"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 GRANDCHILD_SCRIPT = """
 import os, signal, subprocess, sys, time
@@ -1653,3 +1650,13 @@ class OrphanedOperationTests(unittest.TestCase):
         self.assertIn("no confirmed instance", rf.scrub_orphaned_token(PROJECT, dict(op, instance_id=""), run=run))
         self.assertEqual(calls, [])
         self.assertFalse([c for c in calls if "delete" in c])
+
+
+class MachineTypeFilterTests(unittest.TestCase):
+    def test_one_or_term_per_region_and_no_regex_alternation(self):
+        flt = rf.machine_type_filter(("us-central1", "us-east1"))
+        self.assertEqual(flt, "--filter=guestCpus=4 AND (zone~^us-central1- OR zone~^us-east1-)")
+        self.assertNotIn("|", flt)
+
+if __name__ == "__main__":
+    unittest.main()

@@ -950,6 +950,16 @@ class FloorOffer:
                 "total_daily_usd": str(self.total_daily_usd.quantize(Decimal("0.0001")))}
 
 
+def machine_type_filter(regions: Sequence[str]) -> str:
+    """The ``--filter`` for 4-vCPU machine types in ``regions``.
+
+    One ``zone~^<region>-`` term per region joined with OR: gcloud 589 crashes (TypeError) on a regex alternation
+    such as ``zone~^(a|b)-``. Each region matches _REGION_RE (letters, digits, and hyphens only).
+    """
+    zones = " OR ".join(f"zone~^{region}-" for region in regions)
+    return f"--filter=guestCpus={FLOOR_VCPU} AND ({zones})"
+
+
 def price_offers(shapes: Sequence[Mapping[str, Any]], regions: Sequence[str], min_ram_gib: int, *,
                  rates: Callable[[str, str], tuple[Decimal, Decimal]],
                  storage: Callable[[str], Mapping[str, Decimal]]) -> list[FloorOffer]:
@@ -1112,9 +1122,7 @@ class GcloudProvider:
         from .runner_manager import spot_rates
         from .storage_selection import storage_rates
 
-        pattern = "|".join(config.regions)  # each matches _REGION_RE: letters, digits, and hyphens only
-        out = self._checked(["compute", "machine-types", "list",
-                             f"--filter=guestCpus={FLOOR_VCPU} AND zone~^({pattern})-",
+        out = self._checked(["compute", "machine-types", "list", machine_type_filter(config.regions),
                              "--format=json(name,zone,guestCpus,memoryMb)"], "machine-type inventory", timeout=120)
         rows = json.loads(out or "[]")
         from .billing_catalog import catalog_skus
@@ -1945,8 +1953,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.offers:
             provider = services.provider_for(lambda: None, Deadline())
             for row, target in zip(report, config.targets):
-                offers = [o for o in provider.offers(config, target) if o.total_daily_usd < config.max_daily_usd]
-                row["offers"] = [o.to_dict() for o in offers[:5]]
+                # The five cheapest, marked when over the cap, so an empty affordable set still shows why.
+                row["offers"] = [{**o.to_dict(), "over_cap": not o.total_daily_usd < config.max_daily_usd}
+                                 for o in provider.offers(config, target)[:5]]
         print(json.dumps(report, indent=2, sort_keys=True, default=str))
         return 0
     try:
