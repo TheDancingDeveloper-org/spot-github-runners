@@ -1425,51 +1425,75 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </table>
         </div>
 
-        <!-- Record / Test New Rust Build Telemetry & IP VPN/Tor Lookup -->
+        <!-- Record a Rust build by hand: only the fields filled in are sent -->
         <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:14px;">
-          <div style="font-weight:700; font-size:13px; margin-bottom:10px; color:#c4b5fd;">🧪 Record / Simulate New Rust Remote Build (With Live IP Geolocation &amp; ProtonVPN / Tor Lookup)</div>
+          <div style="font-weight:700; font-size:13px; margin-bottom:10px; color:#c4b5fd;">Record a Rust Remote Build</div>
+          <div style="font-size:11.5px; color:var(--text-muted); margin-bottom:10px;">Enter what the build reported. Empty fields are recorded as not reported. A delivered build is stamped as delivered now.</div>
           <div class="form-grid">
             <div class="field">
-              <label>Project / Crate</label>
-              <input type="text" id="rb-new-project" value="oxidex" />
+              <label>Status</label>
+              <select id="rb-new-status">
+                <option value="DELIVERED">DELIVERED</option>
+                <option value="FAILED">FAILED</option>
+                <option value="OOM_KILLED">OOM_KILLED</option>
+                <option value="RUNNING">RUNNING</option>
+                <option value="QUEUED">QUEUED</option>
+              </select>
             </div>
             <div class="field">
-              <label>Origin IP Preset or Custom</label>
-              <select id="rb-new-ip" onchange="document.getElementById('rb-custom-ip').value=this.value">
-                <option value="185.159.157.88">185.159.157.88 (ProtonVPN Exit Node — Zurich)</option>
-                <option value="185.220.101.55">185.220.101.55 (Tor Exit Node — Germany)</option>
-                <option value="193.138.218.40">193.138.218.40 (Mullvad VPN — Sweden)</option>
-                <option value="73.162.44.19">73.162.44.19 (Direct Workstation — Austin, TX)</option>
-              </select>
+              <label>Project / Crate</label>
+              <input type="text" id="rb-new-project" placeholder="optional" />
+            </div>
+            <div class="field">
+              <label>Commit SHA</label>
+              <input type="text" id="rb-new-commit" placeholder="optional" />
+            </div>
+            <div class="field">
+              <label>Compile / Delivery (Seconds)</label>
+              <div style="display:flex; gap:4px;">
+                <input type="number" id="rb-new-compile" min="0" step="0.1" placeholder="compile" style="width:50%;" />
+                <input type="number" id="rb-new-delivery" min="0" step="0.1" placeholder="delivery" style="width:50%;" />
+              </div>
+            </div>
+            <div class="field">
+              <label>Builder Instance / Zone</label>
+              <div style="display:flex; gap:4px;">
+                <input type="text" id="rb-new-instance" placeholder="instance" style="width:50%;" />
+                <input type="text" id="rb-new-zone" placeholder="zone" style="width:50%;" />
+              </div>
+            </div>
+            <div class="field">
+              <label>Machine Type / CPU Platform</label>
+              <div style="display:flex; gap:4px;">
+                <input type="text" id="rb-new-machine" placeholder="machine type" style="width:50%;" />
+                <input type="text" id="rb-new-platform" placeholder="CPU platform" style="width:50%;" />
+              </div>
+            </div>
+            <div class="field">
+              <label>vCPUs</label>
+              <input type="number" id="rb-new-vcpu" min="1" placeholder="optional" />
             </div>
             <div class="field">
               <label>Origin IP Address</label>
-              <input type="text" id="rb-custom-ip" value="185.159.157.88" />
-            </div>
-            <div class="field">
-              <label>Builder Instance</label>
-              <select id="rb-new-instance">
-                <option value="builder-oxidex-turin-01">builder-oxidex-turin-01 (c4d-highcpu-16 · Bench 2485)</option>
-                <option value="builder-oxidex-eu-01">builder-oxidex-eu-01 (n4-highcpu-16 · Bench 2215)</option>
-              </select>
+              <input type="text" id="rb-custom-ip" placeholder="optional" />
             </div>
             <div class="field">
               <label>Cache Hits / Total Crates</label>
               <div style="display:flex; gap:4px;">
-                <input type="number" id="rb-new-hits" value="418" style="width:50%;" />
-                <input type="number" id="rb-new-total" value="430" style="width:50%;" />
+                <input type="number" id="rb-new-hits" min="0" placeholder="hits" style="width:50%;" />
+                <input type="number" id="rb-new-total" min="0" placeholder="total" style="width:50%;" />
               </div>
             </div>
             <div class="field">
               <label>Peak Active RAM (GiB)</label>
-              <input type="number" id="rb-new-ram" step="0.1" value="22.4" />
+              <input type="number" id="rb-new-ram" min="0" step="0.1" placeholder="optional" />
             </div>
             <div class="field">
               <label>CPU Time (Seconds)</label>
-              <input type="number" id="rb-new-cputime" step="10" value="960" />
+              <input type="number" id="rb-new-cputime" min="0" step="10" placeholder="optional" />
             </div>
           </div>
-          <button class="btn btn-purple" onclick="submitNewRustBuild()">+ Record Rust Build &amp; Compute CPU Points</button>
+          <button class="btn btn-purple" onclick="submitNewRustBuild()">+ Record Rust Build</button>
         </div>
       </div>
     </section>
@@ -1882,6 +1906,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         .replace(/'/g, "&#39;");
     }
 
+    // A build figure nobody reported is null; show that instead of a number.
+    function reportedOr(val, render, missing = "not reported") {
+      return val === null || val === undefined ? missing : render(val);
+    }
+
     function formatLocalTime(isoOrEpoch) {
       if (!isoOrEpoch) return "—";
       const d = typeof isoOrEpoch === "number" ? new Date(isoOrEpoch * 1000) : new Date(isoOrEpoch);
@@ -1975,7 +2004,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const runningBuilders = allRunning.filter(i => i.role === "rust_builder");
       const runningBuilderVms = fs.running_builder_vms !== undefined ? fs.running_builder_vms : runningBuilders.length;
       document.getElementById("kpi-builders-online").textContent = `${runningBuilderVms} Builders Online`;
-      document.getElementById("kpi-builders-sub").textContent = `Min benchmark: ${APP_STATE.profiles.rust_builder.min_benchmark_score} · Peak RAM floor: ${APP_STATE.rust_builds.max_peak_ram_gib} GiB`;
+      document.getElementById("kpi-builders-sub").textContent = `Min benchmark: ${APP_STATE.profiles.rust_builder.min_benchmark_score} · Peak RAM floor: ${reportedOr(APP_STATE.rust_builds.max_peak_ram_gib, v => `${v} GiB`)}`;
 
       const cq = APP_STATE.qualifications.cicd_runner;
       document.getElementById("kpi-qualifying-offers").textContent = `${cq.spot_price_qualifying_count} Spot-Qualifying`;
@@ -3074,18 +3103,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">Crate Cache Hits &amp; Rate</div>
-          <div class="kpi-value" style="color:#34d399;">${rb.total_cache_hits.toLocaleString()} Hits (${rb.overall_cache_hit_rate_percent}%)</div>
+          <div class="kpi-value" style="color:#34d399;">${reportedOr(rb.total_cache_hits, v => `${v.toLocaleString()} Hits`)}${reportedOr(rb.overall_cache_hit_rate_percent, v => ` (${v}%)`, "")}</div>
           <div class="kpi-sub">Persistent NVMe /mnt/runner-data/remote-build</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">Peak Active Memory (OOM Floor)</div>
-          <div class="kpi-value" style="color:#fbbf24;">${rb.max_peak_ram_gib} GiB</div>
+          <div class="kpi-value" style="color:#fbbf24;">${reportedOr(rb.max_peak_ram_gib, v => `${v} GiB`)}</div>
           <div class="kpi-sub">Active RAM required without OOM killing</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">Total CPU Time &amp; CPU Points</div>
-          <div class="kpi-value" style="color:#38bdf8;">${rb.total_cpu_points.toLocaleString()} pts</div>
-          <div class="kpi-sub">${rb.total_cpu_time_seconds.toLocaleString()}s CPU time × Instance Bench</div>
+          <div class="kpi-value" style="color:#38bdf8;">${reportedOr(rb.total_cpu_points, v => `${v.toLocaleString()} pts`)}</div>
+          <div class="kpi-sub">${reportedOr(rb.total_cpu_time_seconds, v => `${v.toLocaleString()}s CPU time × Instance Bench`, "CPU time not reported")}</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">VPN / Proxy / Tor Origins</div>
@@ -3111,8 +3140,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return `
           <tr>
             <td>
-              <div class="mono" style="font-weight:700; color:#fff;">${esc(b.build_id)}</div>
-              <div style="font-size:11.5px; color:var(--text-muted);">${esc(b.project_name)} (<code class="mono">--${esc(b.profile)}</code>) · <code class="mono">${esc((b.commit_sha || "").slice(0, 8))}</code></div>
+              <div class="mono" style="font-weight:700; color:#fff;">${esc(b.build_id)} <span style="font-size:11px; color:var(--text-muted);">${esc(b.status)}</span></div>
+              <div style="font-size:11.5px; color:var(--text-muted);">${esc(b.project_name || "project not reported")}${b.profile ? ` (<code class="mono">--${esc(b.profile)}</code>)` : ""} · <code class="mono">${esc(b.commit_sha ? b.commit_sha.slice(0, 8) : "commit not reported")}</code></div>
             </td>
             <td style="font-size:11.5px;">
               <div><strong>Req:</strong> ${esc(formatLocalTime(b.requested_at))}</div>
@@ -3120,19 +3149,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <div><strong>Del:</strong> ${esc(formatLocalTime(b.delivered_at))}</div>
             </td>
             <td class="mono">
-              <div style="font-weight:700; color:#fff;">${b.total_duration_seconds}s total</div>
-              <div style="font-size:11px; color:var(--text-muted);">${b.compile_duration_seconds}s compile + ${b.delivery_duration_seconds}s delivery</div>
+              <div style="font-weight:700; color:#fff;">${reportedOr(b.total_duration_seconds, v => `${v}s total`, "duration not reported")}</div>
+              <div style="font-size:11px; color:var(--text-muted);">${reportedOr(b.delivery_duration_seconds, v => `${b.compile_duration_seconds}s compile + ${v}s delivery`, reportedOr(b.compile_duration_seconds, c => (["QUEUED", "PENDING", "WAITING", "RUNNING", "COMPILING", "ACTIVE", "IN_PROGRESS", "BUILDING"].includes(String(b.status).toUpperCase()) ? `${c}s compile so far` : `${c}s compile · not delivered`), "compile/delivery split not reported"))}</div>
             </td>
             <td class="mono">
-              <div style="font-weight:700; color:#34d399;">${b.cache_hits} / ${b.total_crates} (${b.cache_hit_rate_percent}%)</div>
-              <div style="font-size:11px; color:var(--text-muted);">${b.cache_misses} misses</div>
+              <div style="font-weight:700; color:#34d399;">${reportedOr(b.cache_hit_rate_percent, v => `${b.cache_hits} / ${b.total_crates} (${v}%)`, `${reportedOr(b.cache_hits, h => `${h} hits`, "cache not reported")}`)}</div>
+              <div style="font-size:11px; color:var(--text-muted);">${reportedOr(b.cache_misses, v => `${v} misses`)}</div>
             </td>
             <td>
-              <div class="mono" style="font-weight:700; color:#c4b5fd;">${esc(b.instance_name)}</div>
-              <div style="font-size:11px; color:var(--text-muted);">${esc(b.machine_type)} (${esc(b.zone)}) · Bench: <strong class="mono">${b.instance_benchmark_score}</strong></div>
+              <div class="mono" style="font-weight:700; color:#c4b5fd;">${esc(b.instance_name || "host not reported")}</div>
+              <div style="font-size:11px; color:var(--text-muted);">${esc(b.machine_type || "shape not reported")} (${esc(b.zone || "zone not reported")}) · Bench: <strong class="mono">${esc(reportedOr(b.instance_benchmark_score, v => v, "—"))}</strong></div>
             </td>
             <td class="mono">
-              <div style="font-weight:700; color:#f8fafc;">${esc(b.origin_ip)}</div>
+              <div style="font-weight:700; color:#f8fafc;">${esc(b.origin_ip || "not reported")}</div>
               <div style="font-size:11px; color:#93c5fd;">${esc(b.origin_hostname)}</div>
             </td>
             <td>
@@ -3143,15 +3172,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <span class="badge ${badgeClass}">${esc(ns.badge_text)}</span>
             </td>
             <td class="mono">
-              <div style="font-weight:700; color:#fbbf24;">${b.peak_ram_gib.toFixed(2)} GiB active</div>
+              <div style="font-weight:700; color:#fbbf24;">${reportedOr(b.peak_ram_gib, v => `${v.toFixed(2)} GiB active`)}</div>
               <div style="font-size:10.5px; color:var(--text-muted);">OOM floor (cap ${b.container_ram_cap_gib} GiB)</div>
             </td>
             <td class="mono" style="font-weight:700;">
-              ${b.cpu_time_seconds.toLocaleString()} CPU-s
+              ${reportedOr(b.cpu_time_seconds, v => `${v.toLocaleString()} CPU-s`)}
             </td>
             <td class="mono">
-              <div style="font-size:13.5px; font-weight:700; color:#38bdf8;">${b.cpu_points.toLocaleString()} pts</div>
-              <div style="font-size:10.5px; color:var(--text-muted);">${b.cpu_time_seconds}s × ${b.instance_benchmark_score} bench</div>
+              <div style="font-size:13.5px; font-weight:700; color:#38bdf8;">${reportedOr(b.cpu_points, v => `${v.toLocaleString()} pts`)}</div>
+              <div style="font-size:10.5px; color:var(--text-muted);">${esc(b.cpu_points_formula)}</div>
             </td>
           </tr>
         `;
@@ -3159,22 +3188,35 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     async function submitNewRustBuild() {
-      const instName = document.getElementById("rb-new-instance").value;
-      const isEu = instName.includes("eu");
-      const payload = {
-        project_name: document.getElementById("rb-new-project").value.trim() || "oxidex",
-        origin_ip: document.getElementById("rb-custom-ip").value.trim() || "185.159.157.88",
-        instance_name: instName,
-        zone: isEu ? "europe-west4-a" : "us-south1-b",
-        machine_type: isEu ? "n4-highcpu-16" : "c4d-highcpu-16",
-        cpu_platform: isEu ? "Intel Emerald Rapids" : "AMD Turin",
-        vcpu: 16,
-        cache_hits: parseInt(document.getElementById("rb-new-hits").value || "418", 10),
-        total_crates: parseInt(document.getElementById("rb-new-total").value || "430", 10),
-        peak_ram_gib: parseFloat(document.getElementById("rb-new-ram").value || "22.4"),
-        cpu_time_seconds: parseFloat(document.getElementById("rb-new-cputime").value || "960"),
-        total_duration_seconds: 88.5
+      const text = id => document.getElementById(id).value.trim();
+      const num = id => {
+        const raw = text(id);
+        return raw === "" ? null : Number(raw);
       };
+      const fields = {
+        status: text("rb-new-status"),
+        project_name: text("rb-new-project"),
+        commit_sha: text("rb-new-commit"),
+        compile_duration_seconds: num("rb-new-compile"),
+        delivery_duration_seconds: num("rb-new-delivery"),
+        instance_name: text("rb-new-instance"),
+        zone: text("rb-new-zone"),
+        machine_type: text("rb-new-machine"),
+        cpu_platform: text("rb-new-platform"),
+        vcpu: num("rb-new-vcpu"),
+        origin_ip: text("rb-custom-ip"),
+        cache_hits: num("rb-new-hits"),
+        total_crates: num("rb-new-total"),
+        peak_ram_gib: num("rb-new-ram"),
+        cpu_time_seconds: num("rb-new-cputime"),
+      };
+      // Send only what was entered; the server records the rest as not reported.
+      const payload = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== null && v !== ""));
+      if (payload.status === "DELIVERED"
+          && (payload.compile_duration_seconds === undefined || payload.delivery_duration_seconds === undefined)) {
+        showToast("A delivered build needs its compile and delivery seconds");
+        return;
+      }
       const res = await fetch("/api/rust-builds", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3186,7 +3228,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return;
       }
       if (data.build) {
-        showToast(`Recorded Rust build ${data.build.build_id}: ${data.build.network_security.badge_text} · ${data.build.cpu_points.toLocaleString()} CPU points`);
+        showToast(`Recorded Rust build ${data.build.build_id}: ${data.build.network_security.badge_text} · ${reportedOr(data.build.cpu_points, v => `${v.toLocaleString()} CPU points`, "CPU points not reported")}`);
         await loadOverview();
       }
     }

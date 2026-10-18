@@ -68,7 +68,7 @@ def no_live_pricing(test: unittest.TestCase) -> None:
 
 # States written by a version that already ran the one-time telemetry and template migrations: a missing marker is legacy
 # and gets one version of its own on the active slot (DemoTelemetryMigrationCommitTests covers that).
-MIGRATED = {"demo_telemetry_migration": 1, "demo_template_source_migration": 1}
+MIGRATED = {"demo_telemetry_migration": 1, "demo_template_source_migration": 1, "builder_preset_migration": 1}
 
 
 def write_state(path: Path, version: int, targets: list[str]) -> None:

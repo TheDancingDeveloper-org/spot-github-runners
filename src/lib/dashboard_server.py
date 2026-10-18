@@ -22,7 +22,7 @@ import stat
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 import uuid
 
@@ -112,11 +112,20 @@ from .rust_build_telemetry import (
     SUCCESSFUL_BUILD_STATUSES,
     UNFINISHED_BUILD_STATUSES,
     UNSUCCESSFUL_BUILD_STATUSES,
+    _crate_counts,
     _finite_float,
     _finite_int,
     _iso_to_epoch,
     classify_ip_and_network,
     enrich_rust_build_record,
+)
+
+# A completed build is stored only with its own timing: requested and delivered times (reported, derived from
+# reported durations, or the report's arrival for delivery) and a finish time only when one is known. Nothing
+# stands in for a missing figure.
+UNKNOWN_BUILD_TIMING_MESSAGE = (
+    "A completed Rust build needs its timing: report requested_at, total_duration_seconds, or both "
+    "compile_duration_seconds and delivery_duration_seconds (delivered_at defaults to when the report arrives)"
 )
 
 MAX_JSON_BODY_BYTES = 262_144
@@ -237,6 +246,14 @@ def _iso_hours_ago(hours_ago: float, base_epoch: float | None = None) -> str:
     now_ts = base_epoch if base_epoch is not None else time.time()
     dt = datetime.fromtimestamp(now_ts - hours_ago * 3600.0, tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_at_epoch(epoch: float) -> str:
+    """UTC ISO timestamp of ``epoch``: whole seconds when it is one, else with microseconds."""
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    if abs(epoch - round(epoch)) < 1e-6:
+        return datetime.fromtimestamp(round(epoch), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _iso_seconds_ago(seconds_ago: float, base_epoch: float | None = None) -> str:
@@ -585,6 +602,74 @@ SEEDED_TEMPLATE_SOURCE_INSTANCES = frozenset({
     ("tpl-builder-c4d-16", "builder-oxidex-turin-01"),
 })
 
+# Dedicated builders run on n4-highcpu-16 (16 vCPU, 32 GiB RAM). Earlier versions shipped the builder preset as
+# tpl-builder-c4d-16 on c4d-highcpu-16; loading a state without this marker replaces an unedited copy of that old
+# preset with tpl-builder-n4-16 once and repoints profiles that used it. An edited copy is the owner's template
+# and stays as it is.
+BUILDER_PRESET_MIGRATION_KEY = "builder_preset_migration"
+BUILDER_PRESET_MIGRATION_VERSION = 1
+BUILDER_PRESET_ID = "tpl-builder-n4-16"
+LEGACY_BUILDER_PRESET_ID = "tpl-builder-c4d-16"
+# The old preset exactly as earlier versions wrote it, without its generated created_at (and without the source
+# instance that drop_seeded_template_sources removes).
+LEGACY_BUILDER_PRESET: dict[str, Any] = {
+    "id": LEGACY_BUILDER_PRESET_ID,
+    "name": "Dedicated Rust Builder C4D-HighCPU-16 (AMD Turin)",
+    "role": "rust_builder",
+    "machine_type": "c4d-highcpu-16",
+    "vcpu": 16,
+    "ram_gib": 32,
+    "cpu_platform": "AMD Turin",
+    "benchmark_score": compute_cpu_benchmark_score("AMD Turin", 16, "c4d-highcpu-16"),
+    "disk_category": "hyperdrive",
+    "boot_disk_type": "hyperdisk-balanced",
+    "boot_disk_gb": 40,
+    "data_disk_type": "hyperdisk-balanced",
+    "data_disk_gb": 100,
+    "runners_count": 1,
+    "runner_vcpu": 16,
+    "runner_ram_gib": 28,
+    "cloud_init_template_id": "ci-rust-builder-199",
+}
+
+
+def migrate_builder_preset(
+    state: dict[str, Any],
+    validate: Callable[[dict[str, Any], dict[str, Any], str], Any] | None = None,
+) -> bool:
+    """Replace an unedited legacy c4d builder preset with the n4 preset in place; True when it changed ``state``.
+
+    ``validate(template, profile, role)`` raises ValueError when a profile can't use a template. When any profile
+    that uses the old preset would reject the new one (a raised benchmark minimum, for example), nothing changes:
+    the owner's working configuration stays as it is.
+    """
+    templates = state.get("vm_templates")
+    if not isinstance(templates, list) or any(
+            isinstance(t, dict) and t.get("id") == BUILDER_PRESET_ID for t in templates):
+        return False
+    index = next((i for i, tpl in enumerate(templates)
+                  if isinstance(tpl, dict) and tpl.get("id") == LEGACY_BUILDER_PRESET_ID
+                  and {k: v for k, v in tpl.items() if k != "created_at"} == LEGACY_BUILDER_PRESET), None)
+    if index is None:
+        return False
+    default_preset = next(t for t in default_dashboard_state()["vm_templates"] if t["id"] == BUILDER_PRESET_ID)
+    preset = dict(default_preset, created_at=templates[index].get("created_at", default_preset["created_at"]))
+    profiles = state.get("profiles")
+    users = [(role, profile) for role, profile in (profiles.items() if isinstance(profiles, dict) else [])
+             if isinstance(profile, dict) and profile.get("vm_template_id") == LEGACY_BUILDER_PRESET_ID]
+    if validate is not None:
+        for role, profile in users:
+            try:
+                validate(preset, profile, str(profile.get("role", role)))
+            except ValueError as exc:
+                LOG.warning("Kept builder preset %s: profile %s would not accept %s (%s)",
+                            LEGACY_BUILDER_PRESET_ID, role, BUILDER_PRESET_ID, exc)
+                return False
+    templates[index] = preset
+    for _role, profile in users:
+        profile["vm_template_id"] = BUILDER_PRESET_ID
+    return True
+
 
 def drop_seeded_template_sources(state: dict[str, Any]) -> int:
     """Remove the fabricated ``source_instance`` of the preset VM templates in place; returns how many it removed."""
@@ -678,6 +763,9 @@ def _original_seed_reference(state: dict[str, Any]) -> float | None:
     ):
         expected = {row["id"]: {k: v for k, v in row.items() if k != timestamp}
                     for row in defaults[field]}
+        if field == "vm_templates":
+            # Seeded states hold the builder preset as it was then (see migrate_builder_preset).
+            expected[LEGACY_BUILDER_PRESET_ID] = dict(LEGACY_BUILDER_PRESET)
         records = state.get(field)
         for row in records if isinstance(records, list) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row["id"] not in offsets:
@@ -3055,14 +3143,14 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "created_at": _iso_hours_ago(18.0, ref_now),
         },
         {
-            "id": "tpl-builder-c4d-16",
-            "name": "Dedicated Rust Builder C4D-HighCPU-16 (AMD Turin)",
+            "id": BUILDER_PRESET_ID,
+            "name": "Dedicated Rust Builder N4-HighCPU-16 (Intel Emerald Rapids)",
             "role": "rust_builder",
-            "machine_type": "c4d-highcpu-16",
+            "machine_type": "n4-highcpu-16",
             "vcpu": 16,
             "ram_gib": 32,
-            "cpu_platform": "AMD Turin",
-            "benchmark_score": compute_cpu_benchmark_score("AMD Turin", 16, "c4d-highcpu-16"),
+            "cpu_platform": "Intel Emerald Rapids",
+            "benchmark_score": compute_cpu_benchmark_score("Intel Emerald Rapids", 16, "n4-highcpu-16"),
             "disk_category": "hyperdrive",
             "boot_disk_type": "hyperdisk-balanced",
             "boot_disk_gb": 40,
@@ -3121,7 +3209,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "boot_disk_gb": 40,
             "data_disk_gb": 100,
             "use_vm_template": True,
-            "vm_template_id": "tpl-builder-c4d-16",
+            "vm_template_id": BUILDER_PRESET_ID,
             "cloud_init_template_id": "ci-rust-builder-199",
             "budget": {
                 "active_period": "day",
@@ -3189,6 +3277,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         # drop_seeded_template_sources.
         DEMO_TELEMETRY_MIGRATION_KEY: DEMO_TELEMETRY_MIGRATION_VERSION,
         DEMO_TEMPLATE_SOURCE_MIGRATION_KEY: DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION,
+        BUILDER_PRESET_MIGRATION_KEY: BUILDER_PRESET_MIGRATION_VERSION,
     }
 
 
@@ -3633,6 +3722,15 @@ class DashboardStore:
             base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
             if dropped_sources:
                 LOG.warning("Removed the nonexistent source instance from %d preset VM template(s)", dropped_sources)
+        preset_marker = loaded.get(BUILDER_PRESET_MIGRATION_KEY)
+        if not (isinstance(preset_marker, int) and not isinstance(preset_marker, bool)
+                and preset_marker >= BUILDER_PRESET_MIGRATION_VERSION):
+            base[BUILDER_PRESET_MIGRATION_KEY] = BUILDER_PRESET_MIGRATION_VERSION
+            # Like the template marker, the new marker must reach KV even when nothing else changed.
+            base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
+            if migrate_builder_preset(base, self._validate_vm_template_compatibility):
+                LOG.warning("Replaced the c4d-highcpu-16 builder preset %s with %s (n4-highcpu-16)",
+                            LEGACY_BUILDER_PRESET_ID, BUILDER_PRESET_ID)
         previous = getattr(self, "state", None)
         self.state = base
         try:
@@ -4829,9 +4927,9 @@ class DashboardStore:
             if name:
                 inst["ssh_command"] = format_gcloud_ssh_command(name, zone, self.project)
         for build in self.state.get("rust_builds", []):
-            inst_name = str(build.get("instance_name", ""))
-            zone = str(build.get("zone", "us-south1-b"))
-            if inst_name:
+            inst_name = str(build.get("instance_name") or "")
+            zone = str(build.get("zone") or "")
+            if inst_name and zone:
                 build["ssh_command"] = format_gcloud_ssh_command(inst_name, zone, self.project)
 
     def _resolve_template_runners_per_instance(self) -> int:
@@ -4938,7 +5036,8 @@ class DashboardStore:
                 try:
                     dt = datetime.fromisoformat(str(ts_str).strip().replace("Z", "+00:00"))
                     age_sec = ref_ts - dt.timestamp()
-                    if 0.0 <= age_sec <= 3600.0:
+                    # A build stamped at the report's arrival can round a microsecond past ref_ts.
+                    if -1.0 <= age_sec <= 3600.0:
                         builds_past_hour += 1
                 except ValueError:
                     # Safe to ignore unparseable timestamps in legacy or partial build records.
@@ -7445,12 +7544,27 @@ class DashboardStore:
                 if completed_count
                 else 0.0
             )
-            total_hits = sum(b["cache_hits"] for b in completed_builds)
-            total_crates = sum(b["total_crates"] for b in completed_builds)
-            overall_hit_rate = round((total_hits / total_crates * 100.0) if total_crates else 0.0, 1)
-            max_peak_ram = max((b["peak_ram_gib"] for b in completed_builds), default=0.0)
-            total_cpu_time = round(sum(b["cpu_time_seconds"] for b in completed_builds), 2)
-            total_cpu_points = round(sum(b["cpu_points"] for b in completed_builds), 2)
+            # Aggregates cover only the builds that reported each figure (unreported figures are None).
+            # An aggregate with no reported figure behind it is None (unknown), not 0.
+
+            def reported_values(key: str) -> list[Any]:
+                return [b[key] for b in completed_builds if b.get(key) is not None]
+
+            hits = reported_values("cache_hits")
+            total_hits = sum(hits) if hits else None
+            with_crates = [b for b in completed_builds
+                           if b.get("cache_hits") is not None and b.get("total_crates") is not None]
+            total_crates = sum(b["total_crates"] for b in with_crates)
+            if total_crates:
+                overall_hit_rate = round(sum(b["cache_hits"] for b in with_crates) / total_crates * 100.0, 1)
+            else:
+                overall_hit_rate = 0.0 if with_crates else None  # reported zero-crate builds count as 0%
+            peaks = reported_values("peak_ram_gib")
+            max_peak_ram = max(peaks) if peaks else None
+            cpu_times = reported_values("cpu_time_seconds")
+            total_cpu_time = round(sum(cpu_times), 2) if cpu_times else None
+            points = reported_values("cpu_points")
+            total_cpu_points = round(sum(points), 2) if points else None
             vpn_or_tor_count = sum(
                 1 for b in builds if b["network_security"]["is_vpn"] or b["network_security"]["is_tor"]
             )
@@ -7490,7 +7604,9 @@ class DashboardStore:
                 else {}
             )
 
-            status_str = str(payload.get("status", existing_build.get("status", "DELIVERED")))
+            if payload.get("status") is None and not existing_build.get("status"):
+                raise ValueError("A new Rust build needs a status")
+            status_str = str(payload["status"] if payload.get("status") is not None else existing_build["status"])
             norm_status = status_str.strip().upper()
             if norm_status not in ALLOWED_BUILD_STATUSES:
                 raise ValueError(f"Unsupported Rust build status: {status_str!r}")
@@ -7509,15 +7625,25 @@ class DashboardStore:
                 if "total_duration_seconds" in payload
                 else (existing_build.get("total_duration_seconds") if not was_non_delivered else None)
             )
+            # A build still in progress keeps its reported stage durations across partial updates; once it
+            # finishes, its final timing replaces them. (An active build's total is its compile time, re-derived.)
+            # A stage duration derived from stored timestamps is not carried as a constraint: it is derived
+            # again, so a corrected request or finish time recomputes it.
+            keep_stage_durations = not was_non_delivered or (
+                is_unfinished and prev_status_norm in UNFINISHED_BUILD_STATUSES
+                and not payload.get("finished_at") and not payload.get("delivered_at")
+                and (not payload.get("requested_at")
+                     or str(payload["requested_at"]) == str(existing_build.get("requested_at")))
+                and not existing_build.get("finished_at"))
             raw_delivery = (
                 payload.get("delivery_duration_seconds")
                 if "delivery_duration_seconds" in payload
-                else (existing_build.get("delivery_duration_seconds") if not was_non_delivered else None)
+                else (existing_build.get("delivery_duration_seconds") if keep_stage_durations else None)
             )
             raw_compile = (
                 payload.get("compile_duration_seconds")
                 if "compile_duration_seconds" in payload
-                else (existing_build.get("compile_duration_seconds") if not was_non_delivered else None)
+                else (existing_build.get("compile_duration_seconds") if keep_stage_durations else None)
             )
             explicit_total = (
                 _finite_float(raw_duration, "total_duration_seconds", min_val=0.0)
@@ -7549,11 +7675,16 @@ class DashboardStore:
                 )
             )
             if is_non_delivered:
+                duration_includes_delivery = explicit_total is not None
                 if explicit_total is not None:
                     duration = explicit_total
                 elif explicit_compile is not None:
                     duration = explicit_compile
-                elif is_unsuccessful and (payload.get("requested_at") or existing_build.get("requested_at")):
+                elif is_unsuccessful and (payload.get("requested_at") or existing_build.get("requested_at")) and (
+                        payload.get("finished_at") or existing_build.get("finished_at")
+                        or not (existing_build and prev_status_norm in UNSUCCESSFUL_BUILD_STATUSES)):
+                    # A failure reported now ended now; a stored failure whose end was never reported stays
+                    # unknown on later updates.
                     req_epoch_existing = _iso_to_epoch(
                         str(payload.get("requested_at") or existing_build["requested_at"])
                     )
@@ -7570,7 +7701,7 @@ class DashboardStore:
                     # carry a status-only completion into the next second and hide it from immediate telemetry.
                     duration = max(0.0, fin_epoch_target - req_epoch_existing)
                 else:
-                    duration = 0.0
+                    duration = None  # no timing reported: it stays unknown
                 delivery_sec = explicit_delivery if explicit_delivery is not None else 0.0
             else:
                 if explicit_total is not None:
@@ -7580,7 +7711,7 @@ class DashboardStore:
                     elif explicit_compile is not None:
                         delivery_sec = max(0.0, duration - min(explicit_compile, duration))
                     else:
-                        delivery_sec = min(8.0, round(duration * 0.2, 2))
+                        delivery_sec = None
                 elif (
                     was_non_delivered
                     and req_matches_existing
@@ -7604,60 +7735,47 @@ class DashboardStore:
                         fin_ep = _iso_to_epoch(str(payload["finished_at"]))
                         delivery_sec = min(duration, max(0.0, round(completion_epoch - fin_ep, 2)))
                     else:
-                        delivery_sec = min(8.0, round(duration * 0.2, 2))
+                        delivery_sec = None
                 else:
-                    delivery_sec = explicit_delivery if explicit_delivery is not None else 8.0
-                    c_sec = explicit_compile if explicit_compile is not None else 87.0
-                    duration = c_sec + delivery_sec
+                    delivery_sec = explicit_delivery
+                    duration = (explicit_compile + explicit_delivery
+                                if explicit_compile is not None and explicit_delivery is not None else None)
+            # The compile time, as reported or derived from reported figures (None when it is not known).
+            known_compile = (
+                explicit_compile if explicit_compile is not None
+                else (duration - delivery_sec if duration is not None and delivery_sec is not None else None)
+            )
 
-            has_hits = payload.get("cache_hits") is not None
-            has_misses = payload.get("cache_misses") is not None
-            has_total = payload.get("total_crates") is not None
-            has_existing_crates = bool(existing_build)
-            if has_hits:
-                cache_hits = _finite_int(payload["cache_hits"], "cache_hits", min_val=0)
-            elif has_total and has_misses:
-                cache_hits = max(
-                    0,
-                    _finite_int(payload["total_crates"], "total_crates", min_val=0)
-                    - _finite_int(payload["cache_misses"], "cache_misses", min_val=0),
-                )
-            elif has_existing_crates:
-                cache_hits = _finite_int(existing_build.get("cache_hits", 0), "cache_hits", min_val=0)
-            else:
-                cache_hits = 0 if is_non_delivered else 380
-
-            if has_misses:
-                cache_misses = _finite_int(payload["cache_misses"], "cache_misses", min_val=0)
-            elif has_total:
-                cache_misses = max(
-                    0, _finite_int(payload["total_crates"], "total_crates", min_val=0) - cache_hits
-                )
-            elif has_existing_crates:
-                cache_misses = _finite_int(existing_build.get("cache_misses", 0), "cache_misses", min_val=0)
-            else:
-                cache_misses = 0 if is_non_delivered else 25
-
-            if has_total:
-                total_crates = _finite_int(payload["total_crates"], "total_crates", min_val=0)
-            elif has_existing_crates and not (has_hits or has_misses):
-                total_crates = _finite_int(existing_build.get("total_crates", 0), "total_crates", min_val=0)
-            else:
-                total_crates = cache_hits + cache_misses
+            cache_hits, cache_misses, total_crates, reported_crates = _merged_crate_counts(payload, existing_build)
 
             if is_non_delivered:
+                # Without a reported request time, a build that reports elapsed time started that long ago.
                 req_at = (
                     payload.get("requested_at")
                     or existing_build.get("requested_at")
-                    or _iso_seconds_ago(duration if is_unsuccessful else 0, now_ts)
+                    # Whole seconds, like every inferred timestamp, so later durations stay consistent with it.
+                    or _iso_seconds_ago(0, now_ts - (duration if duration is not None else 0))
                 )
                 req_epoch = _iso_to_epoch(str(req_at))
                 if "finished_at" in payload:
                     fin_at = payload.get("finished_at")
                 elif existing_build.get("finished_at"):
                     fin_at = existing_build.get("finished_at")
-                elif is_unsuccessful:
-                    fin_at = _iso_seconds_ago(0, max(now_ts, req_epoch + max(0.0, duration - delivery_sec)))
+                elif is_unsuccessful and duration is not None:
+                    # Only a total includes delivery; a compile time (or request-to-failure span) is the run itself.
+                    run_seconds = max(0.0, duration - delivery_sec) if duration_includes_delivery else duration
+                    request_inferred = not payload.get("requested_at") and (
+                        not existing_build.get("requested_at") or existing_build.get("requested_at_inferred") is True)
+                    if req_epoch + run_seconds > now_ts + 1.0:
+                        if not request_inferred:
+                            raise ValueError("Inconsistent failure timing: requested_at plus the reported duration "
+                                             "is after the report")
+                        # An inferred request time (the first report's arrival) can't be right: the build ran for
+                        # the reported time and ended by now, so it started that long before now.
+                        req_epoch = float(math.floor(now_ts - run_seconds))
+                        req_at = _iso_seconds_ago(0, req_epoch)
+                    # Request time plus the exact reported run time, at the precision of the resulting time.
+                    fin_at = _iso_at_epoch(req_epoch + run_seconds)
                 else:
                     fin_at = None
                 del_at = (
@@ -7677,12 +7795,14 @@ class DashboardStore:
                     del_at = str(payload["delivered_at"])
                     del_epoch = _iso_to_epoch(del_at)
                 else:
-                    del_epoch = max(now_ts, req_epoch + duration)
-                    del_at = _iso_seconds_ago(0, del_epoch)
+                    del_at = _iso_at_epoch(max(now_ts, req_epoch + duration))
+                    del_epoch = _iso_to_epoch(del_at)
                 if payload.get("finished_at"):
                     fin_at = str(payload["finished_at"])
+                elif delivery_sec is not None:
+                    fin_at = _iso_at_epoch(max(req_epoch, del_epoch - delivery_sec))
                 else:
-                    fin_at = _iso_seconds_ago(0, max(req_epoch, del_epoch - delivery_sec))
+                    fin_at = None  # not reported: the compile/delivery split stays unknown
             elif (payload.get("requested_at") or existing_build.get("requested_at")) and not payload.get("delivered_at"):
                 req_at = str(payload.get("requested_at") or existing_build["requested_at"])
                 req_epoch = _iso_to_epoch(req_at)
@@ -7696,9 +7816,16 @@ class DashboardStore:
                 ):
                     fin_at = str(existing_build["finished_at"])
                     fin_epoch = _iso_to_epoch(fin_at)
+                elif known_compile is not None:
+                    fin_at = _iso_at_epoch(req_epoch + max(0.0, known_compile))
+                    fin_epoch = _iso_to_epoch(fin_at)
+                elif delivery_sec is not None:
+                    # Delivered when reported, so it finished the reported delivery time before that.
+                    fin_at = _iso_at_epoch(now_ts - delivery_sec)
+                    fin_epoch = _iso_to_epoch(fin_at)
                 else:
-                    fin_epoch = req_epoch + max(0.0, duration - delivery_sec)
-                    fin_at = _iso_seconds_ago(0, fin_epoch)
+                    fin_epoch = None
+                    fin_at = None  # not reported: the compile/delivery split stays unknown
                 if (
                     existing_build.get("delivered_at")
                     and not payload.get("requested_at")
@@ -7707,49 +7834,82 @@ class DashboardStore:
                 ):
                     del_at = str(existing_build["delivered_at"])
                 else:
-                    del_epoch = (
-                        (req_epoch + duration)
-                        if explicit_total is not None
-                        else (fin_epoch + delivery_sec)
-                    )
-                    del_at = _iso_seconds_ago(0, del_epoch)
+                    if explicit_total is not None:
+                        del_at = _iso_at_epoch(req_epoch + duration)
+                    elif delivery_sec is not None and fin_epoch is not None:
+                        del_at = _iso_at_epoch(fin_epoch + delivery_sec)
+                    else:
+                        del_at = _iso_at_epoch(now_ts)  # delivered when reported
             else:
-                del_at = payload.get("delivered_at") or _iso_seconds_ago(0, now_ts)
+                del_at = payload.get("delivered_at") or _iso_at_epoch(now_ts)
                 del_epoch = _iso_to_epoch(str(del_at))
-                fin_at = payload.get("finished_at") or _iso_seconds_ago(delivery_sec, del_epoch)
-                fin_epoch = _iso_to_epoch(str(fin_at))
-                req_at = payload.get("requested_at") or _iso_seconds_ago(
-                    max(0.0, duration - delivery_sec), fin_epoch
-                )
+                if payload.get("finished_at"):
+                    fin_at = payload["finished_at"]
+                elif delivery_sec is not None:
+                    fin_at = _iso_at_epoch(del_epoch - delivery_sec)
+                elif known_compile is not None and (payload.get("requested_at") or existing_build.get("requested_at")):
+                    fin_at = _iso_at_epoch(_iso_to_epoch(str(payload.get("requested_at")
+                                                             or existing_build["requested_at"]))
+                                           + max(0.0, known_compile))
+                else:
+                    fin_at = None  # not reported: the compile/delivery split stays unknown
+                fin_epoch = _iso_to_epoch(str(fin_at)) if fin_at else None
+                if payload.get("requested_at"):
+                    req_at = payload["requested_at"]
+                elif existing_build.get("requested_at"):
+                    # A stored request time is evidence: keep it (enrichment rejects timing that contradicts it).
+                    req_at = existing_build["requested_at"]
+                elif known_compile is not None and fin_epoch is not None:
+                    req_at = _iso_at_epoch(fin_epoch - max(0.0, known_compile))
+                elif duration is not None:
+                    req_at = _iso_at_epoch(del_epoch - max(0.0, duration))
+                else:
+                    raise ValueError(UNKNOWN_BUILD_TIMING_MESSAGE)
 
-            existing_peak_ram = existing_build.get("peak_ram_gib")
-            default_peak_ram = (
-                existing_peak_ram
-                if existing_peak_ram is not None
-                else 0.0
-            )
-            existing_cpu_time = existing_build.get("cpu_time_seconds")
-            default_cpu_time = (
-                existing_cpu_time
-                if existing_cpu_time is not None
-                else 0.0
-            )
+            def given(key: str) -> Any:
+                """This report's value, treating a blank string as not reported."""
+                value = payload.get(key)
+                return None if isinstance(value, str) and not value.strip() else value
+
+            def reported(key: str) -> Any:
+                """This report's value, else the stored build's; None when neither reported it."""
+                value = given(key)
+                return value if value is not None else existing_build.get(key)
+
+            # An explicit benchmark score stands in for the host shape. A stored score is kept unless the report
+            # changes an already reported shape value, so a different host is scored again.
+            shape_keys = ("cpu_platform", "vcpu", "machine_type")
+            def shape_value(value: Any) -> Any:
+                """A shape value in comparable form: whole numbers (16, "16", 16.0) as integers, names stripped."""
+                text = str(value).strip()
+                try:
+                    number = float(text)
+                except ValueError:
+                    return text
+                return int(number) if math.isfinite(number) and number.is_integer() else text
+
+            # Only a value that conflicts with a previously reported one means a different host; filling in a
+            # field nobody reported before keeps the stored score.
+            shape_changed = any(given(k) is not None and existing_build.get(k) is not None
+                                and shape_value(given(k)) != shape_value(existing_build[k])
+                                for k in shape_keys)
+            benchmark_score = (given("instance_benchmark_score")
+                               if given("instance_benchmark_score") is not None
+                               else (None if shape_changed else existing_build.get("instance_benchmark_score")))
 
             raw = {
                 "build_id": incoming_build_id or f"rb-{uuid.uuid4().hex[:8]}",
-                "project_name": payload.get(
-                    "project_name", existing_build.get("project_name", "oxidex")
-                ),
-                "profile": payload.get("profile", existing_build.get("profile", "release")),
-                "target_triple": payload.get(
-                    "target_triple",
-                    existing_build.get("target_triple", "x86_64-unknown-linux-gnu"),
-                ),
-                "commit_sha": payload.get(
-                    "commit_sha", existing_build.get("commit_sha", "af7c14f8cb2c")
-                ),
+                "project_name": reported("project_name"),
+                "profile": reported("profile"),
+                "target_triple": reported("target_triple"),
+                "commit_sha": reported("commit_sha"),
                 "status": status_str,
                 "requested_at": req_at,
+                # Whether no report ever gave the request time (it was inferred from a report's arrival).
+                "requested_at_inferred": (False if payload.get("requested_at") else (
+                    existing_build.get("requested_at_inferred") is True
+                    if existing_build.get("requested_at") and str(req_at) == str(existing_build["requested_at"])
+                    else True)),
                 "finished_at": fin_at,
                 "delivered_at": del_at,
                 "total_duration_seconds": raw_duration,
@@ -7768,31 +7928,20 @@ class DashboardStore:
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
                 "total_crates": total_crates,
-                "instance_name": payload.get(
-                    "instance_name",
-                    existing_build.get("instance_name", "builder-oxidex-turin-01"),
-                ),
-                "zone": payload.get("zone", existing_build.get("zone", "us-south1-b")),
-                "machine_type": payload.get(
-                    "machine_type", existing_build.get("machine_type", "c4d-highcpu-16")
-                ),
-                "vcpu": _finite_int(
-                    payload.get("vcpu", existing_build.get("vcpu", 16)), "vcpu", min_val=1
-                ),
-                "cpu_platform": payload.get(
-                    "cpu_platform", existing_build.get("cpu_platform", "AMD Turin")
-                ),
-                "origin_ip": payload.get(
-                    "origin_ip", existing_build.get("origin_ip", "185.159.157.42")
-                ),
+                REPORTED_CRATE_COUNTS_KEY: reported_crates,
+                "instance_name": reported("instance_name"),
+                "zone": reported("zone"),
+                "machine_type": reported("machine_type"),
+                "vcpu": reported("vcpu"),
+                "cpu_platform": reported("cpu_platform"),
+                "instance_benchmark_score": benchmark_score,
+                "origin_ip": reported("origin_ip"),
                 "origin_hostname": (
                     payload.get("origin_hostname")
                     if "origin_hostname" in payload
                     else existing_build.get("origin_hostname")
                 ),
-                "peak_ram_gib": _finite_float(
-                    payload.get("peak_ram_gib", default_peak_ram), "peak_ram_gib", min_val=0.0
-                ),
+                "peak_ram_gib": reported("peak_ram_gib"),
                 "container_ram_cap_gib": _finite_float(
                     payload.get(
                         "container_ram_cap_gib",
@@ -7801,11 +7950,7 @@ class DashboardStore:
                     "container_ram_cap_gib",
                     min_val=0.1,
                 ),
-                "cpu_time_seconds": _finite_float(
-                    payload.get("cpu_time_seconds", default_cpu_time),
-                    "cpu_time_seconds",
-                    min_val=0.0,
-                ),
+                "cpu_time_seconds": reported("cpu_time_seconds"),
             }
             _assert_finite_json_tree(payload, "payload")
             enriched = enrich_rust_build_record(raw, project=self.project)
@@ -7853,6 +7998,47 @@ class DashboardStore:
                 "build": enriched,
                 "builder_scaling_evaluation": builder_eval,
             }
+
+
+CRATE_COUNT_KEYS = ("cache_hits", "cache_misses", "total_crates")
+REPORTED_CRATE_COUNTS_KEY = "reported_crate_counts"
+
+
+def _merged_crate_counts(
+    payload: dict[str, Any], stored: dict[str, Any],
+) -> tuple[int | None, int | None, int | None, list[str]]:
+    """Crate counts of a build update, plus which of them were reported rather than derived.
+
+    This report's counts win over the stored ones, field by field. A stored count that contradicts the new report
+    is dropped and derived again from the others, a previously derived count before a reported one (a build stored
+    before reported counts were tracked treats every stored count as reported). A count nobody reported stays None.
+    """
+    reported = {k: payload[k] for k in CRATE_COUNT_KEYS if payload.get(k) is not None}
+    stored_reported = stored.get(REPORTED_CRATE_COUNTS_KEY)
+    if not isinstance(stored_reported, list):
+        stored_reported = [k for k in CRATE_COUNT_KEYS if stored.get(k) is not None]
+    # A stored count derived from others is derived again whenever this report changes any count.
+    kept = {k: stored[k] for k in CRATE_COUNT_KEYS
+            if k not in reported and stored.get(k) is not None and (not reported or k in stored_reported)}
+
+    def counts(values: dict[str, Any]) -> tuple[int | None, int | None, int | None, list[str]]:
+        hits, misses, total = _crate_counts(*(values.get(k) for k in CRATE_COUNT_KEYS))
+        sources = [k for k in CRATE_COUNT_KEYS if k in reported or (k in values and k in stored_reported)]
+        return hits, misses, total, sources
+
+    try:
+        return counts({**kept, **reported})
+    except ValueError:
+        if not kept:
+            raise
+    order = sorted(("cache_misses", "cache_hits", "total_crates"), key=lambda k: k in stored_reported)
+    for dropped in order:
+        if dropped in kept:
+            try:
+                return counts({**{k: v for k, v in kept.items() if k != dropped}, **reported})
+            except ValueError:
+                continue
+    return counts(reported)
 
 
 def _is_loopback_host(host: str) -> bool:

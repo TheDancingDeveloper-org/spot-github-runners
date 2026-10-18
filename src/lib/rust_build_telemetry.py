@@ -364,6 +364,59 @@ def _iso_to_epoch(iso_str: str) -> float:
     return dt.timestamp()
 
 
+def _optional_str(value: Any) -> str | None:
+    """A reported text field, or None when it was not reported (missing, null, or blank)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _crate_counts(raw_hits: Any, raw_misses: Any, raw_total: Any) -> tuple[int | None, int | None, int | None]:
+    """Cache hits, misses, and total crates as reported; a missing count is derived only from the other two."""
+    hits = _finite_int(raw_hits, "cache_hits", min_val=0) if raw_hits is not None else None
+    misses = _finite_int(raw_misses, "cache_misses", min_val=0) if raw_misses is not None else None
+    total = _finite_int(raw_total, "total_crates", min_val=0) if raw_total is not None else None
+    if hits is not None and misses is not None:
+        if total is None:
+            total = hits + misses
+        elif total < hits + misses:
+            raise ValueError(f"total_crates ({total}) is below cache_hits + cache_misses ({hits + misses})")
+    elif total is not None and hits is not None:
+        if hits > total:
+            raise ValueError(f"cache_hits ({hits}) exceeds total_crates ({total})")
+        misses = total - hits
+    elif total is not None and misses is not None:
+        if misses > total:
+            raise ValueError(f"cache_misses ({misses}) exceeds total_crates ({total})")
+        hits = total - misses
+    return hits, misses, total
+
+
+def unreported_origin(hostname: Any = None) -> dict[str, Any]:
+    """Network fields for a build whose origin IP was not reported (nothing is looked up or assumed)."""
+    return {
+        "ip_address": None,
+        "hostname": _optional_str(hostname),
+        "provider_label": "Not reported",
+        "network_type": "Unknown",
+        "is_vpn": False,
+        "is_tor": False,
+        "is_proxy": False,
+        "badge_text": "Origin Not Reported",
+        "geolocation": {
+            "city": "Unknown",
+            "region": "Unknown",
+            "country": "Unknown",
+            "country_code": "UN",
+            "lat": None,
+            "lon": None,
+            "asn": "Unknown",
+            "isp": "Unknown",
+        },
+    }
+
+
 def enrich_rust_build_record(
     record: dict[str, Any],
     project: str = "homelab-424523",
@@ -371,7 +424,9 @@ def enrich_rust_build_record(
     """Normalize and enrich a Rust remote build telemetry record with durations,
     cache hit rate, IP geolocation, VPN/Tor lookup, active RAM OOM floor, and CPU points.
     """
-    status_str = str(record.get("status", "DELIVERED"))
+    if record.get("status") is None:
+        raise ValueError("A Rust build needs a status")
+    status_str = str(record["status"])
     norm_status = status_str.strip().upper()
     if norm_status not in ALLOWED_BUILD_STATUSES:
         raise ValueError(f"Unsupported Rust build status: {status_str!r}")
@@ -398,9 +453,9 @@ def enrich_rust_build_record(
         delivered_at = None
         del_ts = None
 
-    if is_successful and (fin_ts is None or del_ts is None):
+    if is_successful and del_ts is None:
         raise ValueError(
-            "Invalid Rust build timestamps: requested_at, finished_at, and delivered_at are required for completed builds"
+            "Invalid Rust build timestamps: requested_at and delivered_at are required for completed builds"
         )
     if fin_ts is not None and req_ts > fin_ts:
         raise ValueError(
@@ -415,9 +470,16 @@ def enrich_rust_build_record(
             "Invalid Rust build timestamps: requested_at <= finished_at <= delivered_at is required"
         )
 
-    compile_seconds = round(fin_ts - req_ts, 2) if fin_ts is not None else 0.0
-    delivery_seconds = round(del_ts - fin_ts, 2) if (del_ts is not None and fin_ts is not None) else 0.0
+    # Without a finish time the compile time is only what was reported (an active build's elapsed compile, for
+    # example) and the delivery time is unknown: None, never 0 or a guess.
     raw_compile = record.get("compile_duration_seconds")
+    if fin_ts is not None:
+        compile_seconds: float | None = round(fin_ts - req_ts, 2)
+    elif raw_compile is not None:
+        compile_seconds = round(_finite_float(raw_compile, "compile_duration_seconds", min_val=0.0), 2)
+    else:
+        compile_seconds = None
+    delivery_seconds = round(del_ts - fin_ts, 2) if (del_ts is not None and fin_ts is not None) else None
     if raw_compile is not None and fin_ts is not None:
         explicit_compile = round(
             _finite_float(raw_compile, "compile_duration_seconds", min_val=0.0), 2
@@ -454,51 +516,35 @@ def enrich_rust_build_record(
     else:
         total_duration_seconds = compile_seconds
 
-    cache_hits = _finite_int(record.get("cache_hits", 0), "cache_hits", min_val=0)
-    if record.get("cache_misses") is not None:
-        cache_misses = _finite_int(record["cache_misses"], "cache_misses", min_val=0)
-    elif record.get("total_crates") is not None:
-        cache_misses = max(0, _finite_int(record["total_crates"], "total_crates", min_val=0) - cache_hits)
-    else:
-        cache_misses = 0
-    if record.get("total_crates") is not None:
-        total_crates = max(
-            cache_hits + cache_misses,
-            _finite_int(record["total_crates"], "total_crates", min_val=0),
-        )
-    else:
-        total_crates = cache_hits + cache_misses
-    cache_hit_rate = round((cache_hits / total_crates * 100.0) if total_crates > 0 else 0.0, 1)
+    hits, misses, total_crates = _crate_counts(record.get("cache_hits"), record.get("cache_misses"),
+                                               record.get("total_crates"))
+    cache_hit_rate = (round(hits / total_crates * 100.0, 1) if hits is not None and total_crates else
+                      (0.0 if hits is not None and total_crates == 0 else None))
 
-    instance_name = str(record.get("instance_name", "builder-oxidex-turin-01"))
-    zone = str(record.get("zone", "us-south1-a"))
-    region = zone.rsplit("-", 1)[0] if "-" in zone else zone
-    machine_type = str(record.get("machine_type", "c4d-highcpu-16"))
-    vcpu = _finite_int(record.get("vcpu", 16), "vcpu", min_val=1)
-    cpu_platform = str(record.get("cpu_platform", "AMD Turin"))
+    instance_name = _optional_str(record.get("instance_name"))
+    zone = _optional_str(record.get("zone"))
+    region = (zone.rsplit("-", 1)[0] if "-" in zone else zone) if zone else None
+    machine_type = _optional_str(record.get("machine_type"))
+    vcpu = _finite_int(record["vcpu"], "vcpu", min_val=1) if record.get("vcpu") is not None else None
+    cpu_platform = _optional_str(record.get("cpu_platform"))
     raw_bench = record.get("instance_benchmark_score")
-    benchmark_score = (
-        _finite_int(raw_bench, "instance_benchmark_score", min_val=1)
-        if raw_bench is not None
-        else compute_cpu_benchmark_score(cpu_platform, vcpu, machine_type)
-    )
+    if raw_bench is not None:
+        benchmark_score: int | None = _finite_int(raw_bench, "instance_benchmark_score", min_val=1)
+    elif cpu_platform and vcpu is not None and machine_type:
+        benchmark_score = compute_cpu_benchmark_score(cpu_platform, vcpu, machine_type)
+    else:
+        benchmark_score = None
 
-    default_cpu_time = 0.0 if (is_unfinished or is_unsuccessful) else (compile_seconds * 8.5)
-    cpu_time_seconds = round(
-        _finite_float(
-            record.get("cpu_time_seconds", default_cpu_time),
-            "cpu_time_seconds",
-            min_val=0.0,
-        ),
-        2,
-    )
-    cpu_points = compute_cpu_points(cpu_time_seconds, benchmark_score)
+    raw_cpu_time = record.get("cpu_time_seconds")
+    cpu_time_seconds = (round(_finite_float(raw_cpu_time, "cpu_time_seconds", min_val=0.0), 2)
+                        if raw_cpu_time is not None else None)
+    cpu_points = (compute_cpu_points(cpu_time_seconds, benchmark_score)
+                  if cpu_time_seconds is not None and benchmark_score is not None else None)
 
-    default_peak_ram = 0.0 if (is_unfinished or is_unsuccessful) else 18.4
-    peak_ram_gib = round(
-        _finite_float(record.get("peak_ram_gib", default_peak_ram), "peak_ram_gib", min_val=0.0),
-        2,
-    )
+    raw_peak_ram = record.get("peak_ram_gib")
+    peak_ram_gib = (round(_finite_float(raw_peak_ram, "peak_ram_gib", min_val=0.0), 2)
+                    if raw_peak_ram is not None else None)
+    # The dedicated builder container's memory cap (28 GiB) is part of the builder design, not a measurement.
     container_ram_cap_gib = round(
         _finite_float(
             record.get("container_ram_cap_gib", 28.0),
@@ -507,21 +553,22 @@ def enrich_rust_build_record(
         ),
         2,
     )
-    ram_headroom_gib = round(max(0.0, container_ram_cap_gib - peak_ram_gib), 2)
+    ram_headroom_gib = (round(max(0.0, container_ram_cap_gib - peak_ram_gib), 2)
+                        if peak_ram_gib is not None else None)
 
-    ip_intel = classify_ip_and_network(
-        str(record.get("origin_ip", "73.162.44.19")),
-        record.get("origin_hostname"),
-    )
+    origin_ip = _optional_str(record.get("origin_ip"))
+    ip_intel = (classify_ip_and_network(origin_ip, record.get("origin_hostname")) if origin_ip
+                else unreported_origin(record.get("origin_hostname")))
 
     return {
-        "build_id": str(record.get("build_id", "build-001")),
-        "project_name": str(record.get("project_name", "oxidex")),
-        "profile": str(record.get("profile", "release")),
-        "target_triple": str(record.get("target_triple", "x86_64-unknown-linux-gnu")),
-        "commit_sha": str(record.get("commit_sha", "af7c14f8cb2c")),
+        "build_id": str(record["build_id"]),
+        "project_name": _optional_str(record.get("project_name")),
+        "profile": _optional_str(record.get("profile")),
+        "target_triple": _optional_str(record.get("target_triple")),
+        "commit_sha": _optional_str(record.get("commit_sha")),
         "status": status_str,
         "requested_at": requested_at,
+        "requested_at_inferred": record.get("requested_at_inferred") is True,
         "finished_at": finished_at,
         "delivered_at": delivered_at,
         "requested_epoch": req_ts,
@@ -530,9 +577,13 @@ def enrich_rust_build_record(
         "compile_duration_seconds": compile_seconds,
         "delivery_duration_seconds": delivery_seconds,
         "total_duration_seconds": total_duration_seconds,
-        "cache_hits": cache_hits,
-        "cache_misses": max(0, total_crates - cache_hits),
+        "cache_hits": hits,
+        "cache_misses": misses,
         "total_crates": total_crates,
+        # Which counts were reported rather than derived (record_rust_build's merge prefers reported ones).
+        "reported_crate_counts": [k for k in ("cache_hits", "cache_misses", "total_crates")
+                                  if k in (record.get("reported_crate_counts") or [])
+                                  or (record.get("reported_crate_counts") is None and record.get(k) is not None)],
         "cache_hit_rate_percent": cache_hit_rate,
         "instance_name": instance_name,
         "zone": zone,
@@ -541,9 +592,10 @@ def enrich_rust_build_record(
         "vcpu": vcpu,
         "cpu_platform": cpu_platform,
         "instance_benchmark_score": benchmark_score,
-        "ssh_command": format_gcloud_ssh_command(instance_name, zone, project),
+        "ssh_command": format_gcloud_ssh_command(instance_name, zone, project) if instance_name and zone else None,
         "origin_ip": ip_intel["ip_address"],
-        "origin_hostname": ip_intel["hostname"],
+        # Only a reported hostname; the classifier's default or "unknown" name is not the build's host.
+        "origin_hostname": _optional_str(record.get("origin_hostname")),
         "geolocation": ip_intel["geolocation"],
         "network_security": {
             "provider_label": ip_intel["provider_label"],
@@ -556,8 +608,12 @@ def enrich_rust_build_record(
         "peak_ram_gib": peak_ram_gib,
         "container_ram_cap_gib": container_ram_cap_gib,
         "ram_headroom_gib": ram_headroom_gib,
-        "oom_floor_note": f"Build requires >={peak_ram_gib:.2f} GiB active memory or it will OOM",
+        "oom_floor_note": (f"Build requires >={peak_ram_gib:.2f} GiB active memory or it will OOM"
+                           if peak_ram_gib is not None else "Peak memory not reported"),
         "cpu_time_seconds": cpu_time_seconds,
         "cpu_points": cpu_points,
-        "cpu_points_formula": f"{cpu_time_seconds:g}s CPU time × {benchmark_score} benchmark = {cpu_points:,.0f} pts",
+        "cpu_points_formula": (
+            f"{cpu_time_seconds:g}s CPU time × {benchmark_score} benchmark = {cpu_points:,.0f} pts"
+            if cpu_points is not None else "CPU time or host benchmark not reported"
+        ),
     }

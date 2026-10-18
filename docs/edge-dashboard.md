@@ -562,10 +562,46 @@ state unchanged.
   it's shown but never triggers a fleet scale-up.
 - The dashboard's own form sends only what you enter in it.
 
+### Recording a build
+
+`POST /api/rust-builds` records a build, or merges a partial update into the build with the same
+`build_id`. The dashboard stores only reported values: a field that neither this report nor the stored
+build carries stays `null`, and the page shows it as not reported. It never fills in a builder, zone,
+machine type, commit, origin IP, crate count, memory peak, CPU time, or duration.
+
+- A new build needs a `status`. An update without one keeps the stored status.
+- A blank text value counts as not reported, so it doesn't replace a stored value. An update without
+  `requested_at` keeps the stored request time, and timing that contradicts it is rejected.
+- A completed build, such as `DELIVERED`, needs enough timing to place it. `delivered_at` defaults to
+  when the report arrives. The request time comes from `requested_at`, from `total_duration_seconds`, or
+  from both `compile_duration_seconds` and `delivery_duration_seconds`. Without one of these the request
+  fails with HTTP 400.
+- The finish time comes from `finished_at`, from the delivery time minus `delivery_duration_seconds`, or
+  from `requested_at` plus `compile_duration_seconds`. Without any of these, `finished_at` and the compile
+  and delivery durations stay `null`. The dashboard doesn't split the total between compiling and delivery.
+- An active build, such as `RUNNING`, keeps a reported `compile_duration_seconds` across partial updates,
+  until its final timing replaces it. Without `requested_at`, its request time is that many seconds before
+  the report. A build that hasn't been delivered has no delivery time, and a
+  failed build reported without timing has no durations.
+- `cache_hits`, `cache_misses`, and `total_crates` are stored as reported. A missing count is derived only
+  when the other two are present. An update keeps the stored counts it omits, unless one contradicts the
+  counts it reports. That stored count is then derived again from the others, a derived count before a
+  reported one. `reported_crate_counts` lists which counts were reported.
+- The benchmark score needs `cpu_platform`, `vcpu`, and `machine_type`, or an explicit
+  `instance_benchmark_score`, which an update keeps unless it changes an already reported shape value. CPU points need the benchmark score and `cpu_time_seconds`.
+- Without `origin_ip` the build has no network classification and shows the origin as not reported.
+  `origin_hostname` is stored only when reported; the classification never supplies one.
+- The summary's cache, memory, and CPU totals count only completed builds that reported each figure. A
+  total that no build reported is `null`, not 0.
+- `container_ram_cap_gib` defaults to 28, the dedicated builder container's memory cap.
+- The dashboard's own form sends only what you enter in it.
+
 ## Machine shape templates
 
-The VM templates `tpl-runner-n4-std16`, `tpl-runner-za-n2-16`, and `tpl-builder-c4d-16` are preset
-machine shapes, so they don't name a source VM. A template created from a listed instance with
+The VM templates `tpl-runner-n4-std16`, `tpl-runner-za-n2-16`, and `tpl-builder-n4-16` are preset
+machine shapes, so they don't name a source VM. The builder preset `tpl-builder-n4-16` is the dedicated
+builder shape, `n4-highcpu-16` (16 vCPU, 32 GiB RAM, Intel Emerald Rapids), and the Rust builder profile
+uses it. A template created from a listed instance with
 `POST /api/vm-templates/from-instance` records that VM as its `source_instance`.
 
 - Earlier versions gave the presets the source VMs `oxidex-runners-dallas-01`,
@@ -577,6 +613,13 @@ machine shapes, so they don't name a source VM. A template created from a listed
 - Cleanup uses the telemetry migration's pending commit path. The active slot saves a new state version
   before publishing to KV, including when only template sources changed. A standby waits until active,
   and a pending commit survives a restart.
+- Earlier versions shipped the builder preset as `tpl-builder-c4d-16` on `c4d-highcpu-16`. When the
+  dashboard loads a state without the `builder_preset_migration` marker, it replaces an unedited copy of
+  that preset with `tpl-builder-n4-16`, keeps its creation time, and points any profile that used it at
+  the new preset. A copy that someone edited is their template, so it stays, and so do the profiles that
+  use it. The old preset also stays when a profile that uses it would reject the new one, for example
+  with a benchmark minimum higher than the new preset's score, and the dashboard logs why. This runs once and
+  commits through the same pending path.
 
 ## State durability
 

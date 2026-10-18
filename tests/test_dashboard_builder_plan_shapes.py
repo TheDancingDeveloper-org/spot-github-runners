@@ -105,13 +105,20 @@ class BuilderPlanShapeTests(unittest.TestCase):
                              ("n4-highcpu-16", 16, 32))
             self.assertEqual((record["runner_vcpu"], record["runner_ram_gib"]), (16, 28))
 
-    def test_default_c4d_template_growth_rejected_without_existing_builders(self):
+    def test_default_n4_template_growth_plans_the_fixed_shape(self):
         self.assertEqual(self.store.state["instances"], [])
         self.assertTrue(self.profile["use_vm_template"])
         template = next(t for t in self.store.state["vm_templates"]
                         if t["id"] == self.profile["vm_template_id"])
-        self.assertEqual(template["id"], "tpl-builder-c4d-16")
-        self.assertEqual(template["machine_type"], "c4d-highcpu-16")
+        self.assertEqual((template["id"], template["machine_type"]), ("tpl-builder-n4-16", "n4-highcpu-16"))
+        self.assert_fixed_plan(self.plan(), target=3, previous=0)
+
+    def test_legacy_c4d_template_growth_rejected_without_existing_builders(self):
+        from lib.dashboard_server import LEGACY_BUILDER_PRESET
+
+        # A saved state that kept the old c4d preset (an edited copy, say) still can't plan c4d builders.
+        self.store.state["vm_templates"] = [dict(LEGACY_BUILDER_PRESET, created_at="2026-10-15T00:00:00Z")]
+        self.profile.update(use_vm_template=True, vm_template_id=LEGACY_BUILDER_PRESET["id"])
         with self.assertRaisesRegex(ValueError, self.shape_error):
             self.plan()
 
