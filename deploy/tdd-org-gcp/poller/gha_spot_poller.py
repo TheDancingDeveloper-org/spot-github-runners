@@ -12,12 +12,16 @@ Environment:
   GCP_PROJECT, GCP_ZONE, GCP_INSTANCE (default gha-spot-1)
   GH_ORG              default TheDancingDeveloper-org
   REPOS               comma list, default vogt,codex,rustnzb,msp-klaudia
-  RUNNER_LABEL        default gcp-spot
+  RUNNER_LABELS       persistent mode: comma list; a job needs one of them and nothing
+                      outside them plus self-hosted/linux/x64 (RUNNER_LABEL is the fallback)
   MAX_HOURS_PER_MONTH default 250 (belt and braces under the budget)
   GCP_BUDGET_SUBSCRIPTION default gha-spot-budget-poller (budget Pub/Sub; >=100% stops and locks the VM)
   STATE_FILE          default ~/.local/state/gha-spot-poller.json
   MODE                persistent (start/stop GCP_INSTANCE) or ephemeral (one throwaway VM per job)
-  GCP_TEMPLATE, MAX_VMS, RUNNER_GROUP_ID, MAX_VM_AGE_MIN   ephemeral mode settings
+  RUNNER_GROUP_ID, MAX_VM_AGE_MIN, VCPU_QUOTA (default 32)   ephemeral mode settings
+  {LARGE,SMALL}_TEMPLATE, _LABELS, _VCPUS, _MAX   ephemeral VM classes (an empty
+                      template disables the class; GCP_TEMPLATE/RUNNER_LABELS/MAX_VMS
+                      are the large class's fallbacks)
   --once              one poll then exit (for a systemd timer); default loops every 30 s
 """
 import base64
@@ -32,7 +36,8 @@ import urllib.request
 
 ORG = os.environ.get("GH_ORG", "TheDancingDeveloper-org")
 REPOS = os.environ.get("REPOS", "vogt,codex,rustnzb").split(",")
-LABEL = os.environ.get("RUNNER_LABEL", "rust-heavy")
+LABELS = [l.strip() for l in os.environ.get("RUNNER_LABELS", os.environ.get("RUNNER_LABEL", "rust-heavy")).split(",") if l.strip()]
+assert "publish" not in LABELS, "publish jobs carry release secrets; never serve them here"
 PROJECT = os.environ.get("GCP_PROJECT", "")
 ZONE = os.environ.get("GCP_ZONE", "australia-southeast1-c")
 INSTANCE = os.environ.get("GCP_INSTANCE", "gha-spot-1")
@@ -44,8 +49,29 @@ BUDGET_SUB = os.environ.get("GCP_BUDGET_SUBSCRIPTION", "gha-spot-budget-poller")
 # MODE=ephemeral: create one throwaway VM per queued job from GCP_TEMPLATE with a
 # just-in-time runner registration, and delete it once it has powered off.
 MODE = os.environ.get("MODE", "persistent")
-TEMPLATE = os.environ.get("GCP_TEMPLATE", "")          # instance template self link or name
-MAX_VMS = int(os.environ.get("MAX_VMS", "1"))
+
+
+def _labels(raw):
+    labels = [l.strip() for l in raw.split(",") if l.strip()]
+    assert "publish" not in labels, "publish jobs carry release secrets; never serve them here"
+    return labels
+
+
+# Ephemeral VM classes. The project's vCPU quota (32) fits one large VM or four
+# small ones, never both, so creation is gated on VCPU_QUOTA below.
+CLASSES = {}
+for _cls, _prefix, _tpl, _labels_default, _vcpus, _max in (
+        ("large", "gha-rh-", os.environ.get("GCP_TEMPLATE", ""), ",".join(LABELS), "30", os.environ.get("MAX_VMS", "1")),
+        ("small", "gha-rs-", "", "gcp-rust", "8", "4")):
+    _env = _cls.upper()
+    _template = os.environ.get(f"{_env}_TEMPLATE", _tpl)
+    if _template:
+        CLASSES[_cls] = {
+            "prefix": _prefix, "template": _template,
+            "labels": _labels(os.environ.get(f"{_env}_LABELS", _labels_default)),
+            "vcpus": int(os.environ.get(f"{_env}_VCPUS", _vcpus)),
+            "max": int(os.environ.get(f"{_env}_MAX", _max))}
+VCPU_QUOTA = int(os.environ.get("VCPU_QUOTA", "32"))
 RUNNER_GROUP_ID = int(os.environ.get("RUNNER_GROUP_ID", "6"))
 MAX_VM_AGE_S = int(os.environ.get("MAX_VM_AGE_MIN", "420")) * 60  # backstop over the VM's own 6 h limit
 
@@ -141,9 +167,25 @@ def gh(method, path, body=None):
     return http(method, f"https://api.github.com/{path}", cred("GH_TOKEN", "gh_token"), body)
 
 
-def queued_jobs():
-    """Queued jobs whose runs-on labels are all served by the gcp-spot runner."""
-    served = {"self-hosted", "linux", "x64", LABEL}
+BASE_LABELS = {"self-hosted", "linux", "x64"}
+
+
+def job_class(labels, classes):
+    """The class whose labels cover a job's runs-on labels, or None.
+
+    Bare [self-hosted] jobs match no class and are left to the on-prem fleet."""
+    extra = {l.lower() for l in labels} - BASE_LABELS
+    for name, cls in classes.items():
+        if extra and extra <= {l.lower() for l in cls["labels"]}:
+            return name
+    return None
+
+
+def queued_jobs(classes=None):
+    """Queued jobs whose runs-on labels are all served by the GCP runners.
+
+    With `classes`, returns (ref, class) pairs; otherwise refs served by LABELS."""
+    classes = classes or {"persistent": {"labels": LABELS}}
     found = []
     for repo in REPOS:
         for status in ("queued", "in_progress"):
@@ -151,10 +193,10 @@ def queued_jobs():
             for run in runs.get("workflow_runs", []):
                 jobs = gh("GET", f"repos/{ORG}/{repo}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
                 for job in jobs.get("jobs", []):
-                    labels = set(job.get("labels", []))
-                    if job["status"] == "queued" and LABEL in labels and labels <= served:
-                        found.append(f"{repo}#{job['id']}")
-    return found
+                    cls = job_class(job.get("labels", []), classes) if job["status"] == "queued" else None
+                    if cls:
+                        found.append((f"{repo}#{job['id']}", cls))
+    return found if "persistent" not in classes else [ref for ref, _ in found]
 
 
 # ---------------------------------------------------------------- state
@@ -226,24 +268,46 @@ def ephemeral_vms():
     return resp.get("items", [])
 
 
-def template_metadata_items():
-    name = TEMPLATE.rsplit("/", 1)[-1]
+def vm_vcpus(vm):
+    """vCPUs from the machine type (c3d-highcpu-8 -> 8); 0 if it has no count."""
+    suffix = vm.get("machineType", "").rsplit("-", 1)[-1]
+    return int(suffix) if suffix.isdigit() else 0
+
+
+def vm_class(vm):
+    """A VM's class from its template label, or for older VMs from its vCPUs."""
+    if "gha-class" in vm.get("labels", {}):
+        return vm["labels"]["gha-class"]
+    return next((n for n, c in CLASSES.items() if c["vcpus"] == vm_vcpus(vm)), "large")
+
+
+def template_metadata_items(template):
+    name = template.rsplit("/", 1)[-1]
     tpl = http("GET", f"https://compute.googleapis.com/compute/v1/projects/{PROJECT}/global/instanceTemplates/{name}",
                gcp_token())
     return tpl["properties"].get("metadata", {}).get("items", []), name
 
 
-def create_vm(job_ref):
-    name = "gha-rh-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+def create_vm(job_ref, cls_name):
+    """Create a VM of the class for a job. False (no raise) if GCP refuses it."""
+    cls = CLASSES[cls_name]
+    name = cls["prefix"] + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S-") + os.urandom(2).hex()
+    items, tpl_name = template_metadata_items(cls["template"])
     jit = gh("POST", f"orgs/{ORG}/actions/runners/generate-jitconfig", {
         "name": name, "runner_group_id": RUNNER_GROUP_ID,
-        "labels": ["self-hosted", "Linux", "X64", LABEL], "work_folder": "_work"})["encoded_jit_config"]
-    items, tpl_name = template_metadata_items()
+        "labels": ["self-hosted", "Linux", "X64", *cls["labels"]], "work_folder": "_work"})["encoded_jit_config"]
     # An instance body's metadata replaces the template's, so carry its items over.
     items = [i for i in items if i["key"] != "gha-jitconfig"] + [{"key": "gha-jitconfig", "value": jit}]
-    zone_api("POST", f"/instances?sourceInstanceTemplate=projects/{PROJECT}/global/instanceTemplates/{tpl_name}",
-             {"name": name, "metadata": {"items": items}})
-    log(f"created {name} for {job_ref}")
+    try:
+        zone_api("POST", f"/instances?sourceInstanceTemplate=projects/{PROJECT}/global/instanceTemplates/{tpl_name}",
+                 {"name": name, "metadata": {"items": items}})
+    except urllib.error.HTTPError as error:
+        # Quota or capacity refusals: the job stays queued and the next poll retries.
+        # The unused JIT runner registration expires on its own.
+        log(f"could not create {cls_name} VM {name} for {job_ref}: HTTP {error.code} {error.read()[:300]!r}")
+        return False
+    log(f"created {cls_name} VM {name} for {job_ref}")
+    return True
 
 
 def delete_vm(name, why):
@@ -258,11 +322,14 @@ def poll_ephemeral(state):
     now = time.time()
     vms = ephemeral_vms()
     live = [v for v in vms if v["status"] not in ("TERMINATED", "STOPPING", "STOPPED", "SUSPENDED")]
+    # STOPPING VMs still hold their vCPUs against the quota.
+    used = sum(vm_vcpus(v) or CLASSES.get(vm_class(v), {"vcpus": VCPU_QUOTA})["vcpus"]
+               for v in vms if v["status"] not in ("TERMINATED", "STOPPED", "SUSPENDED"))
     if state.get("last_poll"):
         state["running_seconds"] += len([v for v in live if v["status"] == "RUNNING"]) * min(now - state["last_poll"], 10 * INTERVAL)
     state["last_poll"] = now
     hours = state["running_seconds"] / 3600
-    heartbeat(state, f"{len(live)} live / {len(vms)} total throwaway VMs")
+    heartbeat(state, f"{len(live)} live / {len(vms)} total throwaway VMs, {used}/{VCPU_QUOTA} vCPU")
 
     for v in vms:  # finished (powered off) or overdue VMs go, with their disks
         created = dt.datetime.fromisoformat(v["creationTimestamp"]).timestamp()
@@ -282,16 +349,42 @@ def poll_ephemeral(state):
             delete_vm(v["name"], f"monthly cap {MAX_HOURS}h reached")
         return
 
-    jobs = queued_jobs()
-    # A VM that has not yet picked up its job still counts against the queue.
-    want = min(len(jobs), MAX_VMS) - len(live)
-    if want <= 0:
+    jobs = queued_jobs(CLASSES)
+    if not jobs:
+        state.pop("waiting", None)
         return
     if state.get("budget_locked"):
         log(f"{len(jobs)} queued but budget-locked; not creating VMs")
         return
-    for job in jobs[:want]:
-        create_vm(job)
+    plan, waiting = plan_vms(jobs, [vm_class(v) for v in live], used, CLASSES, VCPU_QUOTA)
+    if waiting and waiting != state.get("waiting"):
+        log(waiting)  # once per change, not every poll
+    state["waiting"] = waiting
+    for job_ref, cls_name in plan:
+        create_vm(job_ref, cls_name)
+
+
+def plan_vms(jobs, live_classes, used, classes, quota):
+    """Which (job, class) VMs to create now, within the vCPU quota.
+
+    A VM that has not yet picked up its job still counts against its class's
+    queue. Large jobs go first: while one waits for vCPUs, no new small VMs
+    start, so the running small ones drain and free the quota."""
+    plan, waiting = [], ""
+    for name in ("large", "small"):
+        if name not in classes or (waiting and name == "small"):
+            continue
+        cls = classes[name]
+        queued = [ref for ref, c in jobs if c == name]
+        want = min(len(queued), cls["max"]) - live_classes.count(name)
+        for ref in queued[:max(want, 0)]:
+            if used + cls["vcpus"] > quota:
+                waiting = (f"{name} job {ref} waits: needs {cls['vcpus']} vCPU, "
+                           f"{used}/{quota} in use")
+                break
+            plan.append((ref, name))
+            used += cls["vcpus"]
+    return plan, waiting
 
 
 _last_heartbeat = [0.0]
@@ -308,8 +401,8 @@ def heartbeat(state, status):
 def main():
     if not PROJECT:
         sys.exit("GCP_PROJECT is required")
-    if MODE == "ephemeral" and not TEMPLATE:
-        sys.exit("GCP_TEMPLATE is required in ephemeral mode")
+    if MODE == "ephemeral" and not CLASSES:
+        sys.exit("LARGE_TEMPLATE (or GCP_TEMPLATE) or SMALL_TEMPLATE is required in ephemeral mode")
     once = "--once" in sys.argv
     while True:
         state = load_state()
