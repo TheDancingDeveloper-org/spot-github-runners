@@ -273,8 +273,8 @@ class ExecuteTests(unittest.TestCase):
             argv = list(argv)
             calls.append(argv)
             for arg in argv:
-                if arg.startswith("--condition-from-file="):
-                    files["condition"] = json.loads(Path(arg.split("=", 1)[1]).read_text())
+                if arg.startswith("--condition-from-file=") and "add-iam-policy-binding" in argv:
+                    files.setdefault("condition", json.loads(Path(arg.split("=", 1)[1]).read_text()))
             if argv[:3] == ["gcloud", "projects", "describe"]:
                 return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
             if "describe" in argv and "versions" in argv:
@@ -363,3 +363,232 @@ class ArtifactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+FLOOR_TARGETS = ("swack-tools:secret=spot-floor-github-swackhamer,account=swackhamer,group=10;"
+                 "Appz4Fun:secret=spot-floor-github-xbmc4lyfe,account=xbmc4lyfe;"
+                 "xbmc4lyfe/newznab-tmux:secret=spot-floor-github-xbmc4lyfe,account=xbmc4lyfe,labels=ubuntu-latest")
+FLOOR_ENV = dict(ENV, SPOT_RUNNER_FLOOR_TARGETS=FLOOR_TARGETS)
+
+
+def cel_allows(expression: str, resource_type: str, name: str) -> bool:
+    """Evaluate the subset of CEL the compute conditions use, the way IAM does for one resource."""
+    def extract(template_prefix: str) -> str:
+        index = name.find(template_prefix)
+        return name[index + len(template_prefix):].split("/")[0] if index >= 0 else ""
+    python = (expression.replace("&&", " and ").replace("||", " or ")
+              .replace("resource.type", "rtype").replace(".startsWith(", ".startswith(")
+              .replace('resource.name.extract("/instances/{name}")', 'extract("/instances/")')
+              .replace('resource.name.extract("/disks/{name}")', 'extract("/disks/")'))
+    return bool(eval(python, {"__builtins__": {}}, {"rtype": resource_type, "extract": extract}))  # noqa: S307
+
+
+INSTANCE, DISK = "compute.googleapis.com/Instance", "compute.googleapis.com/Disk"
+
+
+class FloorDeployTests(unittest.TestCase):
+    def setUp(self):
+        self.code, self.script, self.err = dry_run(f"--image={IMAGE}", env=FLOOR_ENV)
+        self.assertEqual(self.code, 0, self.err)
+        self.commands = commands(self.script)
+        self.service = next(c for c in self.commands if c[1:3] == ["run", "deploy"])
+
+    def test_a_second_narrow_compute_binding_and_the_control_binding_unchanged(self):
+        project_level = [c for c in self.commands if c[1:3] == ["projects", "add-iam-policy-binding"]]
+        self.assertEqual([flag(c, "role") for c in project_level], ["roles/compute.instanceAdmin.v1"] * 2)
+        self.assertEqual([flag(c, "condition-from-file") for c in project_level],
+                         ["@FILE:compute-condition.json", "@FILE:floor-condition.json"])
+        self.assertIn(deploy.FLOOR_CONDITION_TITLE, self.script)
+        # No actAs beyond the control VM account: floor hosts run with no service account.
+        act_as = [c for c in self.commands if flag(c, "role") == "roles/iam.serviceAccountUser"]
+        self.assertEqual([c[4] for c in act_as], [CONTROL_SA])
+        _, unconditioned, _ = dry_run(f"--image={IMAGE}", "--no-compute-condition", env=FLOOR_ENV)
+        compute = [c for c in commands(unconditioned) if c[1:3] == ["projects", "add-iam-policy-binding"]]
+        self.assertEqual([flag(c, "condition") for c in compute], ["None"])
+
+    def test_the_floor_condition_admits_runner_hosts_and_their_disks_only(self):
+        floor, control = deploy.FLOOR_CONDITION_EXPRESSION, deploy.COMPUTE_CONDITION_EXPRESSION
+        zone = "projects/p/zones/us-central1-a"
+        allowed = [(INSTANCE, f"{zone}/instances/oxidex-runners-uscentral1-a-grks-tn31sq"),
+                   (DISK, f"{zone}/disks/oxidex-runners-uscentral1-a-grks-tn31sq"),
+                   (DISK, f"{zone}/disks/runner-data-uscentral1-a-grks-tn31sq"),
+                   (DISK, f"{zone}/disks/runner-data"),
+                   ("compute.googleapis.com/Subnetwork", "projects/p/regions/us-central1/subnetworks/default"),
+                   ("cloudresourcemanager.googleapis.com/Project", "projects/p")]
+        denied = [(INSTANCE, f"{zone}/instances/newznab-spot-runners-asia"),
+                  (INSTANCE, f"{zone}/instances/builder-a"), (DISK, f"{zone}/disks/builder-cache-a"),
+                  (INSTANCE, f"{zone}/instances/spot-control-a"), (DISK, f"{zone}/disks/spot-control-a"),
+                  (INSTANCE, f"{zone}/instances/runner-data-x"), (DISK, f"{zone}/disks/xoxidex-runners-a"),
+                  (DISK, f"{zone}/disks/registry-cache"), (DISK, f"{zone}/disks/oxidex-builder-cache")]
+        for rtype, name in allowed:
+            with self.subTest(name=name):
+                self.assertTrue(cel_allows(floor, rtype, name))
+        for rtype, name in denied:
+            with self.subTest(name=name):
+                self.assertFalse(cel_allows(floor, rtype, name))
+        # The control VM condition still admits only spot-control-* instances and disks.
+        self.assertTrue(cel_allows(control, INSTANCE, f"{zone}/instances/spot-control-a"))
+        self.assertFalse(cel_allows(control, INSTANCE, f"{zone}/instances/oxidex-runners-a"))
+
+    def test_one_mounted_secret_per_account_and_never_an_env_var(self):
+        refs = dict(item.split("=", 1) for item in flag(self.service, "set-secrets").split(","))
+        self.assertEqual(refs["/secrets/runner-floor/spot-floor-github-swackhamer/token"],
+                         "spot-floor-github-swackhamer:latest")
+        self.assertEqual(refs["/secrets/runner-floor/spot-floor-github-xbmc4lyfe/token"],
+                         "spot-floor-github-xbmc4lyfe:latest")
+        self.assertEqual(len([k for k in refs if k.startswith("/secrets/runner-floor/")]), 2)
+        env = dict(item.split("=", 1) for item in flag(self.service, "set-env-vars")[len("^|^"):].split("|"))
+        self.assertEqual(env["SPOT_RUNNER_FLOOR_TARGETS"], FLOOR_TARGETS)  # secret names only
+        self.assertEqual(env["SPOT_RUNNER_FLOOR_STATE_URI"], f"gs://{PROJECT}-spot-control-state/runner-floor")
+        self.assertEqual(env["SPOT_RUNNER_FLOOR_TOKEN_SOURCE"], "secret-files")
+        self.assertFalse([k for k in env if "TOKEN" in k and not k.endswith("_TOKEN_SOURCE")])
+        accessor = sorted(c[3] for c in self.commands if flag(c, "role") == "roles/secretmanager.secretAccessor")
+        self.assertIn("spot-floor-github-swackhamer", accessor)
+        self.assertIn("spot-floor-github-xbmc4lyfe", accessor)
+        for secret in ("spot-floor-github-swackhamer", "spot-floor-github-xbmc4lyfe"):
+            self.assertIn(f"--secret={secret}", self.script)  # the enabled-version check
+        self.assertEqual(env["SPOT_GCP_TOKEN_SOURCE"], "metadata")
+
+    def test_refusals(self):
+        token = "ghp_" + "A" * 36
+        for env, message in ((dict(ENV, SPOT_RUNNER_FLOOR_TARGETS=f"swack-tools:secret={token}"), "never hold a token"),
+                             (dict(ENV, SPOT_RUNNER_FLOOR_TARGETS="o/r:secret=spot-control-access-client-id"),
+                              "also back other service variables"),
+                             (dict(FLOOR_ENV, SPOT_CONFIG_REPO=f"{token}/x"), "looks like a GitHub token"),
+                             (dict(ENV, SPOT_RUNNER_FLOOR_TARGETS="swack-tools"), "runner floor"),
+                             (dict(FLOOR_ENV, SPOT_RUNNER_FLOOR_MAX_DAILY_USD="50"), "runner floor")):
+            with self.subTest(message=message):
+                code, _, err = dry_run(f"--image={IMAGE}", env=env)
+                self.assertEqual(code, 1)
+                self.assertIn(message, err)
+                self.assertNotIn(token, err)
+
+    def test_floor_services_get_the_billing_api_and_more_memory(self):
+        self.assertIn("--memory=1Gi", self.service)
+        enable = next(c for c in self.commands if c[1:3] == ["services", "enable"])
+        self.assertIn("cloudbilling.googleapis.com", enable)
+        _, plain, _ = dry_run(f"--image={IMAGE}")
+        service = next(c for c in commands(plain) if c[1:3] == ["run", "deploy"])
+        self.assertIn("--memory=512Mi", service)
+        self.assertNotIn("cloudbilling.googleapis.com", next(c for c in commands(plain) if c[1:3] == ["services", "enable"]))
+
+    def test_the_documented_bindings_list_the_floor(self):
+        config = deploy.config_from_args(deploy.args_parser().parse_args([f"--project={PROJECT}"]), FLOOR_ENV)
+        rows = deploy.iam_bindings(config)
+        self.assertTrue(any("oxidex-runners-*" in row[0] for row in rows))
+        self.assertTrue(any("spot-floor-github-xbmc4lyfe" in row[0] for row in rows))
+
+    def test_execute_passes_both_condition_files(self):
+        calls, files = [], []
+
+        def run(argv):
+            argv = list(argv)
+            calls.append(argv)
+            for arg in argv:
+                if arg.startswith("--condition-from-file="):
+                    files.append(json.loads(Path(arg.split("=", 1)[1]).read_text()))
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if "describe" in argv and "versions" in argv:
+                return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
+            return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}"], runner=run, env=FLOOR_ENV)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual([f["title"] for f in files], ["spot-control-vms-only", deploy.FLOOR_CONDITION_TITLE])
+        self.assertEqual(files[1]["expression"], deploy.FLOOR_CONDITION_EXPRESSION)
+
+    def test_the_image_carries_what_runner_manager_reads_from_disk(self):
+        text = (ROOT / "watchdog" / "Dockerfile").read_text()
+        self.assertIn("COPY runner/job-started.sh /app/runner/job-started.sh", text)
+        self.assertIn("COPY builder/docker-admission.py /app/builder/docker-admission.py", text)
+        self.assertIn("lib.runner_floor", text)
+        workflow = (ROOT / deploy.IMAGE_WORKFLOW).read_text()
+        self.assertIn('"runner/job-started.sh"', workflow)
+        self.assertIn('"builder/docker-admission.py"', workflow)
+        from lib import runner_manager
+        source = Path(runner_manager.__file__).read_text()
+        self.assertEqual(sorted(set(re.findall(r"ROOT\s*/\s*'([^']+)'", source))),
+                         ["builder/docker-admission.py", "runner/job-started.sh"])
+
+
+class FloorRemovalTests(unittest.TestCase):
+    """Turning the floor off (or dropping a target's secret) removes the grants an earlier deploy made."""
+
+    def runner(self, labeled=("spot-floor-github-swackhamer", "spot-floor-github-old"), absent=()):
+        calls = []
+
+        def run(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if "describe" in argv and "versions" in argv:
+                return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
+            if argv[:3] == ["gcloud", "secrets", "list"]:
+                return SimpleNamespace(returncode=0, stdout="".join(f"{n}\n" for n in labeled), stderr="")
+            if "remove-iam-policy-binding" in argv and any(a in argv for a in absent):
+                return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: Policy binding with the specified "
+                                       "principal, role, and condition not found!")
+            return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
+        return run, calls
+
+    def deploy(self, run, env):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}"], runner=run, env=env)
+        return code, err.getvalue()
+
+    def removed(self, calls):
+        return [c for c in calls if "remove-iam-policy-binding" in c or "--remove-labels=spot-runner-floor" in c]
+
+    def test_floor_off_removes_the_compute_binding_and_every_labeled_secret_grant(self):
+        # A labeled secret that also backs a service variable keeps its access.
+        run, calls = self.runner(labeled=("spot-floor-github-swackhamer", "spot-floor-github-old",
+                                          "spot-dashboard-control-secret"))
+        code, err = self.deploy(run, ENV)
+        self.assertEqual(code, 0, err)
+        compute = [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]]
+        self.assertEqual(len(compute), 1)
+        self.assertEqual(flag(compute[0], "role"), "roles/compute.instanceAdmin.v1")
+        removed = sorted(c[3] for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"])
+        self.assertEqual(removed, ["spot-floor-github-old", "spot-floor-github-swackhamer"])
+        self.assertTrue(all(flag(c, "role") == "roles/secretmanager.secretAccessor"
+                            for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"]))
+
+    def test_floor_on_keeps_current_secrets_and_removes_a_dropped_one(self):
+        run, calls = self.runner()
+        code, err = self.deploy(run, FLOOR_ENV)
+        self.assertEqual(code, 0, err)
+        removed = [c[3] for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"]]
+        self.assertEqual(removed, ["spot-floor-github-old"])  # swackhamer's secret is still configured
+        self.assertFalse([c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]])
+        labels = sorted(c[3] for c in calls if any(a.startswith("--update-labels=spot-runner-floor") for a in c))
+        self.assertEqual(labels, ["spot-floor-github-swackhamer", "spot-floor-github-xbmc4lyfe"])
+
+    def test_removal_is_idempotent(self):
+        run, calls = self.runner(absent=("spot-floor-github-old", "projects"))
+        self.assertEqual(self.deploy(run, ENV)[0], 0)
+        run, calls = self.runner(labeled=())
+        self.assertEqual(self.deploy(run, ENV)[0], 0)
+        self.assertFalse([c for c in calls if c[1:3] == ["secrets", "remove-iam-policy-binding"]])
+
+    def test_other_removal_failures_stop_the_deploy(self):
+        def run(argv):
+            if "remove-iam-policy-binding" in argv:
+                return SimpleNamespace(returncode=1, stdout="", stderr="PERMISSION_DENIED")
+            return self.runner()[0](argv)
+        code, err = self.deploy(run, ENV)
+        self.assertEqual(code, 1)
+        self.assertIn("PERMISSION_DENIED", err)
+
+    def test_the_dry_run_shows_the_removals_and_stays_valid_bash(self):
+        for env in (ENV, FLOOR_ENV):
+            with self.subTest(floor=env is FLOOR_ENV):
+                code, script, err = dry_run(f"--image={IMAGE}", env=env)
+                self.assertEqual(code, 0, err)
+                self.assertIn("labels.spot-runner-floor=token", script)
+                self.assertIn('"$name"', script)
+                self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
+                self.assertEqual("projects remove-iam-policy-binding" in script, env is ENV)

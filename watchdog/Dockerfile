@@ -1,4 +1,5 @@
-# Control VM watchdog image: the Cloud Run service whose POST /tick runs one control VM lifecycle step.
+# Control VM watchdog image: the Cloud Run service whose POST /tick runs one control VM lifecycle step and, with
+# SPOT_RUNNER_FLOOR_TARGETS, one runner floor step.
 #
 # Built and pushed to Artifact Registry by .github/workflows/control-watchdog-image.yml. Build from the
 # repository root (the .dockerignore allowlist sends only src/, cloud-init/, and the other image inputs):
@@ -21,8 +22,12 @@ ENV PYTHONPATH=/app/src \
 WORKDIR /app
 
 # control_vm.py renders cloud-init/control-vm-startup.sh into every control VM it creates, so the image carries it.
+# The runner floor (runner_floor.py) renders runner hosts' startup scripts through runner_manager, which reads the
+# job-started hook and the Docker admission wrapper from these two files (everything else it embeds lives in src/).
 COPY src/ /app/src/
 COPY cloud-init/control-vm-startup.sh /app/cloud-init/control-vm-startup.sh
+COPY runner/job-started.sh /app/runner/job-started.sh
+COPY builder/docker-admission.py /app/builder/docker-admission.py
 
 # The control plane needs a system Python 3.11 or newer (newer gcloud releases bundle their own Python and may not
 # put python3 on PATH). Root-owned and world-readable, never writable by the runtime user; gcloud keeps its config
@@ -37,7 +42,7 @@ RUN if ! command -v python3 >/dev/null 2>&1; then \
     && chmod -R u=rwX,go=rX /app \
     && groupadd --system --gid 10001 watchdog \
     && useradd --system --uid 10001 --gid 10001 --home-dir /home/watchdog --create-home --shell /usr/sbin/nologin watchdog \
-    && python3 -B -c "import lib.control_vm, lib.gcs_control_state, lib.image_tracking, lib.control_watchdog_server" \
+    && python3 -B -c "import lib.control_vm, lib.gcs_control_state, lib.image_tracking, lib.control_watchdog_server, lib.runner_floor, lib.runner_floor_replace" \
     && gcloud --version >/dev/null
 
 USER 10001:10001

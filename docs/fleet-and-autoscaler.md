@@ -18,13 +18,14 @@ and which guards protect running jobs.
 
 ## What the controller does
 
-Three entry points manage runner hosts. Run each from the repository root.
+Four entry points manage runner hosts. Run each from the repository root.
 
 | Entry point | Purpose | Changes resources? |
 | --- | --- | --- |
 | `src/runner_fleet.py` | Prints GitHub runner registrations, GCP VM counts, and the scale-out plan that restores a runner floor. | No |
 | `src/spot_runner_manager.py` | Previews or provisions one runner host, or a strict heavy-runner pool. | With `--apply`, and with `--patch-live`, which changes a running VM and its runner containers at once without `--apply` |
 | `src/spot_runner_autoscaler.py` | Runs the control loop that launches, drains, rotates, and deletes hosts. | Yes (see the warning at the top of this page) |
+| `src/runner_floor.py` | Keeps one minimal floor host per target; the watchdog runs it. See [Runner floor keeper](#runner-floor-keeper). | With `tick --apply` and `replace-unmanaged --apply` |
 
 The autoscaler runs the same loop in every mode. Each check does the following:
 
@@ -191,6 +192,288 @@ To preview the floor against live registrations without changing anything, run
 `src/runner_fleet.py` with the same `--minimum-runners` and `--runners-per-vm`
 values. It prints the online and registered runner counts and the scale-out
 plan.
+
+`--minimum-runners` only limits scale-down. To keep a host running for a target
+without a workstation, use the [runner floor keeper](#runner-floor-keeper).
+
+## Runner floor keeper
+
+The runner floor keeper, `src/runner_floor.py`, keeps at least one minimal Spot
+runner host for each target in `SPOT_RUNNER_FLOOR_TARGETS`. The
+[control VM watchdog](edge-dashboard.md#watchdog) runs one floor step after its
+control VM step on every tick, so the floor holds while no operator workstation
+runs. The keeper only guarantees the floor. Scaling beyond it, drains,
+rotations, and lost-host cleanup stay with the autoscaler.
+
+### Floor targets
+
+`SPOT_RUNNER_FLOOR_TARGETS` lists the targets, separated by semicolons. Each
+entry is a target, a colon, and comma-separated options:
+
+```text
+swack-tools:secret=spot-floor-github-<account>,account=<account>,group=<runner group ID>;<org>:secret=spot-floor-github-<other account>,account=<other account>;<owner>/<repo>:secret=spot-floor-github-<other account>,account=<other account>,labels=ubuntu-latest
+```
+
+| Option | Meaning |
+| --- | --- |
+| `secret` | Required. The Secret Manager secret that holds the GitHub token of the account that administers the target. It names a secret and never holds a token: the parser refuses a value that looks like one. Targets that one account administers share its secret. |
+| `account` | The GitHub account that `gh auth token --user` reads on a workstation, for `status` and `replace-unmanaged`. |
+| `group` | Organizations only. The runner group that the floor host's runner joins. The keeper requires a group with selected-repository access, and it refuses the Default group. Without `group`, the runner joins the Default group. Personal accounts support only repository runners, so a repository target has no group. |
+| `labels` | Extra scheduling labels joined with `+`, such as `ubuntu-latest`. Every floor runner also gets `spot`, its machine type, and its region. The keeper records the extra labels in the host metadata, so a later live patch keeps them. Labels compare without case, as on GitHub: the parser refuses a label listed twice in another case, and one that repeats a label every runner gets. At most 16 extra labels, the most the host metadata records. |
+| `ram` | The least RAM in GiB, from 4 to 32. The default is 16. |
+
+The configuration is an environment variable of the watchdog service, not an
+object in the state bucket. Each change is a new service revision that the deploy
+dry run shows for review, and the deploy needs the target-to-secret map anyway
+to mount each secret and grant access to it. The watchdog's own account can
+write the state bucket, so a configuration stored there could be changed by
+the process that it configures.
+
+### Floor host shape and price
+
+A runner gets 4 vCPU (`runner_count = host_vCPU // 4`; see
+[Runner sizing](provisioning.md#runner-sizing)), so the smallest host that holds
+one runner has 4 vCPU. The keeper prices every 4-vCPU shape of a supported x86
+family with at least the target's RAM in the regions of
+`SPOT_RUNNER_FLOOR_REGIONS`, from the billing catalog, the same source as the
+manager's price guard. The total is compute plus a 40 GiB boot disk and a
+100 GiB data disk, with the cheapest SSD-backed data disk that the manager
+would choose. The keeper takes the cheapest offer strictly below
+`SPOT_RUNNER_FLOOR_MAX_DAILY_USD` (default 1.50 dollars a day). The manager's
+live price and quota check then runs again before anything exists.
+
+To reduce correlated preemptions, the keeper spreads targets across zones. A
+zone that no other floor target's host uses wins when it costs at most 1.5
+times the cheapest offer, and among those, a region that no other floor target
+uses wins. A zone where a launch failed is skipped for six hours.
+
+A floor host runs one runner, named `gha-<host name>-1`. It has no tier and
+no admission service. It runs with no service account and no access scopes, so
+CI jobs on it can't get Google credentials from the metadata server. Its name,
+labels, and disks match the autoscaler's launches: `oxidex-runners-*`, the
+target's `spot-target` label, and a `runner-data-*` data disk. An autoscaler
+for the same target therefore counts it as one of its own hosts.
+
+### What the keeper decides
+
+Each tick plans one step for each target from the Compute Engine inventory,
+the target's runner registrations, and the target's floor record:
+
+| Situation | Step |
+| --- | --- |
+| A managed host of the target is provisioning, staging, or repairing, or it's running and has a runner online or started less than 30 minutes ago | Nothing |
+| A managed host is stopping or suspending | Wait for it to settle |
+| A launch or start is in progress | Advance it (see below) |
+| Earlier launches failed | Wait: 5 minutes after the first failure, doubling up to an hour |
+| The keeper's own floor host is stopped, and every start guard holds | Start it |
+| Anything else, including no host | Launch a floor host |
+
+A running host whose runners all stayed offline for 30 minutes doesn't meet
+the floor: the keeper launches another host next to it and leaves the broken
+one for the autoscaler or an operator. A step that only waits takes no lease
+and writes nothing, so a steady floor costs a few reads a tick.
+
+Floor hosts, like every autoscaler launch, use
+`--instance-termination-action=DELETE`, so a Spot preemption deletes the VM and
+its auto-delete disks, and the next tick launches a replacement. A stopped
+floor host comes from a guest shutdown or a host error, not a preemption. The
+keeper starts it only when all of these hold:
+
+- It's the host that the keeper recorded, with the same instance ID.
+- Its `startup-script` metadata is gone. The manager removes the script, and
+  its one-use registration token, after a completed bootstrap, so a start can't
+  replay the fresh-host bootstrap. With the script still present, a start would
+  replay it.
+- Every runner of the host is still registered, offline, idle, and carries its
+  scheduling labels. A drain deregisters runners or removes their labels, and
+  the host job-start cordon marker lives in `/run`, which a reboot clears. A
+  start would quietly return a host that was being retired to service.
+- No earlier start of that instance failed to bring its runners back within
+  15 minutes.
+
+Otherwise the keeper launches a new host and leaves the stopped one in place
+for the autoscaler's lost-host cleanup or for an operator. A stopped host
+still bills its disks.
+
+### Launch steps
+
+A launch spans several ticks, so no tick waits for a bootstrap:
+
+1. **Creating.** The keeper picks the offer, runs the manager's price and quota
+   check, and checks the runner group. It saves the launch, with the host and
+   disk names, before the registration token exists. Then it creates the data
+   disk and the VM through `runner_manager`. The startup script carries the
+   token, and the token never reaches the floor record.
+2. **Booting.** Once the VM exists, the keeper records its instance ID. Later
+   ticks wait until GitHub lists the host's runner online. No SSH is needed:
+   the startup script itself refuses to register runners unless Docker and
+   containerd run on the data disk.
+3. **Ready.** The keeper first removes the `startup-script` metadata and the
+   token. Then it repairs the runner's labels if needed and records the host's
+   patch as `none`.
+
+A launch that has no runner online 30 minutes after the create is abandoned,
+unless its runner is running a job: the keeper deletes that VM, only if the
+VM still has the recorded instance ID and a fresh runner list, read right
+before the delete, shows no runner of it online or busy. Then it removes the
+launch's own offline registrations. A VM that never appears within 20 minutes of the create, or one
+that disappears during the bootstrap, ends the launch the same way. Each
+failure starts the backoff. A create that was given up can still land, for
+example after a call timed out. When its VM appears within an hour, the keeper
+adopts it and finishes or abandons it like any other launch, so its token
+never stays in the metadata. If another host already serves the floor by then,
+the late VM is excess: the keeper records its instance ID, removes its runner
+registrations, and deletes it, but only while none of its runners is online or
+busy. Otherwise it holds and logs why, and after the hour it leaves the VM for
+the autoscaler or an operator.
+
+### Coordinate with the autoscaler
+
+Each target has its own floor state object and its own lease in the state
+bucket, next to the control VM state, with the same generation-checked writes and lease
+rules as the [control VM lease](edge-dashboard.md#shared-state-and-lease). The
+keeper takes a target's lease only for a step that acts, and skips the target
+while someone else holds it.
+
+Set `SPOT_RUNNER_FLOOR_STATE_URI` in the environment of an autoscaler that
+manages a floor target, to the same `gs://<bucket>/runner-floor` location that
+the watchdog uses. The autoscaler then holds its target's floor lease while it
+runs and checks it every 5 seconds, so the keeper leaves that target alone. While
+the autoscaler runs, it alone keeps the target's floor: `tiered` mode launches
+a first host into an empty fleet, but `resource` and `legacy` modes only
+restore lost hosts. The lease covers the controller's whole run, not each
+check, because both controllers would otherwise replace one lost floor host:
+
+
+- At start-up, the autoscaler waits for the lease, checking at each interval.
+  It also waits while the keeper has a launch or start in progress on the
+  target, so that the keeper can finish it and remove its registration token.
+  With `--once`, it logs why and exits instead. A running keeper ends every
+  such operation by its own deadline. Once that deadline has passed by 15
+  minutes, for example because the target left `SPOT_RUNNER_FLOOR_TARGETS`, the
+  floor is off, or the watchdog is paused, the autoscaler stops waiting. It
+  treats the host as an ordinary managed host, removes a leftover registration
+  token from the recorded instance, and changes nothing else: it deletes
+  nothing and leaves the floor record to the keeper.
+- Every fleet mutation first proves that the lease is still held. When it
+  can't, for example after a workstation slept past the lease, the mutation is
+  held and the controller exits with status 75 at its next check, so a restart
+  takes the lease again before it acts.
+- A launch runs `src/spot_runner_manager.py` in its own process group, fenced
+  by the lease. The first check that can't prove the lease kills that whole
+  group at once, including its `gcloud` processes, and the launch stops. The
+  lease keeps at least 11 minutes left while it's proven, and nobody can break
+  it until a minute after it expires, so the manager is gone before another
+  controller may act. The controller's other provider calls time out within
+  10 minutes.
+- Every child process that can change something, `gcloud` other than reads,
+  `gh` other than reads, `ssh`, and the deployment manager, proves the lease
+  immediately before it starts, whichever part of the controller starts it.
+  An unknown command counts as a change.
+- `--dry-run` takes no lease.
+
+An autoscaler without `SPOT_RUNNER_FLOOR_STATE_URI` doesn't coordinate. Two
+controllers then act on one target at once, and both can launch a first host
+into an empty fleet.
+
+The floor host shape matches the `small` tier, but a floor host has no
+admission service. A tiered autoscaler for a floor target replaces it only
+through its own tier migrations.
+
+### Commands
+
+Show each target's plan, floor record, hosts, and runners. With `--offers`,
+it also prices the cheapest floor host offers. Both read only:
+
+```bash
+PYTHONPATH=src python3 src/runner_floor.py status --offers
+```
+
+Plan one step for each target without a lease or a write, then run it:
+
+```bash
+PYTHONPATH=src python3 src/runner_floor.py tick
+PYTHONPATH=src python3 src/runner_floor.py tick --apply --target '<owner>/<repo>'
+```
+
+On a workstation, the keeper reads each target's token with `gh auth token
+--user <account>`, or with `--github-user` for every target. It never reads a
+token from an environment variable.
+
+### Replace an unmanaged host
+
+`src/runner_floor.py replace-unmanaged` retires a runner host that was created
+outside these tools, make before break. It runs only when an operator starts
+it, never from the watchdog, and it supports repository targets only. Without
+`--apply`, it reads only and prints the plan:
+
+```bash
+PYTHONPATH=src python3 src/runner_floor.py replace-unmanaged \
+  --target '<owner>/<repo>' --instance '<old VM>' --zone '<zone>' \
+  --old-runner '<runner 1>' --old-runner '<runner 2>'
+```
+
+The preview lists runner names that look like the old host's, the scheduling
+labels the managed host must carry, the labels that don't move, and the steps.
+The command attributes a runner to the old VM when its name contains the VM
+name or its labels name the VM's machine type and region, whatever the flags
+say. `--old-runner` must name exactly that set: every attributed runner, and
+no other. The preview refuses when it doesn't, when the target's `labels=`
+lacks a label that the old runners carry, or when the old VM is a managed
+host. The old machine-type and region labels don't move; check that no
+workflow selects them, then pass `--accept-dropped-labels`.
+
+With `--apply`, the command holds the target's floor lease, so the watchdog
+skips the target, and saves each phase before it acts, so a rerun resumes:
+
+1. It provisions the managed floor host with the keeper's launch steps, unless
+   the target already has a running managed host.
+2. It verifies that every runner of the managed host is online with every
+   required label, and it records the old runners' labels.
+3. It places the host job-start cordon on the old host over
+   `gcloud compute ssh`. Then `drain_runners` removes the old runners' custom
+   labels, waits until they're idle, and deregisters each one after a fresh
+   idle read.
+4. When a fresh read shows every old registration gone, no other runner is
+   attributed to the VM, and the managed host is still ready, it deletes the
+   old VM,
+   if the VM still has the instance ID recorded at the start, with its
+   auto-delete disks. It keeps every other disk, and the preview names both
+   kinds. Right before the delete, it reads the runners, the managed host, and
+   the old VM again. It refuses while any runner attributed to the VM is still
+   registered, or when the VM is now another instance. A VM that's already gone
+   counts as deleted. Then it waits until the VM is gone.
+
+A rerun with the same `--instance` resumes the recorded phase, even after the
+old runners or the old VM are gone. It refuses instead when the target's
+`labels=` no longer includes a label that the old runners carry. If the old VM
+disappears during the drain while its registrations remain, the command
+confirms with a fresh read that the VM is gone, then removes each registration
+that is offline and idle on a fresh read. It holds while any of them is online
+or busy. Before every drain step, the command checks
+the managed host again. If the managed host loses a runner before any old
+runner is deregistered, the command releases the cordon, then restores the old
+runners' labels, and stops. Until the release is confirmed, the old runners
+stay without labels and the command retries, because a host that is still
+cordoned refuses every job that its labels would route to it. If the managed host stops being ready after
+an old runner is deregistered, during the drain or before the delete, the
+command keeps the old VM, because it may be the only host that can recover. It
+provisions the managed floor host again with the keeper's launch steps, then
+continues where it stopped. The command saves the cordon's owner token before it
+calls the cordon, so a rollback also releases a cordon whose result was lost,
+for example to an SSH timeout. After a deregistration, the old host can't be
+put back, so the command waits for the managed host and then goes on. A
+deregistration whose result was never saved is settled from a fresh runner
+list first: a runner that is gone counts as deregistered. A rerun resumes such
+a replacement, even one recorded as aborted.
+
+An old host whose runner containers lack the read-only cordon mount or the
+cordon-aware job-started hook can't refuse jobs at job start. The command then
+stops before it changes anything. `--label-strip-drain` instead drains by
+removing the old runners' custom labels and waiting until they've been idle
+for two minutes. Until the old runners are deregistered, a job that selects
+only the built-in labels, such as `self-hosted`, can still start on the old
+host, so check the workflows before you pass it.
 
 ## Price rotation and make-before-break
 

@@ -437,3 +437,86 @@ class HttpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FloorStepTests(unittest.TestCase):
+    def test_the_floor_step_runs_only_when_targets_are_configured(self):
+        self.assertEqual(len(server.tick_commands("p", {})), 1)
+        commands = server.tick_commands("p", {"SPOT_RUNNER_FLOOR_TARGETS": "swack-tools:secret=s"})
+        self.assertEqual(commands[0], server.tick_command("p"))
+        self.assertTrue(commands[1][2].endswith("src/runner_floor.py"))
+        self.assertEqual(commands[1][3:], ["--project=p", "tick", "--apply"])
+
+    def two_step(self, fn, clock=None):
+        made = []
+        runner = server.TickRunner(["control"], then=[["floor"]], popen=fake_popen(fn, made),
+                                   killpg=lambda p, s: (_ for _ in ()).throw(ProcessLookupError()) if s == 0 else None,
+                                   wall=lambda: 1_000.0, **({"clock": clock} if clock else {}))
+        return runner, made
+
+    def test_both_steps_share_one_deadline(self):
+        times = iter([0.0, 0.0, 300.0, 300.0, 310.0])
+        runner, made = self.two_step(lambda a, k: SimpleNamespace(returncode=0, stdout=f"{a[0]} ok\n", stderr=""),
+                                     clock=lambda: next(times))
+        status, summary = runner.run()
+        self.assertEqual(status, 200)
+        self.assertEqual([p.argv for p in made], [["control"], ["floor"]])
+        deadline = 1_000.0 + server.TICK_TIMEOUT_SECONDS
+        self.assertEqual({p.kwargs["env"]["SPOT_TICK_DEADLINE_EPOCH"] for p in made}, {f"{deadline:.3f}"})
+        self.assertTrue(all(p.kwargs["start_new_session"] for p in made))
+        self.assertEqual(summary["result"], "control ok")
+        self.assertEqual([s["result"] for s in summary["steps"]], ["control ok", "floor ok"])
+
+    def test_a_failed_floor_step_fails_the_tick(self):
+        runner, _ = self.two_step(lambda a, k: SimpleNamespace(returncode=1 if a == ["floor"] else 0, stdout="x",
+                                                               stderr=""))
+        status, summary = runner.run()
+        self.assertEqual((status, summary["status"], summary["exit_code"]), (500, "failed", 1))
+
+    def test_a_timed_out_control_step_skips_the_floor(self):
+        def slow(argv, kw):
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        runner, made = self.two_step(slow)
+        status, summary = runner.run()
+        self.assertEqual((status, summary["status"]), (500, "timeout"))
+        self.assertEqual([p.argv for p in made], [["control"]])
+
+    def test_the_floor_gets_only_what_is_left(self):
+        timeouts = []
+
+        def record(argv, kw):
+            timeouts.append(kw["timeout"])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        times = iter([0.0, 800.0, 800.0, 800.0])
+        runner, _ = self.two_step(record, clock=lambda: next(times))
+        runner.run()
+        self.assertEqual(timeouts, [server.TICK_TIMEOUT_SECONDS, server.TICK_TIMEOUT_SECONDS - 800.0])
+
+
+class ShutdownTests(unittest.TestCase):
+    def test_no_floor_step_starts_after_sigterm_between_steps(self):
+        made = []
+        holder = {}
+
+        def clock():
+            # The clock is read for the second step's timeout, after the first child is gone and before the next
+            # Popen: SIGTERM lands exactly in that gap.
+            holder["calls"] = holder.get("calls", 0) + 1
+            if holder["calls"] == 2:
+                holder["runner"].terminate()
+            return 0.0
+        runner = server.TickRunner(["control"], then=[["floor"]], popen=fake_popen(
+            lambda a, k: SimpleNamespace(returncode=0, stdout="ok", stderr=""), made),
+            killpg=lambda p, s: None, clock=clock, wall=lambda: 1_000.0)
+        holder["runner"] = runner
+        status, summary = runner.run()
+        self.assertEqual((status, summary["status"]), (500, "terminated"))
+        self.assertEqual([p.argv for p in made], [["control"]])
+
+    def test_a_terminated_server_starts_no_tick_at_all(self):
+        made = []
+        runner = server.TickRunner(["control"], then=[["floor"]], popen=fake_popen(
+            lambda a, k: SimpleNamespace(returncode=0, stdout="ok", stderr=""), made), killpg=lambda p, s: None)
+        runner.terminate()  # no child was running: the shutdown must still stick
+        self.assertEqual(runner.run()[1]["status"], "terminated")
+        self.assertEqual(made, [])

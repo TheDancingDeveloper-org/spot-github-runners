@@ -14,6 +14,8 @@ on:
     paths:
       - "src/**"
       - "cloud-init/control-vm-startup.sh"
+      - "runner/job-started.sh"
+      - "builder/docker-admission.py"
       - "watchdog/**"
       - ".dockerignore"
       - ".github/workflows/control-watchdog-image.yml"

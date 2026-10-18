@@ -604,6 +604,13 @@ one lifecycle step in a child process and answers 200 with a JSON summary, or 50
 control_vm.py ensure --apply --skip-if-idle --skip-if-locked --project=PROJECT
 ```
 
+With `SPOT_RUNNER_FLOOR_TARGETS` set, the same tick then runs one [runner floor](#runner-floor-step) step,
+which keeps at least one minimal Spot runner host for each listed target:
+
+```bash
+runner_floor.py --project=PROJECT tick --apply
+```
+
 The watchdog is a service, not a Cloud Run job, because of billing. Jobs use instance-based billing with a
 one-minute minimum per execution: every 2 minutes, that's about 1.3 million vCPU-seconds, or about $19 a month.
 A service with request-based billing pays only while a request runs, in 100 ms steps.
@@ -611,16 +618,16 @@ A service with request-based billing pays only while a request runs, in 100 ms s
 | Part | Name (defaults) | Role |
 | --- | --- | --- |
 | Cloud Scheduler job | `spot-control-watchdog` | Sends `POST https://spot-control-watchdog-<project number>.<region>.run.app/tick` every 3 minutes with an OIDC identity token of `spot-watchdog-invoker`, whose audience is that URL. No retries. |
-| Cloud Run service | `spot-control-watchdog` | No unauthenticated access, concurrency 1, 0 to 1 instances, request-based billing (`--cpu-throttling`), 1 vCPU, 512 MiB, 15-minute request timeout. Runs as `spot-control-watchdog`. |
-| Watchdog image | `<region>-docker.pkg.dev/<project>/spot-control/control-watchdog` | `watchdog/Dockerfile`: the slim Google Cloud command-line tool image, pinned by digest, plus `src/` and the control VM startup script. |
-| State bucket | `gs://<project>-spot-control-state` | Holds `control-vm/control-vm-<project>.json` (the state) and `control-vm/control-vm-<project>.lock` (the lease). |
+| Cloud Run service | `spot-control-watchdog` | No unauthenticated access, concurrency 1, 0 to 1 instances, request-based billing (`--cpu-throttling`), 1 vCPU, 512 MiB (1 GiB with floor targets, because a floor launch holds the billing catalog), 15-minute request timeout. Runs as `spot-control-watchdog`. |
+| Watchdog image | `<region>-docker.pkg.dev/<project>/spot-control/control-watchdog` | `watchdog/Dockerfile`: the slim Google Cloud command-line tool image, pinned by digest, plus `src/`, the control VM startup script, and the two runner files that the runner floor renders into runner hosts. |
+| State bucket | `gs://<project>-spot-control-state` | Holds `control-vm/control-vm-<project>.json` (the state) and `control-vm/control-vm-<project>.lock` (the lease). With the runner floor, also `runner-floor/floor-<project>-<target key>.json` and `.lock` for each target. |
 | Secret Manager | See [Watchdog IAM](#watchdog-iam) | The service's secrets, passed as references in the service spec, never as values. |
 
 The service answers only these requests:
 
 | Request | Answer |
 | --- | --- |
-| `POST /tick` with the invoker's identity token | 200 or 500 with `{"status", "exit_code", "result", "seconds"}`; 429 with `Retry-After` while another tick runs |
+| `POST /tick` with the invoker's identity token | 200 or 500 with `{"status", "exit_code", "result", "seconds"}`, and `steps` with each step's exit code and result when the floor step runs; 429 with `Retry-After` while another tick runs |
 | `POST /tick` without it | 403, and no step runs |
 | `GET /health` | 200 |
 | Anything else | 404 or 405 |
@@ -634,9 +641,9 @@ issuer, the service URL as audience, an unexpired token, and the verified email 
 `--no-verify-signature` keeps the claim checks but skips the signature, for the case where a request reaches
 the container with the signature removed.
 
-Each tick runs in its own process group. A tick that runs longer than 14 minutes answers 500, and the server
-stops the whole group, including `gcloud` processes that the tick started. It sends `SIGTERM`, waits 10
-seconds, then sends `SIGKILL`. The server does the same when Cloud Run sends it `SIGTERM` at shutdown. The group is gone within
+Each tick step runs in its own process group. A tick whose steps together run longer than 14 minutes answers
+500, and the server stops the running step's whole group, including `gcloud` processes that the step started. It sends `SIGTERM`, waits 10
+seconds, then sends `SIGKILL`. The server does the same when Cloud Run sends it `SIGTERM` at shutdown, and from then on it starts no further step, so no floor step starts after `SIGTERM`. The group is gone within
 855 seconds of the tick's start. No other controller can take the lease earlier than 1,260 seconds after the
 start (its 20-minute time to live plus the 60-second grace), so nothing that the tick started still runs when
 another controller acts. The lease guard returns only while more than 11 minutes of the lease remain, even
@@ -698,6 +705,41 @@ transition. `migrate-state --apply` creates the object.
 The bucket keeps the default soft delete policy, so overwritten and deleted state versions stay
 recoverable for 7 days.
 
+### Runner floor step
+
+The floor step runs after the control VM step, in the time that is left of the same 14 minutes. The server
+passes the tick's deadline to every step in `SPOT_TICK_DEADLINE_EPOCH`, and the floor step keeps 20 seconds
+of margin. It starts a launch only with at least 5 minutes left, and any other action with at least 2
+minutes left, so every call ends before the server stops the group; a hard deadline also stops a hung call.
+A launch that doesn't fit waits for the next tick. A launch's bootstrap takes several ticks, and no tick waits
+for it. See [Runner floor keeper](fleet-and-autoscaler.md#runner-floor-keeper) for what each step decides.
+
+Each target has its own state object and lease under `SPOT_RUNNER_FLOOR_STATE_URI`, which the deploy sets to
+`gs://<bucket>/runner-floor`, with the same lease rules as the control VM. A floor lease taken at any point
+in a tick can't be broken before 1,260 seconds after that point, and the tick is gone within 855 seconds of
+its start. A step that only waits takes no lease and writes nothing. A target whose lease another controller
+holds, such as an operator's autoscaler or the replacement command, is skipped; its result is `locked`, and
+the tick still answers 200. A target that fails doesn't stop the others, and makes the tick answer 500.
+
+Each GitHub account's token is its own Secret Manager secret. The service mounts each one as a file at
+`/secrets/runner-floor/<secret>/token` and gets `SPOT_RUNNER_FLOOR_TOKEN_SOURCE=secret-files`. The floor step
+reads tokens only from those files, never from an environment variable, and the deploy refuses a service
+variable whose value looks like a GitHub token. A token needs, for an organization target, permission to
+manage the organization's self-hosted runners and read its runner groups (the classic `admin:org` scope), and
+for a repository target, administration of that repository (the classic `repo` scope).
+
+The classic OAuth 2.0 token that `gh` holds reaches every organization and repository that its account administers. Two narrower
+alternatives need no code change, because the keeper only reads a token from the secret:
+
+- A fine-grained personal access token for each account, with the organization permission **Self-hosted
+  runners** set to **Read and write** for each organization target, or the repository permission
+  **Administration** set to **Read and write** for each repository target, and nothing else. The organization must allow fine-grained tokens.
+  Fine-grained tokens expire, so set a reminder to rotate them: add a new secret version, and the next tick
+  reads it.
+- A GitHub App installed on each organization and repository with the same permissions. Its installation
+  tokens last one hour, so this needs a small token-minting step in front of the secret. The keeper doesn't
+  mint App tokens yet.
+
 ### Container and registry
 
 The watchdog image is built on the slim Google Cloud command-line tool image, which supplies `gcloud`. The
@@ -725,7 +767,8 @@ pinned by digest. The OIDC provider admits only that workflow on `main` of `swac
 | Member | Role | Resource | Why |
 | --- | --- | --- | --- |
 | `spot-control-watchdog` | `roles/compute.instanceAdmin.v1` | Project, with the IAM condition `spot-control-vms-only` | List, describe, create, start, stop, set scheduling on, and delete the control VMs and their boot disks; list machine types; use the subnetwork and an external IP. The condition limits instances and disks to names that start with `spot-control-`. |
-| `spot-control-watchdog` | `roles/iam.serviceAccountUser` | The control VM service account only | Create control VMs that run as that account. |
+| `spot-control-watchdog` | `roles/compute.instanceAdmin.v1` | Project, with the IAM condition `spot-runner-floor-hosts`; only with floor targets | Create, describe, start, set metadata and labels on, and delete runner floor hosts and their disks. The condition limits instances to names that start with `oxidex-runners-`, and disks to those names and names that start with `runner-data`. The control VM binding stays as it is, so removing this binding turns the floor's compute access off. |
+| `spot-control-watchdog` | `roles/iam.serviceAccountUser` | The control VM service account only | Create control VMs that run as that account. Floor hosts run with no service account, so the floor needs no `actAs` on any account. |
 | `spot-control-watchdog` | `roles/storage.objectAdmin` | The state bucket only | Read and conditionally write the state and lease objects. |
 | `spot-control-watchdog` | `roles/secretmanager.secretAccessor` | Each referenced secret only | Read the service's secrets when an instance starts. |
 | `spot-watchdog-invoker` | `roles/run.invoker` | The Cloud Run service only | Let Cloud Scheduler call this one service. No other member, and never `allUsers`. |
@@ -741,6 +784,7 @@ The service references these secrets:
 | `CF_ACCESS_CLIENT_ID` | `spot-control-access-client-id` | New: the Access service token for the tunnel hostnames. |
 | `CF_ACCESS_CLIENT_SECRET` | `spot-control-access-client-secret` | New. |
 | `SPOT_DASHBOARD_IMAGE_TRACK_TOKEN` | `spot-control-watchdog-github-token` | New, only with image tracking. |
+| None: a file at `/secrets/runner-floor/<secret>/token` | One `secret=` of `SPOT_RUNNER_FLOOR_TARGETS` for each GitHub account | New, only with floor targets. Each account's secret is separate, and none may back another service variable. The deploy labels it `spot-runner-floor=token`, and removes the access again once no target names it. |
 
 `--secret ENV=SECRET` references another secret for a variable. The deploy never writes a secret value. It
 stops before any IAM change when a referenced secret has no enabled version.
@@ -757,8 +801,11 @@ for permission in compute.instances.create compute.instances.delete compute.disk
 done
 ```
 
+With floor targets, check the floor condition the same way against a runner host name, such as
+`.../instances/oxidex-runners-check` and `.../disks/runner-data-check` with `compute.disks.delete`.
+
 If a check reports the access as denied, deploy again with `--no-compute-condition`, which grants the role on
-the project without the condition.
+the project without either condition.
 
 ### Deploy the watchdog
 
@@ -822,6 +869,54 @@ To deploy:
 
 To update the watchdog later, run the image workflow and deploy the new digest with `--image`.
 
+### Turn on the runner floor
+
+The floor needs a watchdog image built from a commit that has `src/runner_floor.py`. To turn it on:
+
+1. Create one secret for each GitHub account that administers a floor target, from standard input. For
+   example, with the account's token in the shell variable `TOKEN`:
+
+   ```bash
+   printf '%s' "$TOKEN" | gcloud secrets create spot-floor-github-ACCOUNT \
+     --data-file=- --replication-policy=automatic --project=PROJECT
+   ```
+
+1. Add `SPOT_RUNNER_FLOOR_TARGETS` to the environment file and source it. Optionally add
+   `SPOT_RUNNER_FLOOR_REGIONS` and `SPOT_RUNNER_FLOOR_MAX_DAILY_USD`. See
+   [Floor targets](fleet-and-autoscaler.md#floor-targets).
+1. Preview the deploy. The dry run shows the second compute binding, each secret mount, and the floor
+   settings:
+
+   ```bash
+   PYTHONPATH=src python3 src/control_watchdog_deploy.py --project=PROJECT --image="$IMAGE" --dry-run
+   ```
+
+1. Preview the floor from a workstation. Both commands read only, and use `gh` for each target's
+   `account=`:
+
+   ```bash
+   SPOT_RUNNER_FLOOR_STATE_URI=gs://PROJECT-spot-control-state/runner-floor \
+     PYTHONPATH=src python3 src/runner_floor.py status --offers
+   SPOT_RUNNER_FLOOR_STATE_URI=gs://PROJECT-spot-control-state/runner-floor \
+     PYTHONPATH=src python3 src/runner_floor.py tick
+   ```
+
+1. Deploy without `--dry-run`. From the next tick on, each target without a running managed host gets one.
+1. Set `SPOT_RUNNER_FLOOR_STATE_URI` to the same location in the environment of every autoscaler that manages
+   a floor target, so that it holds the target's floor lease while it runs.
+
+To turn the floor off, remove `SPOT_RUNNER_FLOOR_TARGETS`, preview the deploy with `--dry-run`, and deploy
+again. Every deploy removes the grants the floor no longer needs, and skips those already gone:
+
+- With no floor target, it removes the `spot-runner-floor-hosts` compute binding.
+- The deploy labels each floor token secret `spot-runner-floor=token` when it grants access to it. It then
+  removes the runtime account's `roles/secretmanager.secretAccessor` binding, and the label, from every
+  labeled secret that the service no longer references. That covers every former floor token secret,
+  including one that only left a target's `secret=`.
+
+Removing the floor never deletes a secret or a VM. Floor hosts that exist keep running until the autoscaler or
+an operator retires them.
+
 ### Migrate from the workstation state
 
 The migration uploads the local `control-vm-<project>.json` once. It refuses when both the local file and the
@@ -868,7 +963,8 @@ gcloud scheduler jobs resume spot-control-watchdog --location=us-central1 --proj
 ```
 
 While it's paused, `src/control_vm.py ensure --apply` with the same `SPOT_CONTROL_STATE_URI` still works from a
-workstation.
+workstation. Pausing the scheduler also pauses the runner floor; `src/runner_floor.py tick --apply` with the same
+`SPOT_RUNNER_FLOOR_STATE_URI` still works from a workstation.
 
 ### Image tracking
 
@@ -941,6 +1037,20 @@ million requests a month. Check it against current pricing.
 
 The total is about $0.12 to $0.40 a month, mostly Secret Manager.
 
+The floor step adds about 1 second of CPU time a tick when it only checks: one Compute Engine listing, one
+runner listing per target, and one state read per target. That's about 14,000 vCPU-seconds, so the service
+stays inside the free tier. With floor targets the service has 1 GiB, which doubles the memory use to about
+116,000 GiB-seconds, 32 percent of the free tier. The deploy also turns on the Cloud Billing API, which the
+floor needs to price offers. The extra reads, about 43,000 a month for three targets, can pass the 50,000 free
+Cloud Storage reads, at $0.004 per 10,000. Each tick also reads the mounted token secrets, about 43,000
+accesses a month for three targets, or about $0.13. A launch tick also downloads the billing catalog.
+
+The floor hosts cost far more than the watchdog. Each is a 4-vCPU Spot VM with a 40 GiB boot disk and a
+100 GiB data disk, at less than `SPOT_RUNNER_FLOOR_MAX_DAILY_USD` (default $1.50 a day, about $45 a month) for
+compute and disks. Its ephemeral external IPv4 address adds about $1.80 a month at the Spot rate. Three floor
+targets therefore cost at most about $140 a month, and usually less: `src/runner_floor.py status --offers` prints
+the current totals.
+
 `--schedule='*/2 * * * *'` makes 21,600 requests a month. At 8 seconds a tick that's about 173,000 vCPU-seconds,
 96 percent of the free tier, and beyond about 8.3 seconds a tick it costs $0.000024 per extra vCPU-second, for
 example about $0.86 a month at 10 seconds. A Cloud Run job at the same 2-minute cadence would bill at least 60
@@ -961,6 +1071,9 @@ list.
 | `SPOT_DASHBOARD_IMAGE` or `SPOT_DASHBOARD_SOURCE_REF` | A digest-pinned image, or a 40-character commit to build on the VM. |
 | `SPOT_CONTROL_PROVISIONING` | `spot` (default) or `standard`, the free-tier e2-micro, which needs a published image. See [Use the free-tier control VM](#use-the-free-tier-control-vm). |
 | `SPOT_CONTROL_STATE_URI` | Optional `gs://<bucket>[/<prefix>]` bucket location for the control VM state and lease. See [Watchdog](#watchdog). |
+| `SPOT_RUNNER_FLOOR_TARGETS` | Optional runner floor targets, each with the Secret Manager secret of its account. See [Floor targets](fleet-and-autoscaler.md#floor-targets). |
+| `SPOT_RUNNER_FLOOR_STATE_URI` | The `gs://<bucket>/runner-floor` location of the floor state and leases. The deploy sets it on the service; set it for an autoscaler that manages a floor target. |
+| `SPOT_RUNNER_FLOOR_REGIONS`, `SPOT_RUNNER_FLOOR_MAX_DAILY_USD` | Optional floor host regions (default `us-central1,us-east1,us-west1`) and daily cap per host (default `1.50`). |
 | `SPOT_DASHBOARD_IMAGE_TRACK`, `SPOT_DASHBOARD_IMAGE_TRACK_TOKEN` | Optional `main` to roll out the published `:main` image, and the GitHub token that reads it. See [Image tracking](#image-tracking). |
 | `SPOT_CONFIG_REPO` | Optional config repository, as `owner/repo`, whose `repos/<owner>/<repo>.yaml` files are controlled targets. The autoscaler's `--config-repo` takes precedence. Default: `<org>/spot-runners-config`. |
 | `DASHBOARD_CONTROLLED_TARGETS` | Optional comma-separated organizations and `owner/repo` targets that the signed-in user must administer. Default: none. |

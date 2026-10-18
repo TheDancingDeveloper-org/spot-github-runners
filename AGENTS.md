@@ -76,6 +76,7 @@ This repository provisions and operates persistent GitHub Actions runners and de
 | `src/lib/builder_runtime_update.py` | Capture, verify, apply, finish, or recover an in-place runtime update on an occupied dedicated builder | Capture and default `--plan` check are read-only; mutates only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed` |
 | `src/web_dashboard.py` | Run the Web UI dashboard (GitHub sign-in, runner-patch console, telemetry); on the control VM it runs in edge mode behind the Cloudflare Worker | Writes the local dashboard state file; patch saves open pull requests on the config repository |
 | `src/control_vm.py` | Inspect (`status`, `plan`), render the startup script, or run lifecycle steps (`ensure`, `rotate`) for the Spot control VM that hosts the dashboard | Only with `--apply`; the autoscaler's `--manage-control-vm` runs the same lifecycle each check |
+| `src/runner_floor.py` | Keep at least one minimal Spot runner host per `SPOT_RUNNER_FLOOR_TARGETS` target (`status`, `tick`), or replace an unmanaged runner host make-before-break (`replace-unmanaged`); the control VM watchdog runs `tick --apply` every tick | Only with `tick --apply` or `replace-unmanaged --apply` |
 
 ### Key directories and modules
 

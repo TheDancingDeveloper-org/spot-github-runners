@@ -38,6 +38,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import control_vm as cv
 from . import image_tracking
+from . import runner_floor as floor
 
 DEFAULT_REGION = "us-central1"
 # Every 3 minutes: 14,400 requests a month at about 8 s is about 115,000 vCPU-seconds, inside the 180,000 free.
@@ -46,6 +47,7 @@ DEFAULT_SCHEDULE = "*/3 * * * *"
 DEFAULT_GITHUB_REPO = "swack-tools/spot-github-runners"
 IMAGE_WORKFLOW = ".github/workflows/control-watchdog-image.yml"
 STATE_PREFIX = "control-vm"
+FLOOR_STATE_PREFIX = "runner-floor"
 REQUEST_TIMEOUT_SECONDS = 900  # the server kills a tick after 840 s
 
 # Every env var the service receives from Secret Manager, and the secret it references by default.
@@ -65,6 +67,8 @@ PASSTHROUGH_ENV = (
     "SPOT_DASHBOARD_SOURCE_REF", "SPOT_DASHBOARD_PUBLIC_URL", "SPOT_CLOUDFLARED_IMAGE", "SPOT_CONFIG_REPO",
     "DASHBOARD_CONTROLLED_TARGETS", "DASHBOARD_GLOBAL_ADMINS", "DASHBOARD_SESSION_NOT_BEFORE",
     "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_KV_NAMESPACE_ID", image_tracking.ENV_IMAGE_TRACK,
+    # Runner floor (src/runner_floor.py): targets name each account's Secret Manager secret, never a token.
+    floor.ENV_TARGETS, floor.ENV_REGIONS, floor.ENV_MAX_DAILY_USD,
 )
 
 APIS = ("run.googleapis.com", "cloudscheduler.googleapis.com", "artifactregistry.googleapis.com",
@@ -86,6 +90,18 @@ COMPUTE_CONDITION_EXPRESSION = (
     'resource.name.extract("/instances/{name}").startsWith("spot-control-") || '
     'resource.name.extract("/disks/{name}").startsWith("spot-control-")'
 )
+
+# A second compute binding, only with floor targets: runner hosts (oxidex-runners-*), their boot disks (named after
+# the instance), and their data disks (runner-data-*, and the manager's default runner-data). The control VM binding
+# above stays as it is, so removing this one binding turns the floor's compute access off again.
+FLOOR_CONDITION_TITLE = "spot-runner-floor-hosts"
+FLOOR_CONDITION_EXPRESSION = (
+    '(resource.type != "compute.googleapis.com/Instance" && resource.type != "compute.googleapis.com/Disk") || '
+    f'resource.name.extract("/instances/{{name}}").startsWith("{floor.HOST_PREFIX}") || '
+    f'resource.name.extract("/disks/{{name}}").startsWith("{floor.HOST_PREFIX}") || '
+    'resource.name.extract("/disks/{name}").startsWith("runner-data")'
+)
+_TOKEN_VALUE_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 _JOB_RE = re.compile(r"^[a-z][a-z0-9-]{0,47}[a-z0-9]$")
@@ -171,6 +187,26 @@ class DeployConfig:
                 f"{self.wif_provider}")
 
     @property
+    def floor_state_uri(self) -> str:
+        return f"gs://{self.state_bucket}/{FLOOR_STATE_PREFIX}"
+
+    @property
+    def floor_targets(self) -> tuple[floor.FloorTarget, ...]:
+        """The runner floor targets (raises ValueError on a malformed SPOT_RUNNER_FLOOR_TARGETS)."""
+        return floor.parse_targets(self.env.get(floor.ENV_TARGETS, ""))
+
+    @property
+    def floor_enabled(self) -> bool:
+        return bool(str(self.env.get(floor.ENV_TARGETS, "") or "").strip())
+
+    def floor_mounts(self) -> dict[str, str]:
+        """File path -> Secret Manager secret: one GitHub token secret per account, mounted, never an env var."""
+        if not self.floor_enabled:
+            return {}
+        return {f"{floor.SECRET_ROOT}/{secret}/token": secret
+                for secret in sorted({target.secret for target in self.floor_targets})}
+
+    @property
     def track_mode(self) -> str:
         """SPOT_DASHBOARD_IMAGE_TRACK normalized exactly as ControlConfig.from_env normalizes it."""
         return str(self.env.get(image_tracking.ENV_IMAGE_TRACK, "") or "").strip().lower()
@@ -209,6 +245,9 @@ class DeployConfig:
             # one reaches stderr, which the inventory parser treats as a failed read. /tmp is writable on Cloud Run.
             "CLOUDSDK_CONFIG": "/tmp/gcloud-config",
         })
+        if self.floor_enabled:
+            env[floor.ENV_STATE_URI] = self.floor_state_uri
+            env[floor.ENV_TOKEN_SOURCE] = floor.TOKEN_SOURCE_FILES
         return env
 
 
@@ -255,6 +294,19 @@ def validate(config: DeployConfig) -> list[str]:
     for key, value in env.items():
         if any(c in value for c in "|\n\r"):
             problems.append(f"{key} contains a character the service spec can't carry ('|' or a newline)")
+        if _TOKEN_VALUE_RE.search(value):
+            problems.append(f"{key} holds what looks like a GitHub token; tokens come from Secret Manager only")
+    if config.floor_enabled:
+        try:
+            targets = config.floor_targets
+            floor.FloorConfig.from_env(config.project, env)
+        except ValueError as exc:
+            problems.append(f"runner floor: {exc}")
+        else:
+            shared = sorted({t.secret for t in targets} & set(refs.values()))
+            if shared:
+                problems.append(f"runner floor: secret(s) {', '.join(shared)} also back other service variables; "
+                                "give each GitHub account its own floor secret")
     # The service runs the same checks before it creates anything; refusing here keeps a broken one from deploying.
     dummy = {key: "x" for key in ("CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "DASHBOARD_CONTROL_SECRET")}
     control = cv.ControlConfig.from_env(config.project, {**env, **dummy})
@@ -279,10 +331,27 @@ class Step:
     update: tuple[tuple[str, ...], ...] = ()
     require: tuple[tuple[tuple[str, ...], str], ...] = ()  # (command that must print ENABLED, what to do if not)
     files: Mapping[str, str] = field(default_factory=dict)  # name -> content, referenced as @FILE:<name>
+    # Removals that are done when the thing is already absent ("not found"), so every deploy can repeat them.
+    remove: tuple[tuple[str, ...], ...] = ()
+    # (list command printing one name per line, names to keep, commands run for every other name with the argument
+    # NAME_ARG replaced by it): removes what an earlier deploy granted and this one no longer needs.
+    prune: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, ...], ...]], ...] = ()
 
 
 def _c(*argv: str) -> tuple[str, ...]:
     return tuple(argv)
+
+
+NAME_ARG = "{name}"
+# Every floor token secret this deploy grants access to carries this label, so a later deploy can find the grants
+# it made and remove those it no longer needs, even after the secret names left SPOT_RUNNER_FLOOR_TARGETS.
+FLOOR_SECRET_LABEL = "spot-runner-floor"
+
+
+def floor_condition() -> dict[str, str]:
+    """The floor compute binding's condition; the same file adds it and, once the floor is off, removes it."""
+    return {"expression": FLOOR_CONDITION_EXPRESSION, "title": FLOOR_CONDITION_TITLE,
+            "description": "Runner floor hosts oxidex-runners-* and their runner-data disks"}
 
 
 def iam_bindings(config: DeployConfig) -> list[tuple[str, str, str, str]]:
@@ -298,8 +367,16 @@ def iam_bindings(config: DeployConfig) -> list[tuple[str, str, str, str]]:
         (f"bucket gs://{config.state_bucket}", runtime, ROLE_OBJECTS,
          "read and conditionally write the state and lease objects; no other bucket"),
     ]
+    if config.floor_enabled and config.compute_condition:
+        bindings.insert(1, (f"project {config.project} (condition: instances oxidex-runners-*, disks oxidex-runners-* "
+                            "and runner-data*)", runtime, ROLE_COMPUTE,
+                            "the runner floor: create, start, set metadata and labels on, and delete runner floor "
+                            "hosts and their disks; no service account is attached to them"))
     for env_name, secret in sorted(config.secret_refs().items()):
         bindings.append((f"secret {secret}", runtime, ROLE_SECRET, f"read {env_name} at instance start; no other secret"))
+    for path, secret in sorted(config.floor_mounts().items()):
+        bindings.append((f"secret {secret}", runtime, ROLE_SECRET,
+                         f"read one GitHub account's runner floor token, mounted at {path}; no other secret"))
     bindings.append((f"Cloud Run service {config.service}", f"serviceAccount:{config.invoker_email}", ROLE_INVOKER,
                      "Cloud Scheduler calls this one service (run.routes.invoke); nobody else can"))
     bindings.append((f"repository {config.repository}", f"serviceAccount:{config.publisher_email}", ROLE_AR_WRITER,
@@ -311,13 +388,21 @@ def iam_bindings(config: DeployConfig) -> list[tuple[str, str, str, str]]:
     return bindings
 
 
+def _hint_variable(names: Sequence[str]) -> str:
+    """The shell variable the secret-creation hint reads (a floor token's hint names a generic one)."""
+    plain = sorted(n for n in names if re.match(r"^[A-Z_][A-Z0-9_]*$", n))
+    return plain[0] if plain else "GITHUB_TOKEN_FOR_THIS_ACCOUNT"
+
+
 def build_steps(config: DeployConfig) -> list[Step]:
     p = f"--project={config.project}"
     region = f"--region={config.region}"
     location = f"--location={config.region}"
     bucket = f"gs://{config.state_bucket}"
     runtime = f"serviceAccount:{config.runtime_email}"
-    steps = [Step("Enable the APIs", run=(_c("gcloud", "services", "enable", *APIS, p),))]
+    # The runner floor prices offers from the Cloud Billing Catalog API, which needs the API in this project.
+    apis = (*APIS, "cloudbilling.googleapis.com") if config.floor_enabled else APIS
+    steps = [Step("Enable the APIs", run=(_c("gcloud", "services", "enable", *apis, p),))]
     steps.append(Step(
         f"State bucket {bucket}: regional, uniform bucket-level access, public access prevention",
         check=_c("gcloud", "storage", "buckets", "describe", bucket, p, "--format=value(name)"),
@@ -342,13 +427,16 @@ def build_steps(config: DeployConfig) -> list[Step]:
     by_secret: dict[str, list[str]] = {}
     for env_name, secret in refs.items():
         by_secret.setdefault(secret, []).append(env_name)
+    mounts = config.floor_mounts()
+    for path, secret in mounts.items():
+        by_secret.setdefault(secret, []).append(f"the runner floor GitHub token at {path}")
     steps.append(Step(
         "Secrets the service references (each needs an enabled version; this deploy never writes secret values)",
         require=tuple((_c("gcloud", "secrets", "versions", "describe", "latest", f"--secret={secret}", p,
                           "--format=value(state)"),
                        f"secret {secret} ({', '.join(sorted(by_secret[secret]))}) has no enabled version; create it "
-                       f"from stdin: printf '%s' \"${sorted(by_secret[secret])[0]}\" | gcloud secrets create {secret} "
-                       f"--data-file=- --replication-policy=automatic {p}")
+                       f"from stdin: printf '%s' \"${_hint_variable(by_secret[secret])}\" | gcloud secrets create "
+                       f"{secret} --data-file=- --replication-policy=automatic {p}")
                       for secret in sorted(by_secret))))
 
     condition = {"expression": COMPUTE_CONDITION_EXPRESSION, "title": "spot-control-vms-only",
@@ -363,11 +451,37 @@ def build_steps(config: DeployConfig) -> list[Step]:
         _c("gcloud", "storage", "buckets", "add-iam-policy-binding", bucket, f"--member={runtime}",
            f"--role={ROLE_OBJECTS}", "--format=none"),
     ]
+    files = {"compute-condition.json": json.dumps(condition, indent=2)} if config.compute_condition else {}
+    if config.floor_enabled and config.compute_condition:
+        files["floor-condition.json"] = json.dumps(floor_condition(), indent=2)
+        iam_runs.insert(1, _c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={runtime}",
+                              f"--role={ROLE_COMPUTE}", "--condition-from-file=@FILE:floor-condition.json",
+                              "--format=none"))
     iam_runs += [_c("gcloud", "secrets", "add-iam-policy-binding", secret, p, f"--member={runtime}",
-                    f"--role={ROLE_SECRET}", "--format=none") for secret in sorted(set(refs.values()))]
+                    f"--role={ROLE_SECRET}", "--format=none")
+                 for secret in sorted(set(refs.values()) | set(mounts.values()))]
+    iam_runs += [_c("gcloud", "secrets", "update", secret, p, f"--update-labels={FLOOR_SECRET_LABEL}=token",
+                    "--format=none") for secret in sorted(set(mounts.values()))]
     steps.append(Step("Runtime service account IAM (narrowest resource for each role)", run=tuple(iam_runs),
-                      files={"compute-condition.json": json.dumps(condition, indent=2)}
-                      if config.compute_condition else {}))
+                      files=files))
+    # Grants the runner floor no longer needs: the floor compute binding once no floor target is configured, and
+    # the accessor on every labeled floor token secret that the service no longer references.
+    removals: list[tuple[str, ...]] = []
+    removal_files: dict[str, str] = {}
+    if not config.floor_enabled and config.compute_condition:
+        removal_files["floor-condition.json"] = json.dumps(floor_condition(), indent=2)
+        removals.append(_c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
+                           f"--role={ROLE_COMPUTE}", "--condition-from-file=@FILE:floor-condition.json",
+                           "--format=none"))
+    keep = tuple(sorted(set(refs.values()) | set(mounts.values())))
+    prune = ((_c("gcloud", "secrets", "list", p, f"--filter=labels.{FLOOR_SECRET_LABEL}=token",
+                 "--format=value(name.basename())"), keep,
+              (_c("gcloud", "secrets", "remove-iam-policy-binding", NAME_ARG, p, f"--member={runtime}",
+                  f"--role={ROLE_SECRET}", "--format=none"),
+               _c("gcloud", "secrets", "update", NAME_ARG, p, f"--remove-labels={FLOOR_SECRET_LABEL}",
+                  "--format=none"))),)
+    steps.append(Step("Remove runner floor grants that are no longer configured (absent ones are skipped)",
+                      remove=tuple(removals), prune=prune, files=removal_files))
 
     owner = config.github_repo.split("/", 1)[0]
     workflow_ref = f"{config.github_repo}/{IMAGE_WORKFLOW}@refs/heads/main"
@@ -405,11 +519,15 @@ def build_steps(config: DeployConfig) -> list[Step]:
 
     env = config.service_env()
     env_arg = "--set-env-vars=^|^" + "|".join(f"{k}={v}" for k, v in sorted(env.items()))
-    secrets_arg = "--set-secrets=" + ",".join(f"{k}={v}:latest" for k, v in sorted(refs.items()))
+    # Env-var references for the service's own secrets; file mounts (one directory each) for the floor's tokens.
+    secrets_arg = "--set-secrets=" + ",".join([f"{k}={v}:latest" for k, v in sorted(refs.items())]
+                                              + [f"{k}={v}:latest" for k, v in sorted(mounts.items())])
     steps.append(Step(f"Cloud Run service {config.service} (one tick per POST /tick; IAM only)", run=(
         _c("gcloud", "run", "deploy", config.service, p, region, f"--image={config.image}",
            f"--service-account={config.runtime_email}", "--no-allow-unauthenticated", "--ingress=all",
-           "--concurrency=1", "--min-instances=0", "--max-instances=1", "--cpu=1", "--memory=512Mi",
+           "--concurrency=1", "--min-instances=0", "--max-instances=1", "--cpu=1",
+           # A floor launch holds the whole Compute Engine billing catalog in memory while it prices offers.
+           "--memory=1Gi" if config.floor_enabled else "--memory=512Mi",
            "--cpu-throttling", "--no-cpu-boost", f"--timeout={REQUEST_TIMEOUT_SECONDS}", env_arg, secrets_arg,
            "--labels=spot-role=control-watchdog", "--quiet"),
         _c("gcloud", "run", "services", "add-iam-policy-binding", config.service, p, region,
@@ -470,6 +588,13 @@ def render(config: DeployConfig, steps: Sequence[Step]) -> str:
             lines += [f"  {_shell(c)}" for c in step.create]
             lines.append("fi")
         lines += [_shell(c) for c in step.run]
+        lines += [f"{_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
+        for listing, keep, commands in step.prune:
+            lines.append(f"for name in $({_shell(listing)}); do")
+            lines.append(f"  case ' {' '.join(keep)} ' in *\" $name \"*) continue ;; esac")
+            lines += [f"  {_shell(c).replace(shlex.quote(NAME_ARG), '"$name"')} 2>/dev/null || echo 'already absent'"
+                      for c in commands]
+            lines.append("done")
     if not config.image:
         lines += ["", "# The Cloud Run service and the scheduler need --image: build the watchdog image first (see the",
                   "# Control watchdog image workflow), then run this deploy again with --image=<digest>."]
@@ -521,6 +646,13 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
             if result.returncode != 0:
                 raise DeployError(f"{what} failed: {(result.stderr or '').strip()[:500]}")
 
+        def remove(argv: Sequence[str], files: Mapping[str, str], what: str) -> None:
+            command = materialize(argv, files)
+            out(f"+ {shlex.join(command)}")
+            result = runner(command)
+            if result.returncode != 0 and "not found" not in (result.stderr or "").lower():
+                raise DeployError(f"{what} failed: {(result.stderr or '').strip()[:500]}")
+
         for index, step in enumerate(steps, 1):
             out(f"# {index}. {step.title}")
             for command, hint in step.require:
@@ -535,6 +667,17 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
                     out("  exists")
             for command in step.run:
                 run(command, step.files, step.title)
+            for command in step.remove:
+                remove(command, step.files, step.title)
+            for listing, keep, commands in step.prune:
+                result = runner(materialize(listing, step.files))
+                if result.returncode != 0:
+                    raise DeployError(f"{step.title} failed: {(result.stderr or '').strip()[:500]}")
+                for name in sorted({line.strip() for line in (result.stdout or "").splitlines() if line.strip()}):
+                    if name in keep:
+                        continue
+                    for command in commands:
+                        remove(tuple(name if arg == NAME_ARG else arg for arg in command), step.files, step.title)
 
 
 # --------------------------------------------------------------------------------------------
@@ -562,7 +705,7 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--secret", action="append", default=[], metavar="ENV=SECRET",
                         help="Reference another Secret Manager secret for a service env var (repeatable)")
     parser.add_argument("--no-compute-condition", dest="compute_condition", action="store_false",
-                        help="Grant the compute role without the spot-control-* IAM condition")
+                        help="Grant the compute role without the spot-control-* (and runner floor) IAM conditions")
     parser.add_argument("--skip-scheduler", action="store_true",
                         help="Deploy the service but not the scheduler (call it by hand first)")
     parser.add_argument("--no-verify-signature", dest="verify_signature", action="store_false",

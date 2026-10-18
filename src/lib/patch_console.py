@@ -603,6 +603,8 @@ class GcloudHotPatchExecutor:
             *(["--heavy-runner-pool", str(int(heavy))] if heavy in (2, 3) else []),
         ])
         args.runner_patch = patch
+        # A runner floor host's extra scheduling labels (recorded at provisioning) survive the label sync.
+        args.extra_runner_labels = tuple(host.get("runner_extra_labels") or ())
         # runner_manager reads its project from a module global (set by its own main()); scope the override.
         with _RUNNER_MANAGER_LOCK:
             previous = runner_manager.PROJECT

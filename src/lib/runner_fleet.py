@@ -54,6 +54,11 @@ PATCH_LABEL_KEY = "spot-runner-patch"
 RUNNER_PREFIX_METADATA_KEY = "spot-runner-prefix"
 RUNNER_COUNT_METADATA_KEY = "spot-runner-count"
 RUNNER_LABEL_METADATA_KEY = "spot-runner-label"
+# Extra scheduling labels of a runner floor host, joined with "+" (runner_floor); absent on other hosts.
+RUNNER_EXTRA_LABELS_METADATA_KEY = "spot-runner-extra-labels"
+# The most extra labels that metadata record carries; the floor parser and the writer enforce the same limit, so a
+# later label sync (a live patch) never drops labels that the host was registered with.
+MAX_EXTRA_RUNNER_LABELS = 16
 RUNNER_REGION_METADATA_KEY = "spot-runner-region"
 RUNNER_HEAVY_POOL_METADATA_KEY = "spot-runner-heavy-pool"
 # The GitHub scope the runners registered with (an org such as swack-tools, or owner/repo) and, for org scopes, the
@@ -126,6 +131,9 @@ def runner_deployment_from_gce_item(item: dict) -> dict[str, Any]:
     label = metadata.get(RUNNER_LABEL_METADATA_KEY, "").strip()
     if label and len(label) <= 64 and all(c.isalnum() or c in "._-" for c in label):
         out["runner_label"] = label
+    extra = [part for part in metadata.get(RUNNER_EXTRA_LABELS_METADATA_KEY, "").strip().split("+") if part]
+    if extra and len(extra) <= MAX_EXTRA_RUNNER_LABELS and all(len(p) <= 64 and all(c.isalnum() or c in "._-" for c in p) for p in extra):
+        out["runner_extra_labels"] = extra
     region = metadata.get(RUNNER_REGION_METADATA_KEY, "").strip()
     if region and len(region) <= 40 and all(c.islower() or c.isdigit() or c == "-" for c in region):
         out["runner_region"] = region

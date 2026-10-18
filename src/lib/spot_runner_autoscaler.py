@@ -252,9 +252,24 @@ def runner_inventory_stale(state):
                                      or not 0<=time.time()-observed<=120)
 
 
+# While this controller holds its target's runner floor lease (SPOT_RUNNER_FLOOR_STATE_URI set), the lease's guard:
+# every fleet mutation first proves the lease still held, so the floor keeper and this controller never both act.
+_FLOOR_LEASE_GUARD = None
+# The held lease itself: long provider-mutating children run fenced by it (runner_floor.run_fenced).
+_FLOOR_LEASE_HOLDER = None
+
+
+def raise_if_floor_lease_lost() -> None:
+    if _FLOOR_LEASE_HOLDER is not None and _FLOOR_LEASE_HOLDER.lost is not None:
+        raise RuntimeError('Fleet mutation held: the runner floor lease was lost while the deployment manager ran; '
+                           'its process group was stopped, and the launch is reconciled once the lease is held again')
+
+
 def guard_inventory_fresh(state):
     if runner_inventory_stale(state):
         raise RuntimeError('Fleet mutation held: runner inventory expired')
+    if _FLOOR_LEASE_GUARD is not None:
+        _FLOOR_LEASE_GUARD()
 
 
 def guard_fleet_mutation(state, vm=None, is_rotation=False):
@@ -408,12 +423,12 @@ def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRun
         on_deleted()
     subprocess.run(["gcloud", "compute", "instances", "delete", vm.name,
                     f"--zone={vm.zone}", f"--project={project}", "--delete-disks=all", "--quiet"],
-                   check=True, text=True, capture_output=True)
+                   check=True, text=True, capture_output=True, timeout=300)
     LOG.info("Deleted idle Spot VM %s and its attached disks", vm_details(vm))
     for runner in assigned:
         subprocess.run(["gh", "api", "-X", "DELETE",
                         f"{target_api_prefix(org)}/actions/runners/{runner.runner_id}"],
-                       check=True, text=True, capture_output=True)
+                       check=True, text=True, capture_output=True, timeout=60)
 
 
 def read_scale_state(path: Path) -> dict:
@@ -726,6 +741,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
     if stale:
         for runner in stale:
             try:
+                guard_inventory_fresh(state)  # inventory freshness and the floor lease, right before the delete
                 subprocess.run(["gh", "api", "-X", "DELETE",
                                 f"{target_api_prefix(operation.get('target') or _active_target(args))}/actions/runners/{runner.runner_id}"],
                                check=True, text=True, capture_output=True, timeout=60)
@@ -2684,7 +2700,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         result = subprocess.run(
             ["gcloud", "compute", "zones", "list", f"--project={args.project}",
              f"--filter=name~'^{offer.region}-' AND status=UP", "--format=value(name)"],
-            check=True, text=True, capture_output=True,
+            check=True, text=True, capture_output=True, timeout=60,
         )
         zones = result.stdout.split()
     if not zones:
@@ -2778,15 +2794,21 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         started = time.monotonic()
         manager_hung = False
         try:
-            # The manager enforces the registration deadline; this backstop covers a hung manager.
+            # The manager enforces the registration deadline; this backstop covers a hung manager. With a floor lease
+            # held, the manager runs in its own process group, killed the moment the lease is lost (runner_floor).
             guard_fleet_mutation(state)
-            result = subprocess.run(command, check=False, text=True, capture_output=True,
-                                    timeout=deadline + 120)
+            if _FLOOR_LEASE_HOLDER is None:
+                result = subprocess.run(command, check=False, text=True, capture_output=True,
+                                        timeout=deadline + 120)
+            else:
+                from .runner_floor import run_fenced
+                result = run_fenced(command, timeout=deadline + 120, holder=_FLOOR_LEASE_HOLDER)
         except subprocess.TimeoutExpired:
             manager_hung = True
             result = SimpleNamespace(returncode=-9, stdout="",
                                      stderr="Deployment manager timed out before reporting an outcome")
         identity_observed = import_deployment_receipt(state, state_path)
+        raise_if_floor_lease_lost()
         for output in (result.stdout, result.stderr):
             for line in (output or "").splitlines():
                 if line.strip():
@@ -2918,11 +2940,13 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
         return False
     for disk in leftovers:
         if runner_inventory_stale(state):raise RuntimeError('Disk cleanup held: stale runner inventory')
+        guard_inventory_fresh(state)  # and the floor lease, right before the delete
         subprocess.run(["gcloud", "compute", "disks", "delete", disk["name"], f"--zone={vm.zone}",
                         f"--project={args.project}", "--quiet"],
                        check=True, text=True, capture_output=True, timeout=120)
         LOG.info("Deleted disk %s left by launch %s", disk["name"], vm.name)
     for runner in host_runners(vm, list_github_runners(target), [vm]):
+        guard_inventory_fresh(state)  # inventory freshness and the floor lease, right before the delete
         subprocess.run(["gh", "api", "-X", "DELETE", f"{target_api_prefix(target)}/actions/runners/{runner.runner_id}"],
                        check=True, text=True, capture_output=True, timeout=60)
     if host_runners(vm, list_github_runners(target), [vm]):
@@ -2982,7 +3006,7 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
     if getattr(args, 'make_before_break', False):
         plist['ProgramArguments'].append('--make-before-break')
     plist_path.write_bytes(plistlib.dumps(plist))
-    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], check=False)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], check=False, timeout=60)
     return plist_path
 
 
@@ -3047,7 +3071,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError('Resource mode requires 300-second checks and a positive maximum host count')
     load_env(ROOT / ".env")
     if args.github_user:
-        secret=subprocess.check_output(["gh","auth","token","--user",args.github_user],text=True).strip()
+        secret=subprocess.check_output(["gh","auth","token","--user",args.github_user],text=True,timeout=30).strip()
         if not secret:raise RuntimeError("Missing requested GitHub account credential")
         os.environ["GH_TOKEN"]=secret
     args.billing_export_table = args.billing_export_table or os.environ.get('GCP_BILLING_EXPORT_TABLE')
@@ -3111,7 +3135,79 @@ def run_controller(args: argparse.Namespace) -> int:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError(f"Another controller owns state {state_path}") from exc
-        return _run_controller(args)
+        holder = None if getattr(args, 'dry_run', False) else acquire_floor_lease(args)
+        if holder is False:
+            return 0
+        try:
+            return _run_controller(args)
+        finally:
+            if holder:
+                release_floor_lease(holder)
+
+
+def acquire_floor_lease(args: argparse.Namespace):
+    """With SPOT_RUNNER_FLOOR_STATE_URI set, hold this target's runner floor lease while the controller runs.
+
+    Returns None when the variable is unset (no floor coordination), False with --once while another controller
+    (the floor keeper, or a replacement command) holds the lease, else the held lease. Without --once it waits.
+    """
+    global _FLOOR_LEASE_GUARD, _FLOOR_LEASE_HOLDER
+    from .runner_floor import ENV_STATE_URI, AutoscalerTargetLease, install_mutation_fence
+
+    uri = str(os.environ.get(ENV_STATE_URI, '') or '').strip()
+    if not uri:
+        return None
+    target = _active_target(args)
+    holder = AutoscalerTargetLease.for_target(args.project, target, uri)
+    while True:
+        if holder.acquire():
+            try:
+                pending = holder.pending_operation()
+            except BaseException:
+                # A read error or malformed floor state must not keep the lease for its whole time to live.
+                holder.release()
+                raise
+            if not pending:
+                break
+            # The keeper must finish its own launch (and remove its one-use registration token) first.
+            holder.release()
+            LOG.warning('Runner floor keeper has a %s of %s in progress on %s; this controller waits for it',
+                        pending.get('kind'), pending.get('name'), target)
+        else:
+            LOG.warning('Runner floor lease of %s is held by %s; this controller waits before it manages the target',
+                        target, holder.holder())
+        if args.once:
+            return False
+        time.sleep(args.interval_seconds)
+    try:
+        holder.start()
+        _FLOOR_LEASE_GUARD = holder.guard
+        _FLOOR_LEASE_HOLDER = holder
+        # Every mutating child process (gcloud, gh, ssh, the deployment manager), whichever module starts it, proves
+        # the lease immediately before it starts: cleanups that check only inventory freshness are covered too.
+        install_mutation_fence(holder.guard)
+        LOG.info('Holding the runner floor lease of %s; the floor keeper skips this target while this controller '
+                 'runs', target)
+        if holder.orphaned:
+            # Nobody finished that floor operation: its host is an ordinary managed host now. Only its leftover
+            # one-use token is removed; nothing is deleted.
+            from .runner_floor import scrub_orphaned_token
+            LOG.warning('Orphaned runner floor operation on %s: %s', target,
+                        scrub_orphaned_token(args.project, holder.orphaned))
+    except BaseException:
+        release_floor_lease(holder)
+        raise
+    return holder
+
+
+def release_floor_lease(holder) -> None:
+    global _FLOOR_LEASE_GUARD, _FLOOR_LEASE_HOLDER
+    from .runner_floor import install_mutation_fence
+
+    install_mutation_fence(None)
+    _FLOOR_LEASE_GUARD = None
+    _FLOOR_LEASE_HOLDER = None
+    holder.release()
 
 
 def bind_state_to_target(state: dict, args: Any) -> bool:
@@ -3156,6 +3252,12 @@ def _run_controller(args: argparse.Namespace) -> int:
                        tracked_job_repositories(args))
     args.cpu_platforms_by_zone = None
     while True:
+        if _FLOOR_LEASE_GUARD is not None:
+            try:
+                _FLOOR_LEASE_GUARD()
+            except RuntimeError as exc:
+                LOG.error('%s; stopping so that a restart takes the lease again before it acts', exc)
+                return 75
         clear_catalog_cache()
         if args.cpu_platforms_by_zone is None:
             try:

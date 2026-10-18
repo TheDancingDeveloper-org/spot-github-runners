@@ -21,6 +21,7 @@ The last column names the exact flag or action that makes it change something.
 | [`src/spot_runner_manager.py`](#spot-runner-manager) | Prints a plan after read-only checks | `--apply`, which also deletes old unattached manager-labeled disks in the zone, or `--patch-live` (which needs no `--apply`) |
 | [`src/spot_runner_autoscaler.py`](#spot-runner-autoscaler) | Manages the fleet | `--dry-run` leaves VMs, disks, registrations, and controller state unchanged, but its `gcloud compute ssh` can add your SSH key; `--install-launch-agent` installs the macOS agent |
 | [`src/control_vm.py`](#control-vm) | `status` and `plan` read only | `ensure --apply`, `rotate --apply`; `render-startup` always writes its `--output` file |
+| [`src/runner_floor.py`](#runner-floor) | `status` and `tick` read only | `tick --apply` and `replace-unmanaged --apply` create, start, and delete runner hosts and runner registrations |
 | [`src/web_dashboard.py`](#web-dashboard) | Serves HTTP | `--state-file` persists state, including with `--dump-overview`; served POST routes can change state. With `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` set, `POST /api/patches/save` opens a pull request on the config repository, and with `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts |
 | [`src/render_builder_startup.py`](#render-builder-startup) | Writes a local directory | Running the rendered `launch-command.sh` creates a billable VM |
 | [`src/lib/builder_runtime_update.py`](#builder-runtime-update) | Captures and checks only | `--apply`, `--finish`, `--recover-committed`, `--recover-finish` |
@@ -387,6 +388,45 @@ repository root, except for `render-startup`.
 
 ```bash
 python3 src/control_vm.py plan --project YOUR_PROJECT
+```
+
+## `src/runner_floor.py` {#runner-floor}
+
+Keeps at least one minimal Spot runner host for each target in
+`SPOT_RUNNER_FLOOR_TARGETS`, with its state and per-target leases under
+`SPOT_RUNNER_FLOOR_STATE_URI`. The control VM watchdog runs `tick --apply` on
+every tick. See [Runner floor keeper](fleet-and-autoscaler.md#runner-floor-keeper).
+It does nothing while no floor target is set.
+
+| Subcommand | Effect |
+| --- | --- |
+| `status` | Prints each target's plan, floor record, hosts, and runners as JSON. Read-only. |
+| `tick` | Plans one floor step for each target. With `--apply`, takes each acting target's lease and runs its step. |
+| `replace-unmanaged` | Retires an unmanaged runner host after the managed floor host is online. Prints the plan unless you pass `--apply`. |
+
+| Subcommand | Flag | Type | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| All | `--project` | String | Owner's project | GCP project. Put it before the subcommand. |
+| `status`, `tick` | `--github-user` | String | Each target's `account=` | `gh` account for every target. |
+| `status` | `--offers` | Flag | Off | Also price the cheapest floor host offers. Reads the billing catalog. |
+| `tick` | `--apply` | Flag | Off | Run the planned steps. |
+| `tick` | `--target` | String, repeatable | Every target | Only these targets. |
+| `tick` | `--budget-seconds` | Number | None | Time budget of the tick. The watchdog passes its deadline in `SPOT_TICK_DEADLINE_EPOCH` instead. |
+| `replace-unmanaged` | `--target` | `owner/repo` | Required | A repository floor target. |
+| `replace-unmanaged` | `--instance`, `--zone` | String | Required | The unmanaged VM to retire and its zone. |
+| `replace-unmanaged` | `--old-runner` | String, repeatable | None (required) | Each runner registration of the old host. The preview lists candidates. |
+| `replace-unmanaged` | `--accept-dropped-labels` | Flag | Off | Accept that the old machine-type and region labels don't move to the managed host. |
+| `replace-unmanaged` | `--label-strip-drain` | Flag | Off | Drain an old host that can't run the job-start cordon by removing its labels instead. |
+| `replace-unmanaged` | `--github-user` | String | The target's `account=` | `gh` account. |
+| `replace-unmanaged` | `--apply` | Flag | Off | Run the replacement. |
+| `replace-unmanaged` | `--max-wait-seconds` | Integer | `14400` | Stop, resumable with exit status 75, after this long. |
+| `replace-unmanaged` | `--poll-seconds` | Integer | `30` | Time between observations. |
+
+On a workstation, the command loads `.env` from the repository root and reads
+GitHub tokens with `gh auth token --user`, never from an environment variable.
+
+```bash
+PYTHONPATH=src python3 src/runner_floor.py status --offers
 ```
 
 ## `src/web_dashboard.py` {#web-dashboard}

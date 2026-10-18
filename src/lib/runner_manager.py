@@ -40,6 +40,8 @@ from .runner_fleet import (
     RUNNER_COUNT_METADATA_KEY,
     RUNNER_HEAVY_POOL_METADATA_KEY,
     RUNNER_LABEL_METADATA_KEY,
+    RUNNER_EXTRA_LABELS_METADATA_KEY,
+    MAX_EXTRA_RUNNER_LABELS,
     RUNNER_GROUP_METADATA_KEY,
     RUNNER_PREFIX_METADATA_KEY,
     RUNNER_REGION_METADATA_KEY,
@@ -379,7 +381,9 @@ def cleanup_orphan_runner_disks(zone: str) -> list[str]:
 def _desired_runner_labels(args: argparse.Namespace) -> list[str]:
     patch = resolve_runner_patch(args)
     extra = list(patch.runner_labels()) if patch is not None else []
-    return list(dict.fromkeys([args.runner_label, args.instance_type, args.region, *extra]))
+    # Extra scheduling labels of a runner floor host (runner_floor), recorded in its metadata for later label syncs.
+    floor_extra = list(getattr(args, "extra_runner_labels", ()) or ())
+    return list(dict.fromkeys([args.runner_label, args.instance_type, args.region, *floor_extra, *extra]))
 
 
 def render_startup(args: argparse.Namespace, token: str, group_name: str, deployment_id: str) -> str:
@@ -482,6 +486,12 @@ def runner_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) -> 
     region = str(getattr(args, "region", "") or "")
     if re.fullmatch(r"[a-z0-9-]{1,40}", region):
         plain[RUNNER_REGION_METADATA_KEY] = region
+    extra_labels = [str(label) for label in getattr(args, "extra_runner_labels", ()) or ()]
+    if len(extra_labels) > MAX_EXTRA_RUNNER_LABELS:
+        raise RuntimeError(f"At most {MAX_EXTRA_RUNNER_LABELS} extra runner labels can be recorded; "
+                           f"{len(extra_labels)} were requested")
+    if extra_labels and all(re.fullmatch(r"[A-Za-z0-9._-]{1,64}", label) for label in extra_labels):
+        plain[RUNNER_EXTRA_LABELS_METADATA_KEY] = "+".join(extra_labels)
     heavy = getattr(args, "heavy_runner_pool", None)
     if heavy in (2, 3):
         plain[RUNNER_HEAVY_POOL_METADATA_KEY] = str(heavy)
@@ -813,6 +823,9 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                         image_family, "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
                         network, f"--metadata-from-file={metadata_files}", _plain_metadata_flag(patch_plain),
+                        # A runner floor host runs with no service account: CI jobs can reach the metadata server.
+                        *(["--no-service-account", "--no-scopes"] if getattr(args, "no_service_account", False)
+                          else []),
                         f"--labels={TARGET_LABEL_KEY}={launch_target_label(args)}",
                         "--format=json(id,name,zone,status,disks,cpuPlatform,minCpuPlatform)",
                         "--quiet"], quiet=True)

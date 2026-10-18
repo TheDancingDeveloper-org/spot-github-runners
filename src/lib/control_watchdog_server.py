@@ -3,7 +3,10 @@
 Cloud Scheduler sends ``POST /tick`` with an OIDC identity token of the invoker service account. Each accepted
 request runs exactly one ``control_vm.py ensure --apply --skip-if-idle --skip-if-locked`` step, in a child process
 so that every tick starts from fresh module state and a hung step can be killed, and answers 200 with a JSON
-summary, or 500 when the step failed or timed out. ``GET /health`` answers 200. Everything else is refused.
+summary, or 500 when the step failed or timed out. When ``SPOT_RUNNER_FLOOR_TARGETS`` is set, the same tick then runs
+one ``runner_floor.py tick --apply`` step (one floor step per target) in the time that is left; both steps share the
+one tick timeout, and each child gets the tick's deadline in ``SPOT_TICK_DEADLINE_EPOCH``. ``GET /health`` answers
+200. Everything else is refused.
 
 Authentication is Cloud Run IAM: the service allows no unauthenticated callers, and only the invoker account holds
 ``roles/run.invoker`` on it. As a second line of defense this server checks the identity token itself, with no
@@ -39,6 +42,9 @@ LOG = logging.getLogger("spot_runner_autoscaler.watchdog")
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTROL_VM = ROOT / "src" / "control_vm.py"
+RUNNER_FLOOR = ROOT / "src" / "runner_floor.py"
+ENV_FLOOR_TARGETS = "SPOT_RUNNER_FLOOR_TARGETS"
+ENV_TICK_DEADLINE = "SPOT_TICK_DEADLINE_EPOCH"
 ENV_PROJECT = "WATCHDOG_PROJECT"
 ENV_AUDIENCE = "WATCHDOG_AUDIENCE"
 ENV_INVOKER = "WATCHDOG_INVOKER"
@@ -64,6 +70,19 @@ _SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
 def tick_command(project: str) -> list[str]:
     return [sys.executable, "-B", str(CONTROL_VM), "ensure", "--apply", "--skip-if-idle", "--skip-if-locked",
             f"--project={project}"]
+
+
+def floor_command(project: str) -> list[str]:
+    return [sys.executable, "-B", str(RUNNER_FLOOR), f"--project={project}", "tick", "--apply"]
+
+
+def tick_commands(project: str, env: Mapping[str, str] | None = None) -> list[list[str]]:
+    """The control VM step, then the runner floor step when floor targets are configured."""
+    env = os.environ if env is None else env
+    commands = [tick_command(project)]
+    if str(env.get(ENV_FLOOR_TARGETS, "") or "").strip():
+        commands.append(floor_command(project))
+    return commands
 
 
 # --------------------------------------------------------------------------------------------
@@ -176,16 +195,25 @@ class TickRunner:
     server's own SIGTERM, see ``terminate``) signals the whole group: SIGTERM, a short grace, then SIGKILL.
     """
 
-    def __init__(self, command: Sequence[str], *, timeout: float = TICK_TIMEOUT_SECONDS,
+    def __init__(self, command: Sequence[str], *, then: Sequence[Sequence[str]] = (),
+                 timeout: float = TICK_TIMEOUT_SECONDS,
                  term_grace: float = TERM_GRACE_SECONDS, popen: Callable[..., Any] = subprocess.Popen,
-                 killpg: Callable[[int, int], None] = os.killpg, clock: Callable[[], float] = time.monotonic) -> None:
+                 killpg: Callable[[int, int], None] = os.killpg, clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time) -> None:
         self.command = list(command)
+        # Further steps of the same tick (the runner floor), run in order after the first; all share ``timeout``.
+        self.then = [list(step) for step in then]
+        self.wall = wall
         self.timeout = timeout
         self.term_grace = term_grace
         self.popen = popen
         self.killpg = killpg
         self.clock = clock
         self._lock = threading.Lock()
+        # Set once by terminate() and never cleared: after SIGTERM no further step (no floor child) may start. The
+        # spawn lock makes "check the flag, start the child, publish it" atomic against terminate().
+        self._shutdown = False
+        self._spawn_lock = threading.Lock()
         self._process: Any = None
         self._terminated = False
 
@@ -220,8 +248,10 @@ class TickRunner:
         return out or "", err or ""
 
     def terminate(self) -> None:
-        """Kill the running tick's process group (the server got SIGTERM)."""
-        process = self._process
+        """Kill the running tick's process group and start no further step (the server got SIGTERM)."""
+        with self._spawn_lock:
+            self._shutdown = True
+            process = self._process
         if process is not None:
             self._terminated = True
             self._signal_group(process, signal.SIGTERM)
@@ -232,33 +262,50 @@ class TickRunner:
             return None
         try:
             started = self.clock()
+            deadline_epoch = self.wall() + self.timeout
             self._terminated = False
-            try:
-                process = self.popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                     start_new_session=True)
-            except OSError as exc:
-                LOG.error("Watchdog tick could not start: %s", exc)
-                return 500, {"status": "error", "error": type(exc).__name__}
-            self._process = process
-            try:
+            steps: list[dict[str, Any]] = []
+            for index, command in enumerate([self.command, *self.then]):
+                # The first step gets the whole timeout; later steps only what is left of it.
+                timeout = self.timeout if index == 0 else self.timeout - (self.clock() - started)
+                if timeout <= 0:
+                    steps.append({"exit_code": None, "result": "skipped: the tick's time is used up"})
+                    break
+                env = dict(os.environ, **{ENV_TICK_DEADLINE: f"{deadline_epoch:.3f}"})
+                with self._spawn_lock:
+                    if self._shutdown:
+                        LOG.warning("Watchdog is shutting down; step %d of the tick does not start", index + 1)
+                        return 500, {"status": "terminated", "seconds": round(self.clock() - started, 1)}
+                    try:
+                        process = self.popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                             start_new_session=True, env=env)
+                    except OSError as exc:
+                        LOG.error("Watchdog tick could not start: %s", exc)
+                        return 500, {"status": "error", "error": type(exc).__name__}
+                    self._process = process
                 try:
-                    stdout, stderr = process.communicate(timeout=self.timeout)
-                except subprocess.TimeoutExpired:
-                    LOG.error("Watchdog tick timed out after %ss; killing its process group", self.timeout)
-                    _out, stderr = self._kill_group(process)
-                    _write_stderr(stderr)
-                    return 500, {"status": "timeout", "seconds": round(self.clock() - started, 1)}
-            finally:
-                self._process = None
-            # The child's log lines (stderr) go to Cloud Logging; the response carries only the step summary.
-            _write_stderr(stderr)
-            if self._terminated:
-                return 500, {"status": "terminated", "seconds": round(self.clock() - started, 1)}
-            returncode = process.returncode
-            lines = [line for line in (stdout or "").splitlines() if line.strip()]
+                    try:
+                        stdout, stderr = process.communicate(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        LOG.error("Watchdog tick timed out after %ss; killing its process group", self.timeout)
+                        _out, stderr = self._kill_group(process)
+                        _write_stderr(stderr)
+                        return 500, {"status": "timeout", "seconds": round(self.clock() - started, 1)}
+                finally:
+                    self._process = None
+                # The child's log lines (stderr) go to Cloud Logging; the response carries only the step summary.
+                _write_stderr(stderr)
+                if self._terminated or self._shutdown:
+                    return 500, {"status": "terminated", "seconds": round(self.clock() - started, 1)}
+                lines = [line for line in (stdout or "").splitlines() if line.strip()]
+                steps.append({"exit_code": process.returncode,
+                              "result": (lines[-1] if lines else "")[:MAX_SUMMARY_CHARS]})
+            failed = [step["exit_code"] for step in steps if step["exit_code"]]
+            returncode = failed[0] if failed else 0
             summary = {"status": "ok" if returncode == 0 else "failed", "exit_code": returncode,
-                       "result": (lines[-1] if lines else "")[:MAX_SUMMARY_CHARS],
-                       "seconds": round(self.clock() - started, 1)}
+                       "result": steps[0]["result"], "seconds": round(self.clock() - started, 1)}
+            if self.then:
+                summary["steps"] = steps
             return (200 if returncode == 0 else 500), summary
         finally:
             self._lock.release()
@@ -359,7 +406,8 @@ def build_server(env: Mapping[str, str] | None = None, *, host: str = "", port: 
     if runner is None:
         if not project:
             raise RuntimeError(f"{ENV_PROJECT} is not set")
-        runner = TickRunner(tick_command(project))
+        first, *then = tick_commands(project, env)
+        runner = TickRunner(first, then=then)
     verifier = verifier or IdentityVerifier(
         str(env.get(ENV_AUDIENCE, "") or "").strip(), str(env.get(ENV_INVOKER, "") or "").strip(),
         verify_signature=str(env.get(ENV_VERIFY_SIGNATURE, "1")).strip() not in ("0", "false", "no", "off"))
@@ -371,8 +419,11 @@ def main() -> int:
     from .log_format import configure_logging
 
     configure_logging()
-    runner = TickRunner(tick_command(str(os.environ.get(ENV_PROJECT, "") or "").strip())) \
-        if str(os.environ.get(ENV_PROJECT, "") or "").strip() else None
+    project = str(os.environ.get(ENV_PROJECT, "") or "").strip()
+    runner = None
+    if project:
+        first, *then = tick_commands(project)
+        runner = TickRunner(first, then=then)
     server = build_server(runner=runner)
     install_sigterm(server, runner)
     LOG.info("Control VM watchdog listening on port %d", server.server_address[1])
