@@ -25,9 +25,13 @@ $APT update
 $APT install -y --no-install-recommends ca-certificates curl git jq unzip zip xz-utils zstd gnupg \
   build-essential cmake pkg-config libssl-dev python3 clang protobuf-compiler python3-pip \
   libcap-dev libasound2-dev bubblewrap \
-  musl-tools lld libc++-dev libc++abi-dev
+  musl-tools lld libc++-dev libc++abi-dev \
+  sqlite3 ripgrep libopus-dev libclang-dev
 # musl-tools .. libc++abi-dev: codex fork-release's static musl build
 # (.github/scripts/install-musl-build-tools.sh), which jobs here cannot apt-install.
+# sqlite3 .. libclang-dev: gcp-rust jobs routed from other repos (rustnzb tests shell
+# out to sqlite3; vogt engine tests to rg; the vogt voice sidecar builds against
+# opus and libclang).
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo "$VERSION_CODENAME") stable" \
