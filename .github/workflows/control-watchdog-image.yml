@@ -1,0 +1,130 @@
+name: Control watchdog image
+
+# Builds watchdog/Dockerfile and pushes it to Artifact Registry with Workload Identity Federation (no stored key).
+# Inert until the repository variables below are set (src/control_watchdog_deploy.py --dry-run prints them):
+#   WATCHDOG_IMAGE          <region>-docker.pkg.dev/<project>/<repository>/control-watchdog
+#   WATCHDOG_PUBLISHER_SA   the publisher service account e-mail
+#   WATCHDOG_WIF_PROVIDER   projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+#   WATCHDOG_BASE_IMAGE     gcr.io/google.com/cloudsdktool/google-cloud-cli:<version>-slim@sha256:<digest>
+# A pushed image changes nothing by itself: the Cloud Run job runs the digest the deploy pinned.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "cloud-init/control-vm-startup.sh"
+      - "watchdog/**"
+      - ".dockerignore"
+      - ".github/workflows/control-watchdog-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: control-watchdog-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ vars.WATCHDOG_IMAGE != '' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      IMAGE: ${{ vars.WATCHDOG_IMAGE }}
+      BASE_IMAGE: ${{ vars.WATCHDOG_BASE_IMAGE }}
+      PUBLISHER_SA: ${{ vars.WATCHDOG_PUBLISHER_SA }}
+      WIF_PROVIDER: ${{ vars.WATCHDOG_WIF_PROVIDER }}
+    steps:
+      - name: Check settings
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$BASE_IMAGE" =~ ^gcr\.io/google\.com/cloudsdktool/google-cloud-cli:[0-9][0-9.]*-slim@sha256:[0-9a-f]{64}$ ]] \
+            || fail "WATCHDOG_BASE_IMAGE must be google-cloud-cli:<version>-slim pinned by digest"
+          [[ "$IMAGE" =~ ^[a-z0-9-]+-docker\.pkg\.dev/[a-z][a-z0-9-]+/[a-z][a-z0-9-]*/control-watchdog$ ]] \
+            || fail "WATCHDOG_IMAGE must be <region>-docker.pkg.dev/<project>/<repository>/control-watchdog"
+          [[ "$PUBLISHER_SA" =~ ^[a-z][a-z0-9-]+@[a-z][a-z0-9-]+\.iam\.gserviceaccount\.com$ ]] \
+            || fail "WATCHDOG_PUBLISHER_SA must be a service account e-mail"
+          [[ "$WIF_PROVIDER" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$ ]] \
+            || fail "WATCHDOG_WIF_PROVIDER must be the provider's full resource name"
+
+      - name: Check out
+        # actions/checkout v4, pinned to the commit the v4 tag resolved to on 2026-10-17.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          docker build \
+            --pull \
+            --file watchdog/Dockerfile \
+            --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.base.name=${BASE_IMAGE}" \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
+            .
+
+      - name: Smoke test
+        run: |
+          docker run --rm --entrypoint python3 "${IMAGE}:${GITHUB_SHA}" -B -c \
+            "import lib.control_vm, lib.gcs_control_state, lib.image_tracking, lib.control_watchdog_server; print('imports ok')"
+          docker run --rm --entrypoint python3 "${IMAGE}:${GITHUB_SHA}" -B /app/src/control_vm.py ensure --help \
+            | grep -q -- --skip-if-idle
+          # The server answers /health, and refuses a tick without an identity token.
+          docker run -d --name watchdog-smoke -p 127.0.0.1:18080:8080 -e WATCHDOG_PROJECT=smoke \
+            -e WATCHDOG_AUDIENCE=https://smoke.invalid -e WATCHDOG_INVOKER=smoke@smoke.invalid "${IMAGE}:${GITHUB_SHA}"
+          trap 'docker rm -f watchdog-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/health >/dev/null 2>&1 && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18080/health | grep -q '"ok"'
+          status="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18080/tick)"
+          [[ "$status" == 403 ]] || { echo "::error::unauthenticated tick answered ${status}"; exit 1; }
+
+      - name: Authenticate to Artifact Registry
+        run: |
+          set -euo pipefail
+          registry="${IMAGE%%/*}"
+          audience="https://iam.googleapis.com/${WIF_PROVIDER}"
+          oidc="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}" | jq -r '.value')"
+          echo "::add-mask::${oidc}"
+          federated="$(jq -n --arg aud "//iam.googleapis.com/${WIF_PROVIDER}" --arg token "${oidc}" '{
+              audience: $aud,
+              grantType: "urn:ietf:params:oauth:grant-type:token-exchange",
+              requestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+              scope: "https://www.googleapis.com/auth/cloud-platform",
+              subjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+              subjectToken: $token}' \
+            | curl -fsS -X POST -H "Content-Type: application/json" --data @- https://sts.googleapis.com/v1/token \
+            | jq -r '.access_token')"
+          echo "::add-mask::${federated}"
+          access="$(curl -fsS -X POST -H "Authorization: Bearer ${federated}" -H "Content-Type: application/json" \
+            --data '{"scope": ["https://www.googleapis.com/auth/cloud-platform"], "lifetime": "600s"}' \
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${PUBLISHER_SA}:generateAccessToken" \
+            | jq -r '.accessToken')"
+          echo "::add-mask::${access}"
+          [[ -n "$access" && "$access" != null ]] || { echo "::error::no access token"; exit 1; }
+          printf '%s' "${access}" | docker login --username oauth2accesstoken --password-stdin "https://${registry}"
+
+      - name: Push
+        run: |
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${GITHUB_SHA}")"
+          {
+            echo "### Control watchdog image"
+            echo
+            echo "| Reference | Value |"
+            echo "| --- | --- |"
+            echo "| Commit tag | \`${IMAGE}:${GITHUB_SHA}\` |"
+            echo "| Digest | \`${digest}\` |"
+            echo "| Base | \`${BASE_IMAGE}\` |"
+            echo
+            echo "Deploy it with \`src/control_watchdog_deploy.py --image=${digest}\` (dry run first)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Log out
+        if: always()
+        run: docker logout "${IMAGE%%/*}" || true

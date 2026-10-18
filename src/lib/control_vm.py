@@ -28,6 +28,7 @@ Standard library only.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import edge_state
+from . import image_tracking
 from .edge_state import (
     CONTROL_SLOTS,
     DEFAULT_ORIGIN_DOMAIN,
@@ -217,6 +219,9 @@ class ControlConfig:
     controlled_targets: str = ""
     global_admins: str = ""
     provisioning: str = PROVISIONING_SPOT
+    # SPOT_DASHBOARD_IMAGE_TRACK: "" (off) or "main" (roll out the published :main image; see image_tracking).
+    image_track: str = ""
+    image_track_token: str = field(default="", repr=False)
 
     @classmethod
     def from_env(cls, project: str, env: Mapping[str, str] | None = None, **overrides: Any) -> ControlConfig:
@@ -252,6 +257,9 @@ class ControlConfig:
             config_repo=str(env.get(ENV_CONFIG_REPO, "") or "").strip(),
             controlled_targets=str(env.get(ENV_CONTROLLED_TARGETS, "") or "").strip(),
             global_admins=str(env.get(ENV_GLOBAL_ADMINS, "") or "").strip(),
+            # Normalized but never defaulted when set, like the provisioning mode: a misspelt value pauses changes.
+            image_track=str(env.get(image_tracking.ENV_IMAGE_TRACK, "") or "").strip().lower(),
+            image_track_token=str(env.get(image_tracking.ENV_IMAGE_TRACK_TOKEN, "") or "").strip(),
         )
         values.update({key: value for key, value in overrides.items() if value is not None})
         values["provisioning"] = provisioning
@@ -288,6 +296,21 @@ class ControlConfig:
                     f"{', '.join(FREE_TIER_REGIONS)}; SPOT_CONTROL_REGIONS also lists {', '.join(outside)}"]
         return []
 
+    @property
+    def tracking(self) -> bool:
+        """True when the published :main dashboard image is rolled out automatically."""
+        return self.image_track == image_tracking.TRACK_MAIN
+
+    def tracking_problems(self) -> list[str]:
+        """Problems with SPOT_DASHBOARD_IMAGE_TRACK (empty when it is off)."""
+        if self.image_track not in image_tracking.TRACK_VALUES:
+            return [f"{image_tracking.ENV_IMAGE_TRACK} must be empty or {image_tracking.TRACK_MAIN}, "
+                    f"not {self.image_track!r}"]
+        if self.tracking and self.dashboard_repo != DEFAULT_DASHBOARD_REPO:
+            return [f"{image_tracking.ENV_IMAGE_TRACK}=main follows {DEFAULT_DASHBOARD_IMAGE_REPO}, which only "
+                    f"{DEFAULT_DASHBOARD_REPO} publishes; SPOT_DASHBOARD_REPO is {self.dashboard_repo}"]
+        return []
+
     def runtime_problems(self) -> list[str]:
         """Settings without which the manager cannot observe or control the VMs safely."""
         problems = []
@@ -298,6 +321,7 @@ class ControlConfig:
         if not self.regions:
             problems.append("no control VM regions are allowed")
         problems.extend(self.provisioning_problems())
+        problems.extend(self.tracking_problems())
         return problems
 
     @property
@@ -524,6 +548,9 @@ class ControlVm:
     machine_type: str = ""
     instance_id: str = ""
     provisioning_model: str = ""  # MODEL_SPOT, MODEL_STANDARD, or "" when the inventory did not say
+    # scheduling.automaticRestart: True means GCE restarts the VM by itself after a crash or host error, so a
+    # TERMINATED status is not a stable fence (see _stable_stop). None when the inventory did not say.
+    automatic_restart: bool | None = None
 
     @property
     def region(self) -> str:
@@ -560,6 +587,13 @@ def provisioning_model_of(row: Mapping[str, Any]) -> str:
     return ""
 
 
+def automatic_restart_of(row: Mapping[str, Any]) -> bool | None:
+    """``scheduling.automaticRestart`` of an inventory row: True, False, or None when absent."""
+    scheduling = row.get("scheduling")
+    value = scheduling.get("automaticRestart") if isinstance(scheduling, dict) else None
+    return value if isinstance(value, bool) else None
+
+
 def parse_control_vms(rows: Any) -> list[ControlVm]:
     """Convert ``gcloud compute instances list --format=json`` rows to labelled control VMs."""
     if not isinstance(rows, list):
@@ -584,6 +618,7 @@ def parse_control_vms(rows: Any) -> list[ControlVm]:
             machine_type=str(row.get("machineType", "")).rsplit("/", 1)[-1],
             instance_id=str(row.get("id", "")),
             provisioning_model=provisioning_model_of(row),
+            automatic_restart=automatic_restart_of(row),
         ))
     return result
 
@@ -935,7 +970,7 @@ def list_command(project: str) -> list[str]:
     return ["gcloud", "compute", "instances", "list", f"--project={project}",
             f"--filter=labels.{ROLE_LABEL}={ROLE_VALUE}",
             "--format=json(name,zone,status,labels,id,machineType,scheduling.provisioningModel,"
-            "scheduling.preemptible)"]
+            "scheduling.preemptible,scheduling.automaticRestart)"]
 
 
 def zones_command(project: str, machine_types: Sequence[str] = CONTROL_MACHINE_TYPES) -> list[str]:
@@ -946,6 +981,32 @@ def zones_command(project: str, machine_types: Sequence[str] = CONTROL_MACHINE_T
 def start_command(vm: ControlVm, project: str) -> list[str]:
     return ["gcloud", "compute", "instances", "start", vm.name, f"--zone={vm.zone}",
             f"--project={project}", "--quiet"]
+
+
+def no_restart_command(vm: ControlVm, project: str) -> list[str]:
+    """Turn off GCE automatic restart, so a TERMINATED control VM stays down until this manager starts it."""
+    return ["gcloud", "compute", "instances", "set-scheduling", vm.name, f"--zone={vm.zone}",
+            f"--project={project}", "--no-restart-on-failure", "--quiet"]
+
+
+def metadata_command(vm: ControlVm, project: str) -> list[str]:
+    """Read-only: a control VM's id and instance metadata (its pinned ``dashboard-image``)."""
+    return ["gcloud", "compute", "instances", "describe", vm.name, f"--zone={vm.zone}", f"--project={project}",
+            "--format=json(id,metadata.items)"]
+
+
+def dashboard_image_of(stdout: str | None) -> tuple[str, str]:
+    """(instance id, dashboard-image metadata value) from ``metadata_command`` output; "" when absent."""
+    try:
+        row = json.loads(stdout or "{}")
+    except ValueError:
+        return "", ""
+    if not isinstance(row, dict):
+        return "", ""
+    items = (row.get("metadata") or {}).get("items") if isinstance(row.get("metadata"), dict) else None
+    image = next((str(i.get("value") or "") for i in items or [] if isinstance(i, dict)
+                  and i.get("key") == "dashboard-image"), "")
+    return str(row.get("id") or ""), image
 
 
 def stop_command(vm: ControlVm, project: str) -> list[str]:
@@ -973,8 +1034,11 @@ def create_command(config: ControlConfig, slot: str, offer: ControlOffer, startu
     metadata = ",".join(f"{key}={value}" for key, value in metadata_items(config, slot).items())
     if config.standard:
         # Always-on: live-migrated through host maintenance. --no-restart-on-failure keeps the invariant the
-        # rollback and recovery fences rely on: a stopped control VM stays stopped until this manager starts it
-        # (GCE would otherwise restart it on its own after a host failure). The manager restarts it instead.
+        # rollback and recovery fences rely on: they accept a TERMINATED VM as fenced, and GCE automatic restart
+        # would bring a crashed (TERMINATED, not API-stopped) VM back by itself after the fence passed, possibly
+        # while origin:active, which is eventually consistent, still names it. A frozen VM would come back frozen
+        # (the freeze marker lives on its boot disk), but a VM fenced by stop has no such marker. The manager (the
+        # watchdog runs it every 2 minutes) restarts a stopped standard VM instead. See docs/edge-dashboard.md.
         scheduling = ["--provisioning-model=STANDARD", "--maintenance-policy=MIGRATE", "--no-restart-on-failure"]
     else:
         scheduling = ["--provisioning-model=SPOT", "--instance-termination-action=STOP"]
@@ -1012,11 +1076,14 @@ def created_instance_id(stdout: str | None, name: str) -> str:
                  if isinstance(row, dict) and row.get("name") == name and row.get("id")), "")
 
 
+GCLOUD_TIMEOUT_SECONDS = 600  # the longest single provider call; the lease guard leaves more than this
+
+
 def default_gcloud(argv: list[str]) -> Any:
     # Never accept partial Compute results (for example a zone that could not be listed): an omitted
     # VM would look missing and could be created again, giving two VMs the same slot identity.
     env = dict(os.environ, CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR="false") if argv[1:2] == ["compute"] else None
-    return subprocess.run(argv, check=False, text=True, capture_output=True, timeout=600, env=env)
+    return subprocess.run(argv, check=False, text=True, capture_output=True, timeout=GCLOUD_TIMEOUT_SECONDS, env=env)
 
 
 def default_offer_source(config: ControlConfig, gcloud: Callable[[list[str]], Any]) -> list[ControlOffer]:
@@ -1095,7 +1162,8 @@ class ControlVmManager:
                  kv: CloudflareKv | None = None,
                  requester: edge_state.Requester | None = None,
                  offer_source: Callable[[], list[ControlOffer]] | None = None,
-                 clock: Callable[[], float] | None = None) -> None:
+                 clock: Callable[[], float] | None = None,
+                 image_tracker: image_tracking.ImageTracker | None = None) -> None:
         import time as _time
         self.config = config
         self.state = state
@@ -1108,6 +1176,12 @@ class ControlVmManager:
         self._snapshot: dict[str, Any] | None = None
         # (transition id, snapshot) captured when the rollback fence froze the replacement this run.
         self._replacement_freeze: tuple[str, dict[str, Any] | None] | None = None
+        self._image_tracker = image_tracker
+        self._rollout: image_tracking.RolloutDecision | None = None  # set by plan() for the rotate it returns
+        # Previews (tick without apply) record what an applied tick would change, so a caller can tell an idle
+        # check (nothing to do, nothing to save) from one that needs the lock.
+        self.preview_state: dict | None = None
+        self.preview_actions: list[str] = []
         self.log: list[str] = []
 
     # -- state ---------------------------------------------------------------------------
@@ -1186,6 +1260,7 @@ class ControlVmManager:
 
     # -- planning ------------------------------------------------------------------------
     def plan(self, obs: Observation, *, force_rotate: bool = False, control_state: Mapping | None = None) -> Plan:
+        self._rollout = None
         if obs.problems:
             return _wait("; ".join(obs.problems))
         if force_rotate and obs.offers is None and not self.cstate.get("transition"):
@@ -1194,38 +1269,221 @@ class ControlVmManager:
                          offers=obs.offers, control_state=control_state or self.cstate, now=self.clock(),
                          max_daily_usd=self.config.max_daily_usd, force_rotate=force_rotate,
                          provisioning=self.config.provisioning)
+        if self.config.tracking and not force_rotate and control_state is None:
+            plan = self._image_rollout(obs, plan) or plan
         if self.config.standard and plan.offer is not None and not plan.resume:
             # Refuse before a transition begins (for example the switch from Spot) rather than after it fails
             # to create: a free-tier VM without a pinned published image would have to build on 1 GB.
-            problems = self.config.create_problems()
+            image = (self._rollout.image if self._rollout else self._base_image()) if self.config.tracking else ""
+            problems = (dataclasses.replace(self.config, dashboard_image=image) if image
+                        else self.config).create_problems()
             if problems:
                 return _wait(f"{plan.action} refused: " + "; ".join(problems), slot=plan.slot)
         return plan
 
-    def tick(self, *, apply: bool, force_rotate: bool = False) -> Plan:
-        """One lifecycle step. Without ``apply`` only reads happen and nothing is saved."""
-        if not apply:
-            real_state = self.state
-            self.state = copy.deepcopy(real_state)  # Previews never touch the caller's state.
-            try:
-                obs = self.observe(want_offers=True if force_rotate else None)
-                update_tracking(self.cstate, obs.origin, obs.vms, obs.health, self.clock())
-                plan = self.plan(obs, force_rotate=force_rotate)
-            finally:
-                self.state = real_state
-            self._note("plan (dry run, nothing changed): %s", plan.describe())
-            return plan
-        obs = self.observe(want_offers=True if force_rotate else None)
+    def _prepare(self, obs: Observation, *, apply: bool) -> None:
+        """The state changes and maintenance every tick makes before it plans (on the preview copy without apply)."""
         now = self.clock()
         if not obs.problems and obs.origin_known:
             update_tracking(self.cstate, obs.origin, obs.vms, obs.health, now)
         if obs.offers is not None:
             self.cstate["last_price_check_at"] = now
+        if not obs.problems:
+            self._disable_automatic_restart(obs, apply=apply)
+
+    def tick(self, *, apply: bool, force_rotate: bool = False) -> Plan:
+        """One lifecycle step. Without ``apply`` only reads happen and nothing is saved."""
+        self.preview_actions = []
+        if not apply:
+            real_state = self.state
+            self.state = copy.deepcopy(real_state)  # Previews never touch the caller's state.
+            try:
+                obs = self.observe(want_offers=True if force_rotate else None)
+                self._prepare(obs, apply=False)
+                plan = self.plan(obs, force_rotate=force_rotate)
+                self.preview_state = self.state
+            finally:
+                self.state = real_state
+            self._note("plan (dry run, nothing changed): %s", plan.describe())
+            return plan
+        obs = self.observe(want_offers=True if force_rotate else None)
+        self._prepare(obs, apply=True)
         plan = self.plan(obs, force_rotate=force_rotate)
         self._note("plan: %s", plan.describe())
         self.execute(plan, obs)
         self.save()
         return plan
+
+    def preview_is_idle(self, plan: Plan, saved_state: Mapping[str, Any]) -> bool:
+        """After ``tick(apply=False)``: True when an applied tick would change nothing. The plan waits or is a
+        noop, no maintenance action is pending, and the preview state equals ``saved_state`` apart from the
+        ``updated_at`` stamp. Such a check needs neither the project lock nor a state write."""
+        if plan.action not in ("wait", "noop") or self.preview_actions or self.preview_state is None:
+            return False
+
+        def strip(state: Mapping[str, Any]) -> dict:
+            copied = copy.deepcopy(dict(state))
+            section = copied.get(STATE_KEY)
+            if isinstance(section, dict):
+                section.pop("updated_at", None)
+            return copied
+        return strip(self.preview_state) == strip(saved_state)
+
+    # -- automatic restart -----------------------------------------------------------------
+    def _disable_automatic_restart(self, obs: Observation, *, apply: bool) -> None:
+        """Turn off GCE automatic restart on every control VM that has it (for example one an operator changed).
+
+        The recovery and rollback fences accept a TERMINATED VM as fenced. With automatic restart, a VM that
+        crashed (TERMINATED without an API stop) can come back by itself after the fence passed, so the manager
+        keeps the setting off everywhere, ahead of any fence, and restarts stopped standard VMs itself.
+        """
+        for vm in obs.vms:
+            if vm.automatic_restart is not True:
+                continue
+            if not apply:
+                self.preview_actions.append(f"turn off automatic restart on {vm.name}")
+                self._note("would turn off GCE automatic restart on %s (dry run)", vm.name)
+                continue
+            result = self.gcloud(no_restart_command(vm, self.config.project))
+            if result.returncode == 0:
+                self._note("turned off GCE automatic restart on %s: fences rely on a stopped control VM staying "
+                           "stopped, and this manager restarts it instead", vm.name, level=logging.WARNING)
+            else:
+                self._note("could not turn off GCE automatic restart on %s: %s", vm.name,
+                           (result.stderr or "").strip()[:300], level=logging.ERROR)
+
+    def _stable_stop(self, t: dict, role: str, vm: ControlVm) -> bool:
+        """True when ``vm``, observed stopped, stays stopped: GCE automatic restart is not on for it.
+
+        Otherwise turn it off (only on the recorded instance) and wait for a fresh observation to confirm it.
+        """
+        if vm.automatic_restart is not True:
+            return True
+        problem = self._identity_problem(t, role, vm, adopt=False)
+        if problem:
+            t["error"] = f"refusing to change scheduling: {problem}"
+        else:
+            result = self.gcloud(no_restart_command(vm, self.config.project))
+            t["error"] = (f"{vm.name} is {vm.status}, but GCE automatic restart is on, so it could restart by "
+                          f"itself after this fence; turned it off (exit {getattr(result, 'returncode', None)}) and "
+                          f"waiting for the inventory to confirm")
+        t["updated_at"] = self.clock()
+        self.save()
+        self._note(t["error"], level=logging.WARNING)
+        return False
+
+    # -- image tracking ------------------------------------------------------------------
+    def _tracker(self) -> image_tracking.ImageTracker:
+        if self._image_tracker is None:
+            token = self.config.image_track_token
+            repository = DEFAULT_DASHBOARD_IMAGE_REPO
+            self._image_tracker = image_tracking.ImageTracker(
+                repository,
+                image_tracking.RegistryClient(repository, token) if token else None,
+                image_tracking.GitHubClient(self.config.dashboard_repo, token) if token else None,
+                self.clock)
+        return self._image_tracker
+
+    def _active_image(self, vm: ControlVm) -> str:
+        """The ``dashboard-image`` the active VM was created with: from state when it names this instance, else
+        read once from the instance metadata (read-only) and recorded."""
+        record = (self.cstate.get("image") or {}).get("active")
+        if isinstance(record, dict) and record.get("slot") == vm.slot and vm.instance_id \
+                and str(record.get("instance_id") or "") == vm.instance_id:
+            return str(record.get("image") or "")
+        result = self.gcloud(metadata_command(vm, self.config.project))
+        if result.returncode != 0:
+            self._note("could not read the dashboard image of %s: %s", vm.name, (result.stderr or "").strip()[:200],
+                       level=logging.WARNING)
+            return ""
+        instance_id, image = dashboard_image_of(result.stdout)
+        if not instance_id or instance_id != vm.instance_id:
+            return ""
+        self.cstate.setdefault("image", {})["active"] = {"slot": vm.slot, "instance_id": vm.instance_id,
+                                                         "image": image, "at": self.clock(), "source": "metadata"}
+        return image
+
+    def _base_image(self) -> str:
+        """Image for a new control VM that is not an image rollout while tracking: the active VM's recorded image
+        (so a recovery never moves to another image), else the configured one."""
+        record = (self.cstate.get("image") or {}).get("active") or {}
+        recorded = str(record.get("image") or "")
+        digest, commit = image_tracking.parse_image(recorded, DEFAULT_DASHBOARD_IMAGE_REPO)
+        if digest:
+            return recorded
+        if commit:
+            # A published commit tag (the standard VM accepts it) is kept as is, never replaced by an older
+            # configured image. Spot VMs take digests only, so resolve the tag's digest once and record it.
+            if self.config.standard:
+                return recorded
+            resolved = str(record.get("resolved_image") or "")
+            if not resolved:
+                registry = self._tracker().registry
+                try:
+                    resolved = image_tracking.digest_ref(DEFAULT_DASHBOARD_IMAGE_REPO, registry.resolve(commit)) \
+                        if registry is not None else ""
+                except image_tracking.TrackingError as exc:
+                    self._note("could not resolve %s to a digest: %s", recorded, exc, level=logging.WARNING)
+                    resolved = ""
+                if resolved:
+                    self.cstate.setdefault("image", {}).setdefault("active", {})["resolved_image"] = resolved
+            # Unresolved: the commit tag itself, which create_problems refuses on Spot, so the step waits instead of
+            # moving to another image.
+            return resolved or recorded
+        return self.config.effective_dashboard_image
+
+    def _image_rollout(self, obs: Observation, plan: Plan) -> Plan | None:
+        """While tracking: a rotate plan to a newer published :main image, or the base plan with the reason."""
+        if plan.action != "noop" or self.cstate.get("transition") or obs.origin is None:
+            return None
+        active, other = obs.vm(obs.origin.slot), obs.vm(other_slot(obs.origin.slot))
+        if active is not None and not self._same_provisioning(active):
+            # A rollout creates the replacement in the configured mode, so it would switch modes implicitly; the
+            # switch between standard and Spot is always an explicit operator rotate (or the planner's own switch).
+            reason = (f"image rollout held: {active.name} is {active.provisioning_model or 'of unknown model'} but "
+                      f"{ENV_PROVISIONING}={self.config.provisioning}; an explicit rotate is required to change "
+                      f"modes")
+            self._note(reason, level=logging.WARNING)
+            return Plan(plan.action, f"{plan.reason}; {reason}", slot=plan.slot, target_slot=plan.target_slot,
+                        offer=plan.offer)
+        ready = (active is not None and active.running and other is None
+                 and (obs.health.get(obs.origin.slot) or HealthResult.unknown()).ok)
+        now = self.clock()
+        last_end = max(self.cstate.get("last_transition_end_at") or 0, self.cstate.get("last_abort_at") or 0)
+        cooling = bool(last_end and now - last_end < ROTATION_COOLDOWN_SECONDS)
+        active_image = self._active_image(active) if (ready and not cooling) else ""  # may record it in state
+        cache = copy.deepcopy(self.cstate.get("image") or {})
+        before = copy.deepcopy(cache)
+        decision = self._tracker().evaluate(cache, active_image=active_image, transition_active=False,
+                                            active_ready=ready, cooling=cooling, now=now)
+        if cache != before:
+            self.cstate["image"] = cache
+        if not decision.roll:
+            return Plan(plan.action, f"{plan.reason}; image tracking: {decision.reason}", slot=plan.slot,
+                        target_slot=plan.target_slot, offer=plan.offer)
+        offers = obs.offers
+        if offers is None:
+            try:
+                offers = list(self.offer_source())
+            except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+                return Plan(plan.action, f"{plan.reason}; image rollout waits: offer scan failed: {exc}",
+                            slot=plan.slot)
+        best = choose_offer(offers, self.config.max_daily_usd)
+        if best is None:
+            return Plan(plan.action, f"{plan.reason}; image rollout waits: no offer under the cap", slot=plan.slot)
+        self._rollout = decision
+        return Plan("rotate", f"image rollout: {decision.reason}", slot=active.slot,
+                    target_slot=other_slot(active.slot), offer=best)
+
+    def _same_provisioning(self, vm: ControlVm) -> bool:
+        """The VM runs the configured mode: standard needs a VM the inventory reports standard; Spot accepts a Spot
+        VM or one whose model is unknown (VMs listed before the model was recorded were all Spot)."""
+        return vm.standard if self.config.standard else not vm.standard
+
+    def _create_config(self, t: Mapping[str, Any]) -> ControlConfig:
+        """The configuration a transition creates its VM with: its recorded image when it pinned one."""
+        image = t.get("dashboard_image")
+        return dataclasses.replace(self.config, dashboard_image=image) if image else self.config
 
     # -- execution -----------------------------------------------------------------------
     def execute(self, plan: Plan, obs: Observation) -> None:
@@ -1306,6 +1564,13 @@ class ControlVmManager:
             "error": None,
             "reason": plan.reason,
         }
+        if self.config.tracking:
+            # Pin the image every controller that resumes this transition creates, whatever its own settings.
+            rollout = self._rollout if mode == MODE_PRICE else None
+            transition["dashboard_image"] = rollout.image if rollout else self._base_image()
+            if rollout:
+                transition["image_rollout"] = {"image": rollout.image, "digest": rollout.digest,
+                                               "revision": rollout.revision, "from_revision": rollout.from_revision}
         self.cstate["transition"] = transition
         self.save()
         self._note("began %s transition %s -> slot %s: %s", mode, plan.slot or "-", new_slot, plan.reason)
@@ -1432,6 +1697,12 @@ class ControlVmManager:
         return "advance"
 
     def _finish(self, t: dict) -> str:
+        new_vm = t.get("new_vm") or {}
+        if new_vm.get("dashboard_image"):
+            # The image the serving VM was created with; image tracking and recoveries start from it.
+            self.cstate.setdefault("image", {})["active"] = {
+                "slot": t["new_slot"], "instance_id": new_vm.get("instance_id"), "image": new_vm["dashboard_image"],
+                "at": self.clock(), "source": f"transition {t['id']}"}
         self.cstate["transition"] = None
         self.cstate["last_transition_end_at"] = self.clock()
         self.cstate.setdefault("down_since", {}).pop(t["new_slot"], None)
@@ -1583,18 +1854,20 @@ class ControlVmManager:
                 return self._create_failed(t, "every affordable machine type and zone failed; retrying all next tick")
             return self._create_failed(t, "no priced offer under the cap")
         script = render_control_startup()
+        create_config = self._create_config(t)
         with tempfile.TemporaryDirectory(prefix="spot-control-") as tmp:
             script_path = Path(tmp) / "control-vm-startup.sh"
             script_path.write_text(script, encoding="utf-8")
             for offer in candidates[:CREATE_ATTEMPTS_PER_TICK]:
                 try:
-                    command = create_command(self.config, t["new_slot"], offer, str(script_path))
+                    command = create_command(create_config, t["new_slot"], offer, str(script_path))
                 except ValueError as exc:
                     return self._create_failed(t, f"invalid control VM settings: {exc}")
                 # Persist the intended identity and the pending attempt before the provider call, so a
                 # crash or an ambiguous failure is reconciled in this zone before any other zone is tried.
                 t["new_vm"] = {"name": control_vm_name(t["new_slot"]), "zone": offer.zone,
-                               "machine_type": offer.machine_type}
+                               "machine_type": offer.machine_type,
+                               "dashboard_image": create_config.effective_dashboard_image or None}
                 t["pending_create"] = {"name": control_vm_name(t["new_slot"]), "zone": offer.zone,
                                        "machine_type": offer.machine_type, "at": self.clock()}
                 self.save()
@@ -1929,7 +2202,7 @@ class ControlVmManager:
             t, f"old slot {t['old_slot']} was fenced by stopping it, not by a confirmed freeze; changes it "
                f"accepted before it stopped may exist only on its boot disk")
         if old.status in STOPPED_STATES:
-            return True
+            return self._stable_stop(t, "old", old)
         if self._request_stop(t, "old", old, "old_stop_requested_at", "(unreachable old slot) before cutover"):
             t["error"] = f"waiting for old slot {t['old_slot']} ({old.status}) to stop before cutover"
             self.save()
@@ -2162,8 +2435,10 @@ class ControlVmManager:
         if not t.get("cutover_attempted") or not t.get("old_slot"):
             return True
         new = obs.vm(t["new_slot"])
-        if new is None or new.status in STOPPED_STATES or t.get("new_frozen"):
+        if new is None or t.get("new_frozen"):
             return True
+        if new.status in STOPPED_STATES:
+            return self._stable_stop(t, "new", new)
         if new.running:
             status, body = self._control(t["new_slot"], "freeze", "POST")
             version = body.get("state_version") if isinstance(body, dict) else None
@@ -2234,6 +2509,12 @@ class ControlVmManager:
                                    reason=t.get("carry_back_unconfirmed")
                                    or "rollback could not confirm its state reached the old VM"):
                 return "wait"
+        rollout = t.get("image_rollout") or {}
+        if rollout.get("digest"):
+            # Never retry this digest automatically; the next :main digest gets a fresh chance (after the cooldown).
+            image_tracking.record_failed(self.cstate.setdefault("image", {}), rollout["digest"])
+            self._note("image rollout to %s aborted; backing off that digest until %s:main moves", rollout["digest"],
+                       DEFAULT_DASHBOARD_IMAGE_REPO, level=logging.WARNING)
         self.cstate["transition"] = None
         self.cstate["last_abort_at"] = self.clock()
         self.cstate.setdefault("history", []).append(
@@ -2263,24 +2544,46 @@ class ControlVmManager:
                                       else None),
             "problems": obs.problems,
             "offers": [o.to_dict() for o in obs.offers[:5]] if obs.offers else None,
+            "image_track": self.config.image_track or None,
+            "image": self.cstate.get("image"),
         }
 
 
 def build_manager(project: str, state: dict, save: Callable[[], None], *,
-                  env: Mapping[str, str] | None = None, **overrides: Any) -> ControlVmManager:
+                  env: Mapping[str, str] | None = None, guard: Callable[[], None] | None = None,
+                  **overrides: Any) -> ControlVmManager:
+    """The manager with the real gcloud, KV and HTTP clients.
+
+    ``guard`` (the Cloud Storage lease's ``ensure``) runs before every gcloud call and every HTTP request (KV
+    reads and writes, health probes, control calls), so nothing reaches a provider once the lease can't be proven.
+    """
     config = ControlConfig.from_env(project, env, **overrides)
     kv_config = KvConfig.from_env(env)
-    return ControlVmManager(config, state, save, kv=CloudflareKv(kv_config) if kv_config else None)
+    if guard is None:
+        return ControlVmManager(config, state, save, kv=CloudflareKv(kv_config) if kv_config else None)
+
+    def gcloud(argv: list[str]) -> Any:
+        guard()
+        return default_gcloud(argv)
+
+    def requester(method: str, url: str, headers: Mapping[str, str], body: bytes | None,
+                  timeout: float) -> tuple[int, bytes]:
+        guard()
+        return edge_state.default_requester(method, url, headers, body, timeout)
+
+    return ControlVmManager(config, state, save, gcloud=gcloud, requester=requester,
+                            kv=CloudflareKv(kv_config, requester=requester) if kv_config else None)
 
 
 def autoscaler_tick(args: Any, state: dict, save: Callable[[], None], *,
-                    manager: ControlVmManager | None = None) -> Plan | None:
+                    manager: ControlVmManager | None = None,
+                    guard: Callable[[], None] | None = None) -> Plan | None:
     """Run one control VM step from the runner autoscaler loop; never raises."""
     dry_run = bool(getattr(args, "dry_run", False))
     try:
         # The autoscaler's --config-repo is the same central runner configuration repository the
         # dashboard reads its controlled targets from; when it is unset SPOT_CONFIG_REPO applies.
-        manager = manager or build_manager(args.project, state, save,
+        manager = manager or build_manager(args.project, state, save, guard=guard,
                                            config_repo=getattr(args, "config_repo", None) or None)
         plan = manager.tick(apply=not dry_run)
         if dry_run:
@@ -2302,6 +2605,10 @@ def autoscaler_tick(args: Any, state: dict, save: Callable[[], None], *,
 # controller started and then crashed in is resumed by the next controller that gets the lock.
 
 ENV_CONTROL_STATE_DIR = "SPOT_CONTROL_STATE_DIR"
+# gs://bucket[/prefix]: keep the project state and lock in Cloud Storage (lib.gcs_control_state) instead.
+ENV_CONTROL_STATE_URI = "SPOT_CONTROL_STATE_URI"
+# A local state file that migrate-state moved to Cloud Storage holds only {CONTROL_STATE_MOVED_KEY: <uri>, ...}.
+CONTROL_STATE_MOVED_KEY = "control_vm_state_moved_to"
 _PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}$")
 
 
@@ -2332,6 +2639,10 @@ def _must_preserve(cstate: Any) -> bool:
 class ProjectControlState:
     """The project's control VM state file, read and written only while the project lock is held."""
 
+    # Called before every provider call while this state is held (the Cloud Storage lease); None for the local
+    # file, whose flock holds for as long as the process does.
+    guard: Callable[[], None] | None = None
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self.state: dict[str, Any] = {}
@@ -2340,7 +2651,16 @@ class ProjectControlState:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
+            backups = sorted(self.path.parent.glob(f"{self.path.name}.migrated-*"))
+            if backups:
+                # A migrated file whose marker is gone is never empty state: the state lives elsewhere.
+                raise ControlStateConflict(f"control VM state {self.path} is missing but {backups[-1].name} shows it "
+                                           f"was migrated; set {ENV_CONTROL_STATE_URI}, or restore the file by hand")
             data = {}
+        if isinstance(data, dict) and CONTROL_STATE_MOVED_KEY in data:
+            # Fail closed: this file was migrated, and acting on it would fork the state.
+            raise ControlStateConflict(f"control VM state {self.path} moved to {data.get(CONTROL_STATE_MOVED_KEY)}; "
+                                       f"set {ENV_CONTROL_STATE_URI}={data.get(CONTROL_STATE_MOVED_KEY)}")
         if not isinstance(data, dict) or not isinstance(data.get(STATE_KEY, {}), dict):
             # Never start over from defaults: an unreadable record could hide an in-progress transition.
             raise ControlStateConflict(f"control VM state {self.path} is not a JSON object; repair it by hand")
@@ -2414,6 +2734,34 @@ class ProjectControlLock:
             self._handle = None
 
 
+def control_state_uri(env: Mapping[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_CONTROL_STATE_URI, "") or "").strip()
+
+
+def open_project_control_lock(project: str, directory: Path | str | None = None,
+                              env: Mapping[str, str] | None = None) -> Any:
+    """The project lock for the configured backend: the Cloud Storage lease when ``SPOT_CONTROL_STATE_URI`` is
+    set, else the local flock. Both return the loaded state from ``__enter__``, or None when another controller
+    holds the lock."""
+    uri = control_state_uri(env)
+    if uri:
+        from .gcs_control_state import GcsProjectControlLock
+        return GcsProjectControlLock(project, uri)
+    return ProjectControlLock(project, directory)
+
+
+def load_project_control_state(project: str, directory: Path | str | None = None,
+                               env: Mapping[str, str] | None = None) -> ProjectControlState:
+    """Read the project state without taking the lock (previews and status)."""
+    uri = control_state_uri(env)
+    if uri:
+        from .gcs_control_state import load_state
+        return load_state(project, uri)
+    state_path, _lock = project_control_paths(project, directory)
+    return ProjectControlState(state_path).load()
+
+
 # --------------------------------------------------------------------------------------------
 # Command-line interface (src/control_vm.py)
 # --------------------------------------------------------------------------------------------
@@ -2469,6 +2817,16 @@ def args_parser() -> "argparse.ArgumentParser":
                        ("rotate", "Make-before-break rotation to the other slot now")):
         command = sub.add_parser(name, parents=[common], help=text)
         command.add_argument("--apply", action="store_true", help="Execute; without it only print the plan")
+        command.add_argument("--skip-if-locked", action="store_true",
+                             help="Exit 0 instead of failing when another controller holds the project lock")
+        if name == "ensure":
+            command.add_argument("--skip-if-idle", action="store_true",
+                                 help="With --apply: first plan read-only, and take the lock and save state only "
+                                      "when the step would change something (the watchdog's steady state)")
+    migrate = sub.add_parser("migrate-state", parents=[common],
+                             help=f"Upload the local project state to {ENV_CONTROL_STATE_URI} once; refuses when "
+                                  "both exist and differ")
+    migrate.add_argument("--apply", action="store_true", help="Upload; without it only report what would happen")
     return parser
 
 
@@ -2496,9 +2854,17 @@ def main(argv: Sequence[str] | None = None, *, manager_factory: Callable[..., Co
     legacy_path = args.state_file.expanduser()
     apply = bool(getattr(args, "apply", False))
     factory = manager_factory or build_manager
+    if args.command == "migrate-state":
+        uri = control_state_uri()
+        if not uri:
+            raise RuntimeError(f"set {ENV_CONTROL_STATE_URI}=gs://<bucket>[/<prefix>] to migrate the control VM state")
+        from .gcs_control_state import migrate_local_state
+        code, message = migrate_local_state(args.project, args.control_state_dir, uri, apply=apply)
+        print(message)
+        return code
 
-    def run(state: dict, save: Callable[[], None]) -> int:
-        manager = factory(args.project, state, save, **_overrides(args))
+    def run(state: dict, save: Callable[[], None], guard: Callable[[], None] | None = None) -> int:
+        manager = factory(args.project, state, save, **_overrides(args), **({"guard": guard} if guard else {}))
         if args.command == "status":
             print(json.dumps(manager.status(manager.observe(want_offers=True)), indent=2, sort_keys=True,
                              default=str))
@@ -2509,18 +2875,32 @@ def main(argv: Sequence[str] | None = None, *, manager_factory: Callable[..., Co
             print("Re-run with --apply to execute it.")
         return 0
 
-    if not apply:
+    if not apply or getattr(args, "skip_if_idle", False):
         # Read-only: plan on a copy that also folds in unmigrated controller state, and write nothing.
-        state_path, _lock = project_control_paths(args.project, args.control_state_dir)
-        project = ProjectControlState(state_path).load()
+        project = load_project_control_state(args.project, args.control_state_dir)
+        saved = copy.deepcopy(project.state)
         project.adopt(copy.deepcopy(read_scale_state(legacy_path)), legacy_path, persist=False)
-        return run(copy.deepcopy(project.state), lambda: None)
+        if not apply:
+            return run(copy.deepcopy(project.state), lambda: None)
+        preview = factory(args.project, copy.deepcopy(project.state), lambda: None, **_overrides(args))
+        plan = preview.tick(apply=False)
+        if preview.preview_is_idle(plan, saved):
+            # Nothing to do and nothing to save: no lock, no write (the watchdog's steady state).
+            print(f"Idle (no lock taken, nothing changed): {plan.describe()}")
+            return 0
     import fcntl
 
-    with ProjectControlLock(args.project, args.control_state_dir) as project:
+    lock = open_project_control_lock(args.project, args.control_state_dir)
+    with lock as project:
         if project is None:
-            raise RuntimeError(f"Another controller is managing the control VM of project {args.project}; wait "
-                               "for its check to finish")
+            message = f"Another controller is managing the control VM of project {args.project}; wait for its check " \
+                      "to finish"
+            if hasattr(lock, "describe_holder"):
+                message += f" (lease held by {lock.describe_holder()})"
+            if getattr(args, "skip_if_locked", False):
+                print(f"Skipped: {message}")
+                return 0
+            raise RuntimeError(message)
         legacy = read_scale_state(legacy_path) if legacy_path.exists() else {}
         if STATE_KEY in legacy:
             # Moving state out of a controller's file needs that controller's lock; a running autoscaler keeps
@@ -2536,4 +2916,4 @@ def main(argv: Sequence[str] | None = None, *, manager_factory: Callable[..., Co
                     legacy = read_scale_state(legacy_path)
                     if project.adopt(legacy, legacy_path, persist=True):
                         write_scale_state(legacy_path, legacy)
-        return run(project.state, project.save)
+        return run(project.state, project.save, project.guard)

@@ -16,6 +16,7 @@ controlled repository unless global administrators are enabled, which they are b
 | Tunnel hostnames | `spot-origin-a.swacktech.com`, `spot-origin-b.swacktech.com` | One Cloudflare Tunnel per slot, protected by a Cloudflare Access service token. |
 | Startup script | `cloud-init/control-vm-startup.sh` | Fetches secrets, pulls or builds the image, and starts both containers on every boot. |
 | Dashboard image | `dashboard/Dockerfile` | Built on the VM from a pinned commit, or pulled from `ghcr.io/swack-tools/spot-dashboard`. |
+| Watchdog | `watchdog/Dockerfile`, `src/control_watchdog_deploy.py` | A serverless HTTP service that runs one lifecycle step of `src/control_vm.py` every 3 minutes against shared state in a storage bucket. See [Watchdog](#watchdog). |
 
 The dashboard listens only on `127.0.0.1:8787`. The control VM has no inbound firewall rule for it.
 
@@ -372,7 +373,8 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
 
 - **One manager per project**: the `spot-control-a` and `spot-control-b` slots belong to the project, and
   more than one `--target` controller can enable `--manage-control-vm` there. Each check first takes an
-  exclusive lock on `control-vm-<project>.lock`. While another controller or `src/control_vm.py --apply`
+  exclusive lock on `control-vm-<project>.lock`, or the shared lease in a storage bucket when
+  `SPOT_CONTROL_STATE_URI` is set (see [Watchdog](#watchdog)). While another controller or `src/control_vm.py --apply`
   holds it, the autoscaler skips its control VM step for that check and logs why. Runner management
   continues either way.
 - **Shared control VM state**: the transition, retained boot disks, and history live in
@@ -380,6 +382,8 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   transition, the next controller that takes the lock resumes the same transition. Both files live in
   `SPOT_CONTROL_STATE_DIR`, which defaults to the autoscaler's default state directory. Every controller
   in the project must use the same directory, and the lock only serializes controllers on one machine.
+  `SPOT_CONTROL_STATE_URI` moves the state and the lock to a storage bucket, so controllers on different
+  machines, such as the watchdog and a workstation, share them.
 - **Moving earlier state**: control VM state that an older version saved in a controller's `--state-file`
   moves to the project file on that controller's first check. An idle copy is dropped. When both files
   hold different transitions or retained disks, that controller refuses to manage the control VM and
@@ -437,8 +441,9 @@ The autoscaler handles the control VM when you run it with `--manage-control-vm`
   slots without importing from the old VM, and when a recovery imported state from an old VM that never
   confirmed a freeze. The `reason` field in `retained_disks` says which case applies.
 
-Recovery depends on the autoscaler running. If the workstation that runs it is off, the dashboard stays
-down until the autoscaler runs again.
+Recovery depends on a controller running. The [watchdog](#watchdog) runs one check every 3 minutes
+without any workstation. Without it, the dashboard stays down while the workstation that runs the
+autoscaler is off.
 
 ## Use the free-tier control VM
 
@@ -458,8 +463,9 @@ The standard mode enforces what it can:
 
 - The only shape is `e2-micro`, created with `--provisioning-model=STANDARD`,
   `--maintenance-policy=MIGRATE`, and `--no-restart-on-failure`, and with no Spot flags or termination
-  action. Host maintenance live-migrates the VM. After a host failure, the autoscaler restarts it, rather than
-  Compute Engine, so a fenced control VM stays stopped until the autoscaler starts it.
+  action. Host maintenance live-migrates the VM. After a crash or a host failure, the manager restarts it,
+  rather than Compute Engine, so a fenced control VM stays stopped until the manager starts it. The manager
+  also turns automatic restart off on any control VM that has it. See [Restart policy](#restart-policy).
 - The boot disk is a 15 GB `pd-standard` disk. It holds Debian 12, Docker, the 2 GiB swap file, both
   images, and the capped container logs. Two such disks, during a cutover or with a retained boot disk,
   still fit in 30 GB-months.
@@ -570,6 +576,363 @@ To switch:
 1. Confirm that `status` lists only the new slot with `"provisioning_model": "STANDARD"` and that
    `origin:active` names it.
 
+<!-- Cloud Run, Cloud Storage, and Cloud Scheduler are product names, not the old "Cloud" shorthand for GCP. -->
+<!-- vale Google.WordList = NO -->
+
+## Watchdog
+
+The watchdog keeps the control VM alive and up to date without an operator workstation. Every 3 minutes, a
+Cloud Scheduler job sends `POST /tick` to a Cloud Run service, `src/control_watchdog_server.py`. Each request runs
+one lifecycle step in a child process and answers 200 with a JSON summary, or 500 when the step failed:
+
+```bash
+control_vm.py ensure --apply --skip-if-idle --skip-if-locked --project=PROJECT
+```
+
+The watchdog is a service, not a Cloud Run job, because of billing. Jobs use instance-based billing with a
+one-minute minimum per execution: every 2 minutes, that's about 1.3 million vCPU-seconds, or about $19 a month.
+A service with request-based billing pays only while a request runs, in 100 ms steps.
+
+| Part | Name (defaults) | Role |
+| --- | --- | --- |
+| Cloud Scheduler job | `spot-control-watchdog` | Sends `POST https://spot-control-watchdog-<project number>.<region>.run.app/tick` every 3 minutes with an OIDC identity token of `spot-watchdog-invoker`, whose audience is that URL. No retries. |
+| Cloud Run service | `spot-control-watchdog` | No unauthenticated access, concurrency 1, 0 to 1 instances, request-based billing (`--cpu-throttling`), 1 vCPU, 512 MiB, 15-minute request timeout. Runs as `spot-control-watchdog`. |
+| Watchdog image | `<region>-docker.pkg.dev/<project>/spot-control/control-watchdog` | `watchdog/Dockerfile`: the slim Google Cloud command-line tool image, pinned by digest, plus `src/` and the control VM startup script. |
+| State bucket | `gs://<project>-spot-control-state` | Holds `control-vm/control-vm-<project>.json` (the state) and `control-vm/control-vm-<project>.lock` (the lease). |
+| Secret Manager | See [Watchdog IAM](#watchdog-iam) | The service's secrets, passed as references in the service spec, never as values. |
+
+The service answers only these requests:
+
+| Request | Answer |
+| --- | --- |
+| `POST /tick` with the invoker's identity token | 200 or 500 with `{"status", "exit_code", "result", "seconds"}`; 429 with `Retry-After` while another tick runs |
+| `POST /tick` without it | 403, and no step runs |
+| `GET /health` | 200 |
+| Anything else | 404 or 405 |
+
+The path is `/health`, because Cloud Run reserves some paths that end in `z`, such as `/healthz`.
+
+Cloud Run IAM authenticates every request: the service allows no unauthenticated callers, and only
+`spot-watchdog-invoker` holds `roles/run.invoker` on it. The server checks the token again without any
+app-level secret. It needs an RS256 signature by a key from Google's published certificates, a Google
+issuer, the service URL as audience, an unexpired token, and the verified email of the invoker account.
+`--no-verify-signature` keeps the claim checks but skips the signature, for the case where a request reaches
+the container with the signature removed.
+
+Each tick runs in its own process group. A tick that runs longer than 14 minutes answers 500, and the server
+stops the whole group, including `gcloud` processes that the tick started. It sends `SIGTERM`, waits 10
+seconds, then sends `SIGKILL`. The server does the same when Cloud Run sends it `SIGTERM` at shutdown. The group is gone within
+855 seconds of the tick's start. No other controller can take the lease earlier than 1,260 seconds after the
+start (its 20-minute time to live plus the 60-second grace), so nothing that the tick started still runs when
+another controller acts. The lease guard returns only while more than 11 minutes of the lease remain, even
+when its own re-read of the lease was slow, which covers the longest single `gcloud` call of 10 minutes.
+
+Each tick works in this order:
+
+1. It reads the state from Cloud Storage without the lease and plans the step read-only.
+2. When the step changes nothing, it exits. A noop or wait plan with no maintenance action and no state change
+   is idle. Idle executions take no lease and write nothing.
+3. Otherwise it takes the lease, reads the state again, and runs the step. Every save is conditioned on the
+   state object's generation, and the lease guards every `gcloud` call and every HTTP request.
+4. When another controller holds the lease, the tick changes nothing and answers 200.
+
+A tick that fails answers 500, which Cloud Scheduler and Cloud Run report as a failed request.
+
+### Shared state and lease
+
+`SPOT_CONTROL_STATE_URI=gs://<bucket>[/<prefix>]` selects the Cloud Storage backend for `src/control_vm.py`
+and for `src/spot_runner_autoscaler.py --manage-control-vm`. Without it, both keep the local file and the
+`flock` lock. The backend uses the Cloud Storage JSON API with the standard library only. On Cloud Run the
+token comes from the metadata server (`SPOT_GCP_TOKEN_SOURCE=metadata`); on a workstation it comes from
+`gcloud auth print-access-token`.
+
+Every write carries an `ifGenerationMatch` precondition, so no write is ever based on a version that its
+writer didn't read:
+
+- **Take**: the lease object is created with `ifGenerationMatch=0`. Of two contenders, exactly one create
+  succeeds; the other reads the lease and stops.
+- **Hold**: the lease records its owner, a token, a 20-minute time to live, and its expiry. Its holder trusts
+  it only until the send time of its last successful write plus the time to live. It measures the time since
+  then as the larger of its monotonic and its wall-clock deltas, because on macOS the monotonic clock stops
+  while the machine sleeps. Before every `gcloud` call, HTTP request, and state save, the holder renews the
+  lease once less than 11 minutes are left. A single `gcloud` call times out after 10 minutes, so a call that
+  starts inside the lease also ends inside it. A renewal is conditioned on the lease's generation. When it
+  fails, the step stops before its next provider call.
+- **Suspend**: when the wall clock ran more than 5 seconds ahead of the monotonic clock since the holder last
+  confirmed the lease, the process was suspended, so the next guard renews before it acts. A workstation that
+  slept past the expiry finds the lease taken and stops. Without such a jump, the guard still reads the lease
+  object again every 2 minutes and stops when its generation is no longer the holder's.
+- **Break**: another controller breaks a lease only 60 seconds after its expiry. The expiry comes from the
+  Cloud Storage server clock: the lease object's `updated` time plus its time to live, or the expiry it
+  records when that's later, up to one hour. The break is a write conditioned on the stale generation, so of
+  two controllers that break it at once, one wins. A holder that comes back after a break can't renew,
+  save, or delete the new lease, because its generation no longer matches.
+- **Save**: the state is written with `ifGenerationMatch` set to the generation it loaded or last wrote. A
+  save after another controller wrote stops the step.
+- **Lost answers**: a write whose answer is lost, for example after a timeout, counts as written only when
+  reading the object back shows its unique write ID.
+- **Release**: the lease is deleted on exit, conditioned on its generation. A holder that crashed leaves the
+  lease in place, and the next controller waits up to 21 minutes before it breaks it.
+
+The state object wraps the same JSON as the local file in an envelope with a schema, the project, and the
+writer. An object for another project, or one that isn't that schema, stops every controller until it's
+repaired. A missing state object also stops `ensure --apply`, `rotate --apply`, and the autoscaler. That
+check keeps a controller from starting over from empty state while a workstation's local file still holds a
+transition. `migrate-state --apply` creates the object.
+
+The bucket keeps the default soft delete policy, so overwritten and deleted state versions stay
+recoverable for 7 days.
+
+### Container and registry
+
+The watchdog image is built on the slim Google Cloud command-line tool image, which supplies `gcloud`. The
+build adds Debian's `python3` when the image doesn't put one on `PATH`, and it fails unless Python is 3.11 or
+newer. The
+`.github/workflows/control-watchdog-image.yml` workflow pushes it to Artifact Registry in the project. The
+workflow authenticates with Workload Identity Federation, so no service account key exists. Cloud Run can't
+pull the private GitHub Container Registry package without a stored credential, and an image in the same
+project needs no pull credential at all.
+
+The alternative, a stock image that downloads a pinned repository archive at start-up, was rejected. It
+would make every recovery depend on GitHub being reachable, and it would need its own checksum
+verification. The custom image fixes the code and its dependencies in one digest, and the Cloud Run service runs
+exactly the digest that the deploy pinned. A pushed image changes nothing until you deploy its digest.
+
+The workflow stays inert until four repository variables are set, which the deploy dry run prints:
+`WATCHDOG_IMAGE`, `WATCHDOG_PUBLISHER_SA`, `WATCHDOG_WIF_PROVIDER`, and `WATCHDOG_BASE_IMAGE`. The workflow
+refuses a `WATCHDOG_BASE_IMAGE` that isn't `gcr.io/google.com/cloudsdktool/google-cloud-cli:<version>-slim`
+pinned by digest. The OIDC provider admits only that workflow on `main` of `swack-tools/spot-github-runners`.
+
+### Watchdog IAM
+
+`src/control_watchdog_deploy.py` grants each role on the narrowest resource that works:
+
+| Member | Role | Resource | Why |
+| --- | --- | --- | --- |
+| `spot-control-watchdog` | `roles/compute.instanceAdmin.v1` | Project, with the IAM condition `spot-control-vms-only` | List, describe, create, start, stop, set scheduling on, and delete the control VMs and their boot disks; list machine types; use the subnetwork and an external IP. The condition limits instances and disks to names that start with `spot-control-`. |
+| `spot-control-watchdog` | `roles/iam.serviceAccountUser` | The control VM service account only | Create control VMs that run as that account. |
+| `spot-control-watchdog` | `roles/storage.objectAdmin` | The state bucket only | Read and conditionally write the state and lease objects. |
+| `spot-control-watchdog` | `roles/secretmanager.secretAccessor` | Each referenced secret only | Read the service's secrets when an instance starts. |
+| `spot-watchdog-invoker` | `roles/run.invoker` | The Cloud Run service only | Let Cloud Scheduler call this one service. No other member, and never `allUsers`. |
+| `spot-watchdog-publisher` | `roles/artifactregistry.writer` | The `spot-control` repository only | Let the image workflow push the watchdog image. |
+| The `swack-tools/spot-github-runners` principal set | `roles/iam.workloadIdentityUser` | The publisher service account only | Let the image workflow on `main` impersonate the publisher. |
+
+The service references these secrets:
+
+| Service variable | Secret | Note |
+| --- | --- | --- |
+| `CLOUDFLARE_KV_API_TOKEN` | `spot-dashboard-cloudflare-kv-token` | The control VMs already use it. |
+| `DASHBOARD_CONTROL_SECRET` | `spot-dashboard-control-secret` | The control VMs already use it. |
+| `CF_ACCESS_CLIENT_ID` | `spot-control-access-client-id` | New: the Access service token for the tunnel hostnames. |
+| `CF_ACCESS_CLIENT_SECRET` | `spot-control-access-client-secret` | New. |
+| `SPOT_DASHBOARD_IMAGE_TRACK_TOKEN` | `spot-control-watchdog-github-token` | New, only with image tracking. |
+
+`--secret ENV=SECRET` references another secret for a variable. The deploy never writes a secret value. It
+stops before any IAM change when a referenced secret has no enabled version.
+
+The IAM condition uses `resource.name.extract()`. A mistake in a condition only shows when the
+watchdog needs that permission, which can be during an outage, so check the create and delete permissions
+once after the deploy:
+
+```bash
+for permission in compute.instances.create compute.instances.delete compute.disks.create; do
+  gcloud policy-intelligence troubleshoot-policy iam \
+    "//compute.googleapis.com/projects/PROJECT/zones/us-central1-a/instances/spot-control-a" \
+    --principal-email="spot-control-watchdog@PROJECT.iam.gserviceaccount.com" --permission="$permission"
+done
+```
+
+If a check reports the access as denied, deploy again with `--no-compute-condition`, which grants the role on
+the project without the condition.
+
+### Deploy the watchdog
+
+Prerequisites:
+
+- The control VM environment file that `src/control_vm.py` uses, sourced in your shell. The deploy copies its
+  non-secret settings into the service: `SPOT_CONTROL_*`, `SPOT_DASHBOARD_*`, `CLOUDFLARE_ACCOUNT_ID`,
+  `CLOUDFLARE_KV_NAMESPACE_ID`, `SPOT_CONFIG_REPO`, and the dashboard target and session settings.
+- Owner access to the project, for the first deploy.
+
+To deploy:
+
+1. Create the new secrets from standard input, so no value appears in a command line or the shell history:
+
+   ```bash
+   printf '%s' "$CF_ACCESS_CLIENT_ID" | gcloud secrets create spot-control-access-client-id \
+     --data-file=- --replication-policy=automatic --project=PROJECT
+   printf '%s' "$CF_ACCESS_CLIENT_SECRET" | gcloud secrets create spot-control-access-client-secret \
+     --data-file=- --replication-policy=automatic --project=PROJECT
+   ```
+
+1. Preview the infrastructure. This command runs nothing:
+
+   ```bash
+   PYTHONPATH=src python3 src/control_watchdog_deploy.py --project=PROJECT --dry-run
+   ```
+
+1. Create the bucket, the service accounts, the repository, the IAM bindings, and the identity provider.
+   Every step is idempotent, so you can run it again:
+
+   ```bash
+   PYTHONPATH=src python3 src/control_watchdog_deploy.py --project=PROJECT
+   ```
+
+1. Set the four repository variables that the dry run printed, then run the image workflow and copy the
+   digest from its summary:
+
+   ```bash
+   gh workflow run control-watchdog-image.yml --repo swack-tools/spot-github-runners --ref main
+   ```
+
+1. Move the control VM state to Cloud Storage, as described in
+   [Migrate from the workstation state](#migrate-from-the-workstation-state).
+
+1. Deploy the service without the scheduler, call it once as the invoker account, and read its answer:
+
+   ```bash
+   IMAGE=us-central1-docker.pkg.dev/PROJECT/spot-control/control-watchdog@sha256:DIGEST
+   PYTHONPATH=src python3 src/control_watchdog_deploy.py --project=PROJECT --image="$IMAGE" --skip-scheduler --dry-run
+   PYTHONPATH=src python3 src/control_watchdog_deploy.py --project=PROJECT --image="$IMAGE" --skip-scheduler
+   URL="https://spot-control-watchdog-$(gcloud projects describe PROJECT --format='value(projectNumber)').us-central1.run.app"
+   TOKEN="$(gcloud auth print-identity-token --audiences="$URL" --include-email \
+     --impersonate-service-account=spot-watchdog-invoker@PROJECT.iam.gserviceaccount.com)"
+   curl -fsS -X POST -H "Authorization: Bearer $TOKEN" "$URL/tick"
+   ```
+
+   Impersonation needs `iam.serviceAccounts.getOpenIdToken` on the invoker account, which a project owner has.
+   A 403 from the server, with `Watchdog tick refused` in the service log, names the claim that failed.
+
+1. Deploy again without `--skip-scheduler` to create the scheduler job.
+
+To update the watchdog later, run the image workflow and deploy the new digest with `--image`.
+
+### Migrate from the workstation state
+
+The migration uploads the local `control-vm-<project>.json` once. It refuses when both the local file and the
+Cloud Storage object exist and differ, and then changes nothing.
+
+1. Stop every local controller from managing the control VM. Remove `--manage-control-vm` from the
+   autoscaler's LaunchAgent, or wait until you finish the migration before you restart the agent.
+1. Add `SPOT_CONTROL_STATE_URI=gs://<project>-spot-control-state/control-vm` to the environment file and
+   source it.
+1. Preview, then migrate:
+
+   ```bash
+   PYTHONPATH=src python3 src/control_vm.py migrate-state
+   PYTHONPATH=src python3 src/control_vm.py migrate-state --apply
+   ```
+
+   The command holds the local lock and the Cloud Storage lease while it works. It fences the local file
+   before the state object exists. First it copies the file to
+   `control-vm-<project>.json.migrated-<UTC time>` and flushes the copy. Then it renames a flushed marker
+   over the original in one atomic step, so the path always holds the state or the marker. Only then does it
+   upload the state, or create an empty state object when there was no local file. From then on, a controller
+   without `SPOT_CONTROL_STATE_URI` refuses to run instead of acting on the old file. A missing state file next to
+   a `.migrated-*` backup also refuses.
+
+   If the upload fails, the local file stays fenced, and running the command again uploads the backup that the
+   marker names. When there is no local file but the state object exists, the command only installs the marker.
+   It refuses a marker that names another `SPOT_CONTROL_STATE_URI` (a trailing slash doesn't count), and a
+   missing state file next to a `.migrated-*` backup, rather than creating an empty state object.
+1. Check that `PYTHONPATH=src python3 src/control_vm.py status` shows the same `transition` and
+   `retained_disks` as before.
+
+A workstation that keeps `--manage-control-vm` must use the same `SPOT_CONTROL_STATE_URI`. The watchdog and
+the workstation then share one state and one lease, and a check that finds the lease taken skips its
+control VM step. Every controller in the project needs the same `SPOT_CONTROL_PROVISIONING` and
+`SPOT_DASHBOARD_IMAGE_TRACK`.
+
+### Pause the watchdog
+
+Pause the scheduler job. A tick in progress finishes its step:
+
+```bash
+gcloud scheduler jobs pause spot-control-watchdog --location=us-central1 --project=PROJECT
+gcloud scheduler jobs resume spot-control-watchdog --location=us-central1 --project=PROJECT
+```
+
+While it's paused, `src/control_vm.py ensure --apply` with the same `SPOT_CONTROL_STATE_URI` still works from a
+workstation.
+
+### Image tracking
+
+`SPOT_DASHBOARD_IMAGE_TRACK=main` rolls the control VM to the image that
+`ghcr.io/swack-tools/spot-dashboard:main` names. On each check the manager resolves that tag's digest with
+`SPOT_DASHBOARD_IMAGE_TRACK_TOKEN`, a classic GitHub token with `read:packages`. The token also needs `repo`
+while the repository is private. The manager starts a rollout only when all of these hold:
+
+- No transition is in progress, the active VM is running and healthy, and the other slot is empty.
+- The rotation cooldown has passed: 6 hours since the last completed or aborted transition.
+- The digest differs from the active VM's image, and no earlier rollout to it aborted.
+- The image's `org.opencontainers.image.revision` label names a commit whose **Dashboard image** workflow
+  run on `main` concluded `success`.
+- GitHub's compare API reports that commit `ahead` of the active image's commit. The manager never rolls
+  to an older, equal, or diverged commit, or when either commit is unknown.
+
+The rollout is the make-before-break rotation that a price rotation uses: create the other slot with the
+new digest, wait for health, freeze, import, check the version floor, write `origin:active`, wait for
+propagation, and delete the old VM. A rollout that aborts backs off that digest. The manager tries again
+only after `:main` names another digest and the cooldown has passed.
+
+The state's `image` section records the active VM's image, read once from its `dashboard-image` metadata
+or written when a transition completes. It also records the digests that failed and cached workflow answers.
+`status` shows it. While tracking is on, a recovery recreates the recorded image, not `SPOT_DASHBOARD_IMAGE`,
+so a recovery never moves to an older image. Every transition records the image it creates, and a controller
+that resumes the transition creates that image whatever its own settings.
+
+A rollout never changes the provisioning mode. When the active VM's model differs from
+`SPOT_CONTROL_PROVISIONING`, the manager holds the rollout and logs why. For example, a standard VM while Spot
+is configured, or a Spot VM or one of unknown model while standard is configured. The planner's own reason, such
+as the explicit `rotate` needed to move back to Spot, stays in the plan.
+
+The manager reads the registry and GitHub only. A registry or GitHub failure never starts a rollout and never
+blocks recovery.
+
+### Restart policy
+
+Control VMs keep `--no-restart-on-failure`, and the manager turns automatic restart off on any control VM
+that has it, with `gcloud compute instances set-scheduling --no-restart-on-failure`. With the watchdog, a VM
+that crashed is started again within about 3 minutes.
+
+Compute Engine's automatic restart acts only after a crash or a host error, never after an API stop, so a fence
+that stops a VM isn't affected by it. But the recovery fence and the rollback fence accept any `TERMINATED`
+VM as fenced, and they can't tell a stopped VM from one that crashed. With automatic restart, a crashed VM
+can start again by itself after the fence passed, while `origin:active`, which is eventually consistent,
+may still name it. A frozen VM would come back frozen, because the freeze marker is on its boot disk. A VM
+that was fenced by stopping it, or one that crashed before it could freeze, has no such marker.
+
+So before either fence accepts a stopped VM, its inventory must show `automaticRestart` off. When it's on,
+the manager turns it off and waits for a fresh inventory. Turning it off doesn't restart the VM.
+
+### Cost
+
+The estimate assumes `us-central1`, the default schedule of every 3 minutes (14,400 requests a month), and about
+8 seconds of CPU time per tick at 1 vCPU and 512 MiB. Request-based billing charges only while a request runs,
+plus instance start-up, in 100 ms steps. Its free tier is 180,000 vCPU-seconds, 360,000 GiB-seconds, and 2
+million requests a month. Check it against current pricing.
+
+| Item | Use | Monthly cost |
+| --- | --- | --- |
+| Cloud Run service CPU | About 115,000 vCPU-seconds, 64 percent of the free tier; it runs out at about 12.5 seconds a tick | $0 |
+| Cloud Run service memory | About 58,000 GiB-seconds, 16 percent of the free tier | $0 |
+| Cloud Run requests | 14,400, inside the 2 million free | $0 |
+| Cloud Scheduler | 1 job; 3 jobs per billing account are free | $0 |
+| Secret Manager access | 4 or 5 secrets at each instance start: at most about 58,000 accesses, when every request starts an instance; 10,000 are free | $0 to $0.15 |
+| Secret Manager versions | 2 or 3 new secret versions beyond the 6 free ones | $0.12 to $0.18 |
+| Cloud Storage | A few KB; about 14,400 reads, inside the 50,000 free; writes only on ticks that act | $0 |
+| Artifact Registry | Under the 0.5 GB of free storage until many versions accumulate; then $0.10 per GB | $0 to $0.05 |
+| Logging and network | A few log lines per tick; KB of egress | $0 |
+
+The total is about $0.12 to $0.40 a month, mostly Secret Manager.
+
+`--schedule='*/2 * * * *'` makes 21,600 requests a month. At 8 seconds a tick that's about 173,000 vCPU-seconds,
+96 percent of the free tier, and beyond about 8.3 seconds a tick it costs $0.000024 per extra vCPU-second, for
+example about $0.86 a month at 10 seconds. A Cloud Run job at the same 2-minute cadence would bill at least 60
+seconds per execution: about 1.3 million vCPU-seconds, or about $19 a month after its free tier.
+
+<!-- vale Google.WordList = YES -->
+
 ## Configuration
 
 Set these in the autoscaler's environment file outside the Git checkout. See `.env.example` for the full
@@ -582,6 +945,8 @@ list.
 | `DASHBOARD_CONTROL_SECRET` | Signs control calls (`freeze`, `unfreeze`, `snapshot`, `import`). |
 | `SPOT_DASHBOARD_IMAGE` or `SPOT_DASHBOARD_SOURCE_REF` | A digest-pinned image, or a 40-character commit to build on the VM. |
 | `SPOT_CONTROL_PROVISIONING` | `spot` (default) or `standard`, the free-tier e2-micro, which needs a published image. See [Use the free-tier control VM](#use-the-free-tier-control-vm). |
+| `SPOT_CONTROL_STATE_URI` | Optional `gs://<bucket>[/<prefix>]` bucket location for the control VM state and lease. See [Watchdog](#watchdog). |
+| `SPOT_DASHBOARD_IMAGE_TRACK`, `SPOT_DASHBOARD_IMAGE_TRACK_TOKEN` | Optional `main` to roll out the published `:main` image, and the GitHub token that reads it. See [Image tracking](#image-tracking). |
 | `SPOT_CONFIG_REPO` | Optional config repository, as `owner/repo`, whose `repos/<owner>/<repo>.yaml` files are controlled targets. The autoscaler's `--config-repo` takes precedence. Default: `<org>/spot-runners-config`. |
 | `DASHBOARD_CONTROLLED_TARGETS` | Optional comma-separated organizations and `owner/repo` targets that the signed-in user must administer. Default: none. |
 
@@ -620,6 +985,18 @@ Run one lifecycle step. This command creates, starts, or deletes VMs:
 
 ```bash
 PYTHONPATH=src python3 src/control_vm.py ensure --apply
+```
+
+Move the control VM state to `SPOT_CONTROL_STATE_URI` once. Without `--apply` it only reports what it would do:
+
+```bash
+PYTHONPATH=src python3 src/control_vm.py migrate-state --apply
+```
+
+Preview the watchdog deployment. Without `--dry-run`, this command creates or updates the resources:
+
+```bash
+PYTHONPATH=src python3 src/control_watchdog_deploy.py --dry-run
 ```
 
 Run the Worker tests:
