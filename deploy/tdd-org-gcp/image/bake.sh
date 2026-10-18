@@ -53,6 +53,18 @@ EOF
 # --- runner user, Rust, tools -----------------------------------------------------
 id runner >/dev/null 2>&1 || useradd -m -s /bin/bash -u 1001 runner
 usermod -aG docker runner
+# Passwordless sudo, as on GitHub-hosted runners: jobs run `sudo apt-get` and
+# `playwright install --with-deps`. The VM is single-use and deleted after its job.
+echo 'runner ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-gha-runner
+chmod 0440 /etc/sudoers.d/90-gha-runner
+visudo -cf /etc/sudoers.d/90-gha-runner
+# Playwright Chromium system deps (Ubuntu 24.04 list), so browser jobs need no apt step.
+$APT install -y --no-install-recommends \
+  libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 \
+  libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 \
+  libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 xvfb \
+  fonts-liberation fonts-noto-color-emoji fonts-freefont-ttf fonts-ipafont-gothic fonts-wqy-zenhei \
+  fonts-tlwg-loma-otf xfonts-scalable xfonts-cyrillic
 sudo -u runner -H bash -c "curl -fsS --proto =https --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $RUST_TOOLCHAIN -c clippy -c rustfmt -c rust-src"
 sudo -u runner -H bash -c "curl -fsSL https://get.nexte.st/$NEXTEST_VERSION/linux | tar -xz -C ~/.cargo/bin"
 curl -fsSL "https://github.com/mozilla/sccache/releases/download/v$SCCACHE_VERSION/sccache-v$SCCACHE_VERSION-x86_64-unknown-linux-musl.tar.gz" \
@@ -67,6 +79,9 @@ sudo -u runner -H bash -lc 'rustc --version && cargo --version && cargo nextest 
 /usr/local/bin/sccache --version
 command -v bwrap && bwrap --version
 docker --version
+rg --version | head -1
+sqlite3 --version
+sudo -u runner sudo -n true
 echo "gha-bake: tools ok"
 
 # --- generalise: every VM from this image gets its own identity --------------------
