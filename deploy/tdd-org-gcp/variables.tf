@@ -78,7 +78,7 @@ variable "runner_group" {
 variable "runner_labels" {
   description = "Extra labels; GitHub adds self-hosted,linux,x64. Workflows opt in with runs-on: [self-hosted, rust-heavy]."
   type        = string
-  default     = "rust-heavy"
+  default     = "rust-heavy,bigmem"
 }
 
 variable "runner_version" {

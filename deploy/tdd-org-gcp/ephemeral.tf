@@ -1,5 +1,5 @@
 # Throwaway runner VMs from the gha-rust-heavy golden image (WI-1155, 2026-10-11).
-# The poller creates one VM per queued rust-heavy job from this template, with a
+# The poller creates one VM per queued job from a class template (large or small), with a
 # just-in-time runner registration in metadata, and deletes it after the job.
 # Nothing is billed while idle except the image (~US$1/month).
 # Off until enable_ephemeral = true (needs the runner VM service account and the
@@ -34,15 +34,22 @@ variable "ts_audience" {
   default = ""
 }
 
-variable "ephemeral_machine_type" {
-  type    = string
-  default = "c3d-highcpu-30"
-}
-
-variable "ephemeral_disk_gb" {
-  description = "Run-time pd-balanced disk, deleted with the VM. A combined codex job peaks above 80 GB."
-  type        = number
-  default     = 120
+variable "ephemeral_classes" {
+  description = <<-EOT
+    Throwaway VM classes. The project's vCPU quota is 32 (CPUS_ALL_REGIONS and the
+    C3D family in australia-southeast1), so the poller runs either one large VM or
+    up to four small ones. Disks are pd-balanced (SSD_TOTAL_GB quota 500).
+    large: codex fork-ci / fork-release (rust-heavy); a combined codex job peaks above 80 GB of disk.
+    small: routed heavy Rust jobs from vogt, rustnzb and rustTorrent (gcp-rust).
+  EOT
+  type = map(object({
+    machine_type = string
+    disk_gb      = number
+  }))
+  default = {
+    large = { machine_type = "c3d-highcpu-30", disk_gb = 160 }
+    small = { machine_type = "c3d-highcpu-8", disk_gb = 100 }
+  }
 }
 
 data "google_compute_image" "rust_heavy" {
@@ -51,12 +58,17 @@ data "google_compute_image" "rust_heavy" {
   project = var.project_id
 }
 
+moved {
+  from = google_compute_instance_template.rust_heavy[0]
+  to   = google_compute_instance_template.rust_heavy["large"]
+}
+
 resource "google_compute_instance_template" "rust_heavy" {
-  count        = var.enable_ephemeral ? 1 : 0
-  name_prefix  = "gha-rust-heavy-"
-  machine_type = var.ephemeral_machine_type
+  for_each     = var.enable_ephemeral ? var.ephemeral_classes : {}
+  name_prefix  = "gha-${each.key}-"
+  machine_type = each.value.machine_type
   region       = var.region
-  labels       = { "gha-ephemeral" = "true" }
+  labels       = { "gha-ephemeral" = "true", "gha-class" = each.key }
 
   scheduling {
     provisioning_model          = "SPOT"
@@ -68,7 +80,7 @@ resource "google_compute_instance_template" "rust_heavy" {
 
   disk {
     source_image = data.google_compute_image.rust_heavy[0].self_link
-    disk_size_gb = var.ephemeral_disk_gb
+    disk_size_gb = each.value.disk_gb
     disk_type    = "pd-balanced"
     auto_delete  = true
     boot         = true
@@ -105,6 +117,7 @@ resource "google_compute_instance_template" "rust_heavy" {
   }
 }
 
-output "rust_heavy_template" {
-  value = var.enable_ephemeral ? google_compute_instance_template.rust_heavy[0].self_link : null
+output "runner_templates" {
+  description = "Instance template name per class, for the poller's LARGE_TEMPLATE / SMALL_TEMPLATE."
+  value       = { for k, t in google_compute_instance_template.rust_heavy : k => t.name }
 }

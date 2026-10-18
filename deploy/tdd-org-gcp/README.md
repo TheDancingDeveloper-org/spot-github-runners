@@ -108,3 +108,45 @@ The boot disk was resized in place from 100 GB to 160 GB with
 creation-time size (100) while the live disk is 160 GB. Ubuntu's cloud-init
 grew the root filesystem automatically on the next boot (154 GB usable). The
 budget was raised from A$45 to A$60 through Terraform to match.
+
+## Throwaway VM classes (2026-10-18)
+
+The poller (`MODE=ephemeral`) creates one Spot VM per queued job from one of two
+instance templates (`ephemeral_classes` in `ephemeral.tf`):
+
+| Class | Shape | Disk | Labels | Max | Serves |
+| --- | --- | --- | --- | --- | --- |
+| large | c3d-highcpu-30 (30 vCPU, 59 GB) | 160 GB | `rust-heavy`, `bigmem` | 1 | codex fork-ci and fork-release |
+| small | c3d-highcpu-8 (8 vCPU, 16 GB) | 100 GB | `gcp-rust` | 4 | routed heavy Rust jobs (rustnzb, rustTorrent; vogt once the image has its packages) |
+
+The project's vCPU quota is 32 (`CPUS_ALL_REGIONS` and the C3D family in
+australia-southeast1), so one large VM or four small ones run at a time, never
+both. The poller counts the vCPUs of every VM that is not stopped. A large job is
+served first: while it waits for vCPUs, no new small VM starts, so the running
+ones drain. It never asks GCP for a VM that would exceed `VCPU_QUOTA`, and a
+refused create leaves the job queued for the next poll.
+
+Only these VMs carry `gcp-rust`, so jobs that request it can't be taken by an
+idle Node B runner. Bare `[self-hosted]` jobs never wake a VM. A live VM can still
+pick one up, because GitHub gives a job to any idle runner whose labels match.
+
+The systemd unit is `poller/gha-spot-poller.service`. Its template names come from
+`terraform output runner_templates`.
+
+### Quota increase (prepared, not submitted)
+
+To run a large and small VMs together, raise both limits to 64 vCPU:
+
+```bash
+gcloud alpha quotas preferences create --project=email-rs-493900 \
+  --service=compute.googleapis.com --quota-id=CPUS-PER-VM-FAMILY-per-project-region \
+  --dimensions=region=australia-southeast1,vm_family=C3D --preferred-value=64 \
+  --justification="Spot CI runners: one c3d-highcpu-30 and four c3d-highcpu-8 concurrently" \
+  --email=sprooty@sprooty.com --preference-id=gha-c3d-64
+gcloud alpha quotas preferences create --project=email-rs-493900 \
+  --service=compute.googleapis.com --quota-id=CPUS-ALL-REGIONS-per-project \
+  --preferred-value=64 --justification="Spot CI runners (see C3D request)" \
+  --email=sprooty@sprooty.com --preference-id=gha-all-regions-64
+```
+
+Then set `VCPU_QUOTA=64` in the unit.
