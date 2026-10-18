@@ -22,7 +22,11 @@ Environment:
   {LARGE,SMALL}_TEMPLATE, _LABELS, _VCPUS, _MAX   ephemeral VM classes (an empty
                       template disables the class; GCP_TEMPLATE/RUNNER_LABELS/MAX_VMS
                       are the large class's fallbacks)
-  --once              one poll then exit (for a systemd timer); default loops every 30 s
+  POLL_INTERVAL       seconds between polls, default 60
+  RECONCILE_INTERVAL  seconds between scans of in_progress runs for queued later jobs, default 300
+  RATE_LIMIT_FLOOR    pause GitHub calls until X-RateLimit-Reset below this many left, default 200
+  LOG_LEVEL           info (default) or debug (adds the remaining GitHub quota once per poll)
+  --once              one poll then exit (for a systemd timer); default loops every POLL_INTERVAL
 """
 import base64
 import datetime as dt
@@ -43,7 +47,10 @@ ZONE = os.environ.get("GCP_ZONE", "australia-southeast1-c")
 INSTANCE = os.environ.get("GCP_INSTANCE", "gha-spot-1")
 MAX_HOURS = float(os.environ.get("MAX_HOURS_PER_MONTH", "250"))
 STATE_FILE = os.path.expanduser(os.environ.get("STATE_FILE", "~/.local/state/gha-spot-poller.json"))
-INTERVAL = 30
+INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
+RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "300"))
+RATE_LIMIT_FLOOR = int(os.environ.get("RATE_LIMIT_FLOOR", "200"))
+DEBUG = os.environ.get("LOG_LEVEL", "info").lower() == "debug"
 BUDGET_SUB = os.environ.get("GCP_BUDGET_SUBSCRIPTION", "gha-spot-budget-poller")
 # MODE=persistent (default): start/stop the long-lived GCP_INSTANCE.
 # MODE=ephemeral: create one throwaway VM per queued job from GCP_TEMPLATE with a
@@ -78,6 +85,11 @@ MAX_VM_AGE_S = int(os.environ.get("MAX_VM_AGE_MIN", "420")) * 60  # backstop ove
 
 def log(msg):
     print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} {msg}", flush=True)
+
+
+def debug(msg):
+    if DEBUG:
+        log(f"debug: {msg}")
 
 
 def http(method, url, token, body=None):
@@ -163,8 +175,49 @@ def cred(env_name, cred_name):
     return os.environ[env_name]
 
 
+class RateLimited(Exception):
+    """GitHub's quota is spent or nearly so; no GitHub calls until `until`."""
+
+    def __init__(self, until):
+        super().__init__(f"GitHub rate limit: paused until {dt.datetime.fromtimestamp(until, dt.timezone.utc):%H:%M:%SZ}")
+        self.until = until
+
+
+# The last X-RateLimit-* seen, and when GitHub calls may resume.
+_rate = {"remaining": None, "limit": None, "reset": 0, "paused_until": 0}
+
+
+def _note_rate(headers):
+    if headers.get("X-RateLimit-Remaining") is None:
+        return
+    _rate.update(remaining=int(headers["X-RateLimit-Remaining"]), limit=headers.get("X-RateLimit-Limit"),
+                 reset=int(headers.get("X-RateLimit-Reset") or 0))
+
+
 def gh(method, path, body=None):
-    return http(method, f"https://api.github.com/{path}", cred("GH_TOKEN", "gh_token"), body)
+    """A GitHub API call that stops at the rate limit instead of retrying into it."""
+    if time.time() < _rate["paused_until"]:
+        raise RateLimited(_rate["paused_until"])
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"https://api.github.com/{path}", data=data, method=method, headers={
+        "Authorization": f"Bearer {cred('GH_TOKEN', 'gh_token')}", "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json", "User-Agent": "gha-spot-poller"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            _note_rate(resp.headers)
+            raw = resp.read()
+    except urllib.error.HTTPError as error:
+        _note_rate(error.headers)
+        if error.code in (403, 429) and (_rate["remaining"] == 0 or error.headers.get("Retry-After")):
+            retry_after = int(error.headers.get("Retry-After") or 0)
+            until = time.time() + retry_after if retry_after else _rate["reset"] + 5
+            _rate["paused_until"] = max(until, time.time() + INTERVAL)
+            raise RateLimited(_rate["paused_until"]) from error
+        raise
+    if _rate["remaining"] is not None and _rate["remaining"] < RATE_LIMIT_FLOOR:
+        # Leave the rest of the shared quota to other users of the token.
+        _rate["paused_until"] = _rate["reset"] + 5
+    return json.loads(raw) if raw else {}
 
 
 BASE_LABELS = {"self-hosted", "linux", "x64"}
@@ -181,14 +234,22 @@ def job_class(labels, classes):
     return None
 
 
+_last_reconcile = [0.0]
+
+
 def queued_jobs(classes=None):
     """Queued jobs whose runs-on labels are all served by the GCP runners.
 
+    Each poll lists only queued runs. A later job in a run that is already
+    in_progress is found by the slower reconcile scan, every RECONCILE_INTERVAL.
     With `classes`, returns (ref, class) pairs; otherwise refs served by LABELS."""
     classes = classes or {"persistent": {"labels": LABELS}}
     found = []
+    statuses = ["queued"]
+    if time.time() - _last_reconcile[0] >= RECONCILE_INTERVAL:
+        statuses.append("in_progress")
     for repo in REPOS:
-        for status in ("queued", "in_progress"):
+        for status in statuses:
             runs = gh("GET", f"repos/{ORG}/{repo}/actions/runs?status={status}&per_page=50")
             for run in runs.get("workflow_runs", []):
                 jobs = gh("GET", f"repos/{ORG}/{repo}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
@@ -196,6 +257,8 @@ def queued_jobs(classes=None):
                     cls = job_class(job.get("labels", []), classes) if job["status"] == "queued" else None
                     if cls:
                         found.append((f"{repo}#{job['id']}", cls))
+    if "in_progress" in statuses:
+        _last_reconcile[0] = time.time()
     return found if "persistent" not in classes else [ref for ref, _ in found]
 
 
@@ -408,12 +471,16 @@ def main():
         state = load_state()
         try:
             (poll_ephemeral if MODE == "ephemeral" else poll)(state)
+        except RateLimited as error:
+            log(str(error))
         except (urllib.error.URLError, subprocess.CalledProcessError, KeyError) as error:
             log(f"poll failed: {error}")
         save_state(state)
+        debug(f"GitHub quota {_rate['remaining']}/{_rate['limit']} remaining, resets "
+              f"{dt.datetime.fromtimestamp(_rate['reset'], dt.timezone.utc):%H:%M:%SZ}")
         if once:
             return
-        time.sleep(INTERVAL)
+        time.sleep(INTERVAL)  # GCP clean-up carries on; gh() itself waits out a rate-limit pause
 
 
 if __name__ == "__main__":
