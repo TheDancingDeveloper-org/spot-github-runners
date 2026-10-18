@@ -31,6 +31,7 @@ from lib.dashboard_scaling import (
     evaluate_cpu_scope,
     evaluate_scaling_decision,
     parse_github_oom_deep_link,
+    validate_github_oom_run,
 )
 from lib.dashboard_server import (
     _build_instance_record,
@@ -707,6 +708,56 @@ class DashboardModelsTests(unittest.TestCase):
 
 
 class DashboardScalingTests(unittest.TestCase):
+    def test_validate_github_oom_run_requires_caller_facts(self):
+        location = {"repository": "swack-tools/oxidex", "run_id": 11, "job_id": 22, "step_number": 3,
+                    "line_number": 4}
+        excerpt = "##[error]Process completed with exit code 137."
+        for missing in location:
+            item = {k: v for k, v in location.items() if k != missing}
+            with self.assertRaisesRegex(ValueError, f"missing: {missing}"):
+                validate_github_oom_run({**item, "error_excerpt": excerpt})
+        for bad_excerpt in (None, "", "   ", 137):
+            with self.assertRaisesRegex(ValueError, "error_excerpt"):
+                validate_github_oom_run({**location, "error_excerpt": bad_excerpt})
+        for field, bad in (("run_id", True), ("job_id", "12a"), ("step_number", 0), ("line_number", -1),
+                           ("run_id", 1.5)):
+            with self.assertRaisesRegex(ValueError, field):
+                validate_github_oom_run({**location, field: bad, "error_excerpt": excerpt})
+        with self.assertRaises(ValueError):
+            validate_github_oom_run([])
+        with self.assertRaisesRegex(ValueError, "runner_name"):
+            validate_github_oom_run({**location, "error_excerpt": excerpt, "runner_name": 7})
+
+        item = validate_github_oom_run({**location, "run_id": "11", "error_excerpt": f"  {excerpt} "})
+        self.assertEqual(item["run_id"], 11)
+        self.assertEqual(item["error_excerpt"], excerpt)
+        self.assertEqual(item["deep_link"], "https://github.com/swack-tools/oxidex/actions/runs/11/job/22#step:3:4")
+        # No runner name is invented: the run stays unattributed.
+        self.assertNotIn("runner_name", item)
+        self.assertNotIn("runner_name", validate_github_oom_run({**location, "error_excerpt": excerpt,
+                                                                 "runner_name": " "}))
+
+    def test_validate_github_oom_run_from_deep_link(self):
+        link = "https://github.com/swack-tools/oxidex/actions/runs/11/job/22#step:3:4"
+        for invalid in ("runs/0/job/22#step:3:4", "runs/11/job/0#step:3:4",
+                        "runs/11/job/22#step:0:4", "runs/11/job/22#step:3:0"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "positive integer"):
+                validate_github_oom_run({"deep_link": "https://github.com/swack-tools/oxidex/actions/" + invalid,
+                                         "error_excerpt": "exit code 137"})
+        item = validate_github_oom_run({"deep_link": link, "error_excerpt": "exit code 137",
+                                        "runner_name": "gha-oxidex-runners-us-south1-a-1-1"})
+        self.assertEqual((item["repository"], item["run_id"], item["job_id"], item["step_number"],
+                          item["line_number"], item["deep_link"]), ("swack-tools/oxidex", 11, 22, 3, 4, link))
+        self.assertEqual(validate_github_oom_run({"deep_link": link, "run_id": 11, "repository": "swack-tools/oxidex",
+                                                  "error_excerpt": "x"})["job_id"], 22)
+        with self.assertRaisesRegex(ValueError, "run_id does not match"):
+            validate_github_oom_run({"deep_link": link, "run_id": 12, "error_excerpt": "x"})
+        with self.assertRaisesRegex(ValueError, "repository does not match"):
+            validate_github_oom_run({"deep_link": link, "repository": "Appz4Fun/nzbget", "error_excerpt": "x"})
+        with self.assertRaisesRegex(ValueError, "Invalid GitHub Actions"):
+            validate_github_oom_run({"deep_link": "https://github.com/swack-tools/oxidex/actions/runs/11",
+                                     "error_excerpt": "x"})
+
     def test_github_oom_deep_link_build_and_parse(self):
         url = build_github_oom_deep_link(
             "Appz4Fun/nzbget",
@@ -3407,6 +3458,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                     "job_id": 99170002,
                     "step_number": 4,
                     "line_number": 88,
+                    "runner_name": "gha-oxidex-runners-us-south1-a-01",
+                    "error_excerpt": "cargo: rustc killed by signal 9 (SIGKILL) (exit code 137)",
                 },
             },
         )
@@ -7128,6 +7181,34 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
                          [("oom-journal-01", "oxidex-runners-real-1")])
         self.assertEqual((telem["jobs_ran_past_hour"], telem["provisioned_jobs"], telem["queued_jobs"]), (14, 7, 3))
 
+    def test_legacy_template_sources_do_not_block_telemetry_cleanup(self):
+        from lib.dashboard_server import DashboardStore
+
+        for saved_cloud_templates in (0, 1, 3):
+            with self.subTest(saved_cloud_templates=saved_cloud_templates):
+                raw = self._seeded_raw_state()
+                raw.pop("demo_template_source_migration")
+                old_sources = SeededTemplateSourceMigrationTests.SEEDED
+                for template in raw["vm_templates"]:
+                    template["source_instance"] = old_sources[template["id"]]
+                raw["cloud_init_templates"] = raw["cloud_init_templates"][:saved_cloud_templates]
+                self.state_file.write_text(json.dumps(raw), encoding="utf-8")
+                reloaded = DashboardStore(state_path=self.state_file)
+                self.addCleanup(reloaded.close)
+                self._assert_seeds_dropped(reloaded.state)
+                self.assertTrue(all("source_instance" not in t for t in reloaded.state["vm_templates"]))
+                self.assertEqual(reloaded.state["demo_template_source_migration"], 1)
+                self.assertIs(reloaded.state.get("demo_telemetry_migration_pending"), True)
+
+    def test_edited_legacy_template_sources_cannot_anchor_telemetry_cleanup(self):
+        from lib.dashboard_server import _original_seed_reference
+
+        raw = self._seeded_raw_state()
+        raw["cloud_init_templates"] = []
+        for template in raw["vm_templates"]:
+            template["source_instance"] = "builder-real-reassigned"
+        self.assertIsNone(_original_seed_reference(raw))
+
     def test_default_state_seeds_no_telemetry(self):
         from lib.dashboard_server import default_dashboard_state
 
@@ -7373,6 +7454,130 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
             state = {"scaling_telemetry": dict(counters)}
             self.assertEqual(drop_seeded_demo_telemetry(state), 0)
             self.assertEqual(state["scaling_telemetry"], counters)
+
+
+class AddGithubOomRunTests(unittest.TestCase):
+    """A reported GitHub CI failure run holds only what the caller supplied."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from lib.dashboard_server import DashboardStore
+
+        self.store = DashboardStore(state_path=Path(self.tmp.name) / "dashboard-state.json")
+        self.addCleanup(self.store.close)
+
+    def test_incomplete_run_is_rejected_without_changing_state(self):
+        version = self.store.state_version()
+        for item in ({}, {"error_excerpt": "exit code 137"},
+                     {"repository": "swack-tools/oxidex", "run_id": 1, "job_id": 2, "step_number": 1,
+                      "line_number": 1},
+                     "https://github.com/swack-tools/oxidex/actions/runs/1/job/2#step:1:1"):
+            with self.assertRaises(ValueError):
+                self.store.update_scaling({"add_github_oom_run": item})
+        self.assertEqual(self.store.state["scaling_telemetry"]["github_oom_runs"], [])
+        self.assertEqual(self.store.state_version(), version)
+
+    def test_run_without_runner_name_is_not_attributed_to_the_fleet(self):
+        self.store.update_scaling({"add_github_oom_run": {
+            "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/5/job/6#step:7:8",
+            "error_excerpt": "rustc killed by signal 9 (SIGKILL)",
+        }})
+        (run,) = self.store.state["scaling_telemetry"]["github_oom_runs"]
+        self.assertEqual((run["repository"], run["run_id"], run["job_id"]), ("swack-tools/oxidex", 5, 6))
+        self.assertNotIn("runner_name", run)
+        self.assertEqual(run["error_excerpt"], "rustc killed by signal 9 (SIGKILL)")
+        self.assertEqual(run["failure_classification"], "EXTERNAL_RUNNER_OOM")
+        self.assertFalse(run["is_oom"])
+        self.assertFalse(run["is_self_hosted_runner"])
+
+    def test_no_invented_defaults_remain(self):
+        import inspect
+
+        from lib import dashboard_server
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        source = inspect.getsource(dashboard_server.DashboardStore.update_scaling)
+        for fabricated in ("Appz4Fun/nzbget", "38596411473", "115964282184", "1000014245",
+                           "gha-oxidex-runners-us-south1-a-01"):
+            self.assertNotIn(fabricated, source)
+            self.assertNotIn(fabricated, DASHBOARD_HTML)
+
+
+class SeededTemplateSourceMigrationTests(unittest.TestCase):
+    """Preset VM templates no longer name a source VM that never existed."""
+
+    SEEDED = {"tpl-runner-n4-std16": "oxidex-runners-dallas-01",
+              "tpl-runner-za-n2-16": "oxidex-runners-za-jnb-01",
+              "tpl-builder-c4d-16": "builder-oxidex-turin-01"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_file = Path(self.tmp.name) / "dashboard-state.json"
+        from lib.dashboard_server import DashboardStore
+
+        self.store = DashboardStore(state_path=self.state_file)
+        self.addCleanup(self.store.close)
+
+    def _old_raw_state(self) -> dict:
+        """The persisted state as a version that seeded the template sources wrote it, plus a real template."""
+        raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+        raw.pop("demo_template_source_migration")
+        for tpl in raw["vm_templates"]:
+            tpl["source_instance"] = self.SEEDED[tpl["id"]]
+        raw["vm_templates"].append(dict(raw["vm_templates"][0], id="tpl-real0001",
+                                        source_instance="oxidex-runners-us-south1-a-1"))
+        return raw
+
+    def _assert_sources_dropped(self, state: dict) -> None:
+        self.assertEqual({t["id"]: t.get("source_instance") for t in state["vm_templates"]},
+                         {**{tid: None for tid in self.SEEDED}, "tpl-real0001": "oxidex-runners-us-south1-a-1"})
+
+    def test_default_presets_name_no_source_instance(self):
+        from lib.dashboard_server import default_dashboard_state
+
+        for state in (default_dashboard_state(), self.store.state):
+            self.assertEqual(sorted(t["id"] for t in state["vm_templates"]), sorted(self.SEEDED))
+            for tpl in state["vm_templates"]:
+                self.assertNotIn("source_instance", tpl)
+            self.assertEqual(state["demo_template_source_migration"], 1)
+
+    def test_seeded_sources_are_dropped_on_load_from_disk(self):
+        from lib.dashboard_server import DashboardStore
+
+        self.state_file.write_text(json.dumps(self._old_raw_state()), encoding="utf-8")
+        with self.assertLogs("spot_dashboard", "WARNING") as logs:
+            reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        self.assertIn("preset VM template", "\n".join(logs.output))
+        self._assert_sources_dropped(reloaded.state)
+        on_disk = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self._assert_sources_dropped(on_disk)
+        self.assertEqual(on_disk["demo_template_source_migration"], 1)
+
+    def test_seeded_sources_are_dropped_from_kv_snapshot_and_import(self):
+        from lib.edge_state import build_snapshot
+
+        snapshot = build_snapshot(self._old_raw_state(), self.store.state_version() + 1, "a")
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.store.import_snapshot(snapshot)
+        self._assert_sources_dropped(self.store.state)
+
+    def test_migrated_state_keeps_sources_that_match_a_seed(self):
+        from lib.dashboard_server import DashboardStore
+
+        for marker in (1, 2):
+            with self.subTest(marker=marker):
+                raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+                raw["demo_template_source_migration"] = marker
+                raw["vm_templates"][0]["source_instance"] = self.SEEDED[raw["vm_templates"][0]["id"]]
+                self.state_file.write_text(json.dumps(raw), encoding="utf-8")
+                reloaded = DashboardStore(state_path=self.state_file)
+                self.addCleanup(reloaded.close)
+                self.assertEqual(reloaded.state["vm_templates"][0]["source_instance"],
+                                 self.SEEDED[raw["vm_templates"][0]["id"]])
+                self.assertEqual(reloaded.state["demo_template_source_migration"], marker)
 
 
 class PublicOriginBehindWorkerTests(unittest.TestCase):

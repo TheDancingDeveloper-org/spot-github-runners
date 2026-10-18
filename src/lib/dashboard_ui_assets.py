@@ -1183,22 +1183,30 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="form-grid" style="margin-bottom:8px;">
               <div class="field">
                 <label>Repository</label>
-                <input type="text" id="new-oom-repo" value="Appz4Fun/nzbget" />
+                <input type="text" id="new-oom-repo" placeholder="owner/repo" />
               </div>
               <div class="field">
                 <label>Run ID</label>
-                <input type="number" id="new-oom-runid" value="38596411473" />
+                <input type="number" id="new-oom-runid" min="1" />
               </div>
               <div class="field">
                 <label>Job ID</label>
-                <input type="number" id="new-oom-jobid" value="115964282184" />
+                <input type="number" id="new-oom-jobid" min="1" />
               </div>
               <div class="field">
                 <label>Step # : Line #</label>
                 <div style="display:flex; gap:4px;">
-                  <input type="number" id="new-oom-step" value="2" style="width:50%;" />
-                  <input type="number" id="new-oom-line" value="50" style="width:50%;" />
+                  <input type="number" id="new-oom-step" min="1" placeholder="step" style="width:50%;" />
+                  <input type="number" id="new-oom-line" min="1" placeholder="line" style="width:50%;" />
                 </div>
+              </div>
+              <div class="field">
+                <label>Runner Name</label>
+                <input type="text" id="new-oom-runner" placeholder="as shown in the job log (optional)" />
+              </div>
+              <div class="field">
+                <label>Failing Log Line</label>
+                <input type="text" id="new-oom-excerpt" placeholder="copied from the job log" />
               </div>
             </div>
             <button class="btn btn-sm btn-danger" onclick="addGithubOomRun()">Add OOM CI Run Deep-Link</button>
@@ -2630,7 +2638,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="mono" style="font-size:11.5px; color:${textCol}; margin-bottom:6px;">${esc(run.error_excerpt)}</div>
           <div style="font-size:12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-            <span>Runner: <code class="mono">${esc(run.runner_name || 'self-hosted')}</code> · Run <code class="mono">#${esc(run.run_id)}</code> · Job <code class="mono">${esc(run.job_id)}</code> · Step <code class="mono">${esc(run.step_number)}</code> · Line <code class="mono">${esc(run.line_number)}</code> · ${esc(formatLocalTime(run.failed_at))}</span>
+            <span>Runner: <code class="mono">${esc(run.runner_name || 'not reported')}</code> · Run <code class="mono">#${esc(run.run_id)}</code> · Job <code class="mono">${esc(run.job_id)}</code> · Step <code class="mono">${esc(run.step_number)}</code> · Line <code class="mono">${esc(run.line_number)}</code> · ${esc(formatLocalTime(run.failed_at))}</span>
             <a href="${esc(run.deep_link)}" target="_blank" rel="noopener" class="btn btn-sm ${btnCls} mono" style="text-decoration:none;">
               🔗 ${esc(run.deep_link)}
             </a>
@@ -2768,24 +2776,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     async function addGithubOomRun() {
-      const repo = document.getElementById("new-oom-repo").value.trim();
-      const run_id = parseInt(document.getElementById("new-oom-runid").value || "38596411473", 10);
-      const job_id = parseInt(document.getElementById("new-oom-jobid").value || "115964282184", 10);
-      const step_number = parseInt(document.getElementById("new-oom-step").value || "2", 10);
-      const line_number = parseInt(document.getElementById("new-oom-line").value || "50", 10);
+      // Send only what the operator entered; the server rejects a run without its location or log line.
+      const field = id => document.getElementById(id).value.trim();
+      const repo = field("new-oom-repo");
+      const run_id = field("new-oom-runid");
+      const job_id = field("new-oom-jobid");
+      const step_number = field("new-oom-step");
+      const line_number = field("new-oom-line");
+      const runner_name = field("new-oom-runner");
+      const error_excerpt = field("new-oom-excerpt");
       const res = await fetch("/api/scaling", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           add_github_oom_run: {
             repository: repo,
-            workflow_name: "CI Build & Test",
             run_id,
             job_id,
-            job_name: "rust-build-step",
             step_number,
             line_number,
-            error_excerpt: `Process terminated with SIGKILL (OOM) at step ${step_number} line ${line_number}`
+            ...(runner_name ? { runner_name } : {}),
+            error_excerpt
           }
         })
       });
@@ -2820,7 +2831,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:10px 12px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
           <div>
             <div style="font-weight:700; color:#fff;">${esc(tpl.name)} <span class="mono" style="font-size:11px; color:var(--text-muted);">(${esc(tpl.id)})</span></div>
-            <div style="font-size:11.5px; color:var(--text-muted);">Shape: <code class="mono">${esc(tpl.machine_type)}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${esc(tpl.cpu_platform)} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${esc(tpl.data_disk_type)}</code> (${esc(tpl.disk_category)}) · Source: <code class="mono">${esc(tpl.source_instance)}</code></div>
+            <div style="font-size:11.5px; color:var(--text-muted);">Shape: <code class="mono">${esc(tpl.machine_type)}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${esc(tpl.cpu_platform)} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${esc(tpl.data_disk_type)}</code> (${esc(tpl.disk_category)}) · ${tpl.source_instance ? `Source: <code class="mono">${esc(tpl.source_instance)}</code>` : 'Preset shape'}</div>
           </div>
           <span class="badge ${tpl.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${tpl.role === 'cicd_runner' ? 'Runner Template' : 'Builder Template'}</span>
         </div>

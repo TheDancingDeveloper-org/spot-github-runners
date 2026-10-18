@@ -101,12 +101,11 @@ from .dashboard_scaling import (
     _assert_finite_json_tree,
     _is_recent_unhandled_oom,
     _is_eligible_github_oom,
-    build_github_oom_deep_link,
     classify_github_ci_failure,
     default_scaling_config,
     evaluate_builder_scaling_decision,
     evaluate_scaling_decision,
-    parse_github_oom_deep_link,
+    validate_github_oom_run,
 )
 from .rust_build_telemetry import (
     ALLOWED_BUILD_STATUSES,
@@ -575,6 +574,31 @@ SEEDED_BUILD_REQUEST_OFFSETS = {
 }
 
 
+# Earlier versions also gave the preset VM templates a ``source_instance`` naming a VM that never existed. The
+# presets stay (they are shapes, not copies of a VM), but loading a state without this marker removes those exact
+# (template id, source instance) pairs once. Templates created from a live VM keep their source.
+DEMO_TEMPLATE_SOURCE_MIGRATION_KEY = "demo_template_source_migration"
+DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION = 1
+SEEDED_TEMPLATE_SOURCE_INSTANCES = frozenset({
+    ("tpl-runner-n4-std16", "oxidex-runners-dallas-01"),
+    ("tpl-runner-za-n2-16", "oxidex-runners-za-jnb-01"),
+    ("tpl-builder-c4d-16", "builder-oxidex-turin-01"),
+})
+
+
+def drop_seeded_template_sources(state: dict[str, Any]) -> int:
+    """Remove the fabricated ``source_instance`` of the preset VM templates in place; returns how many it removed."""
+    dropped = 0
+    templates = state.get("vm_templates")
+    if not isinstance(templates, list):
+        return dropped
+    for tpl in templates:
+        if isinstance(tpl, dict) and (tpl.get("id"), tpl.get("source_instance")) in SEEDED_TEMPLATE_SOURCE_INSTANCES:
+            del tpl["source_instance"]
+            dropped += 1
+    return dropped
+
+
 def demo_telemetry_migrated(state: dict[str, Any]) -> bool:
     """True when ``state`` was written by a version that no longer seeds demo telemetry (any marker >= 1)."""
     marker = state.get(DEMO_TELEMETRY_MIGRATION_KEY)
@@ -658,7 +682,12 @@ def _original_seed_reference(state: dict[str, Any]) -> float | None:
         for row in records if isinstance(records, list) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row["id"] not in offsets:
                 continue
-            if {k: v for k, v in row.items() if k != timestamp} != expected[row["id"]]:
+            fingerprint = {k: v for k, v in row.items() if k != timestamp}
+            # The preset shapes lost their fabricated source_instance after the seeds were removed.
+            # Accept only those exact historical pairs; a reassigned source is still an edited preset.
+            if field == "vm_templates" and (row["id"], row.get("source_instance")) in SEEDED_TEMPLATE_SOURCE_INSTANCES:
+                fingerprint.pop("source_instance")
+            if fingerprint != expected[row["id"]]:
                 continue
             stamp = row.get(timestamp)
             if not isinstance(stamp, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp):
@@ -3003,7 +3032,6 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "runner_vcpu": 4,
             "runner_ram_gib": 16,
             "cloud_init_template_id": "ci-runner-default",
-            "source_instance": "oxidex-runners-dallas-01",
             "created_at": _iso_hours_ago(12.0, ref_now),
         },
         {
@@ -3024,7 +3052,6 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "runner_vcpu": 4,
             "runner_ram_gib": 8,
             "cloud_init_template_id": "ci-runner-default",
-            "source_instance": "oxidex-runners-za-jnb-01",
             "created_at": _iso_hours_ago(18.0, ref_now),
         },
         {
@@ -3045,7 +3072,6 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "runner_vcpu": 16,
             "runner_ram_gib": 28,
             "cloud_init_template_id": "ci-rust-builder-199",
-            "source_instance": "builder-oxidex-turin-01",
             "created_at": _iso_hours_ago(24.0, ref_now),
         },
     ]
@@ -3159,8 +3185,10 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         "dashboard_admins": [],
         # Bounded audit history of added-administrator changes.
         "dashboard_admins_history": [],
-        # Fresh states hold no seeded demo telemetry; see drop_seeded_demo_telemetry.
+        # Fresh states hold no seeded demo telemetry or template sources; see drop_seeded_demo_telemetry and
+        # drop_seeded_template_sources.
         DEMO_TELEMETRY_MIGRATION_KEY: DEMO_TELEMETRY_MIGRATION_VERSION,
+        DEMO_TEMPLATE_SOURCE_MIGRATION_KEY: DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION,
     }
 
 
@@ -3593,6 +3621,18 @@ class DashboardStore:
             base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
         if base.get(DEMO_TELEMETRY_MIGRATION_PENDING_KEY) is not True:
             base.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
+        if dropped_seeds:
+            LOG.warning("Dropped %d seeded demo telemetry record(s) and counter(s) from the dashboard state",
+                        dropped_seeds)
+        template_marker = loaded.get(DEMO_TEMPLATE_SOURCE_MIGRATION_KEY)
+        if not (isinstance(template_marker, int) and not isinstance(template_marker, bool)
+                and template_marker >= DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION):
+            dropped_sources = drop_seeded_template_sources(base)
+            base[DEMO_TEMPLATE_SOURCE_MIGRATION_KEY] = DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION
+            # The one-time marker must also reach KV when no source pairs needed removal.
+            base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
+            if dropped_sources:
+                LOG.warning("Removed the nonexistent source instance from %d preset VM template(s)", dropped_sources)
         previous = getattr(self, "state", None)
         self.state = base
         try:
@@ -3608,7 +3648,7 @@ class DashboardStore:
                         dropped_seeds)
 
     def commit_demo_telemetry_migration(self) -> bool:
-        """Persist a load that dropped seeded demo telemetry as a new state_version; True when it did.
+        """Persist seeded telemetry or template-source cleanup as a new state_version; True when it did.
 
         The drop changes content without a version, so a slot holding the seeded copy at the same version would
         look caught up (to a rollback, or to KV, which never takes different content at an equal version). The
@@ -6383,41 +6423,10 @@ class DashboardStore:
                     self._consume_active_oom_events(
                         role=None, event_id=str(payload["acknowledge_oom_id"]).strip()
                     )
-                if "add_github_oom_run" in payload and isinstance(payload["add_github_oom_run"], dict):
-                    item = dict(payload["add_github_oom_run"])
-                    if "deep_link" in item and not item.get("run_id"):
-                        parsed = parse_github_oom_deep_link(item["deep_link"])
-                        item = {**item, **parsed, "deep_link": parsed["url"]}
-                    else:
-                        link = build_github_oom_deep_link(
-                            item.get("repository", "Appz4Fun/nzbget"),
-                            item.get("run_id", 38596411473),
-                            item.get("job_id", 115964282184),
-                            item.get("step_number", 2),
-                            item.get("line_number", 50),
-                        )
-                        item["deep_link"] = link
-                    is_known_timeout_run = (
-                        int(item.get("run_id", 0)) == 38596411473
-                        and int(item.get("job_id", 0)) == 115964282184
-                    )
-                    if not item.get("error_excerpt"):
-                        if is_known_timeout_run:
-                            item["error_excerpt"] = (
-                                "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
-                            )
-                        else:
-                            item["error_excerpt"] = (
-                                "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
-                            )
-                    if "runner_name" not in item:
-                        item["runner_name"] = (
-                            "GitHub Actions 1000014245"
-                            if is_known_timeout_run
-                            else "gha-oxidex-runners-us-south1-a-01"
-                        )
+                if "add_github_oom_run" in payload:
+                    item = validate_github_oom_run(payload["add_github_oom_run"])
                     cls_info = classify_github_ci_failure(
-                        str(item["error_excerpt"]),
+                        item["error_excerpt"],
                         runner_name=item.get("runner_name"),
                     )
                     item["failure_classification"] = cls_info["failure_classification"]

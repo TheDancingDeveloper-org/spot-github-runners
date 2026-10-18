@@ -66,9 +66,9 @@ def no_live_pricing(test: unittest.TestCase) -> None:
     test.addCleanup(patcher.stop)
 
 
-# States written by a version that already ran the one-time demo telemetry migration: a markerless state is legacy
+# States written by a version that already ran the one-time telemetry and template migrations: a missing marker is legacy
 # and gets one version of its own on the active slot (DemoTelemetryMigrationCommitTests covers that).
-MIGRATED = {"demo_telemetry_migration": 1}
+MIGRATED = {"demo_telemetry_migration": 1, "demo_template_source_migration": 1}
 
 
 def write_state(path: Path, version: int, targets: list[str]) -> None:
@@ -1149,6 +1149,41 @@ class DemoTelemetryMigrationCommitTests(unittest.TestCase):
         published = parse_snapshot(self.fake.values[KV_STATE_KEY])
         self.assertEqual(published["state_version"], 6)
         self.assert_migrated(published["state"])
+
+    def test_template_marker_only_migration_is_published(self):
+        raw = {"state_version": 5, "demo_telemetry_migration": 1, "vm_templates": []}
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot(raw, 5, "a", now=1))
+        store = self.store("template-marker.json")
+        store.hydrate()
+        self.tick_until_published(store)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual(published["state_version"], 6)
+        self.assertEqual(published["state"]["demo_template_source_migration"], 1)
+        self.assertNotIn("demo_telemetry_migration_pending", published["state"])
+
+    def test_template_only_cleanup_waits_for_active_slot_and_publishes_a_new_version(self):
+        raw = {"state_version": 5, "demo_telemetry_migration": 1,
+               "vm_templates": [{"id": "tpl-builder-c4d-16", "source_instance": "builder-oxidex-turin-01"}]}
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=1).to_json()
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot(raw, 5, "b", now=1))
+        store = self.store("template.json")
+        store.hydrate()
+        self.tick_until_published(store)
+        self.assertEqual(store.state_version(), 5)
+        self.assertNotIn("source_instance", store.state["vm_templates"][0])
+        self.assertFalse(store.commit_demo_telemetry_migration())
+        self.assertIs(store.state.get("demo_telemetry_migration_pending"), True)
+        store.close()
+
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=self.clock.now).to_json()
+        restarted = self.store("template.json")
+        restarted.hydrate()
+        self.tick_until_published(restarted)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual(published["state_version"], 6)
+        self.assertNotIn("source_instance", published["state"]["vm_templates"][0])
+        self.assertEqual(published["state"]["demo_template_source_migration"], 1)
+        self.assertNotIn("demo_telemetry_migration_pending", published["state"])
 
     def test_standby_slot_keeps_the_version_until_it_is_active(self):
         self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=1).to_json()

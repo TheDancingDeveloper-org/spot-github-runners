@@ -69,6 +69,74 @@ def parse_github_oom_deep_link(url: str) -> dict[str, Any]:
     }
 
 
+GITHUB_OOM_RUN_LOCATION_FIELDS = ("repository", "run_id", "job_id", "step_number", "line_number")
+
+
+def _positive_int_field(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"add_github_oom_run.{field} must be a positive integer")
+    text = str(value).strip()
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError(f"add_github_oom_run.{field} must be a positive integer")
+    return int(text)
+
+
+def validate_github_oom_run(raw: Any) -> dict[str, Any]:
+    """Validate a caller-reported GitHub CI failure run; never fills in missing facts.
+
+    The caller supplies the failing job's location, either as a ``deep_link`` or as ``repository``,
+    ``run_id``, ``job_id``, ``step_number``, and ``line_number``, plus the failing log line as
+    ``error_excerpt``. ``runner_name`` is optional: without it the run counts as an external runner's,
+    so it never drives fleet scaling. Raises ValueError when a required fact is missing or malformed.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("add_github_oom_run must be a JSON object")
+    item = dict(raw)
+    deep_link = item.get("deep_link")
+    if deep_link not in (None, ""):
+        if not isinstance(deep_link, str):
+            raise ValueError("add_github_oom_run.deep_link must be a string")
+        parsed = parse_github_oom_deep_link(deep_link)
+        for field in GITHUB_OOM_RUN_LOCATION_FIELDS[1:]:
+            parsed[field] = _positive_int_field(parsed[field], field)
+        for field in GITHUB_OOM_RUN_LOCATION_FIELDS:
+            if item.get(field) in (None, ""):
+                continue
+            given = (str(item[field]).strip().strip("/") if field == "repository"
+                     else _positive_int_field(item[field], field))
+            if given != parsed[field]:
+                raise ValueError(f"add_github_oom_run.{field} does not match deep_link")
+        location = {field: parsed[field] for field in GITHUB_OOM_RUN_LOCATION_FIELDS}
+        location["deep_link"] = parsed["url"]
+    else:
+        missing = [field for field in GITHUB_OOM_RUN_LOCATION_FIELDS if item.get(field) in (None, "")]
+        if missing:
+            raise ValueError(
+                "add_github_oom_run requires a deep_link or " + ", ".join(GITHUB_OOM_RUN_LOCATION_FIELDS)
+                + f" (missing: {', '.join(missing)})"
+            )
+        if not isinstance(item["repository"], str):
+            raise ValueError("add_github_oom_run.repository must be a string")
+        location = {"repository": item["repository"].strip().strip("/")}
+        for field in GITHUB_OOM_RUN_LOCATION_FIELDS[1:]:
+            location[field] = _positive_int_field(item[field], field)
+        location["deep_link"] = build_github_oom_deep_link(
+            location["repository"], location["run_id"], location["job_id"],
+            location["step_number"], location["line_number"],
+        )
+    item.update(location)
+    excerpt = item.get("error_excerpt")
+    if not isinstance(excerpt, str) or not excerpt.strip():
+        raise ValueError("add_github_oom_run requires error_excerpt, the failing log line")
+    item["error_excerpt"] = excerpt.strip()
+    runner_name = item.pop("runner_name", None)
+    if runner_name is not None and not isinstance(runner_name, str):
+        raise ValueError("add_github_oom_run.runner_name must be a string")
+    if runner_name and runner_name.strip():
+        item["runner_name"] = runner_name.strip()
+    return item
+
+
 def is_self_hosted_spot_runner(runner_name: str | None) -> bool:
     """Return True only if runner_name affirmatively matches our self-hosted GCP Spot runner
     fleet naming convention (e.g. 'gha-oxidex-runners-...'), or False if missing or external.
