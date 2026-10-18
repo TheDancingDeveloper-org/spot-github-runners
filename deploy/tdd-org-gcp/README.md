@@ -135,7 +135,8 @@ The systemd unit is `poller/gha-spot-poller.service`. Its template names come fr
 
 ### Quota increase (prepared, not submitted)
 
-To run a large and small VMs together, raise both limits to 64 vCPU:
+To run a large and small VMs together, raise both limits to 64 vCPU (needs
+`gcloud components install alpha`; quota IDs checked against the Cloud Quotas API):
 
 ```bash
 gcloud alpha quotas preferences create --project=email-rs-493900 \
