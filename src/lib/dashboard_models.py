@@ -1888,8 +1888,14 @@ def calculate_spot_pricing(
     machine_type: str | None = None,
     live_pricing: dict[str, Any] | None = None,
     project: str = "homelab-424523",
+    provisioning: str = "spot",
 ) -> dict[str, Any]:
-    """Calculate compute-only and all-in (with disk & taxes) hourly, daily, and monthly prices."""
+    """Calculate compute-only and all-in (with disk & taxes) hourly, daily, and monthly prices.
+
+    ``provisioning="ondemand"`` prices a standard (non-Spot) VM from the Billing Catalog's on-demand component
+    rates. Without them the Spot baseline would understate it, so the result is marked ``"complete": False``.
+    """
+    on_demand = provisioning == "ondemand"
     reg_info = next((r for r in REGIONS_CATALOG if r["region"] == region), None)
     mult = _dec(reg_info["price_multiplier"] if reg_info else "1.0")
     resolved_live = (
@@ -1906,19 +1912,25 @@ def calculate_spot_pricing(
     disk_rates_map = (resolved_live or {}).get("disk_monthly_gib") or {}
 
     live_machine_rate = None
-    if machine_type:
+    if machine_type and not on_demand:  # capacityHistory prices are Spot prices
         live_machine_rate = machine_hourly_map.get((region, machine_type))
         if live_machine_rate is None:
             live_machine_rate = machine_hourly_map.get(f"{region}/{machine_type}")
 
     series_key = family.lower()
-    live_cpu_rate = comp_rates_map.get(("spot", region, series_key, "CPU"))
-    live_ram_rate = comp_rates_map.get(("spot", region, series_key, "RAM"))
+    price_kind = "ondemand" if on_demand else "spot"
+    live_cpu_rate = comp_rates_map.get((price_kind, region, series_key, "CPU"))
+    live_ram_rate = comp_rates_map.get((price_kind, region, series_key, "RAM"))
+    applicable_components_known = (
+        (vcpu > 0 or ram_gib > 0)
+        and (vcpu <= 0 or live_cpu_rate is not None)
+        and (ram_gib <= 0 or live_ram_rate is not None)
+    )
 
     if live_machine_rate is not None:
         compute_hourly = _dec(live_machine_rate)
         pricing_source = "gcp_capacity_history"
-    elif live_cpu_rate is not None and live_ram_rate is not None:
+    elif (live_cpu_rate is not None and live_ram_rate is not None) or applicable_components_known:
         compute_hourly = _dec(live_cpu_rate) * _dec(vcpu) + _dec(live_ram_rate) * _dec(ram_gib)
         pricing_source = "gcp_billing_catalog"
     else:
@@ -1931,15 +1943,15 @@ def calculate_spot_pricing(
     compute_daily = compute_hourly * HOURS_PER_DAY
     compute_monthly = compute_hourly * HOURS_PER_MONTH
 
-    live_boot_disk = (
-        disk_rates_map.get((region, boot_disk_type))
-        or disk_rates_map.get(f"{region}/{boot_disk_type}")
-        or disk_rates_map.get(boot_disk_type)
+    live_boot_disk = next(
+        (disk_rates_map[key] for key in ((region, boot_disk_type), f"{region}/{boot_disk_type}", boot_disk_type)
+         if disk_rates_map.get(key) is not None),
+        None,
     )
-    live_data_disk = (
-        disk_rates_map.get((region, data_disk_type))
-        or disk_rates_map.get(f"{region}/{data_disk_type}")
-        or disk_rates_map.get(data_disk_type)
+    live_data_disk = next(
+        (disk_rates_map[key] for key in ((region, data_disk_type), f"{region}/{data_disk_type}", data_disk_type)
+         if disk_rates_map.get(key) is not None),
+        None,
     )
     boot_rate = (
         _dec(live_boot_disk)
@@ -1965,7 +1977,7 @@ def calculate_spot_pricing(
     total_daily = total_hourly * HOURS_PER_DAY
     total_monthly = total_hourly * HOURS_PER_MONTH
 
-    return {
+    result = {
         "pricing_source": pricing_source,
         "compute_hourly_usd": _money4(compute_hourly),
         "compute_daily_usd": _money(compute_daily),
@@ -1981,6 +1993,43 @@ def calculate_spot_pricing(
         "total_daily_usd": _money(total_daily),
         "total_monthly_usd": _money(total_monthly),
     }
+    custom_shape = bool(machine_type) and ("custom" in machine_type or machine_type.endswith("-ext"))
+    # These types bill provisioned throughput or IOPS separately, which this capacity price leaves out.
+    performance_billed = {"hyperdisk-throughput", "pd-extreme"} & {
+        kind for kind, gb in ((boot_disk_type, boot_disk_gb), (data_disk_type, data_disk_gb)) if gb > 0
+    }
+    if on_demand:
+        result["provisioning"] = "ondemand"
+        result["complete"] = pricing_source == "gcp_billing_catalog" and not custom_shape
+        if not result["complete"]:
+            result["pricing_source"] = "spot_baseline_for_on_demand_vm"
+    if custom_shape and pricing_source != "gcp_capacity_history":
+        # Custom and extended shapes bill their own SKUs; predefined series rates do not price them.
+        result["complete"] = False
+    if performance_billed:
+        result["complete"] = False
+    # A disk type with neither a live rate nor a static one is priced at a generic fallback, which is not a price.
+    unknown_disk = [kind for kind, gb, live in ((boot_disk_type, boot_disk_gb, live_boot_disk),
+                                               (data_disk_type, data_disk_gb, live_data_disk))
+                    if gb and live is None and kind not in DISK_MONTHLY_RATES_USD_PER_GIB]
+    if unknown_disk:
+        result["complete"] = False
+        result["disk_rate_unknown"] = sorted(set(unknown_disk))
+    if pricing_source == "catalog_baseline" and vcpu and family not in SERIES_SPOT_BASE_RATES:
+        # No machine, component, or family rate: the generic per-vCPU/GiB fallback is not a trusted price.
+        result["complete"] = False
+        result["family_rate_unknown"] = True
+    # Static baselines have no regional multiplier outside the catalog. Tax trust is separate.
+    if reg_info is None:
+        if (vcpu > 0 or ram_gib > 0) and pricing_source == "catalog_baseline":
+            result["regional_compute_rate_unknown"] = True
+            result["complete"] = False
+        if any(gb > 0 and live is None for gb, live in (
+            (boot_disk_gb, live_boot_disk), (data_disk_gb, live_data_disk),
+        )):
+            result["regional_disk_rate_unknown"] = True
+            result["complete"] = False
+    return result
 
 
 def normalize_budget(budget: dict[str, Any]) -> dict[str, Any]:
@@ -2081,6 +2130,28 @@ def measure_region_latencies(timeout_seconds: float = 0.25) -> dict[str, int]:
     return measured
 
 
+def validate_builder_container_limits(values: dict[str, Any]) -> None:
+    """Validate supplied builder limit fields before coercion; unrelated patches are allowed.
+
+    Call with mutation fields to preserve unrelated edits to legacy profiles, and with
+    the full profile/policy before rendering or planning new builder capacity.
+    """
+    for keys, cap, integer in (
+        (("runner_vcpu", "container_vcpu", "builder_vcpu"), Decimal("16"), True),
+        (("runner_ram_gib", "container_ram_gib", "builder_ram_gib"), Decimal("28"), False),
+    ):
+        supplied = []
+        for key in keys:
+            if key not in values:
+                continue
+            value = _dec(values[key])
+            if value <= 0 or value > cap or (integer and value != value.to_integral_value()):
+                raise ValueError(f"{key} must be {'an integer ' if integer else ''}> 0 and <= {cap} for a dedicated builder")
+            supplied.append(value)
+        if len(set(supplied)) > 1:
+            raise ValueError(f"Builder limit aliases must agree: {', '.join(keys)}")
+
+
 def qualify_instances(
     profile_config: dict[str, Any],
     regions_state: dict[str, bool],
@@ -2094,6 +2165,17 @@ def qualify_instances(
     Supports both 'cicd_runner' and 'rust_builder' profiles independently.
     """
     role = profile_config.get("role", "cicd_runner")
+    if role == "rust_builder":
+        try:
+            validate_builder_container_limits(profile_config)
+        except ValueError as exc:
+            # Keep old profiles readable and budget-editable, but never recommend impossible capacity.
+            return {
+                "role": role, "pricing_source": "unavailable", "requirements": dict(profile_config),
+                "hardware_qualifying_count": 0, "spot_price_qualifying_count": 0,
+                "hardware_qualifying": [], "spot_price_qualifying": [],
+                "disqualified_counts": {}, "validation_error": str(exc),
+            }
     min_runners = max(1, int(profile_config.get("min_runners", 4 if role == "cicd_runner" else 1)))
     min_instances = max(1, int(profile_config.get("min_instances", 1)))
     max_instances = max(min_instances, int(profile_config.get("max_instances", 10)))
@@ -2155,6 +2237,10 @@ def qualify_instances(
         tax_rate = reg_tax_rate if include_taxes else 0.0
 
         for shape in MACHINE_SHAPES_CATALOG:
+            if role == "rust_builder" and (
+                shape["machine_type"] != "n4-highcpu-16" or shape["vcpu"] != 16 or shape["ram_gib"] != 32
+            ):
+                continue
             family = shape["family"]
             if family not in reg["families"]:
                 continue
@@ -3161,6 +3247,8 @@ def render_cloud_init_for_profile(
     host_overhead_gib: float = 0.0,
 ) -> str:
     """Synchronize runner density and per-slot resource limits in a cloud-init template."""
+    if role == "rust_builder":
+        validate_builder_container_limits({"runner_vcpu": runner_vcpu, "runner_ram_gib": runner_ram_gib})
     text = str(content or "")
     slots = max(1, int(runners_count))
     vcpu = max(1, int(runner_vcpu))

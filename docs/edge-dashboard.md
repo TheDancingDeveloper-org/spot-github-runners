@@ -332,6 +332,176 @@ browser `Origin`. When a `POST` carries an `Origin` header, the dashboard accept
 `--public-origin`, then `DASHBOARD_PUBLIC_ORIGIN`, then the origin of `GITHUB_OAUTH_REDIRECT_URI`. The
 startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` metadata value.
 
+## Instance data
+
+The instance list, the region map, and the fleet telemetry show only VMs that the live Compute Engine
+inventory lists. The dashboard doesn't ship demo or seed instances.
+
+- With `DASHBOARD_FLEET_INVENTORY=gce`, which the control VM sets, the dashboard lists the project's
+  instances every 2 minutes. The listing is one aggregated read-only call, plus one aggregated disk
+  listing and a cached machine type lookup for each shape. It keeps the VMs whose names start with
+  a runner host prefix (`oxidex-runners-`, or an earlier fleet's `newznab-spot-runners-`,
+  `spot-runners-`, or `oxidex-spot-runners-`) or `builder-` (dedicated builders). Control VMs and other VMs aren't
+  listed. The control VM's service account needs `compute.instances.list` and
+  `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
+  (HTTP 403) a VM keeps the types and disk IDs stored from an earlier listing (across any number of
+  denied listings) and a new VM shows `pd-balanced`,
+  but both are marked unverified and incompletely priced, and neither can be a template source. Any other failed or partial disk listing fails the whole refresh,
+  so known disk types are never replaced by the default. An attached disk the listing doesn't cover is
+  treated as an unknown type. On a VM's first listing, each disk is billed from its own creation time,
+  so a disk attached later isn't billed back to the VM's creation; when a creation time is missing, disk
+  history starts at that listing, and the earlier time is billed once a later listing reports every
+  creation time. A machine type whose capacity can't
+  be read also fails the refresh, so no VM is priced without its memory.
+- A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
+  after a Spot preemption or a manual stop. A suspended VM's compute ends at its
+  `lastSuspendedTimestamp`, also when it resumed between two listings. A stopped VM stops adding compute cost at its
+  `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
+  that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
+  window spend. When its machine type or disks change, or its prices change, the time before the change
+  keeps the earlier rates; each disk added to a listed VM starts billing at its own creation time. A stop that's reported late ends the run at the reported stop time. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
+  toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
+  budgets. Hiding deleted instances doesn't hide stopped VMs, because they still exist. The listing
+  carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
+- A VM that was listed before and is no longer in the inventory becomes `DELETED`. Its deletion time is
+  the time of the first listing that missed it. Deleted VMs and earlier runs stay in the history for 31
+  days, and cost windows are limited to 744 hours (31 days) to match. To keep the state and its KV
+  snapshot small, history past 2,000 records, or past 200 runs or disk segments of one VM, is folded
+  into hourly cost totals. If the instance data still exceeds 6 MiB serialized, the oldest deleted
+  records are folded next, then all but the newest 10 runs and disk segments of each live VM, then all
+  of them, and then each live VM's folded totals are merged into daily totals. A listing whose records
+  still don't fit is refused, and the inventory reads as stale. Window totals still include it to within an hour, though a search filter
+  can't match folded records. A VM that's
+  recreated with the same name gets a new record, because the record follows the instance ID.
+  Template creation and deletion plans require `instance_id` when a name matches more than one zonal
+  or historical record. A supplied ID takes priority over the name and never falls back to another VM.
+- Spend covers each VM's attached disks while the VM exists. A fleet-named disk that no VM uses, such
+  as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
+  `DETACHED` record that bills storage until the disk is deleted (shown as present storage). A disk the instance listing still shows
+  attached is billed only by its VM's record, and a disk attached to a fleet VM that the instance listing
+  doesn't show yet is billed on its own until that VM appears. A disk attached to several fleet VMs is
+  billed once, while every VM keeps the full attachment metadata. Detached runner data disks named
+  `runner-data` or `runner-data-*` are included too; where fleet users are present, their role identifies
+  which fleet owns the disk. VM templates cannot copy shared
+  attachments. Disk users are matched by zone and instance name. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
+  is billed by the new record only from the handoff, never again from its creation. Disks are matched
+  by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
+  disks can't be listed, existing `DETACHED` records are kept, not marked deleted, unless a listed VM
+  shows the disk attached (its record takes it over), and a builder that
+  disappears keeps billing the storage of the disks that outlive it (auto-delete off, such as its cache
+  disk; all its disks when the listing didn't report auto-delete), `disk_liability_pending`, until a disk
+  listing shows whether they still exist; its row shows that storage rate. That storage is repriced like other records. A disk that's
+  detached again keeps its earlier standalone interval and restarts billing at the new handoff.
+- Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
+  regional scale plans are refused even when the listing is otherwise current. Grant the permission for
+  scaling to work. For a disk newly attached or resized during this outage, the dashboard defers its cost rather
+  than assigning a fallback rate. Once disk metadata is available, it fills that disk's history from
+  its creation or known handoff time at the verified rate, preserving observed size-change boundaries.
+  Deferred intervals follow a disk when its billing owner changes and survive detachment until metadata
+  can resolve them. Pending disk liabilities remain visible
+  when the deleted-instance filter is off. A complete project disk listing must confirm a resource is
+  missing before its unresolved history can expire. Once that confirmed absence is outside the 31-day
+  window, it no longer holds current budgets; `lifetime_cost_complete` stays false if the old amount
+  couldn't be recovered. A newer disk with the same source name cannot resolve the old uncertainty.
+- A builder name identifies the host's role, but its fixed build capacity is counted only after the
+  machine inventory verifies `n4-highcpu-16`, 16 vCPUs, and 32 GiB of host RAM. Other shapes and unknown
+  capacities have no known container limits and can't be copied into a VM template.
+- Instance metadata records how many runners a host registered, but not the per-runner limits, which
+  depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
+  template can't copy them from such a host; the dashboard hides the template action for such records.
+  The "Runners online" figure counts only confirmed runner slots and names hosts not yet confirmed. A VM with data disks of several types can't be a template
+  source or the shape of a scale plan, since those hold one data-disk type. Neither can a VM with
+  Local SSD, regional disks, or provisioned Hyperdisk performance, which templates don't describe. A
+  scale-up plan whose new VMs can't be fully priced is refused. When a running host has no recorded runner count, or
+  hasn't confirmed its bootstrap in its current boot (an applied patch record for this boot with
+  nothing pending), the runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
+  plans are refused.
+- A VM in a region outside the dashboard's region catalog is priced with no tax, marked
+  `tax_rate_known: false`, rather than with another region's default tax, and its pricing is marked
+  incomplete, since the catalog has no trusted compute or disk rates for that region either. When the budget being
+  checked or the VM's own budget includes taxes, without a tax override on the VM's profile, that
+  unknown tax holds scale-ups like other unpriced costs. A VM first listed while
+  its profile overrides the regional tax is priced with the override from the start. Each inventory
+  refresh, and each budget or profile change, reprices the listed VMs, stopped ones included, but a page read
+  doesn't, so a tax override also applies to
+  their disks, and the rate change is saved with the state.
+- A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
+  `SUSPENDED` VM, whose preserved memory Compute Engine also bills, for a VM with Local SSD (counted
+  as `local_ssd_gb`, not as a persistent data disk), for a VM with a regional (replicated) persistent
+  disk or an Extreme Persistent Disk (`pd-extreme`, whose provisioned IOPS bill separately), for a custom or extended machine shape, which predefined rates don't price, for a machine family
+  without a known rate (when no live price was found), for a disk type without a live or static rate, and for a VM whose
+  Hyperdisk bills provisioned IOPS or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
+  no reported performance), the record is marked
+  `pricing_complete: false`. Under a shared budget, the other role's VMs and disks, including runner VMs the CI evaluation would add,
+  are priced with the disk and tax settings of the budget being checked. While the role's fleet (both roles under a shared
+  budget) has such a VM,
+  scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
+  on a cost that's too low.
+- A suspended VM's memory-storage charge isn't priced here. Its unpriced interval remains in
+  `unpriced_history_intervals` after it resumes or is deleted. A first listing that already shows a
+  restart also records unknown earlier compute history. These records keep `lifetime_cost_complete`
+  false. `window_cost_complete` reports whether the selected cost window overlaps missing charges;
+  scale-up budgets hold while applicable missing charges remain in the supported 31-day window.
+  Expiry from that window doesn't make lifetime history complete. Closing a compute or disk interval
+  at an incomplete fallback price keeps that history marked incomplete even after current rates
+  become trusted. Retained cache-disk prices preserve each disk's pricing-completeness flags.
+- A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
+  at its full rate in burn and budgets. While the role has one, scaling recommendations hold and
+  regional scale plans are refused, including scale-down and no-op plans, because its capacity hasn't settled. For a newly provisioned VM, creation
+  is a provisional boundary until GCE reports its first start. Repricing and state reloads don't turn
+  creation-to-first-start time into a completed compute run; a VM with an earlier proven run retains
+  that history through a restart. Restart staging keeps a completed run's known stop separate from
+  `transitional_since_epoch`, so the stopped gap isn't charged as compute. If a newer stop before the
+  latest start proves an unobserved intervening run whose start can't be recovered, its bounded
+  compute-history uncertainty remains explicit instead of being silently omitted.
+- A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
+  `fleet_inventory` field reports the last successful listing and the last error. Until the next
+  complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false and
+  `fleet_inventory.stale_reason` says why: the rows
+  stay visible, but scaling recommendations hold and all regional scale plans are refused, including scale-down plans. A listing that can't be
+  saved, for example on a full disk, also leaves the inventory stale, and so does a refresh that hasn't
+  completed for three refresh intervals (6 minutes), for example a hung API connection.
+- Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
+  inactive makes no Compute Engine calls and keeps the records the active slot last published.
+- The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
+  already existed, so they don't mark OOM events handled. A runner OOM event that's active for scaling keeps
+  the ready runner slots running when it happened (`baseline_runners`; a late report excludes capacity
+  that started after it), and OOM state is reconciled on every listing, even one with no fleet change, and it's handled only when a runner host
+  first listed after the baseline is `RUNNING` with its bootstrap confirmed and the ready slots reach
+  the event's target. A restart of existing capacity, or a same-size replacement, handles nothing. New
+  capacity stays pending through the OOM lookback, so an OOM reported late can still be answered by it.
+  Without a dated readiness transition, only a new identity created after the incident can satisfy it.
+  A poll time or missing bootstrap metadata cannot date readiness, so uncertain incidents stay active.
+  GitHub CI entries enter baseline, active-event, and acknowledgement handling only when the shared
+  classifier identifies an OOM on this self-hosted GCP runner fleet. Timeouts, external-runner failures,
+  and non-OOM records keep their original incident history. Actual log evidence and runner identity
+  take priority over stale cached classification flags.
+  A later restart of the same identity cannot satisfy a newer incident.
+  Hosts first listed together with an OOM that were already running before it count toward its baseline,
+  and only ready runner slots count as current runners. Builder OOM events are never handled from the
+  inventory, including by the builder scaling evaluation: a builder has no service account, so its
+  instance record can't show that its build container started. Acknowledge them with `POST /api/scaling`
+  and `acknowledge_oom_id` (or `acknowledge_all_ooms`).
+  A held recommendation projects the cost of the fleet it keeps, including the storage its stopped VMs
+  and detached disks still bill. A listing that changes nothing writes
+  nothing, so a quiet fleet doesn't publish a new snapshot.
+- Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
+  empty, the instances tab says that the inventory isn't configured, and scaling recommendations hold
+  and regional scale plans are refused, because the real fleet is unknown. Inventory records loaded from
+  a state file or snapshot are dropped too, since nothing would keep them current, and so is the
+  baseline: a later re-enabled inventory starts a new one.
+- On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance
+  record that didn't come from the inventory. These are the demo instances that earlier versions seeded,
+  such as `oxidex-runners-dallas-01`, and records that the old in-dashboard actions invented.
+- The delete and regional scale controls, `POST /api/instances/delete` and
+  `POST /api/instances/scale-region`, are plans only. They check the request against budgets and caps
+  and report what would launch or retire. The budget projection includes the disks of stopped VMs.
+  They don't change the instance list or any VM, and they run like reads: each request is computed
+  from the current state, an `Idempotency-Key` stores nothing, and a frozen or unreconciled slot still
+  answers them. The autoscaler
+  (`src/spot_runner_autoscaler.py`) drains and retires runner hosts, `src/spot_runner_manager.py`
+  provisions them, and `src/render_builder_startup.py` renders a dedicated builder.
+
 ## State durability
 
 - The dashboard writes state atomically to `/var/lib/spot-dashboard/state.json` on the boot disk.

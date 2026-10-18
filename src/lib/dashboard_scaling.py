@@ -159,6 +159,21 @@ def classify_github_ci_failure(
     }
 
 
+def _github_oom_excerpt(run: dict[str, Any]) -> str:
+    # Raw evidence wins over stale cached classification flags, matching the scaling evaluator's contract.
+    if "error_excerpt" in run and run.get("error_excerpt") is not None:
+        return str(run["error_excerpt"])
+    if run.get("is_oom") is False or str(run.get("failure_classification", "")).strip().upper() == "TIMEOUT":
+        return "##[error]Timeout reached, aborting!"
+    return "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
+
+
+def _is_eligible_github_oom(run: dict[str, Any]) -> bool:
+    """Only classified OOMs on our self-hosted GCP runners can affect scaling or incident disposition."""
+    classification = classify_github_ci_failure(_github_oom_excerpt(run), runner_name=run.get("runner_name"))
+    return bool(classification["is_self_hosted_runner"] and classification["is_oom"])
+
+
 def _is_recent_unhandled_oom(
     evt: dict[str, Any],
     now_ts: float,
@@ -378,6 +393,8 @@ def evaluate_scaling_decision(
     if cfg.get("enable_github_ci_oom_trigger", True) and github_oom_runs:
         oom_target_runners = current_runners
         for run in github_oom_runs:
+            if not isinstance(run, dict) or not _is_eligible_github_oom(run):
+                continue
             if not _is_recent_unhandled_oom(run, now_ts, lookback_seconds):
                 continue
             if run.get("baseline_runners") is not None:
@@ -386,21 +403,7 @@ def evaluate_scaling_decision(
                 if current_runners >= required_target and (current_runners > baseline_val or baseline_val >= max_runners):
                     run["handled"] = True
                     continue
-            if "error_excerpt" in run and run.get("error_excerpt") is not None:
-                excerpt = str(run.get("error_excerpt"))
-            elif (
-                run.get("is_oom") is False
-                or str(run.get("failure_classification", "")).strip().upper() == "TIMEOUT"
-            ):
-                excerpt = "##[error]Timeout reached, aborting!"
-            else:
-                excerpt = (
-                    "cargo: rustc killed by signal 9 (SIGKILL) — cgroup memory.oom.group=1 (exit code 137)"
-                )
-            runner_name = run.get("runner_name")
-            classification = classify_github_ci_failure(excerpt, runner_name=runner_name)
-            if not classification["is_self_hosted_runner"] or not classification["is_oom"]:
-                continue
+            excerpt = _github_oom_excerpt(run)
             baseline_val = _finite_int_val(
                 run.setdefault("baseline_runners", current_runners),
                 "baseline_runners",
