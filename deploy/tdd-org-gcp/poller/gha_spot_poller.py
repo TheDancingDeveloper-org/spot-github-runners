@@ -7,7 +7,11 @@ when idle, so this process only starts it, and stops it when the monthly
 running-hour cap is reached.
 
 Environment:
-  GH_TOKEN            org "Self-hosted runners: write" + Actions read on REPOS
+  GH_APP_ID, GH_APP_INSTALLATION_ID   authenticate as the gha-spot-poller GitHub App; the
+                      private key is the gh_app_key credential (or GH_APP_KEY). Installation
+                      tokens are minted with openssl and reused for 55 minutes
+  GH_TOKEN            fallback when the App variables are unset: org "Self-hosted runners:
+                      write" + Actions read on REPOS (gh_token credential)
   GCP_SA_KEY_FILE     JSON key for gha-spot-poller@PROJECT.iam.gserviceaccount.com
   GCP_PROJECT, GCP_ZONE, GCP_INSTANCE (default gha-spot-1)
   GH_ORG              default TheDancingDeveloper-org
@@ -110,6 +114,18 @@ def b64url(raw):
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
+def rs256_sign(pem, data):
+    """RS256 signature of `data` with the PEM key, which reaches openssl only through a pipe."""
+    keyfd_r, keyfd_w = os.pipe()
+    os.write(keyfd_w, pem.encode())
+    os.close(keyfd_w)
+    try:
+        return subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{keyfd_r}"],
+                              input=data, capture_output=True, check=True, pass_fds=(keyfd_r,)).stdout
+    finally:
+        os.close(keyfd_r)
+
+
 def gcp_token():
     if _gcp["token"] and time.time() < _gcp["exp"] - 120:
         return _gcp["token"]
@@ -121,13 +137,7 @@ def gcp_token():
     claims = b64url(json.dumps({
         "iss": key["client_email"], "aud": key["token_uri"], "iat": now, "exp": now + 3600,
         "scope": "https://www.googleapis.com/auth/cloud-platform"}).encode())
-    signing_input = f"{header}.{claims}".encode()
-    keyfd_r, keyfd_w = os.pipe()
-    os.write(keyfd_w, key["private_key"].encode())
-    os.close(keyfd_w)
-    sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{keyfd_r}"],
-                         input=signing_input, capture_output=True, check=True, pass_fds=(keyfd_r,)).stdout
-    os.close(keyfd_r)
+    sig = rs256_sign(key["private_key"], f"{header}.{claims}".encode())
     assertion = f"{header}.{claims}.{b64url(sig)}"
     body = f"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={assertion}".encode()
     req = urllib.request.Request(key["token_uri"], data=body, method="POST",
@@ -175,6 +185,42 @@ def cred(env_name, cred_name):
     return os.environ[env_name]
 
 
+# GitHub App installation token (GH_APP_ID + GH_APP_INSTALLATION_ID + the
+# gh_app_key credential). GitHub issues it for an hour; reuse it for 55 minutes.
+GH_APP_ID = os.environ.get("GH_APP_ID", "")
+GH_APP_INSTALLATION_ID = os.environ.get("GH_APP_INSTALLATION_ID", "")
+GH_APP_TOKEN_TTL = 55 * 60
+_gh_app = {"token": None, "exp": 0}
+
+
+def gh_app_jwt(pem, app_id, now=None):
+    now = int(time.time()) if now is None else now
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    # iat 60 s back for clock skew; GitHub rejects exp more than 10 minutes out.
+    claims = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": str(app_id)}).encode())
+    return f"{header}.{claims}.{b64url(rs256_sign(pem, f'{header}.{claims}'.encode()))}"
+
+
+def gh_token():
+    """Bearer token for GitHub: the App installation token, or the old gh_token PAT
+    when GH_APP_ID / GH_APP_INSTALLATION_ID are unset."""
+    if not (GH_APP_ID and GH_APP_INSTALLATION_ID):
+        return cred("GH_TOKEN", "gh_token")
+    if _gh_app["token"] and time.time() < _gh_app["exp"]:
+        return _gh_app["token"]
+    now = int(time.time())
+    jwt = gh_app_jwt(cred("GH_APP_KEY", "gh_app_key"), GH_APP_ID, now)
+    req = urllib.request.Request(
+        f"https://api.github.com/app/installations/{GH_APP_INSTALLATION_ID}/access_tokens", data=b"",
+        method="POST", headers={"Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json",
+                                "User-Agent": "gha-spot-poller"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        tok = json.load(resp)
+    _gh_app.update(token=tok["token"], exp=now + GH_APP_TOKEN_TTL)
+    log(f"github: minted installation token for app {GH_APP_ID} (reused for {GH_APP_TOKEN_TTL // 60} min)")
+    return _gh_app["token"]
+
+
 class RateLimited(Exception):
     """GitHub's quota is spent or nearly so; no GitHub calls until `until`."""
 
@@ -200,7 +246,7 @@ def gh(method, path, body=None):
         raise RateLimited(_rate["paused_until"])
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(f"https://api.github.com/{path}", data=data, method=method, headers={
-        "Authorization": f"Bearer {cred('GH_TOKEN', 'gh_token')}", "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {gh_token()}", "Accept": "application/vnd.github+json",
         "Content-Type": "application/json", "User-Agent": "gha-spot-poller"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:

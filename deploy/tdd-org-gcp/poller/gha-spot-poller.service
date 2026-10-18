@@ -14,9 +14,12 @@ Environment=MODE=ephemeral RUNNER_GROUP_ID=6 VCPU_QUOTA=32
 Environment=LARGE_TEMPLATE=gha-large-20261018060207063400000001 LARGE_LABELS=rust-heavy,bigmem LARGE_VCPUS=30 LARGE_MAX=1
 Environment=SMALL_TEMPLATE=gha-small-20261018060207067300000002 SMALL_LABELS=gcp-rust SMALL_VCPUS=8 SMALL_MAX=4
 Environment=GH_ORG=TheDancingDeveloper-org REPOS=codex,vogt,rustnzb,rustTorrent
+# GitHub App gha-spot-poller (WI-1863); unset both to fall back to gh_token.
+Environment=GH_APP_ID=5372559 GH_APP_INSTALLATION_ID=172817044
 Environment=MAX_HOURS_PER_MONTH=250 STATE_FILE=/var/lib/gha-spot-poller/state.json
 # Secrets are TPM2-encrypted at rest and decrypted only into this service's
 # private tmpfs credentials directory.
+LoadCredentialEncrypted=gh_app_key:/etc/credstore.encrypted/gha-spot-poller.gh_app_key
 LoadCredentialEncrypted=gh_token:/etc/credstore.encrypted/gha-spot-poller.gh_token
 LoadCredentialEncrypted=gcp_sa_key:/etc/credstore.encrypted/gha-spot-poller.gcp_sa_key
 ExecStart=/usr/bin/python3 /opt/gha-spot-poller/gha_spot_poller.py
