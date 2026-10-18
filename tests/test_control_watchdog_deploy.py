@@ -35,6 +35,17 @@ ENV = {
 }
 
 
+# The live service as `gcloud run services describe --format=json` prints it: nothing orphaned.
+SERVICE = {"spec": {"template": {"spec": {"containers": [{"volumeMounts": []}], "volumes": []}}}}
+
+
+def described(argv, service=SERVICE):
+    """The fake answer to the post-deploy describe of the service, or None for any other command."""
+    if list(argv[1:4]) == ["run", "services", "describe"]:
+        return SimpleNamespace(returncode=0, stdout=json.dumps(service), stderr="")
+    return None
+
+
 def never(argv):
     raise AssertionError(f"dry run ran {argv}")
 
@@ -277,6 +288,8 @@ class ExecuteTests(unittest.TestCase):
                     files.setdefault("condition", json.loads(Path(arg.split("=", 1)[1]).read_text()))
             if argv[:3] == ["gcloud", "projects", "describe"]:
                 return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if described(argv):
+                return described(argv)
             if "describe" in argv and "versions" in argv:
                 return SimpleNamespace(returncode=0 if secrets_ok else 1, stdout="ENABLED\n" if secrets_ok else "",
                                        stderr="" if secrets_ok else "NOT_FOUND")
@@ -489,6 +502,8 @@ class FloorDeployTests(unittest.TestCase):
                     files.append(json.loads(Path(arg.split("=", 1)[1]).read_text()))
             if argv[:3] == ["gcloud", "projects", "describe"]:
                 return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if described(argv):
+                return described(argv)
             if "describe" in argv and "versions" in argv:
                 return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
             return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
@@ -524,6 +539,8 @@ class FloorRemovalTests(unittest.TestCase):
             calls.append(argv)
             if argv[:3] == ["gcloud", "projects", "describe"]:
                 return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if described(argv):
+                return described(argv)
             if "describe" in argv and "versions" in argv:
                 return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
             if argv[:3] == ["gcloud", "secrets", "list"]:
@@ -592,3 +609,108 @@ class FloorRemovalTests(unittest.TestCase):
                 self.assertIn('"$name"', script)
                 self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
                 self.assertEqual("projects remove-iam-policy-binding" in script, env is ENV)
+
+
+def secret_volume(name, secret):
+    return {"name": name, "secret": {"secretName": secret, "items": [{"key": "latest", "path": "token"}]}}
+
+
+# A floor service after its targets moved from the swackhamer secret to swack-tools': gcloud kept the old volume.
+LIVE = {"spec": {"template": {"spec": {
+    "containers": [{"volumeMounts": [{"name": "spot-floor-github-swack-tools-xul-boc",
+                                      "mountPath": "/secrets/runner-floor/spot-floor-github-swack-tools"}]}],
+    "volumes": [secret_volume("spot-floor-github-swackhamer-jun-vid", "spot-floor-github-swackhamer"),
+                secret_volume("spot-floor-github-swack-tools-xul-boc", "spot-floor-github-swack-tools"),
+                {"name": "scratch", "emptyDir": {"medium": "Memory"}}]}}}}
+
+
+class OrphanedVolumeTests(unittest.TestCase):
+    """--set-secrets keeps the volume of every mount it drops; the deploy removes the secret volumes nothing mounts."""
+
+    def runner(self, service=LIVE, describe_fails=False):
+        calls = []
+
+        def run(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if argv[1:4] == ["run", "services", "describe"]:
+                if describe_fails:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="PERMISSION_DENIED")
+                return described(argv, service)
+            if "describe" in argv and "versions" in argv:
+                return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
+            return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
+        return run, calls
+
+    def deploy(self, run, env=FLOOR_ENV):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}"], runner=run, env=env)
+        return code, err.getvalue()
+
+    def updates(self, calls):
+        return [c for c in calls if c[1:4] == ["run", "services", "update"]]
+
+    def test_only_unmounted_secret_volumes(self):
+        self.assertEqual(deploy.orphaned_secret_volumes(LIVE), ["spot-floor-github-swackhamer-jun-vid"])
+        self.assertEqual(deploy.orphaned_secret_volumes(SERVICE), [])
+        self.assertEqual(deploy.orphaned_secret_volumes({}), [])
+        self.assertEqual(deploy.orphaned_secret_volumes({"spec": {"template": {"spec": {
+            "volumes": [secret_volume("a", "s1"), secret_volume("b", "s2")]}}}}), ["a", "b"])
+
+    def test_the_deploy_removes_them_after_the_service_update(self):
+        run, calls = self.runner()
+        code, err = self.deploy(run)
+        self.assertEqual(code, 0, err)
+        updates = self.updates(calls)
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(flag(updates[0], "remove-volume"), "spot-floor-github-swackhamer-jun-vid")
+        self.assertEqual(updates[0][4], "spot-control-watchdog")
+        for name in ("project", "region"):
+            self.assertTrue(flag(updates[0], name))
+        order = [" ".join(c[1:4]) for c in calls]
+        self.assertLess(order.index("run deploy spot-control-watchdog"), order.index("run services update"))
+        # The floor turned off: every floor volume is left behind, and every one goes.
+        both = {"spec": {"template": {"spec": {"containers": [{}], "volumes": LIVE["spec"]["template"]["spec"]["volumes"]}}}}
+        run, calls = self.runner(service=both)
+        self.assertEqual(self.deploy(run, ENV)[0], 0)
+        self.assertEqual(flag(self.updates(calls)[0], "remove-volume"),
+                         "spot-floor-github-swack-tools-xul-boc,spot-floor-github-swackhamer-jun-vid")
+
+    def test_nothing_orphaned_means_no_extra_revision(self):
+        run, calls = self.runner(service=SERVICE)
+        self.assertEqual(self.deploy(run)[0], 0)
+        self.assertEqual(self.updates(calls), [])
+
+    def test_an_unreadable_service_stops_the_deploy_before_the_scheduler(self):
+        for runner in (self.runner(describe_fails=True), self.runner(service=["not", "a", "service"])):
+            run, calls = runner
+            code, err = self.deploy(run)
+            self.assertEqual(code, 1)
+            self.assertIn("could not read the service's volumes", err)
+            self.assertFalse([c for c in calls if "scheduler" in c])
+            self.assertEqual(self.updates(calls), [])
+
+    def test_an_unexpected_volume_name_is_refused(self):
+        odd = {"spec": {"template": {"spec": {"volumes": [secret_volume("a,b", "s")]}}}}
+        run, calls = self.runner(service=odd)
+        code, err = self.deploy(run)
+        self.assertEqual(code, 1)
+        self.assertIn("unexpected volume name", err)
+        self.assertEqual(self.updates(calls), [])
+
+    def test_the_dry_run_snippet_matches_the_function(self):
+        code, script, err = dry_run(f"--image={IMAGE}", env=FLOOR_ENV)
+        self.assertEqual(code, 0, err)
+        self.assertIn("--format=json | python3 -c", script)
+        self.assertIn('"--remove-volume=$volumes"', script)
+        cases = [LIVE, SERVICE, {}, {"spec": {"template": {"spec": {"containers": [{}], "volumes": [
+            secret_volume("b", "s2"), secret_volume("a", "s1"), {"name": "c", "emptyDir": {}}]}}}}]
+        for service in cases:
+            with self.subTest(service=service):
+                result = subprocess.run(["python3", "-I", "-c", deploy.ORPHANED_VOLUMES_PY], input=json.dumps(service),
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), ",".join(deploy.orphaned_secret_volumes(service)))

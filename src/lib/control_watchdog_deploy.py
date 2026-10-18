@@ -16,6 +16,8 @@ minimum per execution, which at this cadence leaves the free tier. This module c
 7. The Workload Identity pool and GitHub OIDC provider, limited to the image workflow on ``main``.
 8. With ``--image``: the Cloud Run service (no unauthenticated access, concurrency 1, at most one instance, secrets
    as Secret Manager references only), its invoker binding, and the Cloud Scheduler job with an OIDC target.
+   ``--set-secrets`` replaces the mounts but keeps the volume of every dropped mount, so the deploy then removes
+   the secret volumes nothing mounts (a dropped runner floor token's, for example).
 
 ``--dry-run`` prints every command as a reviewable shell script and runs nothing. Without it, every resource is
 described first and created only when missing; bindings and updates are idempotent.
@@ -110,6 +112,7 @@ _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
 _SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
 _GH_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SCHEDULE_RE = re.compile(r"^[0-9*/,\- ]+$")
+_VOLUME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
 
 class DeployError(RuntimeError):
@@ -336,6 +339,9 @@ class Step:
     # (list command printing one name per line, names to keep, commands run for every other name with the argument
     # NAME_ARG replaced by it): removes what an earlier deploy granted and this one no longer needs.
     prune: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, ...], ...]], ...] = ()
+    # (command printing the Cloud Run service as JSON, update command): after the run commands, the update runs with
+    # --remove-volume=<names> when the service has secret volumes that no container mounts.
+    volume_prune: tuple[tuple[str, ...], tuple[str, ...]] | None = None
 
 
 def _c(*argv: str) -> tuple[str, ...]:
@@ -346,6 +352,29 @@ NAME_ARG = "{name}"
 # Every floor token secret this deploy grants access to carries this label, so a later deploy can find the grants
 # it made and remove those it no longer needs, even after the secret names left SPOT_RUNNER_FLOOR_TARGETS.
 FLOOR_SECRET_LABEL = "spot-runner-floor"
+
+
+# The dry-run script's copy of orphaned_secret_volumes (the tests check that both agree): reads the service JSON on
+# stdin and prints the orphaned volume names, comma-separated.
+ORPHANED_VOLUMES_PY = (
+    "import json, sys; "
+    "s = ((json.load(sys.stdin).get('spec') or {}).get('template') or {}).get('spec') or {}; "
+    "m = {v.get('name') for c in s.get('containers') or [] for v in c.get('volumeMounts') or []}; "
+    "print(','.join(sorted(v['name'] for v in s.get('volumes') or [] if v.get('secret') and v.get('name') "
+    "and v['name'] not in m)))")
+
+
+def orphaned_secret_volumes(service: Mapping) -> list[str]:
+    """Secret volumes of the service's template that no container mounts.
+
+    ``gcloud run deploy --set-secrets`` replaces every secret mount but leaves the volume of each mount it dropped,
+    still naming its secret; such a volume does nothing, and deleting its secret would leave it pointing at nothing.
+    """
+    spec = ((service.get("spec") or {}).get("template") or {}).get("spec") or {}
+    mounted = {mount.get("name") for container in spec.get("containers") or []
+               for mount in container.get("volumeMounts") or []}
+    return sorted(volume["name"] for volume in spec.get("volumes") or []
+                  if volume.get("secret") and volume.get("name") and volume["name"] not in mounted)
 
 
 def floor_condition() -> dict[str, str]:
@@ -532,7 +561,8 @@ def build_steps(config: DeployConfig) -> list[Step]:
            "--labels=spot-role=control-watchdog", "--quiet"),
         _c("gcloud", "run", "services", "add-iam-policy-binding", config.service, p, region,
            f"--member=serviceAccount:{config.invoker_email}", f"--role={ROLE_INVOKER}", "--format=none"),
-    )))
+    ), volume_prune=(_c("gcloud", "run", "services", "describe", config.service, p, region, "--format=json"),
+                     _c("gcloud", "run", "services", "update", config.service, p, region, "--quiet"))))
     if config.skip_scheduler:
         return steps
     scheduler = (p, location, f"--schedule={config.schedule}", "--time-zone=Etc/UTC",
@@ -588,6 +618,10 @@ def render(config: DeployConfig, steps: Sequence[Step]) -> str:
             lines += [f"  {_shell(c)}" for c in step.create]
             lines.append("fi")
         lines += [_shell(c) for c in step.run]
+        if step.volume_prune:
+            describe, update = step.volume_prune
+            lines.append(f"volumes=\"$({_shell(describe)} | python3 -c {shlex.quote(ORPHANED_VOLUMES_PY)})\"")
+            lines.append(f"if [ -n \"$volumes\" ]; then {_shell(update)} \"--remove-volume=$volumes\"; fi")
         lines += [f"{_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
         for listing, keep, commands in step.prune:
             lines.append(f"for name in $({_shell(listing)}); do")
@@ -667,6 +701,22 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
                     out("  exists")
             for command in step.run:
                 run(command, step.files, step.title)
+            if step.volume_prune:
+                describe, update = step.volume_prune
+                result = runner(materialize(describe, step.files))
+                try:
+                    service = json.loads(result.stdout or "") if result.returncode == 0 else None
+                except ValueError:
+                    service = None
+                if not isinstance(service, dict):
+                    raise DeployError(f"{step.title} failed: could not read the service's volumes: "
+                                      f"{(result.stderr or '').strip()[:500]}")
+                orphans = orphaned_secret_volumes(service)
+                bad = [name for name in orphans if not _VOLUME_RE.match(name)]
+                if bad:
+                    raise DeployError(f"{step.title} failed: unexpected volume name(s) {', '.join(map(repr, bad))}")
+                if orphans:
+                    run((*update, "--remove-volume=" + ",".join(orphans)), step.files, step.title)
             for command in step.remove:
                 remove(command, step.files, step.title)
             for listing, keep, commands in step.prune:

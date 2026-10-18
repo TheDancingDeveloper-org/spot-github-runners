@@ -913,6 +913,9 @@ again. Every deploy removes the grants the floor no longer needs, and skips thos
   removes the runtime account's `roles/secretmanager.secretAccessor` binding, and the label, from every
   labeled secret that the service no longer references. That covers every former floor token secret,
   including one that only left a target's `secret=`.
+- After it updates the service, it removes every secret volume that no container mounts. `--set-secrets`
+  drops the mount of a former floor token but keeps its volume, which still names the secret. The removal
+  creates one more revision, and only when such a volume exists.
 
 Removing the floor never deletes a secret or a VM. Floor hosts that exist keep running until the autoscaler or
 an operator retires them.
