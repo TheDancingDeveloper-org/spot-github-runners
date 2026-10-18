@@ -405,6 +405,304 @@ LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
 )
 
 
+# -- seeded demo telemetry ------------------------------------------------------------------------------------
+#
+# Earlier versions seeded demo Rust builds, GitHub CI failure runs, a journal OOM event, and job counters into the
+# default state, which then persisted to the state file and the Cloudflare KV snapshot and showed as real. Loading
+# a state without the migration marker (one written by such a version) drops these exact records. Legacy job
+# counters have no source provenance and remain as reported. A record matches only when its id and the fields every
+# seeded version gave it all match, so a real report merged into a seeded row survives. The default state carries
+# the marker, so later loads never touch telemetry reported after the migration. The active slot then commits the
+# migrated state as a new state_version (DashboardStore.commit_demo_telemetry_migration).
+DEMO_TELEMETRY_MIGRATION_KEY = "demo_telemetry_migration"
+DEMO_TELEMETRY_MIGRATION_VERSION = 1
+# True while the drop is saved only at the loaded state_version (it survives a restart); any new version clears it.
+DEMO_TELEMETRY_MIGRATION_PENDING_KEY = "demo_telemetry_migration_pending"
+# build_id -> every field the seed set except its timestamps, which were relative to when the state was created.
+# record_rust_build merges a partial update into the existing row, so a real update to a seeded build_id keeps
+# whatever it omits; matching every field (and the seeded gaps between the timestamps) means any real change keeps
+# the row.
+SEEDED_RUST_BUILDS: dict[str, dict[str, Any]] = {
+    "rb-20261015-001": {
+        "project_name": "oxidex", "profile": "release", "target_triple": "x86_64-unknown-linux-gnu",
+        "commit_sha": "af7c14f8cb2c", "status": "DELIVERED", "cache_hits": 412, "cache_misses": 18,
+        "total_crates": 430, "instance_name": "builder-oxidex-turin-01", "zone": "us-south1-b",
+        "machine_type": "c4d-highcpu-16", "vcpu": 16, "cpu_platform": "AMD Turin", "origin_ip": "185.159.157.42",
+        "origin_hostname": "node-ch-14.protonvpn.net", "peak_ram_gib": 21.8, "container_ram_cap_gib": 28.0,
+        "cpu_time_seconds": 1184.5,
+    },
+    "rb-20261015-002": {
+        "project_name": "oxidex-cli", "profile": "release", "target_triple": "x86_64-unknown-linux-musl",
+        "commit_sha": "ce4af62b32cc", "status": "DELIVERED", "cache_hits": 295, "cache_misses": 94,
+        "total_crates": 389, "instance_name": "builder-oxidex-eu-01", "zone": "europe-west4-a",
+        "machine_type": "n4-highcpu-16", "vcpu": 16, "cpu_platform": "Intel Emerald Rapids",
+        "origin_ip": "185.220.101.34", "origin_hostname": "tor-exit-101.zwiebelfreunde.de", "peak_ram_gib": 24.6,
+        "container_ram_cap_gib": 28.0, "cpu_time_seconds": 1892.0,
+    },
+    "rb-20261015-003": {
+        "project_name": "oxidex", "profile": "debug", "target_triple": "x86_64-unknown-linux-gnu",
+        "commit_sha": "f20f9f9b780f", "status": "DELIVERED", "cache_hits": 424, "cache_misses": 6,
+        "total_crates": 430, "instance_name": "builder-oxidex-turin-01", "zone": "us-south1-b",
+        "machine_type": "c4d-highcpu-16", "vcpu": 16, "cpu_platform": "AMD Turin", "origin_ip": "73.162.44.19",
+        "origin_hostname": "m4air-workstation.local", "peak_ram_gib": 14.2, "container_ram_cap_gib": 28.0,
+        "cpu_time_seconds": 542.0,
+    },
+    "rb-20261015-004": {
+        "project_name": "nzbget-rust-ffi", "profile": "release", "target_triple": "aarch64-apple-darwin",
+        "commit_sha": "e3c84b8190aa", "status": "DELIVERED", "cache_hits": 318, "cache_misses": 42,
+        "total_crates": 360, "instance_name": "builder-oxidex-eu-01", "zone": "europe-west4-a",
+        "machine_type": "n4-highcpu-16", "vcpu": 16, "cpu_platform": "Intel Emerald Rapids",
+        "origin_ip": "193.138.218.77", "origin_hostname": "se-got-wg-004.mullvad.net", "peak_ram_gib": 19.7,
+        "container_ram_cap_gib": 28.0, "cpu_time_seconds": 1510.4,
+    },
+    "rb-20261015-005": {
+        "project_name": "oxidex-bench", "profile": "release", "target_triple": "x86_64-unknown-linux-gnu",
+        "commit_sha": "3317b1b902ef", "status": "DELIVERED", "cache_hits": 260, "cache_misses": 170,
+        "total_crates": 430, "instance_name": "builder-oxidex-turin-01", "zone": "us-south1-b",
+        "machine_type": "c4d-highcpu-16", "vcpu": 16, "cpu_platform": "AMD Turin", "origin_ip": "24.28.119.82",
+        "origin_hostname": "dev-macbook-pro.tx.rr.com", "peak_ram_gib": 26.1, "container_ram_cap_gib": 28.0,
+        "cpu_time_seconds": 2480.0,
+    },
+}
+# build_id -> seconds from requested_at to finished_at, and from finished_at to delivered_at
+SEEDED_RUST_BUILD_GAPS = {
+    "rb-20261015-001": (102, 12),
+    "rb-20261015-002": (160, 16),
+    "rb-20261015-003": (64, 8),
+    "rb-20261015-004": (145, 14),
+    "rb-20261015-005": (190, 14),
+}
+# Match source event content too: reports can replace seeded rows while retaining the same identity.
+# RELATIVE timestamps in the earliest versions are checked against the unchanged build timestamps.
+SEEDED_GITHUB_CI_RUNS = [
+    {
+        "id": "gh-oom-37192272062",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "CI",
+        "run_id": 37192272062,
+        "job_id": 111407847874,
+        "job_name": "Verify Generated Tables / catalog join",
+        "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-2",
+        "step_number": 8,
+        "line_number": 106,
+        "failed_at": "2026-10-04T09:39:54Z",
+        "error_excerpt": "line 14: 15780 Killed python3 tools/exiftool-tables — ##[error]Process completed with exit code 137.",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/37192272062/job/111407847874#step:8:106"
+    },
+    {
+        "id": "gh-oom-37192994059",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "CI",
+        "run_id": 37192994059,
+        "job_id": 111409747367,
+        "job_name": "Verify Generated Tables / tools 5/8",
+        "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-5",
+        "step_number": 7,
+        "line_number": 77,
+        "failed_at": "2026-10-04T10:01:39Z",
+        "error_excerpt": "test_committed_rules_and_ledger_equal_fresh_native_generation ... ##[error]Process completed with exit code 137.",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/37192994059/job/111409747367#step:7:77"
+    },
+    {
+        "id": "gh-timeout-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "docs",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "deploy (Deploy to GitHub Pages)",
+        "runner_name": "GitHub Actions 1000014245",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "2026-10-14T16:25:26Z",
+        "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    },
+    {
+        "id": "gh-oom-38601924810",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "Rust 1.99 Qualification Matrix",
+        "run_id": 38601924810,
+        "job_id": 116012948102,
+        "job_name": "cargo-nextest-heavy",
+        "runner_name": "oxidex-za-jnb-01-3",
+        "step_number": 4,
+        "line_number": 118,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/38601924810/job/116012948102#step:4:118"
+    },
+    {
+        "id": "gh-timeout-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "docs",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "deploy (Deploy to GitHub Pages)",
+        "runner_name": "GitHub Actions 1000014245",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    },
+    {
+        "id": "gh-oom-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "CI Build & Integration Suite",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "linux-x64-release-build",
+        "runner_name": "oxidex-dallas-01-2",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "error: could not compile `nzbget-core`: process didn't exit successfully (signal: 9, SIGKILL: kill) — container memory.max (16 GiB) exhausted",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    }
+]
+SEEDED_JOURNAL_OOM_EVENT = {
+    "id": "oom-journal-01", "instance_name": "oxidex-runners-dallas-01", "zone": "us-south1-a",
+    "pid": 18492, "process": "rustc", "constraint": "CONSTRAINT_MEMCG",
+    "journal_line": (
+        "kernel: oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),"
+        "cpuset=docker-8f4a21.scope,mems_allowed=0,oom_memcg=/system.slice/docker-8f4a21.scope,"
+        "task_memcg=/system.slice/docker-8f4a21.scope,task=rustc,pid=18492,uid=1001"
+    ),
+}
+SEEDED_BUILD_REQUEST_OFFSETS = {
+    "rb-20261015-001": 920, "rb-20261015-002": 2450, "rb-20261015-003": 4800,
+    "rb-20261015-004": 7600, "rb-20261015-005": 11200,
+}
+
+
+def demo_telemetry_migrated(state: dict[str, Any]) -> bool:
+    """True when ``state`` was written by a version that no longer seeds demo telemetry (any marker >= 1)."""
+    marker = state.get(DEMO_TELEMETRY_MIGRATION_KEY)
+    return (isinstance(marker, int) and not isinstance(marker, bool)
+            and marker >= DEMO_TELEMETRY_MIGRATION_VERSION)
+
+
+def _seeded_build_reference(record: dict[str, Any]) -> float | None:
+    build_id = record.get("build_id")
+    fingerprint = SEEDED_RUST_BUILDS.get(build_id)
+    if fingerprint is None or any(record.get(k) != v or type(record.get(k)) is not type(v)
+                                  for k, v in fingerprint.items()):
+        return None
+    # The original seeds always used whole-second UTC strings. A report may shift all three timestamps
+    # equally (keeping their gaps), so fractional or reformatted timestamps still establish a correction.
+    timestamps = [record.get(k) for k in ("requested_at", "finished_at", "delivered_at")]
+    if any(not isinstance(stamp, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp) for stamp in timestamps):
+        return None
+    try:
+        requested, finished, delivered = (_iso_to_epoch(stamp) for stamp in timestamps)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (finished - requested, delivered - finished) != SEEDED_RUST_BUILD_GAPS[build_id]:
+        return None
+    return requested + SEEDED_BUILD_REQUEST_OFFSETS[build_id]
+
+
+# Normalization and OOM handling may add these fields to an unchanged seed. Any other extra field is
+# source evidence that the seed never supplied and must be preserved.
+SEED_EVENT_DERIVED_FIELDS = frozenset({
+    "failure_classification", "is_oom", "is_self_hosted_runner", "badge_text",
+    "handled", "acknowledged", "handled_at", "baseline_runners", "baseline_source",
+})
+
+
+def _seed_fields_match(record: dict[str, Any], fingerprint: dict[str, Any]) -> bool:
+    return (not (record.keys() - fingerprint.keys() - SEED_EVENT_DERIVED_FIELDS)
+            and all(record.get(k) == v and type(record.get(k)) is type(v) for k, v in fingerprint.items()))
+
+
+def _is_seeded_ci_run(record: dict[str, Any], reference: float | None) -> bool:
+    for fingerprint in SEEDED_GITHUB_CI_RUNS:
+        if fingerprint["failed_at"] != "RELATIVE":
+            if _seed_fields_match(record, fingerprint):
+                return True
+        elif reference is not None:
+            expected = dict(fingerprint, failed_at=_iso_epoch(reference - (
+                1380 if fingerprint["id"] == "gh-oom-38601924810" else 540)))
+            if _seed_fields_match(record, expected):
+                return True
+    return False
+
+
+def _is_seeded_journal_oom(record: dict[str, Any], reference: float | None) -> bool:
+    # Its timestamp was generated at startup. Without an unchanged build to recover that startup time,
+    # the record cannot be distinguished from a later report with the same static fields; keep it.
+    if reference is None:
+        return False
+    expected = dict(SEEDED_JOURNAL_OOM_EVENT, observed_at=_iso_epoch(reference - 420))
+    return _seed_fields_match(record, expected)
+
+
+def _original_seed_reference(state: dict[str, Any]) -> float | None:
+    """Recover the original startup time from unchanged saved presets, independently of telemetry timings.
+
+    At least two distinct preset IDs must agree, and any conflicting preset time makes the evidence ambiguous.
+    Defaults filled in for absent saved fields must never serve as anchors (_apply_loaded_state passes loaded).
+    """
+    defaults = default_dashboard_state()
+    epochs: dict[str, float] = {}
+    for field, timestamp, offsets in (
+        ("vm_templates", "created_at", {"tpl-runner-n4-std16": 12, "tpl-runner-za-n2-16": 18,
+                                       "tpl-builder-c4d-16": 24}),
+        ("cloud_init_templates", "updated_at", {"ci-runner-default": 2, "ci-runner-strict-pool": 6,
+                                               "ci-rust-builder-199": 4}),
+    ):
+        expected = {row["id"]: {k: v for k, v in row.items() if k != timestamp}
+                    for row in defaults[field]}
+        records = state.get(field)
+        for row in records if isinstance(records, list) else []:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row["id"] not in offsets:
+                continue
+            if {k: v for k, v in row.items() if k != timestamp} != expected[row["id"]]:
+                continue
+            stamp = row.get(timestamp)
+            if not isinstance(stamp, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp):
+                continue
+            try:
+                epoch = _iso_to_epoch(stamp) + offsets[row["id"]] * 3600
+            except ValueError:
+                continue
+            identity = field + "/" + row["id"]
+            if identity in epochs and epochs[identity] != epoch:
+                return None
+            epochs[identity] = epoch
+    times = set(epochs.values())
+    return next(iter(times)) if len(epochs) >= 2 and len(times) == 1 else None
+
+
+def drop_seeded_demo_telemetry(state: dict[str, Any], *, source_state: dict[str, Any] | None = None) -> int:
+    """Remove seeded demo telemetry from ``state`` in place; returns how many records it dropped."""
+    dropped = 0
+    reference = _original_seed_reference(state if source_state is None else source_state)
+    builds = state.get("rust_builds")
+    if isinstance(builds, list):
+        kept = [b for b in builds if not (
+            reference is not None and isinstance(b, dict) and _seeded_build_reference(b) == reference)]
+        dropped += len(builds) - len(kept)
+        state["rust_builds"] = kept
+    telem = state.get("scaling_telemetry")
+    if not isinstance(telem, dict):
+        return dropped
+    for key, is_seed in (
+        ("github_oom_runs", _is_seeded_ci_run),
+        ("journal_oom_events", _is_seeded_journal_oom),
+        ("builder_journal_oom_events", _is_seeded_journal_oom),
+    ):
+        records = telem.get(key)
+        if isinstance(records, list):
+            kept = [r for r in records if not (isinstance(r, dict) and is_seed(r, reference))]
+            dropped += len(records) - len(kept)
+            telem[key] = kept
+    # Old partial reports could update counters while leaving all seeded event lists untouched. Neither the
+    # numeric tuple nor the presence of old seeds proves the counters are demo data; preserve every saved value.
+    return dropped
+
+
 def _iso_epoch(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -2815,222 +3113,19 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
     # DashboardStore.refresh_fleet_inventory); the dashboard never invents VM records.
     instances: list[dict[str, Any]] = []
 
-    scaling_telemetry = {
-        "current_runners": 10,
-        "jobs_ran_past_hour": 14,
-        "provisioned_jobs": 7,
-        "queued_jobs": 3,
-        "instance_cpu_percentages": [64.0, 72.0, 58.0],
-        "journal_oom_events": [
-            {
-                "id": "oom-journal-01",
-                "instance_name": "oxidex-runners-dallas-01",
-                "zone": "us-south1-a",
-                "observed_at": _iso_seconds_ago(420, ref_now),
-                "pid": 18492,
-                "process": "rustc",
-                "constraint": "CONSTRAINT_MEMCG",
-                "journal_line": (
-                    "kernel: oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),"
-                    "cpuset=docker-8f4a21.scope,mems_allowed=0,oom_memcg=/system.slice/docker-8f4a21.scope,"
-                    "task_memcg=/system.slice/docker-8f4a21.scope,task=rustc,pid=18492,uid=1001"
-                ),
-            },
-        ],
-        "github_oom_runs": [
-            {
-                "id": "gh-oom-37192272062",
-                "repository": "swack-tools/oxidex",
-                "workflow_name": "CI",
-                "run_id": 37192272062,
-                "job_id": 111407847874,
-                "job_name": "Verify Generated Tables / catalog join",
-                "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-2",
-                "step_number": 8,
-                "line_number": 106,
-                "failed_at": "2026-10-04T09:39:54Z",
-                "error_excerpt": (
-                    "line 14: 15780 Killed python3 tools/exiftool-tables — "
-                    "##[error]Process completed with exit code 137."
-                ),
-                "failure_classification": "OOM",
-                "is_oom": True,
-                "is_self_hosted_runner": True,
-                "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
-                "deep_link": build_github_oom_deep_link(
-                    "swack-tools/oxidex", 37192272062, 111407847874, 8, 106
-                ),
-            },
-            {
-                "id": "gh-oom-37192994059",
-                "repository": "swack-tools/oxidex",
-                "workflow_name": "CI",
-                "run_id": 37192994059,
-                "job_id": 111409747367,
-                "job_name": "Verify Generated Tables / tools 5/8",
-                "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-5",
-                "step_number": 7,
-                "line_number": 77,
-                "failed_at": "2026-10-04T10:01:39Z",
-                "error_excerpt": (
-                    "test_committed_rules_and_ledger_equal_fresh_native_generation ... "
-                    "##[error]Process completed with exit code 137."
-                ),
-                "failure_classification": "OOM",
-                "is_oom": True,
-                "is_self_hosted_runner": True,
-                "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
-                "deep_link": build_github_oom_deep_link(
-                    "swack-tools/oxidex", 37192994059, 111409747367, 7, 77
-                ),
-            },
-            {
-                "id": "gh-timeout-38596411473",
-                "repository": "Appz4Fun/nzbget",
-                "workflow_name": "docs",
-                "run_id": 38596411473,
-                "job_id": 115964282184,
-                "job_name": "deploy (Deploy to GitHub Pages)",
-                "runner_name": "GitHub Actions 1000014245",
-                "step_number": 2,
-                "line_number": 50,
-                "failed_at": "2026-10-14T16:25:26Z",
-                "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
-                "failure_classification": "TIMEOUT",
-                "is_oom": False,
-                "is_self_hosted_runner": False,
-                "badge_text": "Timeout · GitHub-Hosted Runner (Not Ours — Ignored)",
-                "deep_link": build_github_oom_deep_link(
-                    "Appz4Fun/nzbget", 38596411473, 115964282184, 2, 50
-                ),
-            },
-        ],
+    # Telemetry starts empty: GitHub CI runs, journal OOM events, job counters, and Rust builds are recorded only
+    # when reported (update_scaling, record_rust_build). Demo records earlier versions seeded here are dropped on
+    # load (see drop_seeded_demo_telemetry).
+    scaling_telemetry: dict[str, Any] = {
+        "current_runners": 0,
+        "jobs_ran_past_hour": 0,
+        "provisioned_jobs": 0,
+        "queued_jobs": 0,
+        "instance_cpu_percentages": [],
+        "journal_oom_events": [],
+        "github_oom_runs": [],
     }
-
-    raw_rust_builds = [
-        {
-            "build_id": "rb-20261015-001",
-            "project_name": "oxidex",
-            "profile": "release",
-            "target_triple": "x86_64-unknown-linux-gnu",
-            "commit_sha": "af7c14f8cb2c",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(920, ref_now),
-            "finished_at": _iso_seconds_ago(818, ref_now),
-            "delivered_at": _iso_seconds_ago(806, ref_now),
-            "cache_hits": 412,
-            "cache_misses": 18,
-            "total_crates": 430,
-            "instance_name": "builder-oxidex-turin-01",
-            "zone": "us-south1-b",
-            "machine_type": "c4d-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "AMD Turin",
-            "origin_ip": "185.159.157.42",
-            "origin_hostname": "node-ch-14.protonvpn.net",
-            "peak_ram_gib": 21.8,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 1184.5,
-        },
-        {
-            "build_id": "rb-20261015-002",
-            "project_name": "oxidex-cli",
-            "profile": "release",
-            "target_triple": "x86_64-unknown-linux-musl",
-            "commit_sha": "ce4af62b32cc",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(2450, ref_now),
-            "finished_at": _iso_seconds_ago(2290, ref_now),
-            "delivered_at": _iso_seconds_ago(2274, ref_now),
-            "cache_hits": 295,
-            "cache_misses": 94,
-            "total_crates": 389,
-            "instance_name": "builder-oxidex-eu-01",
-            "zone": "europe-west4-a",
-            "machine_type": "n4-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "Intel Emerald Rapids",
-            "origin_ip": "185.220.101.34",
-            "origin_hostname": "tor-exit-101.zwiebelfreunde.de",
-            "peak_ram_gib": 24.6,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 1892.0,
-        },
-        {
-            "build_id": "rb-20261015-003",
-            "project_name": "oxidex",
-            "profile": "debug",
-            "target_triple": "x86_64-unknown-linux-gnu",
-            "commit_sha": "f20f9f9b780f",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(4800, ref_now),
-            "finished_at": _iso_seconds_ago(4736, ref_now),
-            "delivered_at": _iso_seconds_ago(4728, ref_now),
-            "cache_hits": 424,
-            "cache_misses": 6,
-            "total_crates": 430,
-            "instance_name": "builder-oxidex-turin-01",
-            "zone": "us-south1-b",
-            "machine_type": "c4d-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "AMD Turin",
-            "origin_ip": "73.162.44.19",
-            "origin_hostname": "m4air-workstation.local",
-            "peak_ram_gib": 14.2,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 542.0,
-        },
-        {
-            "build_id": "rb-20261015-004",
-            "project_name": "nzbget-rust-ffi",
-            "profile": "release",
-            "target_triple": "aarch64-apple-darwin",
-            "commit_sha": "e3c84b8190aa",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(7600, ref_now),
-            "finished_at": _iso_seconds_ago(7455, ref_now),
-            "delivered_at": _iso_seconds_ago(7441, ref_now),
-            "cache_hits": 318,
-            "cache_misses": 42,
-            "total_crates": 360,
-            "instance_name": "builder-oxidex-eu-01",
-            "zone": "europe-west4-a",
-            "machine_type": "n4-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "Intel Emerald Rapids",
-            "origin_ip": "193.138.218.77",
-            "origin_hostname": "se-got-wg-004.mullvad.net",
-            "peak_ram_gib": 19.7,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 1510.4,
-        },
-        {
-            "build_id": "rb-20261015-005",
-            "project_name": "oxidex-bench",
-            "profile": "release",
-            "target_triple": "x86_64-unknown-linux-gnu",
-            "commit_sha": "3317b1b902ef",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(11200, ref_now),
-            "finished_at": _iso_seconds_ago(11010, ref_now),
-            "delivered_at": _iso_seconds_ago(10996, ref_now),
-            "cache_hits": 260,
-            "cache_misses": 170,
-            "total_crates": 430,
-            "instance_name": "builder-oxidex-turin-01",
-            "zone": "us-south1-b",
-            "machine_type": "c4d-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "AMD Turin",
-            "origin_ip": "24.28.119.82",
-            "origin_hostname": "dev-macbook-pro.tx.rr.com",
-            "peak_ram_gib": 26.1,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 2480.0,
-        },
-    ]
-
-    rust_builds = [enrich_rust_build_record(row, project=project) for row in raw_rust_builds]
+    rust_builds: list[dict[str, Any]] = []
 
     return {
         "schema": "spot-web-dashboard-v1",
@@ -3064,6 +3159,8 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         "dashboard_admins": [],
         # Bounded audit history of added-administrator changes.
         "dashboard_admins_history": [],
+        # Fresh states hold no seeded demo telemetry; see drop_seeded_demo_telemetry.
+        DEMO_TELEMETRY_MIGRATION_KEY: DEMO_TELEMETRY_MIGRATION_VERSION,
     }
 
 
@@ -3485,6 +3582,17 @@ class DashboardStore:
                 LOG.warning("Dropped %d dashboard instance record(s) that did not come from the live inventory",
                             len(instances) - len(kept))
             base["instances"] = kept
+        dropped_seeds = 0
+        if not demo_telemetry_migrated(loaded):
+            # A state written before the migration: drop its seeds once (a newer marker is kept as it is).
+            dropped_seeds = drop_seeded_demo_telemetry(base, source_state=loaded)
+            base[DEMO_TELEMETRY_MIGRATION_KEY] = DEMO_TELEMETRY_MIGRATION_VERSION
+            # Adding the marker changes content even when nothing matched (an operator may have cleared the seeds):
+            # a copy without it at the same version would look current to KV and to a rollback, and losing the
+            # one-time marker would let a later upgrade rerun the cleanup. Commit it as a new version either way.
+            base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
+        if base.get(DEMO_TELEMETRY_MIGRATION_PENDING_KEY) is not True:
+            base.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
         previous = getattr(self, "state", None)
         self.state = base
         try:
@@ -3495,6 +3603,40 @@ class DashboardStore:
             if previous is not None:
                 self.state = previous
             raise ValueError(f"invalid dashboard state: {type(exc).__name__}: {exc}") from exc
+        if dropped_seeds:
+            LOG.warning("Dropped %d seeded demo telemetry record(s) from the dashboard state",
+                        dropped_seeds)
+
+    def commit_demo_telemetry_migration(self) -> bool:
+        """Persist a load that dropped seeded demo telemetry as a new state_version; True when it did.
+
+        The drop changes content without a version, so a slot holding the seeded copy at the same version would
+        look caught up (to a rollback, or to KV, which never takes different content at an equal version). The
+        commit goes through the same gates as every change, so only the active, hydrated, reconciled, unfrozen
+        slot advances the version; elsewhere it waits (a standby that bumped could shadow the active slot's next
+        change), and a handover import replaces the state anyway. The pending flag is part of the state, so it
+        survives a restart between the load (whose write-back keeps the loaded version) and the commit.
+        """
+        if self.state.get(DEMO_TELEMETRY_MIGRATION_PENDING_KEY) is not True:
+            return False
+
+        def apply() -> tuple[int, Any]:
+            if self.state.get(DEMO_TELEMETRY_MIGRATION_PENDING_KEY) is not True:
+                return 200, {"changed": False}
+            self._persist()  # a new version clears the pending flag
+            return 200, {"changed": True}
+
+        try:
+            _status, body, _replayed = self.run_request(None, "POST", "/internal/demo-telemetry-migration", apply)
+        except DashboardFrozenError:
+            return False
+        except OSError as exc:
+            LOG.warning("Could not commit the demo telemetry migration: %s", exc)
+            return False
+        if body.get("changed"):
+            LOG.warning("Committed the demo telemetry migration as state_version %d", self.state_version())
+            return True
+        return False
 
     def state_version(self) -> int:
         version = self.state.get("state_version", 0)
@@ -3504,6 +3646,7 @@ class DashboardStore:
         """Hydrate (in a background thread when KV is configured), start KV write-behind and the inventory loop."""
         if self.kv is None:
             self.hydrate()
+            self.commit_demo_telemetry_migration()
         else:
             thread = threading.Thread(target=self._background_main, name="dashboard-kv-sync", daemon=True)
             self._threads.append(thread)
@@ -4291,6 +4434,8 @@ class DashboardStore:
         if self.hydrated and self.kv_writer and not self._writer_synced and not self.sync_with_kv_as_writer():
             self._kv_next_attempt_at = now + KV_RETRY_BACKOFF_SECONDS
             return False
+        if self.hydrated and not self.frozen and self.kv_writer:
+            self.commit_demo_telemetry_migration()
         if not (self.hydrated and not self.frozen and self.kv_writer and self._kv_dirty):
             return False
         quiet = now - self._kv_dirty_last_at >= KV_WRITE_DEBOUNCE_SECONDS
@@ -5188,34 +5333,6 @@ class DashboardStore:
     def _normalize_github_ci_runs(self) -> None:
         runs = self.state.get("scaling_telemetry", {}).get("github_oom_runs", [])
         for r in runs:
-            if int(r.get("run_id", 0)) == 38601924810:
-                r["id"] = "gh-oom-37192272062"
-                r["repository"] = "swack-tools/oxidex"
-                r["workflow_name"] = "CI"
-                r["run_id"] = 37192272062
-                r["job_id"] = 111407847874
-                r["job_name"] = "Verify Generated Tables / catalog join"
-                r["runner_name"] = "gha-oxidex-runners-asianortheast2-a-1791098074-2"
-                r["step_number"] = 8
-                r["line_number"] = 106
-                r["failed_at"] = "2026-10-04T09:39:54Z"
-                r["error_excerpt"] = (
-                    "line 14: 15780 Killed python3 tools/exiftool-tables — "
-                    "##[error]Process completed with exit code 137."
-                )
-                r["deep_link"] = build_github_oom_deep_link(
-                    "swack-tools/oxidex", 37192272062, 111407847874, 8, 106
-                )
-            if int(r.get("run_id", 0)) == 38596411473 and int(r.get("job_id", 0)) == 115964282184:
-                if "nzbget-core" in str(r.get("error_excerpt", "")):
-                    r["id"] = "gh-timeout-38596411473"
-                    r["workflow_name"] = "docs"
-                    r["job_name"] = "deploy (Deploy to GitHub Pages)"
-                    r["runner_name"] = "GitHub Actions 1000014245"
-                    r["error_excerpt"] = (
-                        "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
-                    )
-                    r.pop("is_oom", None)
             cls_info = classify_github_ci_failure(
                 str(r.get("error_excerpt", "")),
                 runner_name=r.get("runner_name"),
@@ -5240,6 +5357,9 @@ class DashboardStore:
             raise OSError(f"Refusing to overwrite the unreadable dashboard state file: {self.controlled_targets_error}")
         new_version = self.state_version() + (1 if bump else 0)
         candidate_state = {**self.state, "updated_at": new_updated_at, "state_version": new_version}
+        if bump:
+            # Every new version carries the content without the seeds, which is all the pending commit waited for.
+            candidate_state.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
         serialized = json.dumps(candidate_state, indent=2, allow_nan=False)
         if self.state_path:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5276,6 +5396,7 @@ class DashboardStore:
         self.state["updated_at"] = new_updated_at
         self.state["state_version"] = new_version
         if bump:
+            self.state.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
             self._mark_kv_dirty()
 
     def _remember_repriced_history(self, inst: dict[str, Any], previous: dict[str, Any]) -> None:

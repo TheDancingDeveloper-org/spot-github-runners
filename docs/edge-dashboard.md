@@ -502,6 +502,51 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   (`src/spot_runner_autoscaler.py`) drains and retires runner hosts, `src/spot_runner_manager.py`
   provisions them, and `src/render_builder_startup.py` renders a dedicated builder.
 
+## Build and scaling telemetry
+
+The Rust build history and the scaling telemetry start empty. The dashboard doesn't ship demo builds,
+GitHub CI failure runs, journal OOM events, or job counters.
+
+- Rust builds appear only after a caller records them with `POST /api/rust-builds`. GitHub CI failure
+  runs, journal OOM events, and the job counters (`jobs_ran_past_hour`, `provisioned_jobs`, and
+  `queued_jobs`) change only through `POST /api/scaling`. A new state starts every counter at 0.
+- When the dashboard loads a state that an earlier version wrote, from the state file, a KV snapshot, or
+  a handover import, it drops the demo records that version seeded and logs how many it dropped. It
+  then marks the state with `demo_telemetry_migration`, so this runs once and later loads keep every
+  reported record and counter. A state with a marker of 1 or higher, including one a later version
+  wrote, is left as it is.
+- A record is dropped only when its ID and the fields that every seeded version gave it all match, so a
+  real report merged into a seeded row stays:
+  - The Rust builds `rb-20261015-001` through `rb-20261015-005`, on `builder-oxidex-turin-01` and
+    `builder-oxidex-eu-01`. `POST /api/rust-builds` merges a partial update into an existing build, so
+    these match only when every field the seed set is unchanged, including the seeded gaps between the
+    requested, finished, and delivered times and their original whole-second UTC format. Fractional timing
+    corrections stay even when all three times shift together. The original startup time must be confirmed
+    independently by at least two unchanged saved preset templates. Shifted builds cannot provide their own
+    time evidence; without agreeing saved presets, they stay untouched.
+  - The GitHub CI runs `gh-oom-37192272062`, `gh-oom-37192994059`, and `gh-timeout-38596411473`, and
+    the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`, matched with their
+    complete seeded report content, including logs, links, and failure times.
+  - The journal OOM event `oom-journal-01`, matched with its complete seeded report content. Its generated
+    observation time and older CI failure times are checked against the original startup time confirmed
+    by the unchanged saved presets. If that time cannot be recovered, these events stay rather than risking a
+    reported correction. Additional source evidence, such as a log hash or cgroup path, also keeps the
+    event; only known classification and handling fields may be added to an unchanged seed.
+- The migration preserves all saved job counters, including the old demo tuple of 14 jobs in the past
+  hour, 7 provisioned, and 3 queued. Earlier versions stored no provenance for counters: a fresh partial
+  report could produce that tuple while leaving old demo events untouched. There is no way to prove the
+  saved counters are still demo data. New states start at 0; later reports replace the saved counters.
+- The migration keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved
+  state, so a restart doesn't lose it. It does this even when no seeded record matched, because adding the
+  marker alone changes the state. The active slot then commits the migrated state as the next
+  `state_version` through the same checks as any change, and publishes it to KV. Any new version clears
+  the flag. A standby slot waits, so its copy never shadows the active slot's next change. A rollback then
+  sees the migrated version as newer than the old slot's copy and carries it back.
+- A handover import keeps the snapshot's `state_version`, because the control plane records the version
+  that an import reports as the floor for any later re-import. The replacement commits the migration once
+  it confirms that it's the active slot, within one writer check (30 seconds) of cutover. A rollback inside
+  that window leaves the old slot's demo telemetry in place until the next rotation migrates it again.
+
 ## State durability
 
 - The dashboard writes state atomically to `/var/lib/spot-dashboard/state.json` on the boot disk.

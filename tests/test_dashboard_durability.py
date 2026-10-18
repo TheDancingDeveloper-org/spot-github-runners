@@ -66,12 +66,19 @@ def no_live_pricing(test: unittest.TestCase) -> None:
     test.addCleanup(patcher.stop)
 
 
+# States written by a version that already ran the one-time demo telemetry migration: a markerless state is legacy
+# and gets one version of its own on the active slot (DemoTelemetryMigrationCommitTests covers that).
+MIGRATED = {"demo_telemetry_migration": 1}
+
+
 def write_state(path: Path, version: int, targets: list[str]) -> None:
-    path.write_text(json.dumps({"state_version": version, "controlled_targets": targets}), encoding="utf-8")
+    path.write_text(json.dumps({"state_version": version, "controlled_targets": targets, **MIGRATED}),
+                    encoding="utf-8")
 
 
 def kv_snapshot(version: int, targets: list[str], slot: str = "a") -> str:
-    return json.dumps(build_snapshot({"controlled_targets": targets, "project": "elsewhere"}, version, slot, now=1))
+    return json.dumps(build_snapshot({"controlled_targets": targets, "project": "elsewhere", **MIGRATED}, version,
+                                     slot, now=1))
 
 
 class HydrationTests(unittest.TestCase):
@@ -1050,6 +1057,159 @@ class FreshOwnershipTests(unittest.TestCase):
         self.assertGreaterEqual(len(self.origin_reads()) - before, 2)
 
 
+class DemoTelemetryMigrationCommitTests(unittest.TestCase):
+    """A load that drops seeded demo telemetry is committed as a new state_version, only by the active slot."""
+
+    SEEDED_RUN = {'id': 'gh-oom-37192994059',
+     'repository': 'swack-tools/oxidex',
+     'workflow_name': 'CI',
+     'run_id': 37192994059,
+     'job_id': 111409747367,
+     'job_name': 'Verify Generated Tables / tools 5/8',
+     'runner_name': 'gha-oxidex-runners-asianortheast2-a-1791098074-5',
+     'step_number': 7,
+     'line_number': 77,
+     'failed_at': '2026-10-04T10:01:39Z',
+     'error_excerpt': 'test_committed_rules_and_ledger_equal_fresh_native_generation ... ##[error]Process '
+                      'completed with exit code 137.',
+     'failure_classification': 'OOM',
+     'is_oom': True,
+     'is_self_hosted_runner': True,
+     'badge_text': 'OOM Killed (Exit 137 · Self-Hosted Spot Runner)',
+     'deep_link': 'https://github.com/swack-tools/oxidex/actions/runs/37192994059/job/111409747367#step:7:77'}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        no_live_pricing(self)
+        self.fake = FakeKvRequester()
+        self.clock = FakeClock()
+
+    def seeded(self, version: int) -> dict:
+        """A state an earlier version wrote: no migration marker, a seeded CI run, and the seeded counters."""
+        return {"state_version": version, "controlled_targets": ["o/kept"],
+                "scaling_telemetry": {"github_oom_runs": [dict(self.SEEDED_RUN)], "jobs_ran_past_hour": 14,
+                                      "provisioned_jobs": 7, "queued_jobs": 3}}
+
+    def store(self, name: str, slot: str | None = "a") -> DashboardStore:
+        kv = make_kv(self.fake) if slot else None
+        store = DashboardStore(Path(self.tmp.name) / name, control_slot=slot, kv=kv, clock=self.clock,
+                               sleep=lambda _s: None)
+        self.addCleanup(store.close)
+        return store
+
+    def assert_migrated(self, state: dict) -> None:
+        self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [])
+        self.assertEqual(state["scaling_telemetry"]["queued_jobs"], 3)
+        self.assertEqual(state["controlled_targets"], ["o/kept"])
+        self.assertEqual(state["demo_telemetry_migration"], 1)
+
+    def tick_until_published(self, store: DashboardStore) -> None:
+        store.kv_tick()
+        self.clock.now += 3600
+        store.kv_tick()
+
+    def test_marker_only_migration_is_committed_as_a_new_version(self):
+        # A legacy state with no seed rows left (for example cleared by an operator) still gains the one-time
+        # marker. That is a content change, so the active slot publishes it as a new version; otherwise a markerless
+        # copy at the same version would look current to KV and to a rollback.
+        legacy = {"state_version": 5, "controlled_targets": ["o/kept"]}
+        (Path(self.tmp.name) / "a.json").write_text(json.dumps(legacy), encoding="utf-8")
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot(dict(legacy), 5, "a", now=1))
+        store = self.store("a.json")
+        self.assertEqual(store.state_version(), 5)
+        self.assertIs(store.state["demo_telemetry_migration_pending"], True)
+        store.hydrate()
+        self.tick_until_published(store)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual(published["state_version"], 6)
+        self.assertEqual(published["state"]["demo_telemetry_migration"], 1)
+        self.assertNotIn("demo_telemetry_migration_pending", published["state"])
+        self.assertEqual(published["state"]["controlled_targets"], ["o/kept"])
+
+    def test_without_kv_the_start_commits_a_new_version(self):
+        path = Path(self.tmp.name) / "local.json"
+        path.write_text(json.dumps(self.seeded(5)), encoding="utf-8")
+        store = self.store("local.json", slot=None)
+        self.assertEqual(store.state_version(), 5)  # the drop alone keeps the loaded version
+        store.start()
+        self.assertEqual(store.state_version(), 6)
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["state_version"], 6)
+        self.assert_migrated(on_disk)
+        self.assertFalse(store.commit_demo_telemetry_migration())  # once only
+
+    def test_active_slot_commits_and_publishes_the_migrated_state(self):
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot(self.seeded(5), 5, "a", now=1))
+        (Path(self.tmp.name) / "a.json").write_text(json.dumps(self.seeded(5)), encoding="utf-8")
+        store = self.store("a.json")
+        store.hydrate()
+        self.tick_until_published(store)
+        self.assertEqual(store.state_version(), 6)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual(published["state_version"], 6)
+        self.assert_migrated(published["state"])
+
+    def test_standby_slot_keeps_the_version_until_it_is_active(self):
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=1).to_json()
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot(self.seeded(5), 5, "b", now=1))
+        store = self.store("a.json")
+        store.hydrate()
+        self.tick_until_published(store)
+        self.assertEqual(store.state_version(), 5)
+        self.assert_migrated(store.state)
+        self.assertEqual([c for c in self.fake.calls if c == ("PUT", KV_STATE_KEY)], [])
+        self.assertFalse(store.commit_demo_telemetry_migration())
+
+    def test_pending_commit_survives_a_restart_before_it_runs(self):
+        path = Path(self.tmp.name) / "a.json"
+        path.write_text(json.dumps(self.seeded(5)), encoding="utf-8")
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=1).to_json()
+        first = self.store("a.json")  # loads, drops the seeds, and writes them back at state_version 5
+        first.close()
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["state_version"], 5)
+        self.assert_migrated(on_disk)
+        self.assertIs(on_disk["demo_telemetry_migration_pending"], True)
+
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=5).to_json()
+        restarted = self.store("a.json")
+        restarted.hydrate()
+        self.tick_until_published(restarted)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual(published["state_version"], 6)
+        self.assert_migrated(published["state"])
+        self.assertNotIn("demo_telemetry_migration_pending", published["state"])
+        self.assertNotIn("demo_telemetry_migration_pending", json.loads(path.read_text(encoding="utf-8")))
+
+    def test_any_new_version_completes_the_pending_commit(self):
+        path = Path(self.tmp.name) / "local.json"
+        path.write_text(json.dumps(self.seeded(5)), encoding="utf-8")
+        store = self.store("local.json", slot=None)
+        store.hydrate()
+        store.set_controlled_targets(["o/kept", "o/new"])
+        self.assertEqual(store.state_version(), 6)
+        self.assertNotIn("demo_telemetry_migration_pending", store.state)
+        self.assertFalse(store.commit_demo_telemetry_migration())
+        self.assertEqual(store.state_version(), 6)
+
+    def test_handover_import_commits_once_the_target_is_active(self):
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=1).to_json()
+        snapshot = build_snapshot(self.seeded(5), 5, "a", now=1)
+        self.fake.values[KV_STATE_KEY] = json.dumps(snapshot)
+        new = self.store("b.json", slot="b")
+        # The import reports the snapshot's own version: the control plane records it as the replacement's
+        # floor and must be able to re-import the same snapshot (from KV or the frozen old slot) to reach it.
+        self.assertEqual(new.import_snapshot(snapshot), {"state_version": 5, "imported": True})
+        self.assertEqual(new.import_snapshot(snapshot), {"state_version": 5, "imported": True})
+        self.assert_migrated(new.state)
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=5).to_json()
+        self.tick_until_published(new)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual((published["state_version"], published["writer_slot"]), (6, "b"))
+        self.assert_migrated(published["state"])
+
+
 class PublishSafetyTests(unittest.TestCase):
     """Codex round 11: publish requires fresh ownership, never overwrites a different snapshot at the same or a
     newer version, and verifies the write by reading it back."""
@@ -1121,6 +1281,9 @@ class PublishSafetyTests(unittest.TestCase):
         new.import_snapshot(old.snapshot_envelope())
         self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=5).to_json()
         puts = len(self.puts())
+        self.assertEqual(new._publish_snapshot(), old.state_version())  # identical content: idempotent
+        new.kv_last_written_version = None
+        new.state["scaling_telemetry"]["queued_jobs"] = 1  # local normalization drift after the import
         with self.assertLogs("spot_dashboard", "WARNING"):
             new._publish_snapshot()  # equal version: KV already holds that history, so nothing is rewritten
         self.assertEqual(len(self.puts()), puts)

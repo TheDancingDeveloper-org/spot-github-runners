@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 import json
 import os
@@ -313,6 +314,239 @@ def fleet_fixture_records(project: str = "homelab-424523", ref_now: float | None
         ),
     ]
     return records
+
+
+def seeded_demo_telemetry(project: str = "homelab-424523", ref_now: float | None = None) -> dict:
+    """The demo telemetry earlier dashboard versions seeded into the default state (now dropped on load)."""
+    ref_now = time.time() if ref_now is None else ref_now
+
+    def _seconds_ago_iso(seconds_ago: float, base: float) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(base - seconds_ago))
+
+    scaling_telemetry = {
+        "current_runners": 10,
+        "jobs_ran_past_hour": 14,
+        "provisioned_jobs": 7,
+        "queued_jobs": 3,
+        "instance_cpu_percentages": [64.0, 72.0, 58.0],
+        "journal_oom_events": [
+            {
+                "id": "oom-journal-01",
+                "instance_name": "oxidex-runners-dallas-01",
+                "zone": "us-south1-a",
+                "observed_at": _seconds_ago_iso(420, ref_now),
+                "pid": 18492,
+                "process": "rustc",
+                "constraint": "CONSTRAINT_MEMCG",
+                "journal_line": (
+                    "kernel: oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),"
+                    "cpuset=docker-8f4a21.scope,mems_allowed=0,oom_memcg=/system.slice/docker-8f4a21.scope,"
+                    "task_memcg=/system.slice/docker-8f4a21.scope,task=rustc,pid=18492,uid=1001"
+                ),
+            },
+        ],
+        "github_oom_runs": [
+            {
+                "id": "gh-oom-37192272062",
+                "repository": "swack-tools/oxidex",
+                "workflow_name": "CI",
+                "run_id": 37192272062,
+                "job_id": 111407847874,
+                "job_name": "Verify Generated Tables / catalog join",
+                "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-2",
+                "step_number": 8,
+                "line_number": 106,
+                "failed_at": "2026-10-04T09:39:54Z",
+                "error_excerpt": (
+                    "line 14: 15780 Killed python3 tools/exiftool-tables — "
+                    "##[error]Process completed with exit code 137."
+                ),
+                "failure_classification": "OOM",
+                "is_oom": True,
+                "is_self_hosted_runner": True,
+                "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
+                "deep_link": build_github_oom_deep_link(
+                    "swack-tools/oxidex", 37192272062, 111407847874, 8, 106
+                ),
+            },
+            {
+                "id": "gh-oom-37192994059",
+                "repository": "swack-tools/oxidex",
+                "workflow_name": "CI",
+                "run_id": 37192994059,
+                "job_id": 111409747367,
+                "job_name": "Verify Generated Tables / tools 5/8",
+                "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-5",
+                "step_number": 7,
+                "line_number": 77,
+                "failed_at": "2026-10-04T10:01:39Z",
+                "error_excerpt": (
+                    "test_committed_rules_and_ledger_equal_fresh_native_generation ... "
+                    "##[error]Process completed with exit code 137."
+                ),
+                "failure_classification": "OOM",
+                "is_oom": True,
+                "is_self_hosted_runner": True,
+                "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
+                "deep_link": build_github_oom_deep_link(
+                    "swack-tools/oxidex", 37192994059, 111409747367, 7, 77
+                ),
+            },
+            {
+                "id": "gh-timeout-38596411473",
+                "repository": "Appz4Fun/nzbget",
+                "workflow_name": "docs",
+                "run_id": 38596411473,
+                "job_id": 115964282184,
+                "job_name": "deploy (Deploy to GitHub Pages)",
+                "runner_name": "GitHub Actions 1000014245",
+                "step_number": 2,
+                "line_number": 50,
+                "failed_at": "2026-10-14T16:25:26Z",
+                "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
+                "failure_classification": "TIMEOUT",
+                "is_oom": False,
+                "is_self_hosted_runner": False,
+                "badge_text": "Timeout · GitHub-Hosted Runner (Not Ours — Ignored)",
+                "deep_link": build_github_oom_deep_link(
+                    "Appz4Fun/nzbget", 38596411473, 115964282184, 2, 50
+                ),
+            },
+        ],
+    }
+
+    raw_rust_builds = [
+        {
+            "build_id": "rb-20261015-001",
+            "project_name": "oxidex",
+            "profile": "release",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "commit_sha": "af7c14f8cb2c",
+            "status": "DELIVERED",
+            "requested_at": _seconds_ago_iso(920, ref_now),
+            "finished_at": _seconds_ago_iso(818, ref_now),
+            "delivered_at": _seconds_ago_iso(806, ref_now),
+            "cache_hits": 412,
+            "cache_misses": 18,
+            "total_crates": 430,
+            "instance_name": "builder-oxidex-turin-01",
+            "zone": "us-south1-b",
+            "machine_type": "c4d-highcpu-16",
+            "vcpu": 16,
+            "cpu_platform": "AMD Turin",
+            "origin_ip": "185.159.157.42",
+            "origin_hostname": "node-ch-14.protonvpn.net",
+            "peak_ram_gib": 21.8,
+            "container_ram_cap_gib": 28.0,
+            "cpu_time_seconds": 1184.5,
+        },
+        {
+            "build_id": "rb-20261015-002",
+            "project_name": "oxidex-cli",
+            "profile": "release",
+            "target_triple": "x86_64-unknown-linux-musl",
+            "commit_sha": "ce4af62b32cc",
+            "status": "DELIVERED",
+            "requested_at": _seconds_ago_iso(2450, ref_now),
+            "finished_at": _seconds_ago_iso(2290, ref_now),
+            "delivered_at": _seconds_ago_iso(2274, ref_now),
+            "cache_hits": 295,
+            "cache_misses": 94,
+            "total_crates": 389,
+            "instance_name": "builder-oxidex-eu-01",
+            "zone": "europe-west4-a",
+            "machine_type": "n4-highcpu-16",
+            "vcpu": 16,
+            "cpu_platform": "Intel Emerald Rapids",
+            "origin_ip": "185.220.101.34",
+            "origin_hostname": "tor-exit-101.zwiebelfreunde.de",
+            "peak_ram_gib": 24.6,
+            "container_ram_cap_gib": 28.0,
+            "cpu_time_seconds": 1892.0,
+        },
+        {
+            "build_id": "rb-20261015-003",
+            "project_name": "oxidex",
+            "profile": "debug",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "commit_sha": "f20f9f9b780f",
+            "status": "DELIVERED",
+            "requested_at": _seconds_ago_iso(4800, ref_now),
+            "finished_at": _seconds_ago_iso(4736, ref_now),
+            "delivered_at": _seconds_ago_iso(4728, ref_now),
+            "cache_hits": 424,
+            "cache_misses": 6,
+            "total_crates": 430,
+            "instance_name": "builder-oxidex-turin-01",
+            "zone": "us-south1-b",
+            "machine_type": "c4d-highcpu-16",
+            "vcpu": 16,
+            "cpu_platform": "AMD Turin",
+            "origin_ip": "73.162.44.19",
+            "origin_hostname": "m4air-workstation.local",
+            "peak_ram_gib": 14.2,
+            "container_ram_cap_gib": 28.0,
+            "cpu_time_seconds": 542.0,
+        },
+        {
+            "build_id": "rb-20261015-004",
+            "project_name": "nzbget-rust-ffi",
+            "profile": "release",
+            "target_triple": "aarch64-apple-darwin",
+            "commit_sha": "e3c84b8190aa",
+            "status": "DELIVERED",
+            "requested_at": _seconds_ago_iso(7600, ref_now),
+            "finished_at": _seconds_ago_iso(7455, ref_now),
+            "delivered_at": _seconds_ago_iso(7441, ref_now),
+            "cache_hits": 318,
+            "cache_misses": 42,
+            "total_crates": 360,
+            "instance_name": "builder-oxidex-eu-01",
+            "zone": "europe-west4-a",
+            "machine_type": "n4-highcpu-16",
+            "vcpu": 16,
+            "cpu_platform": "Intel Emerald Rapids",
+            "origin_ip": "193.138.218.77",
+            "origin_hostname": "se-got-wg-004.mullvad.net",
+            "peak_ram_gib": 19.7,
+            "container_ram_cap_gib": 28.0,
+            "cpu_time_seconds": 1510.4,
+        },
+        {
+            "build_id": "rb-20261015-005",
+            "project_name": "oxidex-bench",
+            "profile": "release",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "commit_sha": "3317b1b902ef",
+            "status": "DELIVERED",
+            "requested_at": _seconds_ago_iso(11200, ref_now),
+            "finished_at": _seconds_ago_iso(11010, ref_now),
+            "delivered_at": _seconds_ago_iso(10996, ref_now),
+            "cache_hits": 260,
+            "cache_misses": 170,
+            "total_crates": 430,
+            "instance_name": "builder-oxidex-turin-01",
+            "zone": "us-south1-b",
+            "machine_type": "c4d-highcpu-16",
+            "vcpu": 16,
+            "cpu_platform": "AMD Turin",
+            "origin_ip": "24.28.119.82",
+            "origin_hostname": "dev-macbook-pro.tx.rr.com",
+            "peak_ram_gib": 26.1,
+            "container_ram_cap_gib": 28.0,
+            "cpu_time_seconds": 2480.0,
+        },
+    ]
+    from lib.dashboard_server import default_dashboard_state
+
+    with unittest.mock.patch("lib.dashboard_server.time.time", return_value=ref_now):
+        presets = default_dashboard_state(project=project)
+    return {
+        "scaling_telemetry": scaling_telemetry,
+        "rust_builds": [enrich_rust_build_record(row, project=project) for row in raw_rust_builds],
+        "vm_templates": presets["vm_templates"],
+        "cloud_init_templates": presets["cloud_init_templates"],
+    }
 
 
 def fleet_observation(
@@ -971,6 +1205,10 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(sc_res["evaluation"]["role"], "rust_builder")
         self.assertGreaterEqual(sc_res["evaluation"]["desired_instances"], 2)
+        self.store.record_rust_build({
+            "build_id": "rb-project-override-01", "instance_name": "builder-oxidex-1", "zone": "us-south1-b",
+            "status": "DELIVERED", "cache_hits": 10, "cache_misses": 2,
+        })
 
         # Reload store from existing state_file with a new project & org
         from lib.dashboard_server import DashboardStore
@@ -985,6 +1223,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertTrue(
             all("--project=custom-gcp-proj-99" in i["ssh_command"] for i in reloaded.state["instances"])
         )
+        self.assertTrue(reloaded.state["rust_builds"])
         self.assertTrue(
             all("--project=custom-gcp-proj-99" in b["ssh_command"] for b in reloaded.state["rust_builds"])
         )
@@ -6847,6 +7086,293 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertNotIn("deleteInstanceNow(", DASHBOARD_HTML)
         self.assertIn("Plan only", DASHBOARD_HTML)
         self.assertIn("live Compute Engine inventory", DASHBOARD_HTML)
+
+
+class SeededTelemetryMigrationTests(unittest.TestCase):
+    """Demo telemetry earlier versions seeded into the default state is dropped from every loaded state."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_file = Path(self.tmp.name) / "dashboard-state.json"
+        from lib.dashboard_server import DashboardStore
+
+        self.store = DashboardStore(state_path=self.state_file)
+        self.addCleanup(self.store.close)
+
+    def _seeded_raw_state(self) -> dict:
+        """The persisted state with the old seeds plus one real record of each kind."""
+        raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+        raw.pop("demo_telemetry_migration")  # written by a version that still seeded demo telemetry
+        seeds = seeded_demo_telemetry()
+        telem = seeds["scaling_telemetry"]
+        telem["github_oom_runs"].append({
+            "id": "gh-ci-real0001", "repository": "swack-tools/oxidex", "run_id": 38601924810, "job_id": 1,
+            "runner_name": "gha-oxidex-runners-us-south1-a-1-1", "step_number": 3, "line_number": 9,
+            "error_excerpt": "##[error]Process completed with exit code 137.", "failed_at": "2026-10-17T10:00:00Z",
+        })
+        telem["journal_oom_events"].append({"id": "oom-journal-01", "instance_name": "oxidex-runners-real-1",
+                                            "observed_at": "2026-10-17T10:00:00Z", "process": "rustc"})
+        real_build = dict(seeds["rust_builds"][0], build_id="rb-real0001", instance_name="builder-oxidex-1")
+        raw["scaling_telemetry"] = telem
+        raw["vm_templates"] = seeds["vm_templates"]
+        raw["cloud_init_templates"] = seeds["cloud_init_templates"]
+        raw["rust_builds"] = seeds["rust_builds"] + [real_build]
+        return raw
+
+    def _assert_seeds_dropped(self, state: dict) -> None:
+        telem = state["scaling_telemetry"]
+        self.assertEqual([b["build_id"] for b in state["rust_builds"]], ["rb-real0001"])
+        self.assertEqual([r["id"] for r in telem["github_oom_runs"]], ["gh-ci-real0001"])
+        self.assertEqual([(e["id"], e["instance_name"]) for e in telem["journal_oom_events"]],
+                         [("oom-journal-01", "oxidex-runners-real-1")])
+        self.assertEqual((telem["jobs_ran_past_hour"], telem["provisioned_jobs"], telem["queued_jobs"]), (14, 7, 3))
+
+    def test_default_state_seeds_no_telemetry(self):
+        from lib.dashboard_server import default_dashboard_state
+
+        for state in (default_dashboard_state(), self.store.state):
+            telem = state["scaling_telemetry"]
+            self.assertEqual(state["rust_builds"], [])
+            self.assertEqual((telem["github_oom_runs"], telem["journal_oom_events"]), ([], []))
+            self.assertEqual((telem["current_runners"], telem["jobs_ran_past_hour"], telem["provisioned_jobs"],
+                              telem["queued_jobs"]), (0, 0, 0, 0))
+        self.assertEqual(self.store.state["scaling_telemetry"]["builds_ran_past_hour"], 0)
+
+    def test_seeded_telemetry_is_dropped_on_load_from_disk(self):
+        from lib.dashboard_server import DashboardStore
+
+        self.state_file.write_text(json.dumps(self._seeded_raw_state()), encoding="utf-8")
+        with self.assertLogs("spot_dashboard", "WARNING") as logs:
+            reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        self.assertIn("seeded demo telemetry", "\n".join(logs.output))
+        self._assert_seeds_dropped(reloaded.state)
+        # A real run that reuses an old seed's run id is kept as reported, not rewritten into the seed.
+        real_run = reloaded.state["scaling_telemetry"]["github_oom_runs"][0]
+        self.assertEqual((real_run["run_id"], real_run["job_id"]), (38601924810, 1))
+        on_disk = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self._assert_seeds_dropped(on_disk)
+        self.assertEqual(on_disk["demo_telemetry_migration"], 1)
+
+    def test_seeded_telemetry_is_dropped_from_kv_snapshot_and_import(self):
+        from lib.edge_state import build_snapshot
+
+        raw = self._seeded_raw_state()
+        snapshot = build_snapshot(raw, self.store.state_version() + 1, "a")
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            self.store.import_snapshot(snapshot)
+        self._assert_seeds_dropped(self.store.state)
+
+    def test_seed_ids_from_older_versions_are_dropped(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        legacy_runs = [{'id': 'gh-oom-38601924810',
+          'repository': 'swack-tools/oxidex',
+          'workflow_name': 'Rust 1.99 Qualification Matrix',
+          'run_id': 38601924810,
+          'job_id': 116012948102,
+          'job_name': 'cargo-nextest-heavy',
+          'runner_name': 'oxidex-za-jnb-01-3',
+          'step_number': 4,
+          'line_number': 118,
+          'failed_at': '2027-01-15T07:37:00Z',
+          'error_excerpt': 'LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)',
+          'failure_classification': 'OOM',
+          'is_oom': True,
+          'is_self_hosted_runner': True,
+          'badge_text': 'OOM Killed (Exit 137 · Self-Hosted Spot Runner)',
+          'deep_link': 'https://github.com/swack-tools/oxidex/actions/runs/38601924810/job/116012948102#step:4:118'},
+         {'id': 'gh-oom-38596411473',
+          'repository': 'Appz4Fun/nzbget',
+          'workflow_name': 'CI Build & Integration Suite',
+          'run_id': 38596411473,
+          'job_id': 115964282184,
+          'job_name': 'linux-x64-release-build',
+          'runner_name': 'oxidex-dallas-01-2',
+          'step_number': 2,
+          'line_number': 50,
+          'failed_at': '2027-01-15T07:51:00Z',
+          'error_excerpt': "error: could not compile `nzbget-core`: process didn't exit successfully (signal: 9, "
+                           'SIGKILL: kill) — container memory.max (16 GiB) exhausted',
+          'deep_link': 'https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50'}]
+        state = seeded_demo_telemetry(ref_now=1800000000)
+        state["scaling_telemetry"] = {"github_oom_runs": legacy_runs}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 7)
+        self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [])
+
+    def test_seed_ids_with_other_fields_are_real_reports(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        seeds = seeded_demo_telemetry()
+        build = dict(seeds["rust_builds"][0], commit_sha="0123456789ab")  # a real report merged into the seed row
+        run = dict(seeds["scaling_telemetry"]["github_oom_runs"][0], job_id=1)
+        event = dict(seeds["scaling_telemetry"]["journal_oom_events"][0], pid=1)
+        state = {"rust_builds": [build],
+                 "scaling_telemetry": {"github_oom_runs": [run], "journal_oom_events": [event]}}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+        self.assertEqual(state["rust_builds"], [build])
+        self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [run])
+        self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [event])
+
+    def test_reported_event_corrections_survive_legacy_cleanup(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        seeds = seeded_demo_telemetry()["scaling_telemetry"]
+        for key, updates in (
+            ("github_oom_runs", ({"error_excerpt": "corrected log evidence"},
+                                 {"failed_at": "2026-10-17T10:00:00Z"},
+                                 {"deep_link": "https://github.com/o/r/actions/runs/123/job/456"})),
+            ("journal_oom_events", ({"journal_line": "corrected kernel evidence"},
+                                    {"process": "python3"}, {"zone": "europe-west1-b"},
+                                    {"observed_at": "2026-10-17T10:00:00Z"})),
+        ):
+            for update in updates:
+                with self.subTest(key=key, update=update):
+                    record = dict(seeds[key][0], **update)
+                    state = seeded_demo_telemetry()
+                    state["scaling_telemetry"] = {key: [record]}
+                    self.assertEqual(drop_seeded_demo_telemetry(state), 5)
+                    self.assertEqual(state["scaling_telemetry"][key], [record])
+
+    def test_uniform_fractional_build_shift_is_a_reported_correction(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        build = seeded_demo_telemetry()["rust_builds"][0]
+        for key in ("requested_at", "finished_at", "delivered_at"):
+            stamp = datetime.fromisoformat(build[key].replace("Z", "+00:00")).timestamp()
+            build[key] = datetime.fromtimestamp(stamp + 0.25, timezone.utc).isoformat()
+        state = {"rust_builds": [build]}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+        self.assertEqual(state["rust_builds"], [build])
+
+    def test_uniform_whole_second_build_shift_keeps_the_corrected_record(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        for shift in (-60, 60):
+            with self.subTest(shift=shift):
+                state = seeded_demo_telemetry(ref_now=1800000000)
+                build = state["rust_builds"][0]
+                for key in ("requested_at", "finished_at", "delivered_at"):
+                    stamp = datetime.fromisoformat(build[key].replace("Z", "+00:00")).timestamp()
+                    build[key] = datetime.fromtimestamp(stamp + shift, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                self.assertEqual(drop_seeded_demo_telemetry(state), 8)
+                self.assertEqual(state["rust_builds"], [build])
+                self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [])
+
+    def test_batch_shifted_builds_are_not_evidence_for_their_own_startup_time(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        state = seeded_demo_telemetry(ref_now=1800000000)
+        builds = state["rust_builds"]
+        for build in builds:
+            for key in ("requested_at", "finished_at", "delivered_at"):
+                stamp = datetime.fromisoformat(build[key].replace("Z", "+00:00")).timestamp()
+                build[key] = datetime.fromtimestamp(stamp + 60, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        drop_seeded_demo_telemetry(state)
+        self.assertEqual(state["rust_builds"], builds)
+
+    def test_markerless_reported_counter_tuple_without_seed_evidence_is_kept(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        counters = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3,
+                    "github_oom_runs": [], "journal_oom_events": []}
+        state = {"rust_builds": [], "scaling_telemetry": dict(counters)}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+        self.assertEqual(state["scaling_telemetry"], counters)
+
+    def test_missing_saved_presets_cannot_be_replaced_with_fresh_time_anchors(self):
+        state = seeded_demo_telemetry()
+        state.pop("vm_templates")
+        state.pop("cloud_init_templates")
+        state["scaling_telemetry"] = {"github_oom_runs": [], "journal_oom_events": [],
+                                      "jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+        self.store._apply_loaded_state(state)
+        self.assertEqual(len(self.store.state["rust_builds"]), 5)
+        self.assertEqual(self.store.state["scaling_telemetry"]["queued_jobs"], 3)
+
+    def test_fresh_partial_counter_report_survives_even_with_old_seed_events(self):
+        from lib.dashboard_server import DashboardStore
+
+        # Simulate the old deployment: its report path wrote no migration marker and left omitted event lists.
+        self.store.state = self._seeded_raw_state()
+        counters = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+        self.store.update_scaling({"telemetry": counters})
+        before = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("demo_telemetry_migration", before)
+        self.assertEqual(len(before["scaling_telemetry"]["github_oom_runs"]), 4)
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        self.assertEqual(len(reloaded.state["scaling_telemetry"]["github_oom_runs"]), 1)
+        self.assertEqual({key: reloaded.state["scaling_telemetry"][key] for key in counters}, counters)
+
+    def test_extra_event_evidence_survives_legacy_cleanup(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        state = seeded_demo_telemetry()
+        state["scaling_telemetry"]["github_oom_runs"][0]["log_sha256"] = "evidence-sha256"
+        state["scaling_telemetry"]["journal_oom_events"][0]["cgroup_path"] = "/jobs/actual-job"
+        self.assertEqual(drop_seeded_demo_telemetry(state), 7)  # 5 builds, 2 CI runs
+        self.assertEqual(len(state["scaling_telemetry"]["github_oom_runs"]), 1)
+        self.assertEqual(len(state["scaling_telemetry"]["journal_oom_events"]), 1)
+
+    def test_partial_real_updates_to_a_seeded_build_are_kept(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        seed = seeded_demo_telemetry()["rust_builds"][0]
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        fractional_finish = datetime.fromtimestamp(
+            datetime.fromisoformat(seed["finished_at"].replace("Z", "+00:00")).timestamp() + 0.2,
+            timezone.utc,
+        ).isoformat()
+        # record_rust_build merges a partial update into the seeded row: every field it omits stays as seeded.
+        for update in ({"status": "FAILED"}, {"cache_hits": 413}, {"project_name": "oxidex-cli"},
+                       {"delivered_at": later}, {"finished_at": fractional_finish}, {"peak_ram_gib": 22}):
+            with self.subTest(update=update):
+                state = {"rust_builds": [dict(seed, **update)]}
+                self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+                self.assertEqual(len(state["rust_builds"]), 1)
+        # One isolated row has no independent startup-time evidence; keep ambiguous history.
+        state = {"rust_builds": [dict(seed)]}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+
+    def test_newer_migration_marker_is_kept_and_not_rerun(self):
+        from lib.dashboard_server import DashboardStore
+
+        raw = self._seeded_raw_state()
+        raw["demo_telemetry_migration"] = 2  # written by a later version, for example before a rollback
+        self.state_file.write_text(json.dumps(raw), encoding="utf-8")
+        reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        self.assertEqual(reloaded.state["demo_telemetry_migration"], 2)
+        self.assertEqual(len(reloaded.state["rust_builds"]), 6)
+        self.assertEqual(reloaded.state["scaling_telemetry"]["queued_jobs"], 3)
+
+    def test_migrated_state_keeps_reported_telemetry_that_matches_a_seed(self):
+        from lib.dashboard_server import DashboardStore
+        from lib.edge_state import build_snapshot
+
+        counters = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+        self.store.update_scaling({"telemetry": dict(counters)})
+        self.store.record_rust_build(dict(seeded_demo_telemetry()["rust_builds"][0]))
+        reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        for state in (reloaded.state, json.loads(self.state_file.read_text(encoding="utf-8"))):
+            self.assertEqual({k: state["scaling_telemetry"][k] for k in counters}, counters)
+            self.assertEqual([b["build_id"] for b in state["rust_builds"]], ["rb-20261015-001"])
+        reloaded.import_snapshot(build_snapshot(copy.deepcopy(reloaded.state), reloaded.state_version() + 1, "a"))
+        self.assertEqual({k: reloaded.state["scaling_telemetry"][k] for k in counters}, counters)
+        self.assertEqual(len(reloaded.state["rust_builds"]), 1)
+
+    def test_reported_job_counters_are_kept(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        for counters in ({"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 4},
+                         {"jobs_ran_past_hour": 14.0, "provisioned_jobs": 7, "queued_jobs": 3}):
+            state = {"scaling_telemetry": dict(counters)}
+            self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+            self.assertEqual(state["scaling_telemetry"], counters)
 
 
 class PublicOriginBehindWorkerTests(unittest.TestCase):
