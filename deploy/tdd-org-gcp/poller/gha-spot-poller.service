@@ -1,0 +1,31 @@
+[Unit]
+Description=Create throwaway GCP Spot runner VMs (large rust-heavy/bigmem, small gcp-rust) for queued jobs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=gha-spot-poller
+Environment=GCP_PROJECT=email-rs-493900 GCP_ZONE=australia-southeast1-c GCP_INSTANCE=gha-spot-1
+# Ephemeral mode: one throwaway VM per queued job, in two classes sharing the
+# project's 32-vCPU quota: one large VM or up to four small ones (2026-10-18).
+Environment=MODE=ephemeral RUNNER_GROUP_ID=6 VCPU_QUOTA=32
+Environment=LARGE_TEMPLATE=gha-large-20261018060207063400000001 LARGE_LABELS=rust-heavy,bigmem LARGE_VCPUS=30 LARGE_MAX=1
+Environment=SMALL_TEMPLATE=gha-small-20261018060207067300000002 SMALL_LABELS=gcp-rust SMALL_VCPUS=8 SMALL_MAX=4
+Environment=GH_ORG=TheDancingDeveloper-org REPOS=codex,vogt,rustnzb,rustTorrent
+Environment=MAX_HOURS_PER_MONTH=250 STATE_FILE=/var/lib/gha-spot-poller/state.json
+# Secrets are TPM2-encrypted at rest and decrypted only into this service's
+# private tmpfs credentials directory.
+LoadCredentialEncrypted=gh_token:/etc/credstore.encrypted/gha-spot-poller.gh_token
+LoadCredentialEncrypted=gcp_sa_key:/etc/credstore.encrypted/gha-spot-poller.gcp_sa_key
+ExecStart=/usr/bin/python3 /opt/gha-spot-poller/gha_spot_poller.py
+Restart=always
+RestartSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
