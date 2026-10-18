@@ -10,9 +10,10 @@ StateDirectory=gha-spot-poller
 Environment=GCP_PROJECT=email-rs-493900 GCP_ZONE=australia-southeast1-c GCP_INSTANCE=gha-spot-1
 # Ephemeral mode: one throwaway VM per queued job, in two classes sharing the
 # project's 32-vCPU quota: one large VM or up to four small ones (2026-10-18).
+# Template names come from `terraform output runner_templates` (deploy/tdd-org-gcp).
 Environment=MODE=ephemeral RUNNER_GROUP_ID=6 VCPU_QUOTA=32
-Environment=LARGE_TEMPLATE=gha-large-20261018060207063400000001 LARGE_LABELS=rust-heavy,bigmem LARGE_VCPUS=30 LARGE_MAX=1
-Environment=SMALL_TEMPLATE=gha-small-20261018060207067300000002 SMALL_LABELS=gcp-rust SMALL_VCPUS=8 SMALL_MAX=4
+Environment=LARGE_TEMPLATE=gha-large-20261018231626514000000002 LARGE_LABELS=rust-heavy,bigmem LARGE_VCPUS=30 LARGE_MAX=1
+Environment=SMALL_TEMPLATE=gha-small-20261018231626512700000001 SMALL_LABELS=gcp-rust SMALL_VCPUS=8 SMALL_MAX=4
 Environment=GH_ORG=TheDancingDeveloper-org REPOS=codex,vogt,rustnzb,rustTorrent
 # GitHub App gha-spot-poller (WI-1863); unset both to fall back to gh_token.
 Environment=GH_APP_ID=5372559 GH_APP_INSTALLATION_ID=172817044
