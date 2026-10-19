@@ -133,6 +133,24 @@ served first: while it waits for vCPUs, no new small VM starts, so the running
 ones drain. It never asks GCP for a VM that would exceed `VCPU_QUOTA`, and a
 refused create leaves the job queued for the next poll.
 
+### Daily spend cap
+
+With `DAILY_USD_CAP` set (the unit sets 5), the poller estimates today's spend
+in USD and creates no VM once the estimate reaches the cap. Running VMs finish
+their jobs, and queued jobs wait or fall back to the static runners. The
+journal logs one `ALERT: daily cap` line when the cap is reached, and another
+when spend is below the cap again.
+
+- The estimate adds, every poll, each listed VM's cost since the last poll:
+  `{LARGE,SMALL}_USD_PER_HOUR` (Spot plus IPv4, defaults 0.135 and 0.04) while
+  it runs, plus `{LARGE,SMALL}_DISK_GB` (160 and 100) times
+  `DISK_USD_PER_GB_MONTH` (0.135) while it exists.
+- It resets at UTC midnight and is kept in the state file.
+- It fails closed: a malformed price or a VM of an unpriced class logs
+  `ALERT: daily spend estimate unavailable` and blocks creates.
+- It's an estimate from list prices, not billing data. Egress and VMs deleted
+  between polls aren't counted. The Pub/Sub budget remains the backstop.
+
 When the poller deletes a VM (finished, overdue or over budget), it also removes
 the VM's runner registration if GitHub lists it offline. A JIT runner removes
 itself only after it runs a job, so a VM deleted before it took one used to

@@ -17,6 +17,8 @@ Environment=SMALL_TEMPLATE=gha-small-20261019095236814000000001 SMALL_LABELS=gcp
 Environment=GH_ORG=TheDancingDeveloper-org REPOS=codex,vogt,rustnzb,rustTorrent
 # GitHub App gha-spot-poller (WI-1863); unset both to fall back to gh_token.
 Environment=GH_APP_ID=5372559 GH_APP_INSTALLATION_ID=172817044
+# Hard daily spend cap (estimate, UTC day): no new VM at $5; running VMs finish.
+Environment=DAILY_USD_CAP=5
 Environment=MAX_HOURS_PER_MONTH=250 STATE_FILE=/var/lib/gha-spot-poller/state.json
 # Webhook intake (WI-1891), off until the App's webhook, its secret and the
 # webhook.caddy route are in place. Then GitHub is listed every 300 s instead of
