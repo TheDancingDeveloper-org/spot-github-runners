@@ -27,6 +27,11 @@ Environment:
                       template disables the class; `gha-small-*` picks the newest template
                       with that prefix, and a missing fixed name falls back to it with a warning; GCP_TEMPLATE/RUNNER_LABELS/MAX_VMS
                       are the large class's fallbacks)
+  DAILY_USD_CAP       ephemeral mode: no new VM once today's (UTC) estimated spend reaches
+                      this many USD; running VMs finish. 0 (default) turns it off. The
+                      estimate is VM-hours x {LARGE,SMALL}_USD_PER_HOUR (Spot + IPv4,
+                      defaults 0.135 / 0.04) plus {LARGE,SMALL}_DISK_GB (160 / 100) x
+                      DISK_USD_PER_GB_MONTH (0.135). An unusable estimate blocks creates
   POLL_INTERVAL       seconds between polls, default 60. Without webhooks, GitHub is listed
                       every poll; with them, only GCP housekeeping runs at this pace
   RECONCILE_INTERVAL  seconds between scans of in_progress runs for queued later jobs, and with
@@ -112,6 +117,12 @@ for _cls, _prefix, _tpl, _labels_default, _vcpus, _max in (
             "max": int(os.environ.get(f"{_env}_MAX", _max))}
 VCPU_QUOTA = int(os.environ.get("VCPU_QUOTA", "32"))
 RUNNER_GROUP_ID = int(os.environ.get("RUNNER_GROUP_ID", "6"))
+# Daily USD cap (ephemeral mode). Prices are Sydney list prices, rounded up.
+DAILY_USD_CAP = float(os.environ.get("DAILY_USD_CAP", "0") or 0)
+DISK_USD_PER_GB_MONTH = os.environ.get("DISK_USD_PER_GB_MONTH", "0.135")
+PRICES = {_cls: {"hour": os.environ.get(f"{_cls.upper()}_USD_PER_HOUR", _hour),
+                 "disk_gb": os.environ.get(f"{_cls.upper()}_DISK_GB", _disk)}
+          for _cls, _hour, _disk in (("large", "0.135", "160"), ("small", "0.04", "100"))}
 MAX_VM_AGE_S = int(os.environ.get("MAX_VM_AGE_MIN", "420")) * 60  # backstop over the VM's own 6 h limit
 
 
@@ -801,6 +812,56 @@ def remove_runner(name):
         log(f"could not remove runner {name}: {error}")
 
 
+def _price(raw, what):
+    value = float(raw)  # ValueError for a malformed setting
+    if not value >= 0 or value == float("inf"):
+        raise ValueError(f"{what} is {raw!r}")
+    return value
+
+
+def accrue_spend(state, vms, now, prices=None):
+    """Add the VMs' cost since the last poll to today's (UTC) estimate; returns it.
+
+    Compute and IPv4 accrue while a VM runs (or is stopping), its disk while it
+    exists. Each VM is charged from the later of the last poll, its creation and
+    UTC midnight, so a restart or a gap undercounts nothing the VM list still
+    shows. Raises ValueError when the estimate can't be trusted."""
+    prices = PRICES if prices is None else prices
+    midnight = dt.datetime.fromtimestamp(now, dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    day = midnight.date().isoformat()
+    if state.get("spend_day") != day:
+        state.update(spend_day=day, spend_usd=0.0)
+    spend = _price(state.get("spend_usd", 0.0), "the saved spend")
+    disk_rate = _price(DISK_USD_PER_GB_MONTH, "DISK_USD_PER_GB_MONTH") / 730
+    since = max(float(state.get("spend_poll") or 0), midnight.timestamp())
+    for vm in vms:
+        cls = vm_class(vm)
+        if cls not in prices:
+            raise ValueError(f"no price for VM {vm.get('name')} of class {cls}")
+        start = max(since, dt.datetime.fromisoformat(vm["creationTimestamp"]).timestamp())
+        hours = max(now - start, 0) / 3600
+        rate = _price(prices[cls]["disk_gb"], f"{cls.upper()}_DISK_GB") * disk_rate
+        if vm["status"] in ("RUNNING", "STOPPING"):
+            rate += _price(prices[cls]["hour"], f"{cls.upper()}_USD_PER_HOUR")
+        spend += hours * rate
+    state.update(spend_usd=spend, spend_poll=now)
+    return spend
+
+
+def spend_gate(state, vms, now):
+    """None if a VM may start, else why not. Fails closed on any estimate error."""
+    if DAILY_USD_CAP <= 0:
+        return None
+    try:
+        spend = accrue_spend(state, vms, now)
+    except (KeyError, TypeError, ValueError) as error:
+        return f"ALERT: daily spend estimate unavailable ({error}); not creating VMs"
+    if spend >= DAILY_USD_CAP:
+        return (f"ALERT: daily cap ${DAILY_USD_CAP:.2f} reached (estimated ${spend:.2f} today, UTC); "
+                f"not creating VMs until UTC midnight, queued jobs fall back to static runners")
+    return None
+
+
 def poll_ephemeral(state):
     month = dt.date.today().strftime("%Y-%m")
     if state.get("month") != month:
@@ -815,6 +876,7 @@ def poll_ephemeral(state):
         state["running_seconds"] += len([v for v in live if v["status"] == "RUNNING"]) * min(now - state["last_poll"], 10 * INTERVAL)
     state["last_poll"] = now
     hours = state["running_seconds"] / 3600
+    capped = spend_gate(state, vms, now)
     heartbeat(state, f"{len(live)} live / {len(vms)} total throwaway VMs, {used}/{VCPU_QUOTA} vCPU")
     if _monitor[0] is not None:
         _monitor[0].set_gcp(
@@ -847,6 +909,13 @@ def poll_ephemeral(state):
     if state.get("budget_locked"):
         log(f"{len(jobs)} queued but budget-locked; not creating VMs")
         return
+    if capped:
+        if capped.split(" (")[0] != str(state.get("capped", "")).split(" (")[0]:
+            log(f"{capped}; {len(jobs)} queued")  # once per change, not every poll
+        state["capped"] = capped
+        return
+    if state.pop("capped", None):
+        log("daily spend below the cap again; creating VMs")
     # A VM inserted in the last two minutes may not be listed yet; count it as live so a
     # wake-up seconds later does not create a second one for the same job.
     listed = {v["name"] for v in vms}
