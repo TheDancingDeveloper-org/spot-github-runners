@@ -24,7 +24,8 @@ Environment:
   MODE                persistent (start/stop GCP_INSTANCE) or ephemeral (one throwaway VM per job)
   RUNNER_GROUP_ID, MAX_VM_AGE_MIN, VCPU_QUOTA (default 32)   ephemeral mode settings
   {LARGE,SMALL}_TEMPLATE, _LABELS, _VCPUS, _MAX   ephemeral VM classes (an empty
-                      template disables the class; GCP_TEMPLATE/RUNNER_LABELS/MAX_VMS
+                      template disables the class; `gha-small-*` picks the newest template
+                      with that prefix, and a missing fixed name falls back to it with a warning; GCP_TEMPLATE/RUNNER_LABELS/MAX_VMS
                       are the large class's fallbacks)
   POLL_INTERVAL       seconds between polls, default 60. Without webhooks, GitHub is listed
                       every poll; with them, only GCP housekeeping runs at this pace
@@ -705,10 +706,48 @@ def vm_class(vm):
     return next((n for n, c in CLASSES.items() if c["vcpus"] == vm_vcpus(vm)), "large")
 
 
+TEMPLATES_URL = "https://compute.googleapis.com/compute/v1/projects/{project}/global/instanceTemplates"
+
+
+def newest_template(prefix):
+    """The most recently created instance template whose name starts with prefix, or None."""
+    query = urllib.parse.urlencode({"filter": f'name eq "{prefix}.*"', "maxResults": 500})
+    items = http("GET", f"{TEMPLATES_URL.format(project=PROJECT)}?{query}", gcp_token()).get("items", [])
+    items = [t for t in items if t.get("name", "").startswith(prefix)]
+    return max(items, key=lambda t: t.get("creationTimestamp", ""))["name"] if items else None
+
+
+def template_prefix(name):
+    """gha-small-20261019095236814000000001 -> gha-small- (Terraform's name_prefix)."""
+    return name.rstrip("0123456789")
+
+
 def template_metadata_items(template):
+    """A template's metadata items and its resolved name.
+
+    A name ending in `*` resolves to the newest template with that prefix, so a
+    Terraform replace (which renames the template) needs no poller change. A fixed
+    name that no longer exists falls back the same way, with a warning, instead of
+    stranding every create on a 404 (WI-1914).
+    """
     name = template.rsplit("/", 1)[-1]
-    tpl = http("GET", f"https://compute.googleapis.com/compute/v1/projects/{PROJECT}/global/instanceTemplates/{name}",
-               gcp_token())
+    if name.endswith("*"):
+        resolved = newest_template(name[:-1])
+        if not resolved:
+            raise LookupError(f"no instance template matches {name}")
+        name = resolved
+    try:
+        tpl = http("GET", f"{TEMPLATES_URL.format(project=PROJECT)}/{name}", gcp_token())
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        fallback = newest_template(template_prefix(name))
+        if not fallback or fallback == name:
+            raise LookupError(f"instance template {name} not found") from error
+        log(f"WARNING: instance template {name} not found; using newest {fallback}. "
+            f"Update the poller's *_TEMPLATE (or use {template_prefix(name)}*)")
+        name = fallback
+        tpl = http("GET", f"{TEMPLATES_URL.format(project=PROJECT)}/{name}", gcp_token())
     return tpl["properties"].get("metadata", {}).get("items", []), name
 
 
@@ -720,7 +759,11 @@ def create_vm(job_ref, cls_name):
     """Create a VM of the class for a job. False (no raise) if GCP refuses it."""
     cls = CLASSES[cls_name]
     name = cls["prefix"] + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S-") + os.urandom(2).hex()
-    items, tpl_name = template_metadata_items(cls["template"])
+    try:
+        items, tpl_name = template_metadata_items(cls["template"])
+    except (LookupError, urllib.error.HTTPError) as error:
+        log(f"ERROR: could not resolve {cls_name} template {cls['template']}: {error}; {job_ref} stays queued")
+        return False
     jit = gh("POST", f"orgs/{ORG}/actions/runners/generate-jitconfig", {
         "name": name, "runner_group_id": RUNNER_GROUP_ID,
         "labels": ["self-hosted", "Linux", "X64", *cls["labels"]], "work_folder": "_work"})["encoded_jit_config"]
