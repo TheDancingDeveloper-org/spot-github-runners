@@ -1,0 +1,300 @@
+{
+  "title": "CI runners",
+  "uid": "ci-runners",
+  "schemaVersion": 39,
+  "tags": [
+    "runner-manager"
+  ],
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Runners by class and state",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (class, state) (runner_manager_runners)",
+          "legendFormat": "{{class}} {{state}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Queued jobs",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (class) (runner_manager_jobs_queued)",
+          "legendFormat": "{{class}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Job wait p50 / p90",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, class) (rate(runner_manager_job_wait_seconds_bucket[1h])))",
+          "legendFormat": "p50 {{class}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.9, sum by (le, class) (rate(runner_manager_job_wait_seconds_bucket[1h])))",
+          "legendFormat": "p90 {{class}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "Job duration p50 by repo",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, repo) (rate(runner_manager_job_duration_seconds_bucket[6h])))",
+          "legendFormat": "{{repo}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "vCPU used / quota",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "runner_manager_vcpu_used",
+          "legendFormat": "used"
+        },
+        {
+          "refId": "B",
+          "expr": "runner_manager_vcpu_quota",
+          "legendFormat": "quota"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Month VM hours",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "runner_manager_month_vm_hours",
+          "legendFormat": "hours"
+        },
+        {
+          "refId": "B",
+          "expr": "runner_manager_month_vm_hours_cap",
+          "legendFormat": "cap"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Budget locked",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 16,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "runner_manager_budget_locked",
+          "legendFormat": "locked"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "GitHub calls left",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "runner_manager_github_rate_remaining",
+          "legendFormat": "{{credential}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Webhooks: missed vs seen",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(runner_manager_missed_webhooks_total[1d])",
+          "legendFormat": "missed"
+        },
+        {
+          "refId": "B",
+          "expr": "increase(runner_manager_jobs_seen_total[1d])",
+          "legendFormat": "seen"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Offline runners",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "runner_manager_runner_offline == 1",
+          "legendFormat": "{{name}}",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "All organization runners",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "runner_manager_runner_info",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}

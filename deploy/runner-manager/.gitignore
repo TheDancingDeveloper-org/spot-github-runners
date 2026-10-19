@@ -1,0 +1,3 @@
+# The repo root ignores everything not allow-listed.
+!*.json
+!*.md

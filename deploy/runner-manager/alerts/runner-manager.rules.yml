@@ -1,0 +1,57 @@
+# Alert rules for the runner manager (docs/runner-manager.md §5, WI-1892). Not applied.
+# RunnerTierPolicyStale and RunnerPriorityRefused arrive with stages 4 and 5, which
+# add the metrics they read.
+groups:
+  - name: runner-manager
+    rules:
+      - alert: RunnerOffline
+        expr: runner_manager_runner_offline{class=~"static-.*|wsl"} == 1 and on() runner_manager_inventory_up == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Runner {{ $labels.name }} ({{ $labels.class }}) offline for 15 minutes"
+      - alert: RunnerInventoryStale
+        expr: runner_manager_inventory_up == 0 or runner_manager_inventory_age_seconds > 600
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "The runner inventory has not refreshed; RunnerOffline cannot fire meanwhile"
+      - alert: RunnerQueueStuck
+        expr: max by (class) (runner_manager_job_oldest_wait_seconds) > 1200
+        labels: {severity: warning}
+        annotations:
+          summary: "A {{ $labels.class }} job has been queued for over 20 minutes"
+      - alert: RunnerManagerDown
+        # /healthz turns 503 after three 60 s intervals plus 30 s; a poll failing every
+        # time (GCP or GitHub down) shows as a stale poll_ok age instead.
+        expr: up{job="runner-manager"} == 0 or absent(up{job="runner-manager"}) or runner_manager_loop_age_seconds > 210 or runner_manager_poll_ok_age_seconds > 900
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "The runner manager is down, unscraped, or its loop has stalled"
+      - alert: RunnerManagerWebhookSilent
+        expr: runner_manager_webhook_silent == 1
+        labels: {severity: warning}
+        annotations:
+          summary: "No workflow_job webhook for 15 minutes while jobs are queued; polling every 60 s"
+      - alert: GcpRunnerBudgetLocked
+        expr: runner_manager_budget_locked == 1
+        labels: {severity: critical}
+        annotations:
+          summary: "GCP runner budget lock is set; no throwaway VMs will start"
+      - alert: GcpRunnerHoursHigh
+        expr: runner_manager_month_vm_hours > 0.8 * runner_manager_month_vm_hours_cap
+        labels: {severity: warning}
+        annotations:
+          summary: "GCP runner VM hours are over 80% of the monthly cap"
+      - alert: GcpOrphanVm
+        expr: runner_manager_vm_oldest_age_seconds > runner_manager_vm_max_age_seconds
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "A throwaway VM has outlived MAX_VM_AGE_MIN"
+      - alert: GithubRateLow
+        expr: runner_manager_github_rate_remaining < 500
+        labels: {severity: warning}
+        annotations:
+          summary: "GitHub credential {{ $labels.credential }} has under 500 calls left"

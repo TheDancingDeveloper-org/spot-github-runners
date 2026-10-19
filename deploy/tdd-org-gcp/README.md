@@ -186,6 +186,41 @@ To enable it (operator steps, none done yet):
 Exit gate: after a week live, missed webhooks stay under 1% of jobs seen, and
 GitHub calls an hour are at least 80% below the 60 s polling baseline.
 
+### Monitoring (built, not enabled)
+
+Stage 2 of the runner manager. With `MONITOR_PORT` set, `poller/runner_monitor.py`
+(installed beside the poller) serves these on `MONITOR_BIND:MONITOR_PORT`, for the
+private network only:
+
+| Endpoint | Content |
+| --- | --- |
+| `GET /metrics` | Prometheus metrics: queued jobs, wait and duration histograms, runners by class and state, VMs, vCPU, month hours, budget lock, GitHub calls left per credential, webhook counters, build commit |
+| `GET /healthz` | 200 while the poll loop finished within three intervals, else 503 |
+| `GET /api/v1/runners` | Every organization runner with class, labels, state, current job and last seen |
+| `GET /api/v1/queue` | Queued jobs with tier, wait and planned class |
+
+The runner list comes from `GET /orgs/<org>/actions/runners` every 120 s through
+the read-only App (`RO_GH_APP_ID`, `RO_GH_APP_INSTALLATION_ID`, credential
+`ro_gh_app_key`), so it doesn't spend the poller App's budget. GCP VMs are
+classed by name prefix and static runners by their class label. Until stage 3
+renames the static `bigmem` label, a label alone can't tell the two apart.
+Queue data and wait times need the webhook intake. With polling only, the
+queue is empty and `RunnerQueueStuck` can't fire. Every job's tier reads
+`normal` until stage 4.
+
+A Prometheus in a container cannot reach the default `127.0.0.1` bind without
+host networking, so set `MONITOR_BIND` to a private address it can reach. If
+the runner listing stops refreshing, `RunnerInventoryStale` fires, because
+`RunnerOffline` can't fire meanwhile. A failure to start monitoring is logged,
+and the poller carries on without it.
+
+`deploy/runner-manager/` holds the Prometheus scrape job, the alert rules and
+the "CI runners" Grafana dashboard. To enable (operator steps, none done yet):
+seal the read-only App key, uncomment the monitoring lines in the unit with
+`BUILD_SHA` set, add the scrape job and rules to the estate Prometheus, and
+import the dashboard. The exit gate is a dashboard that shows every
+organization runner, and an alert drill in which each rule has fired once.
+
 ### Quota increase (prepared, not submitted)
 
 To run a large and small VMs together, raise both limits to 64 vCPU (needs
