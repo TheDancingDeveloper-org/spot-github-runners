@@ -1,6 +1,8 @@
 # Runner manager
 
-Status: design only. Nothing here is built or deployed.
+Status: stage 1 (webhook intake) is built in the poller but not enabled; see
+"Webhook intake" in `deploy/tdd-org-gcp/README.md`. Later stages are design
+only. Nothing here is deployed.
 
 This design grows the ephemeral Spot poller (`deploy/tdd-org-gcp/poller/`)
 into a **runner manager**. The manager is one service that sits between GitHub,

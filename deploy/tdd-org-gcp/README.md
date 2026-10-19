@@ -140,6 +140,52 @@ pick one up, because GitHub gives a job to any idle runner whose labels match.
 The systemd unit is `poller/gha-spot-poller.service`. Its template names come from
 `terraform output runner_templates`.
 
+### Webhook intake (built, not enabled)
+
+Stage 1 of [the runner manager](../../docs/runner-manager.md) lets the poller
+take the gha-spot-poller App's `workflow_job` webhook instead of listing every
+repository each minute. With `WEBHOOK_PORT` set:
+
+- The poller serves `POST /webhook/github` on `WEBHOOK_BIND:WEBHOOK_PORT`.
+  It checks `X-Hub-Signature-256` against the `gh_webhook_secret` credential,
+  refuses unsigned or wrongly signed deliveries with 401, and drops repeated
+  `X-GitHub-Delivery` ids. A `queued` delivery for a served job wakes the loop
+  at once; `in_progress` and `completed` take the job off the queue.
+- GitHub is listed every `RECONCILE_INTERVAL` (300 s), queued runs only, and
+  every 15 minutes (`IN_PROGRESS_SCAN_MIN`) in-progress runs as well, which
+  alone show a started run's later queued jobs. Only that fuller listing
+  removes jobs from the queue. A queued job the listing finds that no
+  delivery announced, older than 120 s, is logged as `missed_webhook` and
+  counted.
+- The fallback starts only after a listing has seen queued jobs, so in a
+  webhook outage that begins while nothing is queued, a new job can wait up
+  to one reconcile interval (300 s) before the 60 s polling resumes.
+- If no delivery arrives for 15 minutes while jobs are queued, the poller
+  lists every `POLL_INTERVAL` (60 s), with the in-progress scan, until
+  deliveries resume, and logs the change both ways.
+- The hourly heartbeat logs GitHub calls since the last heartbeat, jobs seen,
+  missed webhooks and refused deliveries. Counters persist in the state file.
+
+To enable it (operator steps, none done yet):
+
+1. Generate a secret, store it in Infisical, and seal it on the control host
+   as `/etc/credstore.encrypted/gha-spot-poller.gh_webhook_secret`.
+2. Add `poller/webhook.caddy` to the edge proxy with the public hostname and
+   the poller's address as the proxy sees it. The unit binds `127.0.0.1`,
+   which only a proxy on the same host's network can reach; a proxy in a
+   container or on another host needs `WEBHOOK_BIND` set to an address it can
+   reach, and that address should not be open to other clients, since only
+   the signature then guards it.
+3. In the App settings, set the webhook URL to
+   `https://<webhook-host>/webhook/github` with that secret, and subscribe to
+   **Workflow job** events.
+4. Uncomment the two webhook lines in `poller/gha-spot-poller.service`, then
+   reload and restart the unit. The App's recent deliveries page should show
+   the ping answered with 200.
+
+Exit gate: after a week live, missed webhooks stay under 1% of jobs seen, and
+GitHub calls an hour are at least 80% below the 60 s polling baseline.
+
 ### Quota increase (prepared, not submitted)
 
 To run a large and small VMs together, raise both limits to 64 vCPU (needs
