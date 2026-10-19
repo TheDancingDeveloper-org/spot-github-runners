@@ -10,6 +10,13 @@ MD=http://metadata.google.internal/computeMetadata/v1/instance/attributes
 md() { curl -fsS -H 'Metadata-Flavor: Google' "$MD/$1" 2>/dev/null || true; }
 
 RUST_TOOLCHAIN=$(md rust-toolchain); RUST_TOOLCHAIN=${RUST_TOOLCHAIN:-1.95.0}
+# Toolchains and targets routed repos pin (rust-toolchain.toml / CI), preinstalled
+# so a fresh VM downloads nothing. rustnzb pins 1.88.0 plus four cross targets;
+# drop 1.88.0 once its bump to 1.95.0 merges. rustTorrent's CI asks for "1.95",
+# which rustup treats as a separate toolchain name.
+EXTRA_TOOLCHAINS=$(md extra-toolchains); EXTRA_TOOLCHAINS=${EXTRA_TOOLCHAINS:-"1.95 1.88.0"}
+EXTRA_TARGETS=$(md extra-targets)
+EXTRA_TARGETS=${EXTRA_TARGETS:-"aarch64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-pc-windows-msvc x86_64-unknown-linux-musl"}
 NEXTEST_VERSION=$(md nextest-version); NEXTEST_VERSION=${NEXTEST_VERSION:-0.9.103}
 RUNNER_VERSION=$(md runner-version); RUNNER_VERSION=${RUNNER_VERSION:-2.337.0}
 SCCACHE_VERSION=$(md sccache-version); SCCACHE_VERSION=${SCCACHE_VERSION:-0.10.0}
@@ -66,6 +73,9 @@ $APT install -y --no-install-recommends \
   fonts-liberation fonts-noto-color-emoji fonts-freefont-ttf fonts-ipafont-gothic fonts-wqy-zenhei \
   fonts-tlwg-loma-otf xfonts-scalable xfonts-cyrillic
 sudo -u runner -H bash -c "curl -fsS --proto =https --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $RUST_TOOLCHAIN -c clippy -c rustfmt -c rust-src"
+for tc in $RUST_TOOLCHAIN $EXTRA_TOOLCHAINS; do
+  sudo -u runner -H bash -lc "rustup toolchain install $tc --profile minimal -c clippy -c rustfmt && rustup target add --toolchain $tc $EXTRA_TARGETS"
+done
 sudo -u runner -H bash -c "curl -fsSL https://get.nexte.st/$NEXTEST_VERSION/linux | tar -xz -C ~/.cargo/bin"
 curl -fsSL "https://github.com/mozilla/sccache/releases/download/v$SCCACHE_VERSION/sccache-v$SCCACHE_VERSION-x86_64-unknown-linux-musl.tar.gz" \
   | tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/sccache'
@@ -76,6 +86,11 @@ curl -fsSL "https://github.com/actions/runner/releases/download/v$RUNNER_VERSION
 
 # --- verify -----------------------------------------------------------------------
 sudo -u runner -H bash -lc 'rustc --version && cargo --version && cargo nextest --version | head -1'
+for tc in $RUST_TOOLCHAIN $EXTRA_TOOLCHAINS; do
+  for t in $EXTRA_TARGETS; do
+    sudo -u runner -H bash -lc "rustup target list --toolchain $tc --installed" | grep -qx "$t"
+  done
+done
 /usr/local/bin/sccache --version
 command -v bwrap && bwrap --version
 docker --version
@@ -88,6 +103,8 @@ echo "gha-bake: tools ok"
 cat >/etc/gha-image <<EOF
 image_version=$IMAGE_VERSION
 rust=$RUST_TOOLCHAIN
+toolchains=$RUST_TOOLCHAIN $EXTRA_TOOLCHAINS
+targets=$EXTRA_TARGETS
 nextest=$NEXTEST_VERSION
 runner=$RUNNER_VERSION
 sccache=$SCCACHE_VERSION

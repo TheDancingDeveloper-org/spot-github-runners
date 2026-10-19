@@ -145,6 +145,35 @@ pick one up, because GitHub gives a job to any idle runner whose labels match.
 The systemd unit is `poller/gha-spot-poller.service`. Its template names come from
 `terraform output runner_templates`.
 
+### Image toolchains and build parallelism (WI-1914, 2026-10-19)
+
+`image/bake.sh` preinstalls the toolchains the routed repos pin (`1.95.0`,
+`1.95` and `1.88.0`), each with rustnzb's four cross targets, so a fresh VM
+downloads no toolchain. Override them with the `extra-toolchains` and
+`extra-targets` bake metadata. Drop `1.88.0` once rustnzb moves to 1.95.0.
+
+`image/runtime.sh.tpl` sets `CARGO_BUILD_JOBS` from the VM's shape: one job per
+vCPU, capped at one per 2.5 GB of RAM (6 on c3d-highcpu-8). Routed workflows set
+`CARGO_BUILD_JOBS: 1` at job level for their small static runners, and job env
+beats the runner's `.env`. So a job-started hook
+(`ACTIONS_RUNNER_HOOK_JOB_STARTED`) writes the value to `$GITHUB_ENV`, which
+overrides job-level env for the steps that follow. A step-level `env:` still
+wins.
+
+Rollout and rollback:
+
+1. Bake: `CLOUDSDK_CONFIG=... image/bake-image.sh <version>` adds
+   `gha-rust-heavy-<version>` to the family. Templates pin an image by name, so
+   nothing changes until the next apply.
+2. `terraform apply` creates new templates from the family's newest image and
+   the new startup script (`create_before_destroy`). Point the poller's
+   `LARGE_TEMPLATE` and `SMALL_TEMPLATE` at `terraform output runner_templates`.
+3. Rollback: run `gcloud compute images deprecate gha-rust-heavy-<version>
+   --state=DEPRECATED`, which makes the family resolve to the previous image. Then
+   revert this change and apply again, or point the poller back at the old
+   template names. Keep `gha-rust-heavy-20261018-2309` until a routed job has
+   passed on the new image.
+
 ### Webhook intake (built, not enabled)
 
 Stage 1 of [the runner manager](../../docs/runner-manager.md) lets the poller
