@@ -156,7 +156,7 @@ downloads no toolchain. Override them with the `extra-toolchains` and
 vCPU, capped at one per 2.5 GB of RAM (6 on c3d-highcpu-8). Routed workflows set
 `CARGO_BUILD_JOBS: 1` at job level for their small static runners, and job env
 beats the runner's `.env`. So a job-started hook
-(`ACTIONS_RUNNER_HOOK_JOB_STARTED`) writes the value to `$GITHUB_ENV`, which
+(`ACTIONS_RUNNER_HOOK_JOB_STARTED`, a `.sh` path: the runner refuses other extensions) writes the value to `$GITHUB_ENV`, which
 overrides job-level env for the steps that follow. A step-level `env:` still
 wins.
 
