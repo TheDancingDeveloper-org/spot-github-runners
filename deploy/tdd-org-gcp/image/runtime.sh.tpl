@@ -76,14 +76,14 @@ MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 CARGO_JOBS=$(( MEM_KB * 2 / 5 / 1000000 ))
 (( CARGO_JOBS > $(nproc) )) && CARGO_JOBS=$(nproc)
 (( CARGO_JOBS < 1 )) && CARGO_JOBS=1
-cat >/usr/local/bin/gha-job-started <<HOOK
+cat >/usr/local/bin/gha-job-started.sh <<HOOK
 #!/bin/sh
 echo "CARGO_BUILD_JOBS=$CARGO_JOBS" >>"\$GITHUB_ENV"
 echo "gha-vm: CARGO_BUILD_JOBS=$CARGO_JOBS"
 HOOK
-chmod 0755 /usr/local/bin/gha-job-started
+chmod 0755 /usr/local/bin/gha-job-started.sh
 {
-  echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-job-started"
+  echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/gha-job-started.sh"
   echo "CARGO_BUILD_JOBS=$CARGO_JOBS"
   echo "PATH=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   echo "RUSTC_WRAPPER=/usr/local/bin/sccache"
