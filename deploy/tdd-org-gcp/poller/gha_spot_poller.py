@@ -42,6 +42,7 @@ Environment:
                       this, counts as a missed webhook, default 120
   RATE_LIMIT_FLOOR    pause GitHub calls until X-RateLimit-Reset below this many left, default 200
   LOG_LEVEL           info (default) or debug (adds the remaining GitHub quota once per poll)
+  MONITOR_PORT, ...   monitoring endpoints and runner inventory: see runner_monitor.py
   --once              one poll then exit (for a systemd timer); default loops every POLL_INTERVAL
 """
 import base64
@@ -379,6 +380,8 @@ class JobTable:
         self.deliveries = collections.OrderedDict()
         self.last_delivery = self.started = time.time() if now is None else now
         self.stats = collections.Counter()
+        self.baseline = {}
+        self.observer = None  # called as observer(action, ref, class, job) outside the lock
 
     def count(self, name):
         with self.lock:
@@ -387,6 +390,7 @@ class JobTable:
     def restore(self, stats):
         with self.lock:
             self.stats.update({k: int(v) for k, v in (stats or {}).items()})
+            self.baseline = dict(self.stats)
 
     def snapshot(self):
         with self.lock:
@@ -436,10 +440,13 @@ class JobTable:
                 fresh = ref not in self.queued
                 self.queued[ref] = {"cls": cls, "created": gh_time(job.get("created_at")) or now, "noted": now}
                 return fresh
-            if action in ("in_progress", "completed"):
-                self.known[ref] = (action, now)
-                self.queued.pop(ref, None)
-            return False
+            if action not in ("in_progress", "completed") or previous == "completed":
+                return False  # a late in_progress must not mark a finished job running
+            self.known[ref] = (action, now)
+            self.queued.pop(ref, None)
+        if self.observer is not None:
+            self.observer(action, ref, cls, job, previous)
+        return False
 
     def reconcile(self, found, started, now=None, complete=True):
         """Take the reconcile listing, begun at `started`, as the truth for queued jobs.
@@ -704,6 +711,7 @@ def template_metadata_items(template):
     return tpl["properties"].get("metadata", {}).get("items", []), name
 
 
+_monitor = [None]  # runner_monitor.Monitor when MONITOR_PORT is set
 _recent_creates = {}  # VM name -> (class, insert time), until the VM list shows it
 
 
@@ -750,6 +758,11 @@ def poll_ephemeral(state):
     state["last_poll"] = now
     hours = state["running_seconds"] / 3600
     heartbeat(state, f"{len(live)} live / {len(vms)} total throwaway VMs, {used}/{VCPU_QUOTA} vCPU")
+    if _monitor[0] is not None:
+        _monitor[0].set_gcp(
+            vms=[{"class": vm_class(v), "status": v["status"],
+                  "age": now - dt.datetime.fromisoformat(v["creationTimestamp"]).timestamp()} for v in vms],
+            vcpu_used=used, month_hours=hours, budget_locked=bool(state.get("budget_locked")))
 
     for v in vms:  # finished (powered off) or overdue VMs go, with their disks
         created = dt.datetime.fromisoformat(v["creationTimestamp"]).timestamp()
@@ -851,10 +864,22 @@ def main():
         table.restore(load_state().get("webhook_stats"))
         _intake["table"] = table
         start_webhook_server(table, secret, wake)
+    if os.environ.get("MONITOR_PORT", "0") not in ("", "0") and not once:
+        try:  # monitoring must never stop the poller from serving jobs
+            import runner_monitor  # installed beside this file
+            _monitor[0] = runner_monitor.Monitor(sys.modules[__name__])
+            runner_monitor.start(_monitor[0], sys.modules[__name__])
+        except (ImportError, OSError, ValueError) as error:
+            log(f"monitor: not started: {error}")
+            _monitor[0] = None
+        if _monitor[0] is not None and _intake["table"] is not None:
+            _intake["table"].observer = _monitor[0].job_event
     while True:
         state = load_state()
+        ok = False
         try:
             (poll_ephemeral if MODE == "ephemeral" else poll)(state)
+            ok = True
         except RateLimited as error:
             log(str(error))
         except (urllib.error.URLError, subprocess.CalledProcessError, KeyError) as error:
@@ -862,6 +887,8 @@ def main():
         if _intake["table"] is not None:
             state["webhook_stats"] = _intake["table"].snapshot()
         save_state(state)
+        if _monitor[0] is not None:
+            _monitor[0].loop_done(ok)
         debug(f"GitHub quota {_rate['remaining']}/{_rate['limit']} remaining, resets "
               f"{dt.datetime.fromtimestamp(_rate['reset'], dt.timezone.utc):%H:%M:%SZ}")
         if once:

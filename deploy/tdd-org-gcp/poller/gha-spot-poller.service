@@ -28,6 +28,12 @@ Environment=MAX_HOURS_PER_MONTH=250 STATE_FILE=/var/lib/gha-spot-poller/state.js
 LoadCredentialEncrypted=gh_app_key:/etc/credstore.encrypted/gha-spot-poller.gh_app_key
 LoadCredentialEncrypted=gh_token:/etc/credstore.encrypted/gha-spot-poller.gh_token
 LoadCredentialEncrypted=gcp_sa_key:/etc/credstore.encrypted/gha-spot-poller.gcp_sa_key
+# Monitoring (WI-1892), off until wanted: /metrics, /healthz and /api/v1/* on the
+# private network (runner_monitor.py, installed beside the poller). The runner
+# inventory needs the read-only App; leave its lines out to serve GCP and job data only.
+#Environment=MONITOR_PORT=9468 MONITOR_BIND=127.0.0.1 BUILD_SHA=<commit>
+#Environment=RO_GH_APP_ID=<app id> RO_GH_APP_INSTALLATION_ID=<installation id>
+#LoadCredentialEncrypted=ro_gh_app_key:/etc/credstore.encrypted/gha-spot-poller.ro_gh_app_key
 ExecStart=/usr/bin/python3 /opt/gha-spot-poller/gha_spot_poller.py
 Restart=always
 RestartSec=30

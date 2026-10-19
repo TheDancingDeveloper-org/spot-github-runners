@@ -1,0 +1,11 @@
+# Scrape job for the poller's monitoring endpoint (WI-1892). Not applied: add it to
+# the estate Prometheus configuration as an operator step. The target is the
+# poller's MONITOR_BIND:MONITOR_PORT on the private network; never a public route.
+# Replace the placeholder by hand (Prometheus does not expand it). A Prometheus in a
+# container cannot reach a poller bound to 127.0.0.1 without host networking, so set
+# MONITOR_BIND to an address it can reach.
+scrape_configs:
+  - job_name: runner-manager
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["${RUNNER_MONITOR_TARGET}"]
