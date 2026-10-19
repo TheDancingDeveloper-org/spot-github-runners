@@ -1,0 +1,25 @@
+# Reverse-proxy route for the poller's workflow_job webhook (WI-1891). Not applied:
+# adding it to the edge Caddy is an operator step (see ../README.md, "Webhook intake").
+#
+# Only POST /webhook/github reaches the poller; every other path and method gets a
+# 404 from Caddy. The poller still checks X-Hub-Signature-256 and refuses anything
+# unsigned, so this route narrows exposure rather than authenticating.
+#
+# {$RUNNER_WEBHOOK_HOST}      the public webhook hostname
+# {$RUNNER_WEBHOOK_UPSTREAM}  host:port of the poller's WEBHOOK_BIND:WEBHOOK_PORT,
+#                             reached over the private network
+{$RUNNER_WEBHOOK_HOST} {
+	@github_webhook {
+		method POST
+		path /webhook/github
+	}
+	handle @github_webhook {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy {$RUNNER_WEBHOOK_UPSTREAM}
+	}
+	handle {
+		respond 404
+	}
+}

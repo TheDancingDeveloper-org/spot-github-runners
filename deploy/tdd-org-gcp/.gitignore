@@ -5,6 +5,8 @@
 !requirements.txt
 !.terraform.lock.hcl
 !*.md
+!*.service
+!*.caddy
 
 .terraform/
 .build/
