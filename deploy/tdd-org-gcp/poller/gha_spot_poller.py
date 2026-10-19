@@ -58,6 +58,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ORG = os.environ.get("GH_ORG", "TheDancingDeveloper-org")
@@ -741,6 +742,20 @@ def create_vm(job_ref, cls_name):
 def delete_vm(name, why):
     zone_api("DELETE", f"/instances/{name}")
     log(f"deleting {name} ({why})")
+    remove_runner(name)
+
+
+def remove_runner(name):
+    """Drop the org runner a deleted VM registered. A JIT runner removes itself only
+    after it runs a job, so a VM deleted before it took one leaves an offline runner."""
+    try:
+        runners = gh("GET", f"orgs/{ORG}/actions/runners?name={urllib.parse.quote(name)}").get("runners", [])
+        for runner in runners:
+            if runner.get("name") == name and runner.get("status") == "offline":
+                gh("DELETE", f"orgs/{ORG}/actions/runners/{runner['id']}")
+                log(f"removed offline runner {name}")
+    except (RateLimited, urllib.error.URLError, OSError, ValueError) as error:
+        log(f"could not remove runner {name}: {error}")
 
 
 def poll_ephemeral(state):

@@ -133,6 +133,11 @@ served first: while it waits for vCPUs, no new small VM starts, so the running
 ones drain. It never asks GCP for a VM that would exceed `VCPU_QUOTA`, and a
 refused create leaves the job queued for the next poll.
 
+When the poller deletes a VM (finished, overdue or over budget), it also removes
+the VM's runner registration if GitHub lists it offline. A JIT runner removes
+itself only after it runs a job, so a VM deleted before it took one used to
+leave an offline `gha-rh-*` or `gha-*` runner behind.
+
 Only these VMs carry `gcp-rust`, so jobs that request it can't be taken by an
 idle Node B runner. Bare `[self-hosted]` jobs never wake a VM. A live VM can still
 pick one up, because GitHub gives a job to any idle runner whose labels match.
